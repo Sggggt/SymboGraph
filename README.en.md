@@ -6,7 +6,9 @@
 
 <h1 align="center">SymboGraph</h1>
 
-SymboGraph is a general-purpose GraphRAG knowledge infrastructure for local private documents. The system parses PDFs, slides, documents, web pages, Notebooks, images, and Markdown into searchable text chunks, Qdrant dense vectors, PostgreSQL sparse knowledge graphs, and citation-backed question-answering results. Whether your materials are in Chinese or English, the system retrieves them uniformly; all data stays local without uploading to third parties.
+**SymboGraph is a new-generation Neuro-Symbolic Agentic RAG system developed for serious enterprise and academic scenarios. this project is developed based on GraphRAG, but it distinguishes itself from the "semantic fragmentation" of traditional RAG and the "high cost and hallucination accumulation" of bulky GraphRAG architectures.**
+
+The system parses PDFs, slides, documents, web pages, Notebooks, images, and Markdown into searchable text chunks, Qdrant dense vectors, PostgreSQL sparse knowledge graphs, and citation-backed question-answering results. Whether your materials are in Chinese or English, the system retrieves them uniformly; all data stays local without uploading to third parties.
 
 As a general GraphRAG platform, SymboGraph's knowledge-base concept is not limited to any single document type—you can use it for course materials, research literature, technical manuals, legal contracts, or any text collection that requires structured decomposition and semantic linking.
 
@@ -18,13 +20,13 @@ As a general GraphRAG platform, SymboGraph's knowledge-base concept is not limit
 | Backend                | FastAPI, Pydantic, SQLAlchemy, NetworkX, LangGraph                                                                                                                                     |
 | Frontend               | Next.js 16.2.4, React 19, TypeScript, TanStack Query, ECharts                                                                                                                          |
 | Database               | PostgreSQL 16 for knowledge bases, file versions, chunks, graphs, QA sessions, and traces                                                                                              |
-| Vector Store           | Qdrant 1.17.1, collection `knowledge_chunks`                                                                                                                                         |
+| Vector Store           | Qdrant 1.17.1, collection `knowledge_chunks`                                                                                                                                           |
 | Cache And Coordination | Redis 7                                                                                                                                                                                |
 | Model API              | OpenAI-compatible Embedding / Chat API, with independent endpoint configuration                                                                                                        |
-| Retrieval              | Evidence-first retrieval: dense + BM25 + rerank base recall, evidence anchors, controlled graph navigation, then parent context assembly                                          |
+| Retrieval              | Evidence-first retrieval: dense + BM25 + rerank base recall, evidence anchors, controlled graph navigation, then parent context assembly                                               |
 | Graph                  | LLM candidates, chunk-vector semantic graph, graph algorithms for sparse construction, deduplication, communities, centrality, and hidden links; supports incremental and full rebuild |
 | Quality System         | Signal-policy-profile-judge four-tier quality architecture: adaptive tiered filtering and routing for chunks, concepts, and relations                                                  |
-| QA                     | Agentic RAG: Perception → Planning → Retrieval → EvidenceEvaluator → Generation, with cross-lingual retrieval and pre-generation evidence assessment                               |
+| QA                     | Agentic RAG: Perception → Planning → Retrieval → EvidenceEvaluator → Generation, with cross-lingual retrieval and pre-generation evidence assessment                                   |
 
 ## Technology Stack
 
@@ -192,32 +194,38 @@ The policy layer maps signals into discrete routing decisions:
 
 **ChunkQualityPolicy** decision space:
 
-| Action | Meaning | Downstream Impact |
-| ------ | ------- | ----------------- |
-| `discard` | Mechanical noise, drop immediately | No embedding, no retrieval, no graph |
-| `summary_only` | TOC page or structural label | Summary only, no retrieval or graph |
-| `evidence_only` | Too short or Notebook output | Embeddable and retrievable, but no summary, no graph |
-| `retrieval_candidate` | Ordinary content chunk | Embed, retrieve, summarize, no graph |
-| `graph_candidate` | High semantic density (definition/entity/term) | Embed, retrieve, summarize, participate in graph extraction |
-| `embed_only` | Code block without domain context | Embed only, no retrieval or graph |
+| Action                | Meaning                                        | Downstream Impact                                           |
+| --------------------- | ---------------------------------------------- | ----------------------------------------------------------- |
+| `discard`             | Mechanical noise, drop immediately             | No embedding, no retrieval, no graph                        |
+| `summary_only`        | TOC page or structural label                   | Summary only, no retrieval or graph                         |
+| `evidence_only`       | Too short or Notebook output                   | Embeddable and retrievable, but no summary, no graph        |
+| `retrieval_candidate` | Ordinary content chunk                         | Embed, retrieve, summarize, no graph                        |
+| `graph_candidate`     | High semantic density (definition/entity/term) | Embed, retrieve, summarize, participate in graph extraction |
+| `embed_only`          | Code block without domain context              | Embed only, no retrieval or graph                           |
 
 Chunk quality score formula:
 
-$$S_{\text{chunk}} = 0.30 \cdot \min\Bigl(1, \frac{L_{\text{norm}}}{600}\Bigr) + 0.25 \cdot D_{\text{term}} + 0.20 \cdot R_{\text{unique}} + 0.15 \cdot D_{\text{def}} + 0.05 \cdot \mathbf{1}_{\text{formula}} + 0.05 \cdot \mathbf{1}_{\text{table}} - 0.35 \cdot \mathbf{1}_{\text{toc}} - 0.40 \cdot \min\Bigl(1, 20 \cdot R_{\text{mojibake}}\Bigr)$$
+$$
+S_{\text{chunk}} = 0.30 \cdot \min\Bigl(1, \frac{L_{\text{norm}}}{600}\Bigr) + 0.25 \cdot D_{\text{term}} + 0.20 \cdot R_{\text{unique}} + 0.15 \cdot D_{\text{def}} + 0.05 \cdot \mathbf{1}_{\text{formula}} + 0.05 \cdot \mathbf{1}_{\text{table}} - 0.35 \cdot \mathbf{1}_{\text{toc}} - 0.40 \cdot \min\Bigl(1, 20 \cdot R_{\text{mojibake}}\Bigr)
+$$
 
-Where *L*<sub>norm</sub> is normalized length, *D*<sub>term</sub> is term density, *R*<sub>unique</sub> is unique token ratio, *D*<sub>def</sub> is definition score, and *R*<sub>mojibake</sub> is mojibake ratio.
+Where *L*`<sub>`norm`</sub>` is normalized length, *D*`<sub>`term`</sub>` is term density, *R*`<sub>`unique`</sub>` is unique token ratio, *D*`<sub>`def`</sub>` is definition score, and *R*`<sub>`mojibake`</sub>` is mojibake ratio.
 
 **ConceptQualityPolicy** decision space is `accept` / `reject`:
 
-$$S_{\text{concept}} = \max\Bigl(S_{\text{specificity}},\; 0.35 D_{\text{def}} + 0.25 D_{\text{term}} + 0.20 D_{\text{entity}}\Bigr) - 0.35 S_{\text{structural}} - 0.25 G_{\text{genericity}}$$
+$$
+S_{\text{concept}} = \max\Bigl(S_{\text{specificity}},\; 0.35 D_{\text{def}} + 0.25 D_{\text{term}} + 0.20 D_{\text{entity}}\Bigr) - 0.35 S_{\text{structural}} - 0.25 G_{\text{genericity}}
+$$
 
-Admission requires no hard-rejection reasons (too short, mojibake, path/filename, structural container, low specificity, insufficient evidence) and score *S*<sub>concept</sub> ≥ 0.45.
+Admission requires no hard-rejection reasons (too short, mojibake, path/filename, structural container, low specificity, insufficient evidence) and score *S*`<sub>`concept`</sub>` ≥ 0.45.
 
 **RelationQualityPolicy** decision space is `accept` / `candidate_only`:
 
-$$S_{\text{relation}} = 0.40 \cdot c + 0.25 \cdot \mathbf{1}_{\text{src}} + 0.25 \cdot \mathbf{1}_{\text{tgt}} + 0.10 \cdot \min\Bigl(1, \frac{n_{\text{support}}}{3}\Bigr)$$
+$$
+S_{\text{relation}} = 0.40 \cdot c + 0.25 \cdot \mathbf{1}_{\text{src}} + 0.25 \cdot \mathbf{1}_{\text{tgt}} + 0.10 \cdot \min\Bigl(1, \frac{n_{\text{support}}}{3}\Bigr)
+$$
 
-Where *c* is LLM confidence, **1**<sub>src</sub> / **1**<sub>tgt</sub> indicate whether the source/target concept appears in the evidence text. `inferred` or `related_to` relations are forced to `candidate_only`.
+Where *c* is LLM confidence, **1**`<sub>`src`</sub>` / **1**`<sub>`tgt`</sub>` indicate whether the source/target concept appears in the evidence text. `inferred` or `related_to` relations are forced to `candidate_only`.
 
 > **Design Intent (Why we do this)**: Traditional RAG/GraphRAG systems often apply only coarse-grained filtering before graph construction, allowing TOC pages, garbled text, and repeated extraction noise to pollute the vector store and knowledge graph. SymboGraph's tiered quality routing sends different content types to their proper destinations—noise is discarded, structural labels are summary-only, high-semantic-density blocks join the graph, and ordinary blocks handle retrieval—guaranteeing downstream quality from the data source.
 
@@ -273,7 +281,7 @@ $$
 \mathbf{v}_e = \frac{1}{|C_e|}\sum_{c \in C_e}\mathbf{v}_c
 $$
 
-*C*<sub>e</sub> is the set of active child chunks supporting entity *e*. The centroid is normalized before semantic graph construction.
+*C*`<sub>`e`</sub>` is the set of active child chunks supporting entity *e*. The centroid is normalized before semantic graph construction.
 
 > **Design Intent (Why we do this)**: Traditional GraphRAG directly embeds the extracted concept name, which biases the vector space toward the LLM's generic pre-training data. Calculating the centroid of all supporting underlying child chunk vectors ensures the graph remains perfectly faithful to the specific local context of the knowledge base, eliminating concept drift.
 
@@ -291,7 +299,7 @@ $$
 R_i = \mathrm{clamp}\bigl(2 + \lfloor \log_2(1 + r_i) \rfloor,\, 2,\, 8\bigr)
 $$
 
-*m*<sub>i</sub> is evidence chunk count and *r*<sub>i</sub> is chapter reference count. The system keeps mutual nearest neighbors, candidates accepted by the reciprocal cap, and high-confidence explicit LLM relations, keeping edge count close to linear in node count.
+*m*`<sub>`i`</sub>` is evidence chunk count and *r*`<sub>`i`</sub>` is chapter reference count. The system keeps mutual nearest neighbors, candidates accepted by the reciprocal cap, and high-confidence explicit LLM relations, keeping edge count close to linear in node count.
 
 > **Design Intent (Why we do this)**: If high-frequency words (e.g., "algorithm", "data") accept edges without limits, the graph quickly collapses into a useless giant hub (the Hubness Problem). A dynamic bidirectional limit algorithm based on evidence volume and chapter coverage mathematically squeezes out low-quality edges, guaranteeing the graph remains clear, sparse, and focused.
 
@@ -303,7 +311,7 @@ $$
 w_{ij}=0.45\,c_{ij}^{\mathrm{llm}}+0.30\,s_{ij}^{\mathrm{sem}}+0.15\,s_{ij}^{\mathrm{evidence}}+0.10\,s_{ij}^{\mathrm{structure}}
 $$
 
-When no explicit LLM relation exists, *c*<sub>ij</sub><sup>llm</sup>=0. The final *w*<sub>ij</sub> is clipped to [0,1]. The graph stage runs:
+When no explicit LLM relation exists, *c*`<sub>`ij`</sub><sup>`llm`</sup>`=0. The final *w*`<sub>`ij`</sub>` is clipped to [0,1]. The graph stage runs:
 
 - Connected-component ablation: removes isolated, low-evidence, low-importance noise while preserving enough knowledge-base nodes.
 - Louvain community detection: primary community labels and frontend color groups.
@@ -375,12 +383,12 @@ The planning layer configures evidence-first retrieval based on Perception outpu
 
 **Strategy selection:**
 
-| Intent                              | Condition                    | Evidence-first params |
-| ----------------------------------- | ---------------------------- | --------------------- |
-| `definition` / `formula`            | `needs_graph=false`          | Base retrieval and evidence evaluation only |
-| `comparison` or `needs_graph=true`  | —                            | Enable verified-edge path planning after base recall |
-| `application` / `procedure`         | matched concepts exist       | Allow controlled evidence-chain planning up to 3 hops |
-| `analysis`                          | communities or broad query   | Use community summaries only as routing hints; final answers still cite source chunks |
+| Intent                             | Condition                  | Evidence-first params                                                                 |
+| ---------------------------------- | -------------------------- | ------------------------------------------------------------------------------------- |
+| `definition` / `formula`           | `needs_graph=false`        | Base retrieval and evidence evaluation only                                           |
+| `comparison` or `needs_graph=true` | —                          | Enable verified-edge path planning after base recall                                  |
+| `application` / `procedure`        | matched concepts exist     | Allow controlled evidence-chain planning up to 3 hops                                 |
+| `analysis`                         | communities or broad query | Use community summaries only as routing hints; final answers still cite source chunks |
 
 **Cross-lingual query expansion:**
 
@@ -398,13 +406,13 @@ After deduplication, all sub-queries enter BaseRetrieval. This allows a Chinese 
 
 Execution always retrieves text evidence first, then uses the graph for navigation:
 
-| Stage | Backend/node | Description |
-| ----- | ------------ | ----------- |
-| Base recall | `hybrid_search_chunks` / `hybrid_search_chunks_with_audit` | Dense + BM25 hybrid recall, fusion, and reranking |
-| Anchor selection | `select_evidence_anchors` | Select reliable anchor chunks / anchor concepts from base recall |
-| Path planning | `plan_evidence_chains` | Use verified graph edges only; community summaries are routing hints |
-| Controlled enhancement | `controlled_graph_enhancement` | Collect evidence chunks only along planned paths; no neighbor flood |
-| Evidence assembly | `assemble_evidence_documents` | Merge base evidence, anchor evidence, and graph-path evidence |
+| Stage                  | Backend/node                                               | Description                                                          |
+| ---------------------- | ---------------------------------------------------------- | -------------------------------------------------------------------- |
+| Base recall            | `hybrid_search_chunks` / `hybrid_search_chunks_with_audit` | Dense + BM25 hybrid recall, fusion, and reranking                    |
+| Anchor selection       | `select_evidence_anchors`                                  | Select reliable anchor chunks / anchor concepts from base recall     |
+| Path planning          | `plan_evidence_chains`                                     | Use verified graph edges only; community summaries are routing hints |
+| Controlled enhancement | `controlled_graph_enhancement`                             | Collect evidence chunks only along planned paths; no neighbor flood  |
+| Evidence assembly      | `assemble_evidence_documents`                              | Merge base evidence, anchor evidence, and graph-path evidence        |
 
 All strategies follow the **Small-to-Big** principle: only the finest-grained units enter recall and reranking (child chunks, or parent chunks that have no children and thus represent the finest granularity themselves); parent context is assembled later via `parent_chunk_id` where available.
 
@@ -418,8 +426,8 @@ $$
 
 Where:
 
-- *r*<sub>overlap</sub> = |*T*<sub>q</sub> ∩ *T*<sub>d</sub>| / |*T*<sub>q</sub>|, with *T*<sub>q</sub> the query term set and *T*<sub>d</sub> the document title+snippet+content term set
-- *s*<sub>embedding</sub> is the cosine similarity between query and document vectors; when the raw vector is unavailable, it falls back to the dense score recorded at retrieval time
+- *r*`<sub>`overlap`</sub>` = |*T*`<sub>`q`</sub>` ∩ *T*`<sub>`d`</sub>`| / |*T*`<sub>`q`</sub>`|, with *T*`<sub>`q`</sub>` the query term set and *T*`<sub>`d`</sub>` the document title+snippet+content term set
+- *s*`<sub>`embedding`</sub>` is the cosine similarity between query and document vectors; when the raw vector is unavailable, it falls back to the dense score recorded at retrieval time
 
 Admission rules (pass if any holds):
 
@@ -431,9 +439,9 @@ r_{\mathrm{overlap}} \ge 0.25 \;\land\; \mathrm{original\_score} \ge 0.3 & \text
 \end{cases}
 $$
 
-The cross-lingual bridge gate solves a critical problem: a Chinese query "最大流" and English material "max flow" share weak overlap in the `text-embedding-v4` vector space, but LLM-translated sub-queries can recall relevant chunks via dense search. In such cases *r*<sub>overlap</sub> may be near zero while *s*<sub>embedding</sub> remains high; the bridge gate prevents these valid cross-lingual results from being killed by monolingual term matching.
+The cross-lingual bridge gate solves a critical problem: a Chinese query "最大流" and English material "max flow" share weak overlap in the `text-embedding-v4` vector space, but LLM-translated sub-queries can recall relevant chunks via dense search. In such cases *r*`<sub>`overlap`</sub>` may be near zero while *s*`<sub>`embedding`</sub>` remains high; the bridge gate prevents these valid cross-lingual results from being killed by monolingual term matching.
 
-> **Design Intent (Why we do this)**: This is a funnel specifically designed to break the "cross-lingual wall". A Chinese query and English material often share zero literal overlap but high semantic relevance. The *s*<sub>embedding</sub> ≥ 0.45 cross-lingual bridge gate acts as an exemption channel, elegantly preventing purely lexical (BM25) mismatch from killing valid cross-lingual results.
+> **Design Intent (Why we do this)**: This is a funnel specifically designed to break the "cross-lingual wall". A Chinese query and English material often share zero literal overlap but high semantic relevance. The *s*`<sub>`embedding`</sub>` ≥ 0.45 cross-lingual bridge gate acts as an exemption channel, elegantly preventing purely lexical (BM25) mismatch from killing valid cross-lingual results.
 
 ### EvidenceEvaluator
 
@@ -532,17 +540,17 @@ erDiagram
     AgentRun ||--o{ AgentTraceEvent : traces
 ```
 
-| Table                                                     | Purpose                                                                                                          |
-| --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `courses`                                               | Knowledge-base workspace                                                                                         |
-| `documents` / `document_versions`                     | File metadata, versions, and parser artifact paths                                                               |
-| `chunks`                                                | Parent/child text chunks, summaries, keywords, embedding text version, and evidence text                         |
-| `concepts`                                              | Concepts, chapter references, evidence counts, communities, centrality, and graph rank                           |
-| `concept_aliases`                                       | Concept aliases and normalized aliases                                                                           |
-| `concept_relations`                                     | Sparse edges, relation types, evidence chunks, weights, semantic similarity, support count, and inference source |
-| `quality_profiles`                                      | Domain quality profiles (versioned, stratified sampling, positive/negative examples, term baselines)             |
-| `ingestion_batches` / `ingestion_jobs`                | Batch ingestion and single-file jobs                                                                             |
-| `ingestion_logs` / `ingestion_compensation_logs`      | Event streams and cross-store compensation records                                                               |
+| Table                                               | Purpose                                                                                                          |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `courses`                                           | Knowledge-base workspace                                                                                         |
+| `documents` / `document_versions`                   | File metadata, versions, and parser artifact paths                                                               |
+| `chunks`                                            | Parent/child text chunks, summaries, keywords, embedding text version, and evidence text                         |
+| `concepts`                                          | Concepts, chapter references, evidence counts, communities, centrality, and graph rank                           |
+| `concept_aliases`                                   | Concept aliases and normalized aliases                                                                           |
+| `concept_relations`                                 | Sparse edges, relation types, evidence chunks, weights, semantic similarity, support count, and inference source |
+| `quality_profiles`                                  | Domain quality profiles (versioned, stratified sampling, positive/negative examples, term baselines)             |
+| `ingestion_batches` / `ingestion_jobs`              | Batch ingestion and single-file jobs                                                                             |
+| `ingestion_logs` / `ingestion_compensation_logs`    | Event streams and cross-store compensation records                                                               |
 | `qa_sessions` / `agent_runs` / `agent_trace_events` | QA sessions, agent runs, and observable traces                                                                   |
 
 ## Configuration
@@ -555,32 +563,32 @@ Copy-Item .env.example .env
 
 Common variables:
 
-| Variable                                                                    | Description                                                                                        |
-| --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `API_HOST_PORT` / `WEB_HOST_PORT`                                       | Host ports                                                                                         |
-| `DATABASE_URL`                                                            | PostgreSQL connection URL                                                                          |
-| `ENABLE_DATABASE_FALLBACK`                                                | Database fallback switch, default `false`                                                        |
-| `QDRANT_URL` / `QDRANT_COLLECTION`                                      | Qdrant URL and collection name                                                                     |
-| `REDIS_URL`                                                               | Redis URL                                                                                          |
-| `COURSE_NAME`                                                             | Default knowledge-base name                                                                        |
-| `DATA_ROOT`                                                               | Local data root                                                                                    |
-| `OPENAI_API_KEY` / `CHAT_BASE_URL`                                      | OpenAI-compatible chat / graph extraction model endpoint                                           |
-| `CHAT_RESOLVE_IP`                                                         | Target IP when chat model-domain resolution must be pinned                                         |
-| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL`                                | OpenAI-compatible embedding model endpoint, independent from the chat endpoint                     |
-| `EMBEDDING_RESOLVE_IP`                                                    | Target IP when embedding model-domain resolution must be pinned                                    |
-| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` / `EMBEDDING_BATCH_SIZE`   | Embedding model, dimensions, and batch size                                                        |
-| `CHAT_MODEL`                                                              | Chat and graph extraction model                                                                    |
-| `GRAPH_EXTRACTION_SOFT_START_BUDGET` / `GRAPH_EXTRACTION_CONCURRENCY` / `GRAPH_EXTRACTION_RESUME_BATCH_SIZE` | Adaptive graph extraction initial budget, concurrent model calls, and model-call chunk batch size                           |
-| `ENABLE_MODEL_FALLBACK`                                                   | Model fallback switch, default `false`                                                           |
-| `RERANKER_ENABLED` / `RERANKER_MODEL` / `RERANKER_MAX_LENGTH`         | Cross-Encoder reranker settings                                                                    |
-| `SEMANTIC_CHUNKING_ENABLED` / `SEMANTIC_CHUNKING_MIN_LENGTH`            | Semantic chunking switch and minimum text length                                                   |
-| `RETRIEVAL_LAYER_ENABLED`                                                 | Retrieval layer switch, default `true`                                                           |
-| `RETRIEVAL_CACHE_TTL_SECONDS`                                             | Redis retrieval cache TTL, default `300`                                                         |
-| `ENABLE_AGENTIC_REFLECTION`                                               | Agentic reflection and correction master switch, default `true`                                  |
-| `ENABLE_POST_GENERATION_REFLECTION`                                       | Post-generation reflection switch (CitationVerifier/Reflection/AnswerCorrector), default `false` |
-| `CITATION_VERIFICATION_SAMPLE_MAX`                                        | Citation verification sample size per answer, default `3`                                        |
-| `REFLECTION_MAX_RETRIES`                                                  | Max reflection-triggered correction retries, default `2`                                         |
-| `MODEL_BRIDGE_ENABLED` / `MODEL_BRIDGE_PORT`                            | Host model-bridge switch and port                                                                  |
+| Variable                                                                                                     | Description                                                                                       |
+| ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| `API_HOST_PORT` / `WEB_HOST_PORT`                                                                            | Host ports                                                                                        |
+| `DATABASE_URL`                                                                                               | PostgreSQL connection URL                                                                         |
+| `ENABLE_DATABASE_FALLBACK`                                                                                   | Database fallback switch, default `false`                                                         |
+| `QDRANT_URL` / `QDRANT_COLLECTION`                                                                           | Qdrant URL and collection name                                                                    |
+| `REDIS_URL`                                                                                                  | Redis URL                                                                                         |
+| `COURSE_NAME`                                                                                                | Default knowledge-base name                                                                       |
+| `DATA_ROOT`                                                                                                  | Local data root                                                                                   |
+| `OPENAI_API_KEY` / `CHAT_BASE_URL`                                                                           | OpenAI-compatible chat / graph extraction model endpoint                                          |
+| `CHAT_RESOLVE_IP`                                                                                            | Target IP when chat model-domain resolution must be pinned                                        |
+| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL`                                                                   | OpenAI-compatible embedding model endpoint, independent from the chat endpoint                    |
+| `EMBEDDING_RESOLVE_IP`                                                                                       | Target IP when embedding model-domain resolution must be pinned                                   |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` / `EMBEDDING_BATCH_SIZE`                                          | Embedding model, dimensions, and batch size                                                       |
+| `CHAT_MODEL`                                                                                                 | Chat and graph extraction model                                                                   |
+| `GRAPH_EXTRACTION_SOFT_START_BUDGET` / `GRAPH_EXTRACTION_CONCURRENCY` / `GRAPH_EXTRACTION_RESUME_BATCH_SIZE` | Adaptive graph extraction initial budget, concurrent model calls, and model-call chunk batch size |
+| `ENABLE_MODEL_FALLBACK`                                                                                      | Model fallback switch, default `false`                                                            |
+| `RERANKER_ENABLED` / `RERANKER_MODEL` / `RERANKER_MAX_LENGTH`                                                | Cross-Encoder reranker settings                                                                   |
+| `SEMANTIC_CHUNKING_ENABLED` / `SEMANTIC_CHUNKING_MIN_LENGTH`                                                 | Semantic chunking switch and minimum text length                                                  |
+| `RETRIEVAL_LAYER_ENABLED`                                                                                    | Retrieval layer switch, default `true`                                                            |
+| `RETRIEVAL_CACHE_TTL_SECONDS`                                                                                | Redis retrieval cache TTL, default `300`                                                          |
+| `ENABLE_AGENTIC_REFLECTION`                                                                                  | Agentic reflection and correction master switch, default `true`                                   |
+| `ENABLE_POST_GENERATION_REFLECTION`                                                                          | Post-generation reflection switch (CitationVerifier/Reflection/AnswerCorrector), default `false`  |
+| `CITATION_VERIFICATION_SAMPLE_MAX`                                                                           | Citation verification sample size per answer, default `3`                                         |
+| `REFLECTION_MAX_RETRIES`                                                                                     | Max reflection-triggered correction retries, default `2`                                          |
+| `MODEL_BRIDGE_ENABLED` / `MODEL_BRIDGE_PORT`                                                                 | Host model-bridge switch and port                                                                 |
 
 Docker Compose overrides infrastructure URLs inside the API container:
 
@@ -687,10 +695,10 @@ Validation focus:
 
 | Check                   | Expected                                                                                                                                                                                 |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Health                  | `/api/health` returns available service status                                                                                                                                         |
-| Runtime configuration   | `/api/settings/runtime-check` has no blocking issue                                                                                                                                    |
-| Model fallback          | `ENABLE_MODEL_FALLBACK=false`; model outages fail fast                                                                                                                                 |
-| Database fallback       | `ENABLE_DATABASE_FALLBACK=false`; database outages fail fast                                                                                                                           |
+| Health                  | `/api/health` returns available service status                                                                                                                                           |
+| Runtime configuration   | `/api/settings/runtime-check` has no blocking issue                                                                                                                                      |
+| Model fallback          | `ENABLE_MODEL_FALLBACK=false`; model outages fail fast                                                                                                                                   |
+| Database fallback       | `ENABLE_DATABASE_FALLBACK=false`; database outages fail fast                                                                                                                             |
 | Vector health           | Qdrant vector count matches active chunks and no zero vectors exist                                                                                                                      |
 | Retrieval quality       | Child recall, parent context, rerank, and citation fields are complete                                                                                                                   |
 | Graph quality           | Node count meets the retention floor, edge growth is near-linear, and community, centrality, and weight fields are populated; graph remains stable after incremental updates             |
@@ -708,13 +716,13 @@ SymboGraph's core innovations in the general GraphRAG direction can be summarize
 Unlike traditional systems with single-threshold filtering, SymboGraph establishes a signal-policy-profile-judge four-tier quality system. Chunks are no longer limited to "keep/discard" binary fates; instead, they are routed to one of six downstream paths (`discard`, `summary_only`, `evidence_only`, `retrieval_candidate`, `graph_candidate`, `embed_only`). Concepts and relations undergo differentiated policy filtering as well. Domain quality profiles give each knowledge base an adaptive quality baseline rather than relying on global fixed thresholds.
 
 **2. Concept Vector Centroidization and Dynamic Sparse Graph Construction**
-Concept vectors are generated as centroids of their supporting chunk vectors, not by embedding the LLM-extracted concept name directly, fundamentally eliminating concept drift. The dynamic R-NN + K-NN sparse graph algorithm applies bidirectional send/receive limits based on evidence volume *m*<sub>i</sub> and chapter coverage *r*<sub>i</sub>, guaranteeing near-linear edge growth with node count and naturally suppressing the Hubness Problem.
+Concept vectors are generated as centroids of their supporting chunk vectors, not by embedding the LLM-extracted concept name directly, fundamentally eliminating concept drift. The dynamic R-NN + K-NN sparse graph algorithm applies bidirectional send/receive limits based on evidence volume *m*`<sub>`i`</sub>` and chapter coverage *r*`<sub>`i`</sub>`, guaranteeing near-linear edge growth with node count and naturally suppressing the Hubness Problem.
 
 **3. Evidence-first Agentic RAG**
 The QA pipeline is not a simple "retrieve then generate" but a full Agent workflow: Perception → RetrievalPlanner → BaseRetrieval → EvidenceAnchorSelector → EvidenceChainPlanner → ControlledGraphEnhancer → EvidenceAssembler → DocumentGrader → EvidenceEvaluator → Generation. The pre-generation `EvidenceEvaluator` gives the system the ability to "know what it doesn't know", intercepting low-quality retrievals before generation.
 
 **4. Triple-Mechanism Cross-lingual Robust Retrieval**
-LLM explicit translation expansion produces bilingual sub-queries, embedding similarity bridges language barriers, and the DocumentGrader *s*<sub>embedding</sub> ≥ 0.45 cross-lingual bridge gate exempts lexical false kills—three mechanisms together build a robust retrieval system that does not rely on the alignment quality of a single multilingual embedding model.
+LLM explicit translation expansion produces bilingual sub-queries, embedding similarity bridges language barriers, and the DocumentGrader *s*`<sub>`embedding`</sub>` ≥ 0.45 cross-lingual bridge gate exempts lexical false kills—three mechanisms together build a robust retrieval system that does not rely on the alignment quality of a single multilingual embedding model.
 
 **5. Small-to-Big Context Assembly with Parent-Child Decoupling**
 At retrieval time, only the finest-grained units (child chunks) enter dense/BM25/recall/rerank, preventing parents and children from competing in the candidate pool; at generation time, full parent context is assembled via `parent_chunk_id`. This completely decouples the "recall unit" from the "generation unit", achieving both precision and contextual completeness.

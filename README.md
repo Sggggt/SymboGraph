@@ -6,35 +6,37 @@
 
 <h1 align="center">SymboGraph</h1>
 
-SymboGraph 是一套面向本地私有文档的通用 GraphRAG 知识基础设施。系统把 PDF、幻灯片、文档、网页、Notebook、图片和 Markdown 解析为可检索文本块、Qdrant 稠密向量、PostgreSQL 稀疏知识图谱和带引用出处的问答结果。无论你的资料是中文还是英文，系统都能统一检索；所有数据留在本地，无需上传第三方。
+**SymboGraph 是面向严肃企业和学术场景开发的新一代 Neuro-Symbolic Agentic RAG（神经符号代理 RAG） 系统，该项目基于GraphRAG开发，但区别于传统 RAG 的“语义破碎”和笨重 GraphRAG 的“高成本与幻觉叠加”。**
+
+本系统把 PDF、幻灯片、文档、网页、Notebook、图片和 Markdown 解析为可检索文本块、Qdrant 稠密向量、PostgreSQL 稀疏知识图谱和带引用出处的问答结果。无论你的资料是中文还是英文，系统都能统一检索；所有数据留在本地，无需上传第三方。
 
 作为通用 GraphRAG 平台，SymboGraph 的知识库概念并不限于某一类文档——你可以将其用于课程资料、研究文献、技术手册、法律合同或任何需要结构化解构与语义关联的文本集合。
 
 ## 快速概览
 
-| 维度       | 实现                                                                                                              |
-| ---------- | ----------------------------------------------------------------------------------------------------------------- |
-| 运行方式   | Docker Compose，全栈容器化                                                                                        |
-| 后端       | FastAPI、Pydantic、SQLAlchemy、NetworkX、LangGraph                                                                |
-| 前端       | Next.js 16.2.4、React 19、TypeScript、TanStack Query、ECharts                                                     |
-| 数据库     | PostgreSQL 16，保存知识库、文件版本、文本块、图谱、问答会话和运行轨迹                                             |
-| 向量库     | Qdrant 1.17.1，集合 `knowledge_chunks`                                                                          |
-| 缓存与协调 | Redis 7                                                                                                           |
-| 模型接口   | OpenAI 兼容 Embedding / Chat API，Embedding 与 Chat 端点独立配置                                                  |
-| 检索       | Evidence-first 检索：dense + BM25 + rerank 基础召回，证据锚点选择，受控图导航增强，再装配 parent context |
-| 图谱       | LLM 抽候选，chunk 向量建语义图，图算法做构图、消冗、社区、中心性和隐式关系；支持增量更新与全量重建                |
-| 质量系统   | 信号-策略-画像-裁判四级质量架构：对 chunk、concept、relation 做自适应分级过滤与路由                               |
+| 维度       | 实现                                                                                                          |
+| ---------- | ------------------------------------------------------------------------------------------------------------- |
+| 运行方式   | Docker Compose，全栈容器化                                                                                    |
+| 后端       | FastAPI、Pydantic、SQLAlchemy、NetworkX、LangGraph                                                            |
+| 前端       | Next.js 16.2.4、React 19、TypeScript、TanStack Query、ECharts                                                 |
+| 数据库     | PostgreSQL 16，保存知识库、文件版本、文本块、图谱、问答会话和运行轨迹                                         |
+| 向量库     | Qdrant 1.17.1，集合 `knowledge_chunks`                                                                        |
+| 缓存与协调 | Redis 7                                                                                                       |
+| 模型接口   | OpenAI 兼容 Embedding / Chat API，Embedding 与 Chat 端点独立配置                                              |
+| 检索       | Evidence-first 检索：dense + BM25 + rerank 基础召回，证据锚点选择，受控图导航增强，再装配 parent context      |
+| 图谱       | LLM 抽候选，chunk 向量建语义图，图算法做构图、消冗、社区、中心性和隐式关系；支持增量更新与全量重建            |
+| 质量系统   | 信号-策略-画像-裁判四级质量架构：对 chunk、concept、relation 做自适应分级过滤与路由                           |
 | 问答       | Agentic RAG：Perception → Planning → Retrieval → EvidenceEvaluator → Generation，支持跨语言检索与前置证据评估 |
 
 ## 技术栈
 
 | 层         | 技术                                                               | 职责                                                            |
 | ---------- | ------------------------------------------------------------------ | --------------------------------------------------------------- |
-| 前端       | Next.js 16.2.4、React 19、TypeScript、TanStack Query、ECharts      | 知识库管理、上传解析、搜索、问答、图谱浏览、运行时配置            |
+| 前端       | Next.js 16.2.4、React 19、TypeScript、TanStack Query、ECharts      | 知识库管理、上传解析、搜索、问答、图谱浏览、运行时配置          |
 | API        | FastAPI、Pydantic、SQLAlchemy、LangGraph                           | REST / SSE 接口、强类型校验、事务编排、导入任务、检索与问答编排 |
 | 图算法     | NetworkX、NumPy、SciPy                                             | 稀疏构图、连通分量、Louvain、谱聚类、中心性、Dijkstra 隐式关系  |
 | 质量系统   | 信号工程、规则策略、领域画像、LLM-as-judge                         | Chunk/Concept/Relation 分级过滤、自适应领域基线、缓存裁判       |
-| 数据库     | PostgreSQL 16                                                      | 知识库、文件版本、chunks、图谱、问答会话、运行轨迹和补偿记录      |
+| 数据库     | PostgreSQL 16                                                      | 知识库、文件版本、chunks、图谱、问答会话、运行轨迹和补偿记录    |
 | 向量检索   | Qdrant 1.17.1                                                      | parent / child chunk 向量、dense recall、向量健康检查           |
 | 词面检索   | PostgreSQL 文本数据、BM25                                          | child chunk 词面召回与混合检索融合                              |
 | 缓存与协调 | Redis 7                                                            | 运行态缓存、任务协调、服务依赖                                  |
@@ -192,32 +194,38 @@ flowchart LR
 
 **ChunkQualityPolicy** 决策空间：
 
-| 动作 | 含义 | 下游影响 |
-| ---- | ---- | -------- |
-| `discard` | 机械噪声，直接丢弃 | 不嵌入、不检索、不参与图谱 |
-| `summary_only` | 目录页或结构标签 | 仅用于摘要，不参与检索和图谱 |
-| `evidence_only` | 太短或 Notebook output | 可嵌入、可检索，但不生成摘要、不参与图谱 |
-| `retrieval_candidate` | 普通内容块 | 嵌入、检索、生成摘要，不参与图谱 |
-| `graph_candidate` | 高语义密度（定义/实体/术语） | 嵌入、检索、摘要、参与图谱抽取 |
-| `embed_only` | 无领域上下文的代码块 | 仅嵌入，不参与检索和图谱 |
+| 动作                  | 含义                         | 下游影响                                 |
+| --------------------- | ---------------------------- | ---------------------------------------- |
+| `discard`             | 机械噪声，直接丢弃           | 不嵌入、不检索、不参与图谱               |
+| `summary_only`        | 目录页或结构标签             | 仅用于摘要，不参与检索和图谱             |
+| `evidence_only`       | 太短或 Notebook output       | 可嵌入、可检索，但不生成摘要、不参与图谱 |
+| `retrieval_candidate` | 普通内容块                   | 嵌入、检索、生成摘要，不参与图谱         |
+| `graph_candidate`     | 高语义密度（定义/实体/术语） | 嵌入、检索、摘要、参与图谱抽取           |
+| `embed_only`          | 无领域上下文的代码块         | 仅嵌入，不参与检索和图谱                 |
 
 Chunk 质量得分公式：
 
-$$S_{\text{chunk}} = 0.30 \cdot \min\Bigl(1, \frac{L_{\text{norm}}}{600}\Bigr) + 0.25 \cdot D_{\text{term}} + 0.20 \cdot R_{\text{unique}} + 0.15 \cdot D_{\text{def}} + 0.05 \cdot \mathbf{1}_{\text{formula}} + 0.05 \cdot \mathbf{1}_{\text{table}} - 0.35 \cdot \mathbf{1}_{\text{toc}} - 0.40 \cdot \min\Bigl(1, 20 \cdot R_{\text{mojibake}}\Bigr)$$
+$$
+S_{\text{chunk}} = 0.30 \cdot \min\Bigl(1, \frac{L_{\text{norm}}}{600}\Bigr) + 0.25 \cdot D_{\text{term}} + 0.20 \cdot R_{\text{unique}} + 0.15 \cdot D_{\text{def}} + 0.05 \cdot \mathbf{1}_{\text{formula}} + 0.05 \cdot \mathbf{1}_{\text{table}} - 0.35 \cdot \mathbf{1}_{\text{toc}} - 0.40 \cdot \min\Bigl(1, 20 \cdot R_{\text{mojibake}}\Bigr)
+$$
 
-其中 *L*<sub>norm</sub> 为规范化长度，*D*<sub>term</sub> 为术语密度，*R*<sub>unique</sub> 为唯一词比率，*D*<sub>def</sub> 为定义得分，*R*<sub>mojibake</sub> 为乱码比率。
+其中 *L*`<sub>`norm`</sub>` 为规范化长度，*D*`<sub>`term`</sub>` 为术语密度，*R*`<sub>`unique`</sub>` 为唯一词比率，*D*`<sub>`def`</sub>` 为定义得分，*R*`<sub>`mojibake`</sub>` 为乱码比率。
 
 **ConceptQualityPolicy** 决策空间为 `accept` / `reject`：
 
-$$S_{\text{concept}} = \max\Bigl(S_{\text{specificity}},\; 0.35 D_{\text{def}} + 0.25 D_{\text{term}} + 0.20 D_{\text{entity}}\Bigr) - 0.35 S_{\text{structural}} - 0.25 G_{\text{genericity}}$$
+$$
+S_{\text{concept}} = \max\Bigl(S_{\text{specificity}},\; 0.35 D_{\text{def}} + 0.25 D_{\text{term}} + 0.20 D_{\text{entity}}\Bigr) - 0.35 S_{\text{structural}} - 0.25 G_{\text{genericity}}
+$$
 
-准入条件：无硬拒绝理由（过短、乱码、路径名、结构容器、低特异性、证据不足），且得分 *S*<sub>concept</sub> ≥ 0.45。
+准入条件：无硬拒绝理由（过短、乱码、路径名、结构容器、低特异性、证据不足），且得分 *S*`<sub>`concept`</sub>` ≥ 0.45。
 
 **RelationQualityPolicy** 决策空间为 `accept` / `candidate_only`：
 
-$$S_{\text{relation}} = 0.40 \cdot c + 0.25 \cdot \mathbf{1}_{\text{src}} + 0.25 \cdot \mathbf{1}_{\text{tgt}} + 0.10 \cdot \min\Bigl(1, \frac{n_{\text{support}}}{3}\Bigr)$$
+$$
+S_{\text{relation}} = 0.40 \cdot c + 0.25 \cdot \mathbf{1}_{\text{src}} + 0.25 \cdot \mathbf{1}_{\text{tgt}} + 0.10 \cdot \min\Bigl(1, \frac{n_{\text{support}}}{3}\Bigr)
+$$
 
-其中 *c* 为 LLM 置信度，**1**<sub>src</sub> / **1**<sub>tgt</sub> 为证据文本中是否出现源/目标概念。`inferred` 或 `related_to` 类型关系强制降级为 `candidate_only`。
+其中 *c* 为 LLM 置信度，**1**`<sub>`src`</sub>` / **1**`<sub>`tgt`</sub>` 为证据文本中是否出现源/目标概念。`inferred` 或 `related_to` 类型关系强制降级为 `candidate_only`。
 
 > **设计意图（为什么这么做）**：传统的 RAG/GraphRAG 系统往往在建图前只做粗粒度过滤，导致大量目录页、乱码、重复提取噪声进入向量库和知识图谱。SymboGraph 的分级质量路由让不同类型的内容去它该去的地方——噪声被丢弃、结构标签只做摘要、高语义密度块参与图谱、普通块负责检索——从数据源头上保证下游质量。
 
@@ -273,7 +281,7 @@ $$
 \mathbf{v}_e = \frac{1}{|C_e|}\sum_{c \in C_e}\mathbf{v}_c
 $$
 
-其中 *C*<sub>e</sub> 是支撑实体 *e* 的 active child chunks。向量归一化后进入相似图构建。
+其中 *C*`<sub>`e`</sub>` 是支撑实体 *e* 的 active child chunks。向量归一化后进入相似图构建。
 
 > **设计意图（为什么这么做）**：传统的 GraphRAG 直接让 LLM 对提取出的概念名进行向量化，这会导致向量空间偏向大模型预训练数据的通用语境。使用支撑该概念的所有底层证据向量（Child Chunks）求质心，确保了图谱在向量空间中完美忠实于本地知识库的特定语境，从根源上消除概念漂移。
 
@@ -291,7 +299,7 @@ $$
 R_i = \mathrm{clamp}\bigl(2 + \lfloor \log_2(1 + r_i) \rfloor,\, 2,\, 8\bigr)
 $$
 
-*m*<sub>i</sub> 是证据 chunk 数，*r*<sub>i</sub> 是章节引用数。系统保留互为近邻、通过反向接收限制的近邻，以及高置信 LLM 显式关系，从而让边数随节点数近线性增长。
+*m*`<sub>`i`</sub>` 是证据 chunk 数，*r*`<sub>`i`</sub>` 是章节引用数。系统保留互为近邻、通过反向接收限制的近邻，以及高置信 LLM 显式关系，从而让边数随节点数近线性增长。
 
 > **设计意图（为什么这么做）**：如果毫无限制地让高频词（如"算法"、"数据"）接收连边，整个图谱会迅速坍塌成一个毫无意义的巨大枢纽节点（Hubness Problem）。基于证据量与章节覆盖率的动态收发限制算法，强制挤掉蹭热度的低质边，从数学上保证了图谱永远是清晰、稀疏且重点突出的。
 
@@ -303,7 +311,7 @@ $$
 w_{ij}=0.45\,c_{ij}^{\mathrm{llm}}+0.30\,s_{ij}^{\mathrm{sem}}+0.15\,s_{ij}^{\mathrm{evidence}}+0.10\,s_{ij}^{\mathrm{structure}}
 $$
 
-无 LLM 显式关系时 *c*<sub>ij</sub><sup>llm</sup>=0，最终 *w*<sub>ij</sub> 裁剪到 [0,1]。图算法阶段执行：
+无 LLM 显式关系时 *c*`<sub>`ij`</sub><sup>`llm`</sup>`=0，最终 *w*`<sub>`ij`</sub>` 裁剪到 [0,1]。图算法阶段执行：
 
 - 连通分量消融：移除孤立、低证据、低重要度噪声节点，同时保持每个知识库有足够节点规模。
 - Louvain 社区发现：用于主社区标记和前端颜色分组。
@@ -375,12 +383,12 @@ Perception 输出包含：
 
 **策略选择规则：**
 
-| 意图                                   | 条件                  | evidence-first 参数                  |
-| -------------------------------------- | --------------------- | ----------------------------------- |
-| `definition` / `formula`              | `needs_graph=false` | 只走基础召回和证据评估              |
-| `comparison` 或 `needs_graph=true`    | —                    | 基础召回后启用 verified edge 路径规划 |
-| `application` / `procedure`           | 有匹配概念            | 允许最多 3 hop 的受控证据链规划      |
-| `analysis`                            | 匹配社区或 broad query | 社区摘要只做 routing hint，答案仍引用原文 chunk |
+| 意图                               | 条件                   | evidence-first 参数                             |
+| ---------------------------------- | ---------------------- | ----------------------------------------------- |
+| `definition` / `formula`           | `needs_graph=false`    | 只走基础召回和证据评估                          |
+| `comparison` 或 `needs_graph=true` | —                      | 基础召回后启用 verified edge 路径规划           |
+| `application` / `procedure`        | 有匹配概念             | 允许最多 3 hop 的受控证据链规划                 |
+| `analysis`                         | 匹配社区或 broad query | 社区摘要只做 routing hint，答案仍引用原文 chunk |
 
 **跨语言翻译扩展**：
 
@@ -398,13 +406,13 @@ $$
 
 执行层固定先召回文本证据，再用图谱做导航：
 
-| 阶段 | 后端/节点 | 说明 |
-| ---- | --------- | ---- |
-| 基础召回 | `hybrid_search_chunks` / `hybrid_search_chunks_with_audit` | dense + BM25 混合召回、融合、精排 |
-| 锚点选择 | `select_evidence_anchors` | 从基础召回结果中选择可靠 anchor chunks / anchor concepts |
-| 路径规划 | `plan_evidence_chains` | 只使用 verified graph edges；社区摘要仅用于 routing hint |
-| 受控增强 | `controlled_graph_enhancement` | 只沿规划路径收集 evidence chunks，不做全邻居扩展 |
-| 证据装配 | `assemble_evidence_documents` | 合并基础证据、锚点证据和图路径证据 |
+| 阶段     | 后端/节点                                                  | 说明                                                     |
+| -------- | ---------------------------------------------------------- | -------------------------------------------------------- |
+| 基础召回 | `hybrid_search_chunks` / `hybrid_search_chunks_with_audit` | dense + BM25 混合召回、融合、精排                        |
+| 锚点选择 | `select_evidence_anchors`                                  | 从基础召回结果中选择可靠 anchor chunks / anchor concepts |
+| 路径规划 | `plan_evidence_chains`                                     | 只使用 verified graph edges；社区摘要仅用于 routing hint |
+| 受控增强 | `controlled_graph_enhancement`                             | 只沿规划路径收集 evidence chunks，不做全邻居扩展         |
+| 证据装配 | `assemble_evidence_documents`                              | 合并基础证据、锚点证据和图路径证据                       |
 
 所有策略都遵循 **Small-to-Big** 原则：召回最小粒度单元（child chunks，或没有 child 的 parent chunks 自身），避免 parent/child 在同一候选池竞争，最终通过 `parent_chunk_id` 装配 parent context。
 
@@ -418,8 +426,8 @@ $$
 
 其中：
 
-- *r*<sub>overlap</sub> = |*T*<sub>q</sub> ∩ *T*<sub>d</sub>| / |*T*<sub>q</sub>|，*T*<sub>q</sub> 为查询词集合，*T*<sub>d</sub> 为文档标题+摘要+正文词集合
-- *s*<sub>embedding</sub> 为查询向量与文档向量的余弦相似度；当文档未携带原始向量时，回退到检索阶段记录的 dense score
+- *r*`<sub>`overlap`</sub>` = |*T*`<sub>`q`</sub>` ∩ *T*`<sub>`d`</sub>`| / |*T*`<sub>`q`</sub>`|，*T*`<sub>`q`</sub>` 为查询词集合，*T*`<sub>`d`</sub>` 为文档标题+摘要+正文词集合
+- *s*`<sub>`embedding`</sub>` 为查询向量与文档向量的余弦相似度；当文档未携带原始向量时，回退到检索阶段记录的 dense score
 
 准入规则（满足任一即可通过）：
 
@@ -431,9 +439,9 @@ r_{\mathrm{overlap}} \ge 0.25 \;\land\; \mathrm{original\_score} \ge 0.3 & \text
 \end{cases}
 $$
 
-跨语言桥接通道解决了一个关键问题：中文查询"最大流"与英文材料"max flow"在 `text-embedding-v4` 的向量空间中重叠较弱，但 LLM 翻译后的子查询通过 dense recall 能召回相关 chunk。此时 *r*<sub>overlap</sub> 可能接近 0，但 *s*<sub>embedding</sub> 仍然较高，桥接通道防止这类有效跨语言结果被词面匹配误杀。
+跨语言桥接通道解决了一个关键问题：中文查询"最大流"与英文材料"max flow"在 `text-embedding-v4` 的向量空间中重叠较弱，但 LLM 翻译后的子查询通过 dense recall 能召回相关 chunk。此时 *r*`<sub>`overlap`</sub>` 可能接近 0，但 *s*`<sub>`embedding`</sub>` 仍然较高，桥接通道防止这类有效跨语言结果被词面匹配误杀。
 
-> **设计意图（为什么这么做）**：这是一个专为"跨语言墙"设计的破局漏斗。中文查询和英文材料往往字面毫无交集（overlap=0），但高维语义极高。通过设立基于 *s*<sub>embedding</sub> ≥ 0.45 的跨语言桥接豁免通道，巧妙修补了纯词面匹配（BM25）在面对翻译差异时的严重误杀问题。
+> **设计意图（为什么这么做）**：这是一个专为"跨语言墙"设计的破局漏斗。中文查询和英文材料往往字面毫无交集（overlap=0），但高维语义极高。通过设立基于 *s*`<sub>`embedding`</sub>` ≥ 0.45 的跨语言桥接豁免通道，巧妙修补了纯词面匹配（BM25）在面对翻译差异时的严重误杀问题。
 
 ### EvidenceEvaluator（前置证据评估层）
 
@@ -503,7 +511,7 @@ $$
 | 上下文与精度兼顾 | child chunk 精确召回，parent chunk 提供完整解释上下文                                              |
 | 图谱结构可控     | R-NN + K-NN 限制边数，连通分量和社区算法降低噪声                                                   |
 | 自适应质量系统   | 信号-策略-画像-裁判四级架构，对 chunk/concept/relation 做差异化分级与路由                          |
-| 领域质量画像     | 自动构建知识库特异性基线，让质量判断自适应于不同领域                                                 |
+| 领域质量画像     | 自动构建知识库特异性基线，让质量判断自适应于不同领域                                               |
 | 文档资料友好     | 保留章节、页码、公式、表格、Notebook cell 和来源类型                                               |
 | 可审计           | 保存 batch/job/log、模型调用、检索分数、fallback 状态和引用                                        |
 | 可恢复           | PostgreSQL 保存生命周期状态，Qdrant / Redis 可从持久记录修复                                       |
@@ -532,17 +540,17 @@ erDiagram
     AgentRun ||--o{ AgentTraceEvent : traces
 ```
 
-| 表                                                        | 作用                                                             |
-| --------------------------------------------------------- | ---------------------------------------------------------------- |
-| `courses`                                               | 知识库工作区                                                     |
-| `documents` / `document_versions`                     | 文件元数据、版本和解析产物路径                                   |
-| `chunks`                                                | 父子文本块、摘要、关键词、embedding text version 和证据文本      |
-| `concepts`                                              | 概念、章节引用、证据数、社区、中心性和图谱排序                   |
-| `concept_aliases`                                       | 概念别名和规范化别名                                             |
-| `concept_relations`                                     | 稀疏边、关系类型、证据 chunk、权重、语义相似度、支持数和推断来源 |
-| `quality_profiles`                                      | 领域质量画像（版本化、分层采样、正负样本、术语基线）             |
-| `ingestion_batches` / `ingestion_jobs`                | 批量导入与单文件任务                                             |
-| `ingestion_logs` / `ingestion_compensation_logs`      | 事件日志与跨存储补偿记录                                         |
+| 表                                                  | 作用                                                             |
+| --------------------------------------------------- | ---------------------------------------------------------------- |
+| `courses`                                           | 知识库工作区                                                     |
+| `documents` / `document_versions`                   | 文件元数据、版本和解析产物路径                                   |
+| `chunks`                                            | 父子文本块、摘要、关键词、embedding text version 和证据文本      |
+| `concepts`                                          | 概念、章节引用、证据数、社区、中心性和图谱排序                   |
+| `concept_aliases`                                   | 概念别名和规范化别名                                             |
+| `concept_relations`                                 | 稀疏边、关系类型、证据 chunk、权重、语义相似度、支持数和推断来源 |
+| `quality_profiles`                                  | 领域质量画像（版本化、分层采样、正负样本、术语基线）             |
+| `ingestion_batches` / `ingestion_jobs`              | 批量导入与单文件任务                                             |
+| `ingestion_logs` / `ingestion_compensation_logs`    | 事件日志与跨存储补偿记录                                         |
 | `qa_sessions` / `agent_runs` / `agent_trace_events` | 问答会话、智能体运行和可观测轨迹                                 |
 
 ## 配置
@@ -555,32 +563,32 @@ Copy-Item .env.example .env
 
 常用配置：
 
-| 变量                                                                        | 说明                                                                          |
-| --------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| `API_HOST_PORT` / `WEB_HOST_PORT`                                       | 宿主机访问端口                                                                |
-| `DATABASE_URL`                                                            | PostgreSQL 连接地址                                                           |
-| `ENABLE_DATABASE_FALLBACK`                                                | 数据库降级开关，默认 `false`                                                |
-| `QDRANT_URL` / `QDRANT_COLLECTION`                                      | Qdrant 地址和集合名                                                           |
-| `REDIS_URL`                                                               | Redis 地址                                                                    |
-| `COURSE_NAME`                                                             | 默认知识库名称                                                                |
-| `DATA_ROOT`                                                               | 本地数据根目录                                                                |
-| `OPENAI_API_KEY` / `CHAT_BASE_URL`                                      | OpenAI 兼容 chat / 图谱抽取模型接口                                           |
-| `CHAT_RESOLVE_IP`                                                         | 需要固定解析 chat 模型域名时使用的目标 IP                                     |
-| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL`                                | OpenAI 兼容 embedding 模型接口，独立于 chat endpoint                          |
-| `EMBEDDING_RESOLVE_IP`                                                    | 需要固定解析 embedding 模型域名时使用的目标 IP                                |
-| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` / `EMBEDDING_BATCH_SIZE`   | 向量模型、维度和批大小                                                        |
-| `CHAT_MODEL`                                                              | 对话与图谱抽取模型                                                            |
-| `GRAPH_EXTRACTION_SOFT_START_BUDGET` / `GRAPH_EXTRACTION_CONCURRENCY` / `GRAPH_EXTRACTION_RESUME_BATCH_SIZE` | 自适应图谱抽取初始预算、并发模型调用数和每批模型抽取 chunk 数                                  |
-| `ENABLE_MODEL_FALLBACK`                                                   | 模型降级开关，默认 `false`                                                  |
-| `RERANKER_ENABLED` / `RERANKER_MODEL` / `RERANKER_MAX_LENGTH`         | Cross-Encoder 精排配置                                                        |
-| `SEMANTIC_CHUNKING_ENABLED` / `SEMANTIC_CHUNKING_MIN_LENGTH`            | 语义切分开关和最小文本长度                                                    |
-| `RETRIEVAL_LAYER_ENABLED`                                                 | 检索分层开关，默认 `true`                                                   |
-| `RETRIEVAL_CACHE_TTL_SECONDS`                                             | Redis 检索缓存 TTL，默认 `300`                                              |
-| `ENABLE_AGENTIC_REFLECTION`                                               | Agentic 反思与修正总开关，默认 `true`                                       |
-| `ENABLE_POST_GENERATION_REFLECTION`                                       | 后生成反思开关（CitationVerifier/Reflection/AnswerCorrector），默认 `false` |
-| `CITATION_VERIFICATION_SAMPLE_MAX`                                        | 每答案引用验证抽样数，默认 `3`                                              |
-| `REFLECTION_MAX_RETRIES`                                                  | 反思触发修正的最大重试次数，默认 `2`                                        |
-| `MODEL_BRIDGE_ENABLED` / `MODEL_BRIDGE_PORT`                            | 宿主机模型桥接开关和端口                                                      |
+| 变量                                                                                                         | 说明                                                                        |
+| ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
+| `API_HOST_PORT` / `WEB_HOST_PORT`                                                                            | 宿主机访问端口                                                              |
+| `DATABASE_URL`                                                                                               | PostgreSQL 连接地址                                                         |
+| `ENABLE_DATABASE_FALLBACK`                                                                                   | 数据库降级开关，默认 `false`                                                |
+| `QDRANT_URL` / `QDRANT_COLLECTION`                                                                           | Qdrant 地址和集合名                                                         |
+| `REDIS_URL`                                                                                                  | Redis 地址                                                                  |
+| `COURSE_NAME`                                                                                                | 默认知识库名称                                                              |
+| `DATA_ROOT`                                                                                                  | 本地数据根目录                                                              |
+| `OPENAI_API_KEY` / `CHAT_BASE_URL`                                                                           | OpenAI 兼容 chat / 图谱抽取模型接口                                         |
+| `CHAT_RESOLVE_IP`                                                                                            | 需要固定解析 chat 模型域名时使用的目标 IP                                   |
+| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL`                                                                   | OpenAI 兼容 embedding 模型接口，独立于 chat endpoint                        |
+| `EMBEDDING_RESOLVE_IP`                                                                                       | 需要固定解析 embedding 模型域名时使用的目标 IP                              |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` / `EMBEDDING_BATCH_SIZE`                                          | 向量模型、维度和批大小                                                      |
+| `CHAT_MODEL`                                                                                                 | 对话与图谱抽取模型                                                          |
+| `GRAPH_EXTRACTION_SOFT_START_BUDGET` / `GRAPH_EXTRACTION_CONCURRENCY` / `GRAPH_EXTRACTION_RESUME_BATCH_SIZE` | 自适应图谱抽取初始预算、并发模型调用数和每批模型抽取 chunk 数               |
+| `ENABLE_MODEL_FALLBACK`                                                                                      | 模型降级开关，默认 `false`                                                  |
+| `RERANKER_ENABLED` / `RERANKER_MODEL` / `RERANKER_MAX_LENGTH`                                                | Cross-Encoder 精排配置                                                      |
+| `SEMANTIC_CHUNKING_ENABLED` / `SEMANTIC_CHUNKING_MIN_LENGTH`                                                 | 语义切分开关和最小文本长度                                                  |
+| `RETRIEVAL_LAYER_ENABLED`                                                                                    | 检索分层开关，默认 `true`                                                   |
+| `RETRIEVAL_CACHE_TTL_SECONDS`                                                                                | Redis 检索缓存 TTL，默认 `300`                                              |
+| `ENABLE_AGENTIC_REFLECTION`                                                                                  | Agentic 反思与修正总开关，默认 `true`                                       |
+| `ENABLE_POST_GENERATION_REFLECTION`                                                                          | 后生成反思开关（CitationVerifier/Reflection/AnswerCorrector），默认 `false` |
+| `CITATION_VERIFICATION_SAMPLE_MAX`                                                                           | 每答案引用验证抽样数，默认 `3`                                              |
+| `REFLECTION_MAX_RETRIES`                                                                                     | 反思触发修正的最大重试次数，默认 `2`                                        |
+| `MODEL_BRIDGE_ENABLED` / `MODEL_BRIDGE_PORT`                                                                 | 宿主机模型桥接开关和端口                                                    |
 
 Docker Compose 会在 API 容器内使用服务名覆盖基础设施地址：
 
@@ -687,10 +695,10 @@ docker exec course-kg-api python /app/scripts/reingest_all_courses.py --course-n
 
 | 检查项       | 期望                                                                                                                                 |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| 健康状态     | `/api/health` 返回可用服务状态                                                                                                     |
-| 运行时配置   | `/api/settings/runtime-check` 没有阻断项                                                                                           |
-| 模型降级     | `ENABLE_MODEL_FALLBACK=false`，模型不可用时快速失败                                                                                |
-| 数据库降级   | `ENABLE_DATABASE_FALLBACK=false`，数据库不可用时快速失败                                                                           |
+| 健康状态     | `/api/health` 返回可用服务状态                                                                                                       |
+| 运行时配置   | `/api/settings/runtime-check` 没有阻断项                                                                                             |
+| 模型降级     | `ENABLE_MODEL_FALLBACK=false`，模型不可用时快速失败                                                                                  |
+| 数据库降级   | `ENABLE_DATABASE_FALLBACK=false`，数据库不可用时快速失败                                                                             |
 | 向量健康     | Qdrant 向量数量与 active chunks 对齐，没有零向量                                                                                     |
 | 检索质量     | child recall、parent context、rerank 和 citations 字段完整                                                                           |
 | 图谱质量     | 节点数达到保留下限，边数近线性增长，社区字段、中心性和权重非空；增量更新后图谱结构稳定                                               |
@@ -708,13 +716,13 @@ SymboGraph 在通用 GraphRAG 方向上的核心创新可概括为以下六点�
 区别于传统系统的单一阈值过滤，SymboGraph 建立了信号-策略-画像-裁判四级质量体系。Chunk 不再只有"保留/丢弃"两种命运，而是被路由到 `discard`、`summary_only`、`evidence_only`、`retrieval_candidate`、`graph_candidate`、`embed_only` 六种下游路径；Concept 和 Relation 同样经过差异化策略过滤。领域质量画像让每个知识库拥有自适应的质量基线，而非依赖全局固定阈值。
 
 **2. 概念向量质心化与动态稀疏构图**
-概念向量由其证据 chunk 向量求质心生成，而非由 LLM 提取的概念名直接嵌入，从根本上消除了概念漂移。动态 R-NN + K-NN 稀疏构图算法基于证据量 *m*<sub>i</sub> 和章节覆盖 *r*<sub>i</sub> 做双向收发限制，保证边数随节点数近线性增长，天然抑制 Hubness Problem。
+概念向量由其证据 chunk 向量求质心生成，而非由 LLM 提取的概念名直接嵌入，从根本上消除了概念漂移。动态 R-NN + K-NN 稀疏构图算法基于证据量 *m*`<sub>`i`</sub>` 和章节覆盖 *r*`<sub>`i`</sub>` 做双向收发限制，保证边数随节点数近线性增长，天然抑制 Hubness Problem。
 
 **3. Evidence-first Agentic RAG**
 问答链路不是简单的"检索→生成"，而是 Perception → RetrievalPlanner → BaseRetrieval → EvidenceAnchorSelector → EvidenceChainPlanner → ControlledGraphEnhancer → EvidenceAssembler → DocumentGrader → EvidenceEvaluator → Generation 的完整 Agent 工作流。前置 `EvidenceEvaluator` 赋予系统"知道自己不知道"的能力，在生成前拦截低质检索。
 
 **4. 跨语言鲁棒检索的三重机制**
-LLM 显式翻译扩展生成双语子查询、Embedding Similarity 桥接跨越语言壁垒、DocumentGrader 的 *s*<sub>embedding</sub> ≥ 0.45 跨语言桥接通道豁免词面误杀——三重机制共同构建了一个不依赖单一多语言 Embedding 模型对齐质量的鲁棒检索系统。
+LLM 显式翻译扩展生成双语子查询、Embedding Similarity 桥接跨越语言壁垒、DocumentGrader 的 *s*`<sub>`embedding`</sub>` ≥ 0.45 跨语言桥接通道豁免词面误杀——三重机制共同构建了一个不依赖单一多语言 Embedding 模型对齐质量的鲁棒检索系统。
 
 **5. Small-to-Big 上下文装配与父子块解耦**
 检索阶段只让最小粒度单元（child chunks）进入 dense/BM25/recall/rerank，避免 parent 和 child 在候选池中竞争；生成阶段再通过 `parent_chunk_id` 装配完整 parent context。这彻底解耦了"召回单元"与"生成单元"，同时兼顾精度与上下文完整性。
