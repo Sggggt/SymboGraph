@@ -40,6 +40,7 @@ from app.schemas import (
     RebuildGraphRequest,
     RefreshResponse,
     RuntimeCheckResponse,
+    QuerySemanticGraphRequest,
     SearchRequest,
     SearchResponse,
     SessionMessagesResponse,
@@ -47,7 +48,7 @@ from app.schemas import (
     TaskStatusResponse,
     UploadFileResponse,
 )
-from app.services.concept_graph import get_concept_cards, get_graph_node_detail, get_graph_payload, rebuild_course_graph, incremental_update_course_graph
+from app.services.concept_graph import get_concept_cards, get_graph_node_detail, get_graph_payload, get_query_semantic_graph_payload, rebuild_course_graph, incremental_update_course_graph
 from app.services.embeddings import is_degraded_mode
 from app.services.agent_graph import run_agent, run_to_task_status, stream_agent_events
 from app.services.ingestion import (
@@ -261,6 +262,12 @@ def graph_node_detail(concept_id: str, course_id: str | None = None, db: Session
     if payload is None:
         raise HTTPException(status_code=404, detail="Concept node not found")
     return payload
+
+
+@router.post("/search/semantic-graph", response_model=GraphResponse)
+def search_semantic_graph(request: QuerySemanticGraphRequest, db: Session = Depends(get_db)) -> dict:
+    course = get_requested_course(db, request.course_id)
+    return get_query_semantic_graph_payload(db, course.id, request.chunk_ids, query=request.query)
 
 
 @router.get("/concepts", response_model=list[ConceptCard])

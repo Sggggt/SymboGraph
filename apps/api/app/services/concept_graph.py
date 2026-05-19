@@ -3211,3 +3211,225 @@ def get_evidence_graph_payload(db: Session, course_id: str, chapter: str | None 
             seen_edges.add(edge)
             edges.append({"source": edge[0], "target": edge[1], "label": edge[2], "category": "evidence", "evidence_chunk_id": relation.evidence_chunk_id})
     return _graph_response("evidence", nodes, edges, chapter=chapter)
+
+
+def get_query_semantic_graph_payload(db: Session, course_id: str, chunk_ids: list[str], query: str | None = None) -> dict:
+    requested_chunk_ids = list(dict.fromkeys(str(chunk_id) for chunk_id in chunk_ids if chunk_id))
+    if not requested_chunk_ids:
+        return _graph_response("evidence", [], [])
+
+    chunks = db.scalars(
+        select(Chunk).where(
+            Chunk.course_id == course_id,
+            Chunk.id.in_(requested_chunk_ids),
+            Chunk.is_active.is_(True),
+        )
+    ).all()
+    chunks_by_id = {chunk.id: chunk for chunk in chunks}
+    if not chunks_by_id:
+        return _graph_response("evidence", [], [])
+
+    relations = db.scalars(
+        select(ConceptRelation).where(
+            ConceptRelation.course_id == course_id,
+            ConceptRelation.evidence_chunk_id.in_(list(chunks_by_id)),
+        )
+    ).all()
+    query_key = normalize_concept_name(query) if query else ""
+    if query_key:
+        seed_concept_ids = {
+            concept.id
+            for concept in db.scalars(
+                select(Concept).where(
+                    Concept.course_id == course_id,
+                    or_(
+                        Concept.normalized_name.contains(query_key),
+                        Concept.canonical_name.ilike(f"%{query}%"),
+                    ),
+                )
+            ).all()
+        }
+        seed_concept_ids.update(
+            alias.concept_id
+            for alias in db.scalars(
+                select(ConceptAlias)
+                .join(Concept, ConceptAlias.concept_id == Concept.id)
+                .where(
+                    Concept.course_id == course_id,
+                    ConceptAlias.normalized_alias.contains(query_key),
+                )
+            ).all()
+        )
+        if seed_concept_ids:
+            query_relations = db.scalars(
+                select(ConceptRelation).where(
+                    ConceptRelation.course_id == course_id,
+                    or_(
+                        ConceptRelation.source_concept_id.in_(seed_concept_ids),
+                        ConceptRelation.target_concept_id.in_(seed_concept_ids),
+                    ),
+                )
+            ).all()
+            seen_relation_ids = {relation.id for relation in relations}
+            relations.extend(relation for relation in query_relations if relation.id not in seen_relation_ids)
+    relations = [relation for relation in relations if not (relation.metadata_json or {}).get("candidate_only")]
+    if not relations:
+        return _graph_response("evidence", [], [], chapter=chunks[0].chapter if len({chunk.chapter for chunk in chunks}) == 1 else None)
+
+    missing_relation_chunk_ids = {
+        relation.evidence_chunk_id
+        for relation in relations
+        if relation.evidence_chunk_id and relation.evidence_chunk_id not in chunks_by_id
+    }
+    if missing_relation_chunk_ids:
+        relation_chunks = db.scalars(
+            select(Chunk).where(
+                Chunk.course_id == course_id,
+                Chunk.id.in_(list(missing_relation_chunk_ids)),
+                Chunk.is_active.is_(True),
+            )
+        ).all()
+        chunks.extend(relation_chunks)
+        chunks_by_id.update({chunk.id: chunk for chunk in relation_chunks})
+
+    concept_ids = {
+        concept_id
+        for relation in relations
+        for concept_id in (relation.source_concept_id, relation.target_concept_id)
+        if concept_id
+    }
+    concepts = {
+        concept.id: concept
+        for concept in db.scalars(
+            select(Concept).where(
+                Concept.course_id == course_id,
+                Concept.id.in_(list(concept_ids)),
+            )
+        ).all()
+    }
+    documents = {
+        document.id: document
+        for document in db.scalars(
+            select(Document).where(
+                Document.course_id == course_id,
+                Document.id.in_({chunk.document_id for chunk in chunks if chunk.document_id}),
+            )
+        ).all()
+    }
+
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    node_ids: set[str] = set()
+    seen_edges: set[tuple[str, str, str, str | None]] = set()
+
+    def add_node(node: dict) -> None:
+        if node["id"] in node_ids:
+            return
+        node_ids.add(node["id"])
+        nodes.append(node)
+
+    for concept in concepts.values():
+        add_node(
+            {
+                "id": f"semantic:{concept.id}",
+                "concept_id": concept.id,
+                "name": concept.canonical_name,
+                "category": "semantic_entity",
+                "entity_type": normalize_entity_type(concept.concept_type),
+                "aliases": sorted({alias.alias for alias in concept.aliases}),
+                "support_count": getattr(concept, "evidence_count", 0),
+                "confidence": concept.importance_score,
+                "canonical_key": concept.normalized_name,
+                "summary": concept.summary,
+                "chapter": concept.chapter_refs[0] if concept.chapter_refs else None,
+                "evidence_count": concept.evidence_count,
+                "community_louvain": concept.community_louvain,
+                "community_spectral": concept.community_spectral,
+                "component_id": concept.component_id,
+                "centrality_score": (concept.centrality_json or {}).get("degree"),
+                "graph_rank_score": concept.graph_rank_score,
+                "value": max(2.0, concept.importance_score * 10, concept.evidence_count),
+            }
+        )
+
+    for chunk in chunks:
+        document = documents.get(chunk.document_id)
+        chunk_node_id = f"evidence_chunk:{chunk.id}"
+        add_node(
+            {
+                "id": chunk_node_id,
+                "name": chunk.snippet[:80] if chunk.snippet else chunk.id,
+                "category": "evidence_chunk",
+                "value": 1.5,
+                "chapter": chunk.chapter,
+                "document_id": chunk.document_id,
+                "document_version_id": chunk.document_version_id,
+                "snippet": chunk.snippet,
+                "page_number": chunk.page_number,
+                "source_type": chunk.source_type,
+            }
+        )
+        if chunk.document_version_id:
+            version_node_id = f"document_version:{chunk.document_version_id}"
+            add_node(
+                {
+                    "id": version_node_id,
+                    "name": document.title if document else chunk.document_version_id,
+                    "category": "document_version",
+                    "value": 2,
+                    "document_id": chunk.document_id,
+                    "document_version_id": chunk.document_version_id,
+                    "source_type": document.source_type if document else None,
+                }
+            )
+            edge_key = (chunk_node_id, version_node_id, "from_version", None)
+            if edge_key not in seen_edges:
+                seen_edges.add(edge_key)
+                edges.append({"source": chunk_node_id, "target": version_node_id, "label": "from_version", "category": "evidence"})
+
+    for relation in relations:
+        source_node_id = f"semantic:{relation.source_concept_id}"
+        target_node_id = f"semantic:{relation.target_concept_id}" if relation.target_concept_id else None
+        chunk_node_id = f"evidence_chunk:{relation.evidence_chunk_id}"
+        if source_node_id not in node_ids or chunk_node_id not in node_ids:
+            continue
+        evidence_edge_key = (source_node_id, chunk_node_id, "evidenced_by", relation.evidence_chunk_id)
+        if evidence_edge_key not in seen_edges:
+            seen_edges.add(evidence_edge_key)
+            edges.append(
+                {
+                    "source": source_node_id,
+                    "target": chunk_node_id,
+                    "label": "evidenced_by",
+                    "category": "evidence",
+                    "evidence_chunk_id": relation.evidence_chunk_id,
+                    "confidence": relation.confidence,
+                    "weight": relation.weight,
+                    "relation_source": relation.relation_source,
+                    "is_inferred": relation.is_inferred,
+                }
+            )
+        if not target_node_id or target_node_id not in node_ids:
+            continue
+        semantic_edge_key = (source_node_id, target_node_id, relation.relation_type, relation.evidence_chunk_id)
+        if semantic_edge_key in seen_edges:
+            continue
+        seen_edges.add(semantic_edge_key)
+        edges.append(
+            {
+                "source": source_node_id,
+                "target": target_node_id,
+                "label": relation.relation_type,
+                "category": "semantic",
+                "evidence_chunk_id": relation.evidence_chunk_id,
+                "confidence": relation.confidence,
+                "weight": relation.weight,
+                "semantic_similarity": relation.semantic_similarity,
+                "support_count": relation.support_count,
+                "relation_source": relation.relation_source,
+                "is_inferred": relation.is_inferred,
+            }
+        )
+
+    chapters = {chunk.chapter for chunk in chunks if chunk.chapter}
+    return _graph_response("evidence", nodes, edges, chapter=next(iter(chapters)) if len(chapters) == 1 else None)

@@ -57,7 +57,7 @@ export function OverviewDashboard() {
       { label: "文档原件", value: data.ingested_document_count },
       { label: "知识概念", value: data.course.concept_count },
       { label: "图谱关系", value: data.graph_relation_count },
-      { label: "章节数量", value: data.tree.length },
+      { label: "目录分组", value: data.tree.length },
     ];
   }, [data]);
 
@@ -81,9 +81,9 @@ export function OverviewDashboard() {
         >
           <div className="space-y-5">
             <div className="max-w-4xl space-y-4">
-              <p className="section-kicker">课程材料 / 知识智能</p>
-              <h2 className="glow-text text-3xl font-semibold leading-tight text-white lg:text-4xl">课程知识图谱、向量检索与 RAG 联动。</h2>
-              <p className="max-w-3xl text-sm leading-7 text-cyan-50/72">围绕课程原件、章节脉络、概念关系和证据片段展开。新课件导入后自动解析、切块、向量化并更新图谱。</p>
+              <p className="section-kicker">本地资料 / 知识智能</p>
+              <h2 className="glow-text text-3xl font-semibold leading-tight text-white lg:text-4xl">本地知识图谱、向量检索与 RAG 联动。</h2>
+              <p className="max-w-3xl text-sm leading-7 text-cyan-50/72">围绕本地原件、目录脉络、概念关系和证据片段展开。新资料导入后自动解析、切块、向量化并更新图谱。</p>
             </div>
             <div className="flex flex-wrap gap-3">
               <Link href="/upload" className="rounded-full border border-cyan-300/40 bg-cyan-300/12 px-4 py-2.5 text-xs uppercase tracking-[0.24em] text-white">
@@ -162,8 +162,8 @@ export function OverviewDashboard() {
           <div className="glass-panel kg-scroll-panel rounded-[28px] p-6">
             <div className="flex items-center justify-between">
               <div>
-                <p className="section-kicker">课程树</p>
-                <h3 className="mt-2 text-2xl font-semibold text-white">章节脉络</h3>
+                <p className="section-kicker">资料目录</p>
+                <h3 className="mt-2 text-2xl font-semibold text-white">目录脉络</h3>
               </div>
               <Radar className="size-5 text-cyan-200" />
             </div>
@@ -196,10 +196,10 @@ export function OverviewDashboard() {
             </div>
             <div className="mt-6 space-y-4">
               {[
-                { href: "/search", title: "搜索实验室", description: "带过滤条件的向量检索与章节联动视图。" },
+                { href: "/search", title: "搜索实验室", description: "带过滤条件的向量检索与目录联动视图。" },
                 { href: "/qa", title: "问答实验室", description: "流式回答、证据轨迹和命中片段并行展开。" },
-                { href: "/concepts", title: "概念浏览", description: "概念列表、关系摘要、章节引用统一浏览。" },
-                { href: "/graph", title: "图谱舞台", description: "全屏关系画布，按章节聚焦图谱热区。" },
+                { href: "/concepts", title: "概念浏览", description: "概念列表、关系摘要、目录引用统一浏览。" },
+                { href: "/graph", title: "图谱舞台", description: "全屏关系画布，按目录聚焦图谱热区。" },
               ].map((entry) => (
                 <Link
                   key={entry.href}

@@ -97,7 +97,7 @@ export function ConceptsWorkspace() {
               <div className="space-y-5">
                 <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
                   <p className="text-xs uppercase tracking-[0.28em] text-white/45">摘要</p>
-                  <p className="mt-4 text-sm leading-8 text-white/72">{selected.summary || "当前概念还没有足够长的摘要，建议补充更多教学原件后重新抽取。"}</p>
+                  <p className="mt-4 text-sm leading-8 text-white/72">{selected.summary || "当前概念还没有足够长的摘要，建议补充更多本地原件后重新抽取。"}</p>
                 </div>
                 <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
                   <p className="text-xs uppercase tracking-[0.28em] text-white/45">别名</p>
@@ -113,7 +113,7 @@ export function ConceptsWorkspace() {
 
               <div className="space-y-5">
                 <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
-                  <p className="text-xs uppercase tracking-[0.28em] text-white/45">章节引用</p>
+                  <p className="text-xs uppercase tracking-[0.28em] text-white/45">目录引用</p>
                   <div className="mt-4 flex flex-wrap gap-2">
                     {selected.chapter_refs.map((chapter) => (
                       <span key={chapter} className="rounded-full border border-white/10 px-3 py-1 text-sm text-cyan-50/74">

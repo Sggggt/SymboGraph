@@ -22,6 +22,7 @@ import type {
   ParseUploadedFilesRequest,
   QARequest,
   QAResponse,
+  QuerySemanticGraphRequest,
   RebuildGraphRequest,
   RebuildGraphResponse,
   RefreshResponse,
@@ -80,6 +81,35 @@ async function parseResponse<T>(response: Response): Promise<T> {
     throw error;
   }
   return response.json() as Promise<T>;
+}
+
+function extractApiErrorMessage(text: string, status: number): string {
+  const fallback = text || `请求失败，HTTP ${status}`;
+  try {
+    const parsed = JSON.parse(text) as {
+      detail?: StructuredApiErrorBody | string | Array<{ loc?: unknown[]; msg?: string; type?: string }>;
+      message?: string;
+      title?: string;
+    };
+    if (parsed.detail && typeof parsed.detail === "object" && !Array.isArray(parsed.detail)) {
+      return parsed.detail.message || parsed.detail.title || fallback;
+    }
+    if (Array.isArray(parsed.detail)) {
+      return parsed.detail
+        .map((item) => {
+          const location = Array.isArray(item.loc) ? item.loc.join(".") : "";
+          return [location, item.msg].filter(Boolean).join(": ") || item.type;
+        })
+        .filter(Boolean)
+        .join("；") || fallback;
+    }
+    if (typeof parsed.detail === "string") {
+      return parsed.detail;
+    }
+    return parsed.message || parsed.title || fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 export async function fetchCourses(): Promise<CourseSummary[]> {
@@ -190,6 +220,15 @@ export async function fetchChapterGraph(chapter: string, courseId: string | null
 export async function fetchGraphNode(conceptId: string, courseId?: string | null): Promise<GraphNodeDetail> {
   const response = await fetch(buildApiUrl(`/graph/nodes/${conceptId}`, { course_id: courseId }), { cache: "no-store", headers: authHeaders() });
   return parseResponse<GraphNodeDetail>(response);
+}
+
+export async function fetchQuerySemanticGraph(payload: QuerySemanticGraphRequest): Promise<GraphResponse> {
+  const response = await fetch(`${API_BASE_URL}/search/semantic-graph`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<GraphResponse>(response);
 }
 
 export async function fetchConcepts(courseId?: string | null): Promise<ConceptCard[]> {
@@ -303,8 +342,15 @@ export async function streamAnswer(
     headers: jsonHeaders(),
     body: JSON.stringify(payload),
   });
-  if (!response.ok || !response.body) {
-    throw new Error("浏览器不支持流式响应");
+  if (!response.ok) {
+    const message = extractApiErrorMessage(await response.text(), response.status);
+    handlers.onError?.(message);
+    throw new Error(message);
+  }
+  if (!response.body) {
+    const message = "浏览器不支持流式响应";
+    handlers.onError?.(message);
+    throw new Error(message);
   }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -322,7 +368,7 @@ export async function streamAnswer(
       if (!line || line === "[DONE]") {
         continue;
       }
-      const parsed = JSON.parse(line) as {
+      let parsed: {
         type?: string;
         token?: string;
         trace?: AgentTraceEventPayload;
@@ -334,6 +380,12 @@ export async function streamAnswer(
         session_id?: string;
         route?: string;
       };
+      try {
+        parsed = JSON.parse(line);
+      } catch (error) {
+        console.warn("忽略无法解析的 SSE 数据行", { line, error });
+        continue;
+      }
       if (parsed.type === "meta") {
         handlers.onMeta?.({ run_id: parsed.run_id, session_id: parsed.session_id, route: parsed.route });
       }

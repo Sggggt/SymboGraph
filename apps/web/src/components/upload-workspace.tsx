@@ -572,8 +572,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   const cleanupTitle = cleanupDialog === "data" ? "清理数据库" : "清理图谱";
   const cleanupDescription =
     cleanupDialog === "data"
-      ? "清理当前课程的 inactive 数据库记录和 Qdrant stale 向量，当前有效数据会保留。"
-      : "清理当前课程的陈旧图谱关系和孤立概念，不会重建图谱。";
+      ? "清理当前资料库的 inactive 数据库记录和 Qdrant stale 向量，当前有效数据会保留。"
+      : "清理当前资料库的陈旧图谱关系和孤立概念，不会重建图谱。";
 
   if (dashboardQuery.isLoading) {
     return <LoadingBlock rows={4} />;
@@ -592,7 +592,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
             <p className="section-kicker">导入控制台</p>
             <h2 className="glow-text text-4xl font-semibold text-white lg:text-5xl">全量导入控制台</h2>
             <p className="max-w-2xl text-base leading-8 text-cyan-50/72">
-              文件上传后会进入本课程存储文件夹。文件导览中的任意入库文件都可以直接解析、切块、向量化并更新图谱。
+              文件上传后会进入当前资料库存储文件夹。文件导览中的任意入库文件都可以直接解析、切块、向量化并更新图谱。
             </p>
 
             <div className="flex flex-wrap gap-3">
@@ -610,7 +610,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                 onClick={() => parseUploadsMutation.mutate({ paths: parseTargetPaths, force: true })}
                 disabled={parseUploadsMutation.isPending || parseTargetPaths.length === 0}
                 className="rounded-full border border-rose-300/30 bg-rose-300/8 px-4 py-3 text-xs uppercase tracking-[0.2em] text-rose-50/80 transition hover:text-white disabled:opacity-45"
-                  title="强制重建当前课程所有文件的片段、向量、Qdrant 向量记录和图谱"
+                  title="强制重建当前资料库所有文件的片段、向量、Qdrant 向量记录和图谱"
               >
                 {parseUploadsMutation.isPending ? <LoaderCircle className="mr-2 inline size-3.5 animate-spin" /> : <RefreshCcw className="mr-2 inline size-3.5" />}
                 全量重新解析
@@ -707,7 +707,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               {
                 label: "已入库文档",
                 value: String(dashboardQuery.data?.ingested_document_count ?? 0),
-                hint: "当前课程有效版本",
+                hint: "当前资料库有效版本",
               },
               {
                 label: "图谱关系",
@@ -730,7 +730,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
           <div>
             <p className="section-kicker">文件库</p>
             <h3 className="mt-2 text-2xl font-semibold text-white">已入库文件导览</h3>
-            <p className="mt-2 text-sm text-white/50">本课程存储文件夹中的文件会统一显示在这里。</p>
+            <p className="mt-2 text-sm text-white/50">当前资料库存储文件夹中的文件会统一显示在这里。</p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
             <button
@@ -870,7 +870,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                     <LoaderCircle className="size-6 animate-spin text-cyan-100" />
                   </div>
                   <div className="min-w-0">
-                    <p className="text-sm font-semibold text-cyan-50">正在生成课程图谱</p>
+                    <p className="text-sm font-semibold text-cyan-50">正在生成资料库图谱</p>
                     <p className="mt-2 text-sm leading-6 text-cyan-50/72">图谱关系抽取和绘制需要等待模型完成，请不要关闭页面、停止后端或重启服务。</p>
                     <div className="mt-4 flex items-center gap-2">
                       {[0, 1, 2, 3].map((item) => (

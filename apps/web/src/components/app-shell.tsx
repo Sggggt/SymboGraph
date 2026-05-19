@@ -56,7 +56,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     mutationFn: (courseId: string) => deleteCourse(courseId),
     onSuccess: async (data, deletedCourseId) => {
       setDeleteCourseResult(
-        `课程数据已删除：向量 ${data.deleted_vectors} 条，文档 ${data.deleted_documents} 份，片段 ${data.deleted_chunks} 个，图谱关系 ${data.deleted_relations} 条。`,
+        `资料库数据已删除：向量 ${data.deleted_vectors} 条，文档 ${data.deleted_documents} 份，片段 ${data.deleted_chunks} 个，图谱关系 ${data.deleted_relations} 条。`,
       );
       const nextCourse = courses.find((course) => course.id !== deletedCourseId) ?? null;
       setSelectedCourseId(nextCourse?.id ?? null);
@@ -130,9 +130,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 priority
               />
               <div className="min-w-0">
-                <p className="text-[10px] uppercase tracking-[0.34em] text-cyan-100/42">课程知识库</p>
-                <h1 className="mt-1 break-words text-lg font-semibold text-white lg:text-xl">本地课程智能检索台</h1>
-                <p className="mt-1 text-xs text-white/45">{selectedCourse?.name ?? "选择课程空间"}</p>
+                <p className="text-[10px] uppercase tracking-[0.34em] text-cyan-100/42">知 识 库</p>
+                <h1 className="mt-1 break-words text-lg font-semibold text-white lg:text-xl">本地资料智能检索台</h1>
+                <p className="mt-1 text-xs text-white/45">{selectedCourse?.name ?? "选择资料库空间"}</p>
               </div>
             </div>
             <div className="flex flex-wrap items-center justify-end gap-2">
@@ -142,7 +142,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   variant="outline"
                   size="icon"
                   className="rounded-full"
-                  aria-label="刷新当前课程"
+                  aria-label="刷新当前资料库"
                   onClick={() => refreshMutation.mutate()}
                   disabled={!selectedCourseId || refreshMutation.isPending}
                 >
@@ -164,7 +164,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 >
                   {courses.length === 0 ? (
                     <option value="" className="bg-[#081126] text-white">
-                      暂无课程
+                      暂无资料库
                     </option>
                   ) : null}
                   {courses.map((course) => (
@@ -175,8 +175,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 </select>
                 <button
                   type="button"
-                  aria-label="删除当前课程"
-                  title="删除当前课程"
+                  aria-label="删除当前资料库"
+                  title="删除当前资料库"
                   onClick={() => {
                     if (!selectedCourseId || !selectedCourse) {
                       return;
@@ -193,7 +193,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               </div>
               <Button type="button" variant="outline" className="rounded-full" onClick={() => setCreateOpen(true)}>
                 <FolderPlus data-icon="inline-start" />
-                新建课程
+                新建资料库
               </Button>
               <div className="kg-micro-chip rounded-full px-3 py-2 text-xs">
                 <Sparkles data-icon="inline-start" />
@@ -215,8 +215,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
         <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.88)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl">
           <DialogHeader className="border-b border-white/8 px-6 py-5">
-            <DialogTitle>新建课程空间</DialogTitle>
-            <DialogDescription>创建课程看板、图谱、搜索和问答上下文。课程文件会统一进入本课程存储文件夹。</DialogDescription>
+            <DialogTitle>新建资料库空间</DialogTitle>
+            <DialogDescription>创建资料库看板、图谱、搜索和问答上下文。资料文件会统一进入当前资料库存储文件夹。</DialogDescription>
           </DialogHeader>
           <form
             className="space-y-4 px-6 py-5"
@@ -232,7 +232,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             }}
           >
             <label className="flex flex-col gap-2">
-              <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">课程名称</span>
+              <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">资料库名称</span>
               <Input
                 value={nextCourseName}
                 onChange={(event) => setNextCourseName(event.target.value)}
@@ -264,7 +264,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       >
         <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.92)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl" showCloseButton={!deleteCourseMutation.isPending}>
           <DialogHeader className="border-b border-white/8 px-6 py-5">
-            <DialogTitle>删除课程</DialogTitle>
+            <DialogTitle>删除资料库</DialogTitle>
             <DialogDescription>
               {courseToDelete ? `将从文件存储、PostgreSQL、Qdrant 和图谱表中删除“${courseToDelete.name}”。` : ""}
             </DialogDescription>
@@ -272,7 +272,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <div className="space-y-4 px-6 py-5">
             {deleteCourseMutation.isPending ? (
               <div>
-                <p className="text-sm text-white/72">正在删除课程数据...</p>
+                <p className="text-sm text-white/72">正在删除资料库数据...</p>
                 <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/8">
                   <div className="h-full w-2/3 animate-pulse rounded-full bg-[linear-gradient(90deg,#fb7185,#fbbf24,#fb7185)]" />
                 </div>

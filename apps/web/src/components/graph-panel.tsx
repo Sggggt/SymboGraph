@@ -325,8 +325,8 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
         <motion.section initial={{ opacity: 0, x: -12 }} animate={{ opacity: 1, x: 0 }} className="glass-panel kg-scroll-panel rounded-[28px] p-5">
           <div className="flex items-center justify-between gap-4">
             <div className="min-w-0">
-              <p className="section-kicker">章节树</p>
-              <h2 className="mt-2 break-words text-2xl font-semibold text-white">章节与文档</h2>
+              <p className="section-kicker">目录树</p>
+              <h2 className="mt-2 break-words text-2xl font-semibold text-white">目录与文档</h2>
             </div>
             <Boxes className="size-5 shrink-0 text-cyan-200" />
           </div>
@@ -337,7 +337,7 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
               onClick={() => setChapterMenuOpen((open) => !open)}
               className="flex h-11 w-full items-center justify-between gap-3 rounded-full border border-white/10 bg-white/[0.05] px-4 text-left text-sm text-white outline-none transition hover:border-cyan-200/24"
             >
-              <span className="min-w-0 truncate">{selectedChapter || "全部章节"}</span>
+              <span className="min-w-0 truncate">{selectedChapter || "全部目录"}</span>
               <ChevronDown className={`size-4 shrink-0 text-cyan-100/60 transition ${chapterMenuOpen ? "rotate-180" : ""}`} />
             </button>
             {chapterMenuOpen ? (
@@ -347,7 +347,7 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
                   onClick={() => handleChapterChange("")}
                   className="w-full rounded-2xl px-3 py-2.5 text-left text-sm text-white/70 transition hover:bg-cyan-300/[0.08] hover:text-white"
                 >
-                  全部章节
+                  全部目录
                 </button>
                 {chapterOptions.map((chapter) => (
                   <button
@@ -390,9 +390,9 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
         <div className="mb-4 flex flex-wrap items-center justify-between gap-4 px-2">
           <div className="min-w-0">
             <p className="section-kicker">图谱画布</p>
-            <h2 className="mt-2 break-words text-3xl font-semibold text-white">{selectedChapter && graphType !== "structural" ? selectedChapter : "全课程图谱"}</h2>
+            <h2 className="mt-2 break-words text-3xl font-semibold text-white">{selectedChapter && graphType !== "structural" ? selectedChapter : "全库图谱"}</h2>
             <p className="mt-2 max-w-3xl break-words text-sm leading-7 text-white/50">
-              {graphType === "semantic" ? "单击节点只做高亮，双击语义实体打开知识详解。支持拖拽平移与滚轮缩放。" : graphType === "evidence" ? "语义实体、证据片段与文档版本分层展示，单击节点查看基础信息。" : "课程资料结构单独展示，不混入语义实体。"}
+              {graphType === "semantic" ? "单击节点只做高亮，双击语义实体打开知识详解。支持拖拽平移与滚轮缩放。" : graphType === "evidence" ? "语义实体、证据片段与文档版本分层展示，单击节点查看基础信息。" : "本地资料结构单独展示，不混入语义实体。"}
             </p>
           </div>
 
@@ -541,7 +541,7 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
         >
           <DialogHeader className="border-b border-white/8 px-6 py-5">
             <DialogTitle>确认重建图谱</DialogTitle>
-            <DialogDescription>全量重建会清空并重建当前课程的 Semantic KG；结构图和证据图会从持久文档与证据链重新生成。</DialogDescription>
+            <DialogDescription>全量重建会清空并重建当前资料库的 Semantic KG；结构图和证据图会从持久文档与证据链重新生成。</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 px-6 py-5">
             {rebuildMutation.isPending || rebuildBatchId ? (
@@ -621,7 +621,7 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
                   />
                   <div>
                     <p className="text-sm font-medium text-white">全量重建</p>
-                    <p className="mt-1 text-xs leading-5 text-white/60">完整重建整门课程的 Semantic KG，耗时较长，会自动保留备份并在失败时回滚。</p>
+                    <p className="mt-1 text-xs leading-5 text-white/60">完整重建当前资料库的 Semantic KG，耗时较长，会自动保留备份并在失败时回滚。</p>
                   </div>
                 </label>
               </div>
@@ -782,7 +782,7 @@ function NodeDetail({
           </div>
 
           <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
-            <p className="text-xs uppercase tracking-[0.26em] text-white/45">章节引用</p>
+            <p className="text-xs uppercase tracking-[0.26em] text-white/45">目录引用</p>
             <div className="mt-4 flex flex-wrap gap-2">
               {detailQuery.data.chapter_refs.length > 0 ? (
                 detailQuery.data.chapter_refs.map((chapter) => (
@@ -791,7 +791,7 @@ function NodeDetail({
                   </span>
                 ))
               ) : (
-                <span className="text-sm text-white/58">暂无章节引用</span>
+                <span className="text-sm text-white/58">暂无目录引用</span>
               )}
             </div>
           </div>
@@ -837,7 +837,7 @@ function GraphNodeSummary({ node, graphType }: { node: GraphResponse["nodes"][nu
   }
   const rows = [
     ["类型", node.entity_type ?? node.category],
-    ["章节", node.chapter ?? "n/a"],
+    ["目录", node.chapter ?? "n/a"],
     ["证据", node.evidence_count ?? node.support_count ?? "n/a"],
     ["页码", node.page_number ?? "n/a"],
     ["文档版本", node.document_version_id ?? "n/a"],

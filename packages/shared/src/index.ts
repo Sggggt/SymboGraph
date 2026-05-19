@@ -67,6 +67,12 @@ export interface SearchRequest {
   top_k?: number;
 }
 
+export interface QuerySemanticGraphRequest {
+  course_id?: string | null;
+  query?: string | null;
+  chunk_ids: string[];
+}
+
 export interface Citation {
   chunk_id: string;
   document_id: string;

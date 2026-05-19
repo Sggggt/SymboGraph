@@ -153,6 +153,12 @@ class SearchRequest(BaseModel):
     top_k: int = Field(default=6, ge=1, le=50)
 
 
+class QuerySemanticGraphRequest(BaseModel):
+    course_id: str | None = None
+    query: str | None = None
+    chunk_ids: list[str] = Field(default_factory=list, min_length=1, max_length=50)
+
+
 class SearchResult(BaseModel):
     chunk_id: str
     snippet: str

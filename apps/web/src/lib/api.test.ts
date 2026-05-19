@@ -190,4 +190,56 @@ describe("api client", () => {
     expect(meta).toContainEqual({ run_id: "run-1", session_id: "session-1", route: undefined });
     expect(meta).toContainEqual({ degraded_mode: false, run_id: "run-1", session_id: "session-1", route: "retrieve_notes" });
   });
+
+  it("passes structured stream errors to handlers before rejecting", async () => {
+    const body = {
+      detail: {
+        code: "runtime_check_failed",
+        title: "Runtime infrastructure check failed",
+        message: "模型端点不可用。",
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(body), { status: 503 })));
+    const { streamAnswer } = await import("./api");
+    const onError = vi.fn();
+
+    await expect(
+      streamAnswer(
+        { question: "hello", top_k: 3 },
+        {
+          onToken: () => undefined,
+          onCitations: () => undefined,
+          onError,
+        },
+      ),
+    ).rejects.toThrow("模型端点不可用。");
+
+    expect(onError).toHaveBeenCalledWith("模型端点不可用。");
+  });
+
+  it("continues parsing SSE after malformed data lines", async () => {
+    const body = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        controller.enqueue(encoder.encode("data: not-json\n\n"));
+        controller.enqueue(encoder.encode('data: {"token":"still works"}\n\n'));
+        controller.close();
+      },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(body, { status: 200 })));
+    const { streamAnswer } = await import("./api");
+    const tokens: string[] = [];
+
+    await streamAnswer(
+      { question: "hello", top_k: 3 },
+      {
+        onToken: (value) => tokens.push(value),
+        onCitations: () => undefined,
+      },
+    );
+
+    expect(tokens).toEqual(["still works"]);
+    expect(warn).toHaveBeenCalledWith("忽略无法解析的 SSE 数据行", expect.objectContaining({ line: "not-json" }));
+  });
 });

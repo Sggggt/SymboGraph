@@ -2,7 +2,7 @@
 
 import { createPortal } from "react-dom";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { SearchResult, SourceType } from "@course-kg/shared";
+import type { GraphResponse, SearchResult, SourceType } from "@course-kg/shared";
 import { AnimatePresence, motion } from "framer-motion";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
@@ -25,11 +25,12 @@ import { NetworkCanvas } from "@/components/network-canvas";
 import { useCourseContext } from "@/components/course-context";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { fetchChapterGraph, fetchDashboard, searchKnowledge } from "@/lib/api";
+import { fetchDashboard, fetchQuerySemanticGraph, searchKnowledge } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 
 const sourceOptions: SourceType[] = ["pdf", "notebook", "markdown", "text", "image", "docx", "pptx"];
+const emptySearchResults: SearchResult[] = [];
 
 type HoverPreviewState = {
   result: SearchResult;
@@ -101,7 +102,7 @@ function SearchHero({
           混合检索链路
         </div>
         <div className="space-y-3">
-          <h2 className="glow-text text-4xl font-semibold text-white lg:text-6xl">检索课程知识信号</h2>
+          <h2 className="glow-text text-4xl font-semibold text-white lg:text-6xl">检索本地知识信号</h2>
           <p className="mx-auto max-w-2xl text-sm leading-7 text-cyan-50/58 lg:text-base">
             Dense 向量召回、BM25 词面召回、WSF 融合排序与图谱上下文会在这里汇总。
           </p>
@@ -185,7 +186,7 @@ function SearchFilterBar({
           筛选
         </button>
         <button type="button" onClick={onClearChapter} className="kg-micro-chip rounded-full px-3 py-2 text-xs">
-          章节：{chapter || "全部"}
+          目录：{chapter || "全部"}
           {chapter ? <X /> : null}
         </button>
         <button type="button" onClick={onClearSource} className="kg-micro-chip rounded-full px-3 py-2 text-xs">
@@ -250,7 +251,7 @@ function ResultRow({
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm font-medium text-white">{result.document_title ?? result.citations[0]?.document_title ?? "课程来源"}</span>
+            <span className="text-sm font-medium text-white">{result.document_title ?? result.citations[0]?.document_title ?? "资料来源"}</span>
             <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultSourceType(result)}</span>
             <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultChapter(result)}</span>
           </div>
@@ -352,7 +353,7 @@ function HoverPreviewOverlay({ preview }: { preview: HoverPreviewState | null })
               </div>
             </div>
             <p className="mt-3 text-sm font-medium text-white">
-              {preview.result.document_title ?? preview.result.citations[0]?.document_title ?? "课程来源"}
+              {preview.result.document_title ?? preview.result.citations[0]?.document_title ?? "资料来源"}
             </p>
             <MarkdownRenderer content={preview.result.snippet} compact className="mt-3 line-clamp-4 text-white/76" />
           </motion.div>
@@ -368,13 +369,15 @@ function GraphCanvasPanel({
   selectedChapter,
   selectedNodeId,
   graph,
+  hasResults,
   isLoading,
   error,
 }: {
   selectedLabel: string | null;
   selectedChapter: string;
   selectedNodeId: string | null;
-  graph: Awaited<ReturnType<typeof fetchChapterGraph>> | undefined;
+  graph: GraphResponse | undefined;
+  hasResults: boolean;
   isLoading: boolean;
   error: Error | null;
 }) {
@@ -384,12 +387,12 @@ function GraphCanvasPanel({
       <div className="relative z-10 flex items-center justify-between gap-3 px-5 py-4">
         <div>
           <p className="section-kicker">知识画布</p>
-          <h3 className="mt-1 text-xl font-semibold text-white">{selectedLabel ?? selectedChapter ?? "探索图谱"}</h3>
-          {selectedLabel && selectedChapter ? <p className="mt-1 text-sm text-white/42">{selectedChapter}</p> : null}
+          <h3 className="mt-1 text-xl font-semibold text-white">{selectedLabel ?? "查询语义子图"}</h3>
+          <p className="mt-1 text-sm text-white/42">{selectedChapter || "当前检索结果的语义邻域"}</p>
         </div>
         <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
           <GitBranch data-icon="inline-start" />
-          实时图谱
+          语义子图
         </span>
       </div>
       <div className="relative z-10 flex min-h-0 flex-1 px-2 pb-2">
@@ -401,13 +404,13 @@ function GraphCanvasPanel({
           <div className="mx-3 flex min-h-0 w-full flex-1 items-stretch">
             <ErrorBlock message={error.message} />
           </div>
-        ) : graph ? (
+        ) : graph && graph.nodes.length > 0 ? (
           <div className="mx-3 flex h-full min-h-0 w-full flex-1">
             <NetworkCanvas graph={graph} height="100%" selectedNodeId={selectedNodeId} />
           </div>
         ) : (
-          <div className="mx-3 grid h-full min-h-0 w-full flex-1 place-items-center rounded-[1.5rem] border border-white/7 bg-white/[0.025] text-sm text-white/54">
-            检索结果会自动聚焦到图谱画布。
+          <div className="mx-3 grid h-full min-h-0 w-full flex-1 place-items-center rounded-[1.5rem] border border-white/7 bg-white/[0.025] px-6 text-center text-sm leading-7 text-white/54">
+            {hasResults ? "当前检索结果没有匹配到可审计的语义图关系。" : "发起检索后，这里只展示命中片段相关的语义实体、证据片段和真实关系。"}
           </div>
         )}
       </div>
@@ -430,7 +433,7 @@ function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | n
               <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{resultSourceType(result)}</span>
               <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">分数 {result.score.toFixed(3)}</span>
             </div>
-            <h3 className="mt-5 text-2xl font-semibold text-white">{result.document_title ?? result.citations[0]?.document_title ?? "课程来源"}</h3>
+            <h3 className="mt-5 text-2xl font-semibold text-white">{result.document_title ?? result.citations[0]?.document_title ?? "资料来源"}</h3>
             <p className="mt-3 flex items-center gap-2 truncate text-sm text-white/42">
               <FileText />
               {result.source_path ?? result.citations[0]?.source_path}
@@ -483,13 +486,13 @@ function AdvancedFilterDrawer({
       <SheetContent side="right" className="w-full border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-md">
         <SheetHeader className="border-b border-white/8 p-6">
           <SheetTitle>高级筛选</SheetTitle>
-          <SheetDescription>按章节和来源通道限定检索范围。</SheetDescription>
+          <SheetDescription>按目录和来源通道限定检索范围。</SheetDescription>
         </SheetHeader>
         <div className="flex flex-col gap-6 p-6">
           <label className="flex flex-col gap-2">
-            <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">章节</span>
+            <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">目录</span>
             <select value={chapter} onChange={(event) => setChapter(event.target.value)} className="rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-3 text-white outline-none">
-              <option value="">全部章节</option>
+              <option value="">全部目录</option>
               {chapterOptions.map((option) => (
                 <option key={option} value={option}>
                   {option}
@@ -562,14 +565,14 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     },
   });
 
-  const chapterGraphQuery = useQuery({
-    queryKey: ["chapter-graph", selectedCourseId, selectedChapter],
-    queryFn: () => fetchChapterGraph(selectedChapter, selectedCourseId, "evidence"),
-    enabled: Boolean(selectedCourseId && selectedChapter),
-  });
-
   const chapterOptions = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title) ?? [], [dashboardQuery.data]);
-  const results = searchResults?.results ?? [];
+  const results = searchResults?.results ?? emptySearchResults;
+  const resultChunkIds = useMemo(() => results.map((result) => result.chunk_id), [results]);
+  const querySemanticGraphQuery = useQuery({
+    queryKey: ["search-semantic-graph", selectedCourseId, query, resultChunkIds],
+    queryFn: () => fetchQuerySemanticGraph({ course_id: selectedCourseId, query, chunk_ids: resultChunkIds }),
+    enabled: resultChunkIds.length > 0,
+  });
   const selectedResult = results.find((result) => result.chunk_id === activeChunkId) ?? null;
   const focusChapter = selectedResult ? resultChapter(selectedResult) : selectedChapter;
   const selectedNodeId = selectedResult?.chunk_id ? `evidence_chunk:${selectedResult.chunk_id}` : null;
@@ -691,9 +694,10 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
           selectedLabel={selectedLabel}
           selectedChapter={focusChapter}
           selectedNodeId={selectedNodeId}
-          graph={chapterGraphQuery.data}
-          isLoading={chapterGraphQuery.isLoading || searchMutation.isPending}
-          error={(chapterGraphQuery.error as Error | null) ?? null}
+          graph={querySemanticGraphQuery.data}
+          hasResults={results.length > 0}
+          isLoading={querySemanticGraphQuery.isLoading || searchMutation.isPending}
+          error={(querySemanticGraphQuery.error as Error | null) ?? null}
         />
       </section>
 

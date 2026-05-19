@@ -1482,7 +1482,9 @@ async def stream_agent_events(db: Session, request: AgentRequest) -> AsyncGenera
             if event["id"] in yielded_trace_ids:
                 continue
             yield {"type": "trace", "trace": event}
-    for line in response["answer"].splitlines() or [response["answer"]]:
-        yield {"type": "token", "token": line}
+    answer = response["answer"] or ""
+    for start in range(0, len(answer), 8):
+        yield {"type": "token", "token": answer[start : start + 8]}
+        await asyncio.sleep(0.012)
     yield {"type": "citations", "citations": response["citations"], "degraded_mode": response["degraded_mode"]}
     yield {"type": "final", "response": response}
