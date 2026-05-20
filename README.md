@@ -262,7 +262,7 @@ flowchart LR
     LLM --> QUAL["ConceptQualityPolicy<br/>RelationQualityPolicy<br/>质量过滤"]
     QUAL --> ENTITY["Concept merge<br/>alias and duplicate reduction"]
     VEC --> CENTROID["Concept vector centroid"]
-    ENTITY --> SPARSE["Dynamic R-NN + K-NN sparse graph"]
+    ENTITY --> SPARSE["Dynamic KNN + semantic threshold<br/>mutual / inbound quota sparse graph"]
     CENTROID --> SPARSE
     SPARSE --> CC["Connected components<br/>noise ablation"]
     CC --> COMM["Louvain + spectral communities"]
@@ -285,7 +285,9 @@ $$
 
 > **设计意图（为什么这么做）**：传统的 GraphRAG 直接让 LLM 对提取出的概念名进行向量化，这会导致向量空间偏向大模型预训练数据的通用语境。使用支撑该概念的所有底层证据向量（Child Chunks）求质心，确保了图谱在向量空间中完美忠实于本地知识库的特定语境，从根源上消除概念漂移。
 
-### 2. 动态 R-NN + K-NN 稀疏构图
+### 2. 动态 KNN + 语义阈值 + 互近邻/反向入边配额稀疏构图
+
+这里不是标准 Radius-NN（按固定半径或距离阈值直接入选）的构图。当前实现先按动态 KNN 和语义相似度阈值生成候选，再保留互为近邻或通过反向入边配额的候选。
 
 每个概念按证据量动态决定发出候选边数量：
 
@@ -293,15 +295,15 @@ $$
 K_i = \mathrm{clamp}\bigl(4 + \lfloor \log_2(1 + m_i) \rfloor,\, 4,\, 12\bigr)
 $$
 
-每个概念按章节覆盖动态限制接收反向候选：
+每个概念按章节覆盖动态限制可接受的反向入边配额：
 
 $$
-R_i = \mathrm{clamp}\bigl(2 + \lfloor \log_2(1 + r_i) \rfloor,\, 2,\, 8\bigr)
+B_i = \mathrm{clamp}\bigl(2 + \lfloor \log_2(1 + r_i) \rfloor,\, 2,\, 8\bigr)
 $$
 
-*m*`<sub>`i`</sub>` 是证据 chunk 数，*r*`<sub>`i`</sub>` 是章节引用数。系统保留互为近邻、通过反向接收限制的近邻，以及高置信 LLM 显式关系，从而让边数随节点数近线性增长。
+*m*`<sub>`i`</sub>` 是证据 chunk 数，*r*`<sub>`i`</sub>` 是章节引用数。系统保留互为近邻、通过反向入边配额 *B*`<sub>`i`</sub>` 的近邻，以及高置信 LLM 显式关系，从而让边数随节点数近线性增长。
 
-> **设计意图（为什么这么做）**：如果毫无限制地让高频词（如"算法"、"数据"）接收连边，整个图谱会迅速坍塌成一个毫无意义的巨大枢纽节点（Hubness Problem）。基于证据量与章节覆盖率的动态收发限制算法，强制挤掉蹭热度的低质边，从数学上保证了图谱永远是清晰、稀疏且重点突出的。
+> **设计意图（为什么这么做）**：如果毫无限制地让高频词（如"算法"、"数据"）接收连边，整个图谱会迅速坍塌成一个毫无意义的巨大枢纽节点（Hubness Problem）。基于证据量、章节覆盖率、语义阈值和反向入边配额的动态稀疏算法，强制挤掉蹭热度的低质边，从数学上保证了图谱永远是清晰、稀疏且重点突出的。
 
 ### 3. 边权与图算法
 
@@ -509,7 +511,7 @@ $$
 | ---------------- | -------------------------------------------------------------------------------------------------- |
 | 证据优先         | 答案、关系和图谱增强都回到真实文本块与 parent context                                              |
 | 上下文与精度兼顾 | child chunk 精确召回，parent chunk 提供完整解释上下文                                              |
-| 图谱结构可控     | R-NN + K-NN 限制边数，连通分量和社区算法降低噪声                                                   |
+| 图谱结构可控     | 动态 KNN、语义阈值和反向入边配额限制边数，连通分量和社区算法降低噪声                               |
 | 自适应质量系统   | 信号-策略-画像-裁判四级架构，对 chunk/concept/relation 做差异化分级与路由                          |
 | 领域质量画像     | 自动构建知识库特异性基线，让质量判断自适应于不同领域                                               |
 | 文档资料友好     | 保留章节、页码、公式、表格、Notebook cell 和来源类型                                               |
@@ -716,7 +718,7 @@ SymboGraph 在通用 GraphRAG 方向上的核心创新可概括为以下六点�
 区别于传统系统的单一阈值过滤，SymboGraph 建立了信号-策略-画像-裁判四级质量体系。Chunk 不再只有"保留/丢弃"两种命运，而是被路由到 `discard`、`summary_only`、`evidence_only`、`retrieval_candidate`、`graph_candidate`、`embed_only` 六种下游路径；Concept 和 Relation 同样经过差异化策略过滤。领域质量画像让每个知识库拥有自适应的质量基线，而非依赖全局固定阈值。
 
 **2. 概念向量质心化与动态稀疏构图**
-概念向量由其证据 chunk 向量求质心生成，而非由 LLM 提取的概念名直接嵌入，从根本上消除了概念漂移。动态 R-NN + K-NN 稀疏构图算法基于证据量 *m*`<sub>`i`</sub>` 和章节覆盖 *r*`<sub>`i`</sub>` 做双向收发限制，保证边数随节点数近线性增长，天然抑制 Hubness Problem。
+概念向量由其证据 chunk 向量求质心生成，而非由 LLM 提取的概念名直接嵌入，从根本上消除了概念漂移。动态 KNN + 语义阈值 + 互近邻/反向入边配额稀疏构图算法基于证据量 *m*`<sub>`i`</sub>` 和章节覆盖 *r*`<sub>`i`</sub>` 做候选边收发限制，保证边数随节点数近线性增长，天然抑制 Hubness Problem。
 
 **3. Evidence-first Agentic RAG**
 问答链路不是简单的"检索→生成"，而是 Perception → RetrievalPlanner → BaseRetrieval → EvidenceAnchorSelector → EvidenceChainPlanner → ControlledGraphEnhancer → EvidenceAssembler → DocumentGrader → EvidenceEvaluator → Generation 的完整 Agent 工作流。前置 `EvidenceEvaluator` 赋予系统"知道自己不知道"的能力，在生成前拦截低质检索。

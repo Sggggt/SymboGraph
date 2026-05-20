@@ -262,7 +262,7 @@ flowchart LR
     LLM --> QUAL["ConceptQualityPolicy<br/>RelationQualityPolicy<br/>quality filter"]
     QUAL --> ENTITY["Concept merge<br/>alias and duplicate reduction"]
     VEC --> CENTROID["Concept vector centroid"]
-    ENTITY --> SPARSE["Dynamic R-NN + K-NN sparse graph"]
+    ENTITY --> SPARSE["Dynamic KNN + semantic threshold<br/>mutual / inbound quota sparse graph"]
     CENTROID --> SPARSE
     SPARSE --> CC["Connected components<br/>noise ablation"]
     CC --> COMM["Louvain + spectral communities"]
@@ -285,7 +285,9 @@ $$
 
 > **Design Intent (Why we do this)**: Traditional GraphRAG directly embeds the extracted concept name, which biases the vector space toward the LLM's generic pre-training data. Calculating the centroid of all supporting underlying child chunk vectors ensures the graph remains perfectly faithful to the specific local context of the knowledge base, eliminating concept drift.
 
-### 2. Dynamic R-NN + K-NN Sparse Graph
+### 2. Dynamic KNN + Semantic Threshold + Mutual/Inbound-Quota Sparse Graph
+
+This is not standard Radius-NN graph construction, where neighbors are admitted solely by a fixed radius or distance threshold. The current implementation first generates candidates with dynamic KNN and a semantic similarity threshold, then keeps mutual nearest neighbors or candidates accepted by the reverse inbound quota.
 
 Each concept dynamically chooses outgoing candidates from its evidence volume:
 
@@ -293,15 +295,15 @@ $$
 K_i = \mathrm{clamp}\bigl(4 + \lfloor \log_2(1 + m_i) \rfloor,\, 4,\, 12\bigr)
 $$
 
-Each concept dynamically limits accepted reciprocal candidates from chapter coverage:
+Each concept dynamically limits accepted reverse inbound candidates from chapter coverage:
 
 $$
-R_i = \mathrm{clamp}\bigl(2 + \lfloor \log_2(1 + r_i) \rfloor,\, 2,\, 8\bigr)
+B_i = \mathrm{clamp}\bigl(2 + \lfloor \log_2(1 + r_i) \rfloor,\, 2,\, 8\bigr)
 $$
 
-*m*`<sub>`i`</sub>` is evidence chunk count and *r*`<sub>`i`</sub>` is chapter reference count. The system keeps mutual nearest neighbors, candidates accepted by the reciprocal cap, and high-confidence explicit LLM relations, keeping edge count close to linear in node count.
+*m*`<sub>`i`</sub>` is evidence chunk count and *r*`<sub>`i`</sub>` is chapter reference count. The system keeps mutual nearest neighbors, candidates accepted by the reverse inbound quota *B*`<sub>`i`</sub>`, and high-confidence explicit LLM relations, keeping edge count close to linear in node count.
 
-> **Design Intent (Why we do this)**: If high-frequency words (e.g., "algorithm", "data") accept edges without limits, the graph quickly collapses into a useless giant hub (the Hubness Problem). A dynamic bidirectional limit algorithm based on evidence volume and chapter coverage mathematically squeezes out low-quality edges, guaranteeing the graph remains clear, sparse, and focused.
+> **Design Intent (Why we do this)**: If high-frequency words (e.g., "algorithm", "data") accept edges without limits, the graph quickly collapses into a useless giant hub (the Hubness Problem). A dynamic sparse algorithm based on evidence volume, chapter coverage, semantic thresholding, and reverse inbound quotas mathematically squeezes out low-quality edges, guaranteeing the graph remains clear, sparse, and focused.
 
 ### 3. Edge Weights And Graph Algorithms
 
@@ -509,7 +511,7 @@ This avoids both coarse recall from overly large chunks and missing context from
 | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Evidence-first             | Answers, relations, and graph expansion return to real chunks and parent context                                                                   |
 | Context and precision      | Child chunks provide precise recall; parent chunks provide complete explanation context                                                            |
-| Controlled graph structure | R-NN + K-NN caps edge growth, while components and communities reduce noise                                                                        |
+| Controlled graph structure | Dynamic KNN, semantic thresholding, and reverse inbound quotas cap edge growth, while components and communities reduce noise                     |
 | Adaptive quality system    | Signal-policy-profile-judge four-tier architecture with differentiated tiered routing for chunks, concepts, and relations                          |
 | Domain quality profiles    | Auto-built knowledge-base specificity baselines let quality judgments adapt to different domains                                                   |
 | Document-aware             | Preserves chapters, pages, formulas, tables, Notebook cells, and source types                                                                      |
@@ -716,7 +718,7 @@ SymboGraph's core innovations in the general GraphRAG direction can be summarize
 Unlike traditional systems with single-threshold filtering, SymboGraph establishes a signal-policy-profile-judge four-tier quality system. Chunks are no longer limited to "keep/discard" binary fates; instead, they are routed to one of six downstream paths (`discard`, `summary_only`, `evidence_only`, `retrieval_candidate`, `graph_candidate`, `embed_only`). Concepts and relations undergo differentiated policy filtering as well. Domain quality profiles give each knowledge base an adaptive quality baseline rather than relying on global fixed thresholds.
 
 **2. Concept Vector Centroidization and Dynamic Sparse Graph Construction**
-Concept vectors are generated as centroids of their supporting chunk vectors, not by embedding the LLM-extracted concept name directly, fundamentally eliminating concept drift. The dynamic R-NN + K-NN sparse graph algorithm applies bidirectional send/receive limits based on evidence volume *m*`<sub>`i`</sub>` and chapter coverage *r*`<sub>`i`</sub>`, guaranteeing near-linear edge growth with node count and naturally suppressing the Hubness Problem.
+Concept vectors are generated as centroids of their supporting chunk vectors, not by embedding the LLM-extracted concept name directly, fundamentally eliminating concept drift. The dynamic KNN + semantic threshold + mutual/inbound-quota sparse graph algorithm applies candidate send/receive limits based on evidence volume *m*`<sub>`i`</sub>` and chapter coverage *r*`<sub>`i`</sub>`, guaranteeing near-linear edge growth with node count and naturally suppressing the Hubness Problem.
 
 **3. Evidence-first Agentic RAG**
 The QA pipeline is not a simple "retrieve then generate" but a full Agent workflow: Perception → RetrievalPlanner → BaseRetrieval → EvidenceAnchorSelector → EvidenceChainPlanner → ControlledGraphEnhancer → EvidenceAssembler → DocumentGrader → EvidenceEvaluator → Generation. The pre-generation `EvidenceEvaluator` gives the system the ability to "know what it doesn't know", intercepting low-quality retrievals before generation.
