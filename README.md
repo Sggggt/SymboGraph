@@ -253,41 +253,58 @@ $$
 
 ## 图谱构建
 
-SymboGraph 的图谱生成遵循 evidence-first 原则：LLM 只生成候选实体和显式关系，图结构由 chunk 向量与图算法共同确定。PostgreSQL 是稀疏图事实源，Qdrant 只提供 chunk 向量与相似度信号。所有候选在入库前经过质量系统的概念策略和关系策略过滤。
+SymboGraph 的图谱生成不是单一的 KNN 或 LLM 抽取流程，而是一条 evidence-first 的多阶段构图流水线。LLM 负责发现候选实体和显式语义关系，质量门禁负责事实约束，向量相似图负责提供可控的语义候选，传统图算法负责结构分析，LLM 证据补全和 Dijkstra 推断只在受控边界内修补局部结构。PostgreSQL 是概念、关系和生命周期状态的事实源；Qdrant 只提供 chunk 向量与相似度信号，不能单独决定事实关系。
 
 ```mermaid
-flowchart LR
-    CHUNK["Active child chunks<br/>（已通过 ChunkQualityPolicy）"] --> VEC["Qdrant chunk vectors"]
-    CHUNK --> LLM["LLM entity/relation candidates"]
-    LLM --> QUAL["ConceptQualityPolicy<br/>RelationQualityPolicy<br/>质量过滤"]
-    QUAL --> ENTITY["Concept merge<br/>alias and duplicate reduction"]
-    VEC --> CENTROID["Concept vector centroid"]
-    ENTITY --> SPARSE["Dynamic KNN + semantic threshold<br/>mutual / inbound quota sparse graph"]
-    CENTROID --> SPARSE
-    SPARSE --> CC["Connected components<br/>noise ablation"]
-    CC --> COMM["Louvain + spectral communities"]
-    COMM --> CENTRAL["Centrality ranking"]
-    CENTRAL --> DIJK["Dijkstra hidden links"]
-    DIJK --> COMPLETE["Traversal + prompt relation completion"]
-    COMPLETE --> PG["PostgreSQL graph tables"]
+flowchart TB
+    CHUNK["Active child chunks<br/>通过 ChunkQualityPolicy"] --> VEC["Qdrant chunk vectors<br/>派生向量信号"]
+    CHUNK --> LLM["LLM 抽取<br/>候选实体 + 显式关系"]
+
+    LLM --> CONCEPT_GATE["ConceptQualityPolicy<br/>实体质量过滤"]
+    LLM --> REL_GATE["RelationQualityPolicy + hard gate<br/>关系类型/置信度/证据匹配"]
+    CONCEPT_GATE --> MERGE["Concept merge<br/>规范名、别名、去重、章节引用"]
+    REL_GATE --> EXPLICIT["Verified explicit relations<br/>有证据支撑的事实边"]
+
+    VEC --> CENTROID["Concept vector centroid<br/>证据 chunk 向量质心 + L2 归一化"]
+    MERGE --> CENTROID
+    CENTROID --> SPARSE["Semantic sparse candidates<br/>动态 KNN + 语义阈值 + 互近邻/反向入边配额"]
+    SPARSE --> CANDIDATE["semantic_sparse candidates<br/>candidate_only，不直接当事实边"]
+
+    EXPLICIT --> GRAPH["Verified graph<br/>默认中心性/社区分析图"]
+    CANDIDATE --> GRAPH_AUDIT["候选池/审计/补边线索"]
+    GRAPH --> ANALYZE["Graph algorithms<br/>连通分量、Louvain、谱聚类、中心性、剪枝"]
+    ANALYZE --> COMPLETE["LLM relation completion<br/>只基于高排名邻域的 evidence snippets"]
+    COMPLETE --> REL_GATE
+    ANALYZE --> DIJK["Dijkstra inferred links<br/>2-3 hop 结构假设"]
+    DIJK --> INFERRED["dijkstra_inferred<br/>推断边/导航线索"]
+    INFERRED --> GRAPH_AUDIT
+
+    ANALYZE --> PG["PostgreSQL graph tables<br/>概念、验证关系、候选关系、指标"]
+    GRAPH_AUDIT --> PG
+    PG --> RETRIEVAL["Evidence-first retrieval<br/>只沿可审计证据扩展"]
     PG --> UI["Community-aware graph UI"]
 ```
 
 ### 1. 实体与证据
 
-每个概念保留规范名、别名、章节引用、重要度和证据 chunk 数。概念向量不是由概念名直接生成，而是由其证据 chunk 向量求质心：
+每个概念保留规范名、别名、章节引用、重要度、证据 chunk 数和质量审计信息。概念向量不是由概念名直接生成，而是由支撑该概念的证据 chunk 向量求质心，再做 L2 归一化：
 
 $$
-\mathbf{v}_e = \frac{1}{|C_e|}\sum_{c \in C_e}\mathbf{v}_c
+\bar{\mathbf{x}}_i = \frac{1}{|C_i|}\sum_{c \in C_i}\mathbf{z}_c,\qquad
+\mathbf{x}_i = \frac{\bar{\mathbf{x}}_i}{\lVert \bar{\mathbf{x}}_i\rVert_2}
 $$
 
-其中 *C*`<sub>`e`</sub>` 是支撑实体 *e* 的 active child chunks。向量归一化后进入相似图构建。
+其中 *C*`<sub>`i`</sub>` 是支撑概念 *i* 的 active child chunks，\(\mathbf{z}_c\) 是 chunk embedding。这样做的目标是让概念向量忠实于本地课程材料，而不是偏向 LLM 对概念名的通用预训练语义。
 
-> **设计意图（为什么这么做）**：传统的 GraphRAG 直接让 LLM 对提取出的概念名进行向量化，这会导致向量空间偏向大模型预训练数据的通用语境。使用支撑该概念的所有底层证据向量（Child Chunks）求质心，确保了图谱在向量空间中完美忠实于本地知识库的特定语境，从根源上消除概念漂移。
+### 2. LLM 显式关系与质量门禁
 
-### 2. 动态 KNN + 语义阈值 + 互近邻/反向入边配额稀疏构图
+LLM 抽取出的关系不是直接入图。系统先检查关系类型 allowlist、端点是否存在、是否自环、置信度、support count、evidence chunk、端点名称是否能在证据文本中匹配，以及候选关系是否由允许的来源产生。只有通过质量门禁的关系才进入验证图，成为后续中心性、社区发现和检索路径规划的事实边。
 
-这里不是标准 Radius-NN（按固定半径或距离阈值直接入选）的构图。当前实现先按动态 KNN 和语义相似度阈值生成候选，再保留互为近邻或通过反向入边配额的候选。
+质量门禁的职责是约束事实性：LLM 负责“提出可能关系”，门禁负责“确认这条关系是否能被课程资料支持”。这也是图谱避免静默污染的关键边界。
+
+### 3. 动态 KNN + 语义阈值 + 互近邻/反向入边配额稀疏构图
+
+这里不是标准 Radius-NN（按固定半径或距离阈值直接入选）的构图。当前实现先按动态 KNN 和语义相似度阈值生成候选，再保留互为近邻或通过反向入边配额的候选。该层的定位是“语义候选边筛选和规模控制”，不是最终事实关系判定。
 
 每个概念按证据量动态决定发出候选边数量：
 
@@ -303,39 +320,63 @@ $$
 
 *m*`<sub>`i`</sub>` 是证据 chunk 数，*r*`<sub>`i`</sub>` 是章节引用数。系统保留互为近邻、通过反向入边配额 *B*`<sub>`i`</sub>` 的近邻，以及高置信 LLM 显式关系，从而让边数随节点数近线性增长。
 
-> **设计意图（为什么这么做）**：如果毫无限制地让高频词（如"算法"、"数据"）接收连边，整个图谱会迅速坍塌成一个毫无意义的巨大枢纽节点（Hubness Problem）。基于证据量、章节覆盖率、语义阈值和反向入边配额的动态稀疏算法，强制挤掉蹭热度的低质边，从数学上保证了图谱永远是清晰、稀疏且重点突出的。
+纯语义候选边会标记为 `relation_source="semantic_sparse"` 和 `candidate_only=true`。它们可以作为补边线索、审计对象或后续验证材料，但默认不会进入中心性和社区计算图，避免相似度噪声放大成事实结构。
 
-### 3. 边权与图算法
+### 4. 边权、结构分析与剪枝
 
-边权由 LLM 置信度、语义相似度、证据支持和结构一致性组合：
+边权由证据支持、关系置信度、语义相似度、共现强度和章节结构一致性组合：
 
 $$
-w_{ij}=0.45\,c_{ij}^{\mathrm{llm}}+0.30\,s_{ij}^{\mathrm{sem}}+0.15\,s_{ij}^{\mathrm{evidence}}+0.10\,s_{ij}^{\mathrm{structure}}
+w_{ij}=
+0.30\,s_{ij}^{\mathrm{evidence}}
++0.25\,c_{ij}^{\mathrm{relation}}
++0.20\,s_{ij}^{\mathrm{sem}}
++0.15\,s_{ij}^{\mathrm{cooccur}}
++0.10\,s_{ij}^{\mathrm{structure}}
 $$
 
-无 LLM 显式关系时 *c*`<sub>`ij`</sub><sup>`llm`</sup>`=0，最终 *w*`<sub>`ij`</sub>` 裁剪到 [0,1]。图算法阶段执行：
+最终 *w*`<sub>`ij`</sub>` 裁剪到 [0,1]。验证图上执行：
 
-- 连通分量消融：移除孤立、低证据、低重要度噪声节点，同时保持每个知识库有足够节点规模。
+- 连通分量分析：识别孤立结构、噪声节点和主要知识簇。
 - Louvain 社区发现：用于主社区标记和前端颜色分组。
 - 谱聚类：用于大连通分量和大社区的二级结构划分。
 - 中心性：计算 degree、weighted degree、PageRank、betweenness、closeness，并合成 `centrality_score`。
-- 图谱精简：优先保留高中心性节点、社区代表节点、跨社区桥接边和高证据节点。
+- 图谱剪枝：优先保留高中心性节点、社区代表节点、跨社区桥接结构和高证据节点。
 
-> **设计意图（为什么这么做）**：大模型抽取的图谱通常充满噪音和孤立碎片。引入连通分量消融、Louvain 社区发现和中心性计算等经典的传统图论算法，是对冲 LLM 随机性幻觉的最有效手段。通过多维图论消融，只保留高价值核心结构，解决了大规模建图时的"毛线球（Hairball）"展示难题。
+中心性不是在纯语义候选图上计算，而是在经过证据门禁的验证图上计算；`graph_rank_score` 还会混合概念重要度和证据量，避免单一图拓扑支配排序。
 
-### 4. 隐式关系与关系补全
+### 5. LLM 关系补全与 Dijkstra 隐式关系
 
-Dijkstra 在非负代价图上发现 2-3 跳隐式关系：
+结构分析完成后，系统会挑选高 `graph_rank_score` 节点的局部邻域，收集相关 evidence snippets，让 LLM 只基于这些证据做关系补全。补全结果仍要回到同一套 `RelationQualityPolicy + hard gate`，不能绕过质量门禁直接入图。
+
+Dijkstra 在非负代价图上发现 2-3 跳隐式结构线索：
 
 $$
 \mathrm{cost}_{ij}=\frac{1}{0.05+w_{ij}}
 $$
 
-当端点语义相似度足够高且路径代价足够低时，系统写入 `relation_source="dijkstra_inferred"` 的 `relates_to` 边，并用路径分数修正弱边权。随后系统对高中心性节点的二跳邻域抽取证据 snippet，让 LLM 只基于给定证据做抽取式关系补全。
+当端点语义相似度足够高且路径代价足够低时，系统可写入 `relation_source="dijkstra_inferred"` 的推断边。推断边用于导航、审计和候选补全，不应被视为无条件事实；回答仍必须回到原文 chunk 证据。
 
-前端图展示按 Louvain 社区着色，节点大小反映中心性和图谱排序，虚线边表示 inferred 关系。用户可以筛选社区并快速打开关键实体详情。
+### 6. 协作边界与注意事项
 
-> **设计意图（为什么这么做）**：真正的知识往往跨越章节（文档没有明说 A 和 C 的关系，但 A 属于 B，B 包含 C）。用 Dijkstra 去发现隐藏的结构洞（高效），再用 LLM 针对 2 跳证据片段做抽取式验证（精准），实现了一种自动化的本体扩展（Ontology Expansion），突破了传统正则/规则抽取的瓶颈。
+这套架构的核心不是让某个算法单独决定图谱，而是让多种信号互相制衡：
+
+- LLM 负责发现候选语义，但必须接受 evidence-first 约束。
+- 质量门禁负责阻止幻觉、弱证据关系和不可信关系类型进入验证图。
+- 动态 KNN 稀疏构图负责控制语义候选规模，降低 hubness 和毛线球风险。
+- 图算法负责社区、中心性、桥接结构和剪枝，但不能替代证据。
+- LLM 补全和 Dijkstra 推断只做局部修补和导航线索，不能绕过验证流程。
+
+局限和课程资料约束也必须明确：
+
+- 图谱只表达本地课程资料中可被 evidence chunk 支撑的知识，不保证覆盖通用百科知识。
+- 课程资料如果章节混乱、OCR 错误、chunk 过短、重复文件过多或概念抽取质量差，图谱质量会随之下降。
+- 动态 KNN 仍偏向局部语义密集区域，跨章节桥接概念可能被漏召回，需要依赖 LLM 显式关系、证据补全和检索路径校正弥补。
+- 中心性会放大已进入验证图的错误边，因此关系门禁、候选边隔离和回归测试必须保持严格。
+- `semantic_sparse` 和 `dijkstra_inferred` 边不能直接作为答案依据；用户可见答案必须引用原文 chunk。
+- 换 embedding 模型、chunk 策略或关系抽取 prompt 后，需要重新校准相似度阈值、质量门禁和图谱质量指标。
+
+前端图展示按 Louvain 社区着色，节点大小反映中心性和图谱排序，虚线边表示 inferred 关系。用户可以筛选社区并快速打开关键实体详情，但图谱视图应被理解为“课程证据导航图”，不是不带证据的权威本体库。
 
 ## 检索与问答
 

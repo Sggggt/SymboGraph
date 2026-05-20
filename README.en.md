@@ -253,41 +253,58 @@ The judge layer is an optional LLM-as-judge enhancement:
 
 ## Graph Construction
 
-SymboGraph builds graphs with an evidence-first policy: the LLM produces candidate entities and explicit relations, while chunk vectors and graph algorithms decide the final structure. PostgreSQL is the source of truth for the sparse graph; Qdrant provides chunk vectors and similarity signals. All candidates are filtered by the quality system's concept and relation policies before persistence.
+SymboGraph graph construction is not a single KNN or LLM extraction procedure. It is an evidence-first, multi-stage pipeline: the LLM discovers candidate entities and explicit semantic relations, quality gates enforce factual constraints, vector similarity provides controlled semantic candidates, classic graph algorithms analyze structure, and LLM evidence completion plus Dijkstra inference repair only local structure within audited boundaries. PostgreSQL is the source of truth for concepts, relations, and lifecycle state; Qdrant provides chunk vectors and similarity signals, but does not decide factual relations by itself.
 
 ```mermaid
-flowchart LR
-    CHUNK["Active child chunks<br/>(passed ChunkQualityPolicy)"] --> VEC["Qdrant chunk vectors"]
-    CHUNK --> LLM["LLM entity/relation candidates"]
-    LLM --> QUAL["ConceptQualityPolicy<br/>RelationQualityPolicy<br/>quality filter"]
-    QUAL --> ENTITY["Concept merge<br/>alias and duplicate reduction"]
-    VEC --> CENTROID["Concept vector centroid"]
-    ENTITY --> SPARSE["Dynamic KNN + semantic threshold<br/>mutual / inbound quota sparse graph"]
-    CENTROID --> SPARSE
-    SPARSE --> CC["Connected components<br/>noise ablation"]
-    CC --> COMM["Louvain + spectral communities"]
-    COMM --> CENTRAL["Centrality ranking"]
-    CENTRAL --> DIJK["Dijkstra hidden links"]
-    DIJK --> COMPLETE["Traversal + prompt relation completion"]
-    COMPLETE --> PG["PostgreSQL graph tables"]
+flowchart TB
+    CHUNK["Active child chunks<br/>passed ChunkQualityPolicy"] --> VEC["Qdrant chunk vectors<br/>derived vector signals"]
+    CHUNK --> LLM["LLM extraction<br/>candidate entities + explicit relations"]
+
+    LLM --> CONCEPT_GATE["ConceptQualityPolicy<br/>entity quality filter"]
+    LLM --> REL_GATE["RelationQualityPolicy + hard gate<br/>relation type / confidence / evidence match"]
+    CONCEPT_GATE --> MERGE["Concept merge<br/>canonical name, aliases, dedupe, chapter refs"]
+    REL_GATE --> EXPLICIT["Verified explicit relations<br/>evidence-supported factual edges"]
+
+    VEC --> CENTROID["Concept vector centroid<br/>evidence chunk centroid + L2 normalization"]
+    MERGE --> CENTROID
+    CENTROID --> SPARSE["Semantic sparse candidates<br/>dynamic KNN + semantic threshold + mutual/inbound quota"]
+    SPARSE --> CANDIDATE["semantic_sparse candidates<br/>candidate_only, not factual edges by default"]
+
+    EXPLICIT --> GRAPH["Verified graph<br/>default graph for centrality/community analysis"]
+    CANDIDATE --> GRAPH_AUDIT["candidate pool / audit / repair hints"]
+    GRAPH --> ANALYZE["Graph algorithms<br/>components, Louvain, spectral, centrality, pruning"]
+    ANALYZE --> COMPLETE["LLM relation completion<br/>only from evidence snippets in high-rank neighborhoods"]
+    COMPLETE --> REL_GATE
+    ANALYZE --> DIJK["Dijkstra inferred links<br/>2-3 hop structural hypotheses"]
+    DIJK --> INFERRED["dijkstra_inferred<br/>inferred edges / navigation hints"]
+    INFERRED --> GRAPH_AUDIT
+
+    ANALYZE --> PG["PostgreSQL graph tables<br/>concepts, verified relations, candidates, metrics"]
+    GRAPH_AUDIT --> PG
+    PG --> RETRIEVAL["Evidence-first retrieval<br/>expands only along auditable evidence"]
     PG --> UI["Community-aware graph UI"]
 ```
 
 ### 1. Entities And Evidence
 
-Each concept stores a canonical name, aliases, chapter references, importance, and evidence chunk count. Concept vectors are not generated from names. They are centroids of supporting chunk vectors:
+Each concept stores a canonical name, aliases, chapter references, importance, evidence chunk count, and quality audit fields. Concept vectors are not generated from names. They are centroids of supporting evidence chunk vectors, followed by L2 normalization:
 
 $$
-\mathbf{v}_e = \frac{1}{|C_e|}\sum_{c \in C_e}\mathbf{v}_c
+\bar{\mathbf{x}}_i = \frac{1}{|C_i|}\sum_{c \in C_i}\mathbf{z}_c,\qquad
+\mathbf{x}_i = \frac{\bar{\mathbf{x}}_i}{\lVert \bar{\mathbf{x}}_i\rVert_2}
 $$
 
-*C*`<sub>`e`</sub>` is the set of active child chunks supporting entity *e*. The centroid is normalized before semantic graph construction.
+*C*`<sub>`i`</sub>` is the set of active child chunks supporting concept *i*, and \(\mathbf{z}_c\) is the chunk embedding. The purpose is to keep concept vectors faithful to the local course material instead of the LLM's generic pre-training semantics for the concept name.
 
-> **Design Intent (Why we do this)**: Traditional GraphRAG directly embeds the extracted concept name, which biases the vector space toward the LLM's generic pre-training data. Calculating the centroid of all supporting underlying child chunk vectors ensures the graph remains perfectly faithful to the specific local context of the knowledge base, eliminating concept drift.
+### 2. Explicit LLM Relations And Quality Gates
 
-### 2. Dynamic KNN + Semantic Threshold + Mutual/Inbound-Quota Sparse Graph
+LLM-extracted relations are not inserted into the graph directly. The system checks the relation type allowlist, endpoint existence, self-loops, confidence, support count, evidence chunk, whether endpoint names can be matched in the evidence text, and whether the relation source is allowed. Only relations that pass these quality gates enter the verified graph and become factual edges for centrality, community detection, and retrieval path planning.
 
-This is not standard Radius-NN graph construction, where neighbors are admitted solely by a fixed radius or distance threshold. The current implementation first generates candidates with dynamic KNN and a semantic similarity threshold, then keeps mutual nearest neighbors or candidates accepted by the reverse inbound quota.
+The quality gate owns factuality: the LLM proposes possible relations, while the gate verifies whether each relation is supported by course material. This boundary is what prevents silent graph pollution.
+
+### 3. Dynamic KNN + Semantic Threshold + Mutual/Inbound-Quota Sparse Graph
+
+This is not standard Radius-NN graph construction, where neighbors are admitted solely by a fixed radius or distance threshold. The current implementation first generates candidates with dynamic KNN and a semantic similarity threshold, then keeps mutual nearest neighbors or candidates accepted by the reverse inbound quota. This layer exists to screen semantic candidate edges and control graph scale; it does not make final factual-relation decisions.
 
 Each concept dynamically chooses outgoing candidates from its evidence volume:
 
@@ -303,39 +320,63 @@ $$
 
 *m*`<sub>`i`</sub>` is evidence chunk count and *r*`<sub>`i`</sub>` is chapter reference count. The system keeps mutual nearest neighbors, candidates accepted by the reverse inbound quota *B*`<sub>`i`</sub>`, and high-confidence explicit LLM relations, keeping edge count close to linear in node count.
 
-> **Design Intent (Why we do this)**: If high-frequency words (e.g., "algorithm", "data") accept edges without limits, the graph quickly collapses into a useless giant hub (the Hubness Problem). A dynamic sparse algorithm based on evidence volume, chapter coverage, semantic thresholding, and reverse inbound quotas mathematically squeezes out low-quality edges, guaranteeing the graph remains clear, sparse, and focused.
+Pure semantic candidate edges are marked with `relation_source="semantic_sparse"` and `candidate_only=true`. They can be used as repair hints, audit objects, or later validation material, but they do not enter the centrality and community graph by default. This prevents similarity noise from being amplified into factual structure.
 
-### 3. Edge Weights And Graph Algorithms
+### 4. Edge Weights, Structure Analysis, And Pruning
 
-Edge weight combines LLM confidence, semantic similarity, evidence support, and structural consistency:
+Edge weight combines evidence support, relation confidence, semantic similarity, co-occurrence strength, and chapter-structure consistency:
 
 $$
-w_{ij}=0.45\,c_{ij}^{\mathrm{llm}}+0.30\,s_{ij}^{\mathrm{sem}}+0.15\,s_{ij}^{\mathrm{evidence}}+0.10\,s_{ij}^{\mathrm{structure}}
+w_{ij}=
+0.30\,s_{ij}^{\mathrm{evidence}}
++0.25\,c_{ij}^{\mathrm{relation}}
++0.20\,s_{ij}^{\mathrm{sem}}
++0.15\,s_{ij}^{\mathrm{cooccur}}
++0.10\,s_{ij}^{\mathrm{structure}}
 $$
 
-When no explicit LLM relation exists, *c*`<sub>`ij`</sub><sup>`llm`</sup>`=0. The final *w*`<sub>`ij`</sub>` is clipped to [0,1]. The graph stage runs:
+The final *w*`<sub>`ij`</sub>` is clipped to [0,1]. The verified graph stage runs:
 
-- Connected-component ablation: removes isolated, low-evidence, low-importance noise while preserving enough knowledge-base nodes.
+- Connected-component analysis: identifies isolated structures, noise nodes, and major knowledge clusters.
 - Louvain community detection: primary community labels and frontend color groups.
 - Spectral clustering: secondary partitions for large components and large communities.
 - Centrality: degree, weighted degree, PageRank, betweenness, closeness, and a combined `centrality_score`.
 - Graph simplification: keeps central nodes, community representatives, bridge edges, and high-evidence concepts.
 
-> **Design Intent (Why we do this)**: LLM-extracted graphs are often noisy and fragmented. Introducing classic graph algorithms like connected components, Louvain community detection, and centrality is the most effective way to hedge against LLM hallucinations. This multi-dimensional graph ablation retains only high-value core structures, solving the notorious "hairball" visualization problem in large-scale graphs.
+Centrality is not computed on the pure semantic candidate graph. It is computed on the evidence-gated verified graph; `graph_rank_score` also mixes concept importance and evidence count so a single topology signal cannot dominate ranking.
 
-### 4. Hidden Links And Relation Completion
+### 5. LLM Relation Completion And Dijkstra Inference
 
-Dijkstra searches 2-3 hop hidden relations on a non-negative cost graph:
+After structure analysis, the system selects local neighborhoods around high-`graph_rank_score` nodes, collects related evidence snippets, and asks the LLM to complete only relations supported by those snippets. Completion results still return through the same `RelationQualityPolicy + hard gate`; they cannot bypass validation.
+
+Dijkstra searches 2-3 hop hidden structural hints on a non-negative cost graph:
 
 $$
 \mathrm{cost}_{ij}=\frac{1}{0.05+w_{ij}}
 $$
 
-If endpoint semantic similarity is high and path cost is low, the system writes a `relates_to` edge with `relation_source="dijkstra_inferred"` and uses the path score to repair weak existing weights. The system then extracts evidence snippets from two-hop neighborhoods around high-centrality nodes and asks the LLM to complete only evidence-supported relations.
+If endpoint semantic similarity is high and path cost is low, the system may write an inferred edge with `relation_source="dijkstra_inferred"`. Inferred edges are navigation, audit, and candidate-completion hints; they are not unconditional facts. Answers must still return to original chunk evidence.
 
-The frontend colors graph nodes by Louvain community, sizes nodes by centrality and graph rank, and renders inferred edges as dashed lines. Users can filter communities and open key entity details quickly.
+### 6. Collaboration Boundaries And Caveats
 
-> **Design Intent (Why we do this)**: True knowledge often spans chapters (e.g., A belongs to B, B contains C, so A relates to C, even if unstated). Using Dijkstra's algorithm to efficiently find structural holes and then using the LLM to verify these specific 2-hop evidence snippets enables automated, highly precise ontology expansion that surpasses traditional rule-based extraction.
+The architecture does not let any single algorithm decide the graph alone. Its signals constrain each other:
+
+- The LLM discovers candidate semantics, but must obey evidence-first constraints.
+- Quality gates prevent hallucinated, weakly supported, or disallowed relation types from entering the verified graph.
+- Dynamic KNN sparse construction controls semantic candidate scale and reduces hubness and hairball risk.
+- Graph algorithms provide communities, centrality, bridge structure, and pruning, but do not replace evidence.
+- LLM completion and Dijkstra inference only provide local repair and navigation hints; they cannot bypass validation.
+
+The limitations and course-material constraints are explicit:
+
+- The graph represents knowledge supported by local course evidence chunks; it does not guarantee coverage of general encyclopedic knowledge.
+- If course materials have chaotic chapters, OCR errors, overly short chunks, duplicate files, or poor concept extraction, graph quality will degrade accordingly.
+- Dynamic KNN still favors locally dense semantic regions. Cross-chapter bridge concepts may be missed and need explicit LLM relations, evidence completion, or retrieval-path correction.
+- Centrality can amplify bad edges that already entered the verified graph, so relation gates, candidate-edge isolation, and regression tests must stay strict.
+- `semantic_sparse` and `dijkstra_inferred` edges must not be treated as answer evidence by themselves; user-visible answers must cite original chunks.
+- Changing the embedding model, chunking strategy, or relation extraction prompt requires recalibrating similarity thresholds, quality gates, and graph quality metrics.
+
+The frontend colors graph nodes by Louvain community, sizes nodes by centrality and graph rank, and renders inferred edges as dashed lines. Users can filter communities and open key entity details quickly, but the graph view should be understood as a course-evidence navigation graph, not an unsupported authoritative ontology.
 
 ## Retrieval And QA
 
