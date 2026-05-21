@@ -387,7 +387,7 @@ def lightweight_rerank(query: str, candidates: list[dict], top_k: int) -> list[d
         overlap = query_terms.intersection(doc_terms)
         overlap_ratio = len(overlap) / query_len
 
-        fused_score = float(item.get("metadata", {}).get("scores", {}).get("fused", item.get("score", 0.0)))
+        fused_score = _result_score(item)
 
         query_type = item.get("metadata", {}).get("scores", {}).get("query_type", "default")
         alpha = 0.65 if query_type in ("definition", "formula") else 0.75

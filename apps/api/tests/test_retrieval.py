@@ -163,6 +163,25 @@ async def test_hybrid_search_can_skip_reranker(db_session, sample_course, indexe
     assert all("lightweight_rerank" in item["metadata"]["scores"] for item in results)
 
 
+def test_lightweight_rerank_handles_none_fused_score():
+    from app.services.retrieval import lightweight_rerank
+
+    candidates = [
+        {
+            "chunk_id": "chunk-1",
+            "snippet": "conjugate prior beta binomial example",
+            "content": "A Beta prior is conjugate to a Bernoulli likelihood.",
+            "score": 0.42,
+            "metadata": {"scores": {"fused": None, "dense": 0.42}},
+        }
+    ]
+
+    results = lightweight_rerank("Define conjugate prior", candidates, top_k=1)
+
+    assert len(results) == 1
+    assert results[0]["metadata"]["scores"]["lightweight_rerank"] > 0
+
+
 @pytest.mark.asyncio
 async def test_search_chunks_with_audit_reports_real_query_embedding(db_session, sample_course, indexed_chunks, monkeypatch):
     from app.services import retrieval
