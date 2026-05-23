@@ -168,8 +168,8 @@ sequenceDiagram
 | 实体密度 | 来自语义密度信号 | 命名实体占比 |
 | 术语密度 | 来自语义密度信号 | 领域术语占比 |
 | 唯一 token 比例 | 来自语义密度信号 | 文本去重后的词汇丰富度 |
-| 公式信号 | $\min\bigl(1, \frac{12 N_{\text{formula}}}{L_{\text{tokens}}} + 0.35 \cdot \mathbf{1}_{\text{has\_formula}}\bigr)$ | 公式密集程度 |
-| 表格信号 | $\mathbf{1}_{\text{has\_table}}$ | 是否包含表格 |
+| 公式信号 | $\min\bigl(1, \frac{12 N_{\text{formula}}}{L_{\text{tokens}}} + 0.35 \cdot \mathbf{1}_{\text{has formula}}\bigr)$ | 公式密集程度 |
+| 表格信号 | $\mathbf{1}_{\text{has table}}$ | 是否包含表格 |
 | 代码标记比例 | 代码行 / 总行数 | `def`/`class`/`import` 等标记占比 |
 | 符号比例 | $\min(1, \frac{4 N_{\text{symbol}}}{L_{\text{chars}}})$ | 非字母数字符号占比 |
 | 结构噪声 | $\max(S_{\text{structural}}, 20 R_{\text{mojibake}})$ | 结构异常与乱码风险 |
@@ -210,15 +210,15 @@ $$
 目标大小与重叠（由复杂度和密度驱动）：
 
 $$
-S^* = 920 - 380\,\gamma + 160\,\delta + 100\,\rho,\qquad
-O^* = 80 + 130\,\gamma + 40\,\kappa
+S^{*} = 920 - 380\,\gamma + 160\,\delta + 100\,\rho,\qquad
+O^{*} = 80 + 130\,\gamma + 40\,\kappa
 $$
 
 拟合度：
 
 $$
-\phi_{\text{size}} = 1 - \min\!\Bigl(1, \frac{|S - S^*|}{700}\Bigr),\qquad
-\phi_{\text{overlap}} = 1 - \min\!\Bigl(1, \frac{|O - O^*|}{220}\Bigr)
+\phi_{\text{size}} = 1 - \min\!\Bigl(1, \frac{|S - S^{*}|}{700}\Bigr),\qquad
+\phi_{\text{overlap}} = 1 - \min\!\Bigl(1, \frac{|O - O^{*}|}{220}\Bigr)
 $$
 
 策略奖励：
@@ -226,8 +226,8 @@ $$
 $$
 \beta =
 \begin{cases}
-0.08 \cdot \max(\kappa, \delta) & \text{if strategy} = \text{`semantic\_or\_sentence'} \\
-0.10 \cdot r_{\text{code}} + 0.05 \cdot f & \text{if strategy} = \text{`recursive\_structure\_preserving'} \\
+0.08 \cdot \max(\kappa, \delta) & \text{if strategy} = \text{`semantic or sentence'} \\
+0.10 \cdot r_{\text{code}} + 0.05 \cdot f & \text{if strategy} = \text{`recursive structure preserving'} \\
 0 & \text{otherwise}
 \end{cases}
 $$
@@ -308,7 +308,7 @@ $$
 S_{\text{chunk}} = 0.30 \cdot \min\Bigl(1, \frac{L_{\text{norm}}}{600}\Bigr) + 0.25 \cdot D_{\text{term}} + 0.20 \cdot R_{\text{unique}} + 0.15 \cdot D_{\text{def}} + 0.05 \cdot \mathbf{1}_{\text{formula}} + 0.05 \cdot \mathbf{1}_{\text{table}} - 0.35 \cdot \mathbf{1}_{\text{toc}} - 0.40 \cdot \min\Bigl(1, 20 \cdot R_{\text{mojibake}}\Bigr)
 $$
 
-其中 *L*`<sub>`norm`</sub>` 为规范化长度，*D*`<sub>`term`</sub>` 为术语密度，*R*`<sub>`unique`</sub>` 为唯一词比率，*D*`<sub>`def`</sub>` 为定义得分，*R*`<sub>`mojibake`</sub>` 为乱码比率。
+其中 $L_{\text{norm}}$ 为规范化长度，$D_{\text{term}}$ 为术语密度，$R_{\text{unique}}$ 为唯一词比率，$D_{\text{def}}$ 为定义得分，$R_{\text{mojibake}}$ 为乱码比率。
 
 **ConceptQualityPolicy** 决策空间为 `accept` / `reject`：
 
@@ -316,7 +316,7 @@ $$
 S_{\text{concept}} = \max\Bigl(S_{\text{specificity}},\; 0.35 D_{\text{def}} + 0.25 D_{\text{term}} + 0.20 D_{\text{entity}}\Bigr) - 0.35 S_{\text{structural}} - 0.25 G_{\text{genericity}}
 $$
 
-准入条件：无硬拒绝理由（过短、乱码、路径名、结构容器、低特异性、证据不足），且得分 *S*`<sub>`concept`</sub>` ≥ 0.45。
+准入条件：无硬拒绝理由（过短、乱码、路径名、结构容器、低特异性、证据不足），且得分 $S_{\text{concept}}$ ≥ 0.45。
 
 **RelationQualityPolicy** 决策空间为 `accept` / `candidate_only`：
 
@@ -324,7 +324,7 @@ $$
 S_{\text{relation}} = 0.40 \cdot c + 0.25 \cdot \mathbf{1}_{\text{src}} + 0.25 \cdot \mathbf{1}_{\text{tgt}} + 0.10 \cdot \min\Bigl(1, \frac{n_{\text{support}}}{3}\Bigr)
 $$
 
-其中 *c* 为 LLM 置信度，**1**`<sub>`src`</sub>` / **1**`<sub>`tgt`</sub>` 为证据文本中是否出现源/目标概念。`inferred` 或 `related_to` 类型关系强制降级为 `candidate_only`。
+其中 *c* 为 LLM 置信度，$\mathbf{1}_{\text{src}}$ / $\mathbf{1}_{\text{tgt}}$ 为证据文本中是否出现源/目标概念。`inferred` 或 `related_to` 类型关系强制降级为 `candidate_only`。
 
 > **设计意图（为什么这么做）**：传统的 RAG/GraphRAG 系统往往在建图前只做粗粒度过滤，导致大量目录页、乱码、重复提取噪声进入向量库和知识图谱。SymboGraph 的分级质量路由让不同类型的内容去它该去的地方——噪声被丢弃、结构标签只做摘要、高语义密度块参与图谱、普通块负责检索——从数据源头上保证下游质量。
 
@@ -424,7 +424,7 @@ $$
 \mathbf{x}_i = \frac{\bar{\mathbf{x}}_i}{\lVert \bar{\mathbf{x}}_i\rVert_2}
 $$
 
-其中 *C*`<sub>`i`</sub>` 是支撑概念 *i* 的 active child chunks，$\mathbf{z}_c$ 是 chunk embedding。这样做的目标是让概念向量忠实于本地课程材料，而不是偏向 LLM 对概念名的通用预训练语义。
+其中 $C_i$ 是支撑概念 *i* 的 active child chunks，$\mathbf{z}_c$ 是 chunk embedding。这样做的目标是让概念向量忠实于本地课程材料，而不是偏向 LLM 对概念名的通用预训练语义。
 
 ### 2. LLM 显式关系与质量门禁
 
@@ -448,7 +448,7 @@ $$
 B_i = \mathrm{clamp}\bigl(2 + \lfloor \log_2(1 + r_i) \rfloor,\, 2,\, 8\bigr)
 $$
 
-*m*`<sub>`i`</sub>` 是证据 chunk 数，*r*`<sub>`i`</sub>` 是章节引用数。系统保留互为近邻、通过反向入边配额 *B*`<sub>`i`</sub>` 的近邻，以及高置信 LLM 显式关系，从而让边数随节点数近线性增长。
+$m_i$ 是证据 chunk 数，$r_i$ 是章节引用数。系统保留互为近邻、通过反向入边配额 $B_i$ 的近邻，以及高置信 LLM 显式关系，从而让边数随节点数近线性增长。
 
 纯语义候选边会标记为 `relation_source="semantic_sparse"` 和 `candidate_only=true`。它们可以作为补边线索、审计对象或后续验证材料，但默认不会进入中心性和社区计算图，避免相似度噪声放大成事实结构。
 
@@ -465,7 +465,7 @@ w_{ij}=
 +0.10\,s_{ij}^{\mathrm{structure}}
 $$
 
-最终 *w*`<sub>`ij`</sub>` 裁剪到 [0,1]。验证图上执行：
+最终 $w_{ij}$ 裁剪到 [0,1]。验证图上执行：
 
 - 连通分量分析：识别孤立结构、噪声节点和主要知识簇。
 - Louvain 社区发现：用于主社区标记和前端颜色分组。
@@ -656,8 +656,8 @@ $$
 
 其中：
 
-- *r*`<sub>`overlap`</sub>` = |*T*`<sub>`q`</sub>` ∩ *T*`<sub>`d`</sub>`| / |*T*`<sub>`q`</sub>`|，*T*`<sub>`q`</sub>` 为查询词集合，*T*`<sub>`d`</sub>` 为文档标题+摘要+正文词集合
-- *s*`<sub>`embedding`</sub>` 为查询向量与文档向量的余弦相似度；当文档未携带原始向量时，回退到检索阶段记录的 dense score
+- $r_{\text{overlap}}$ = |$T_q$ ∩ $T_d$| / |$T_q$|，$T_q$ 为查询词集合，$T_d$ 为文档标题+摘要+正文词集合
+- $s_{\text{embedding}}$ 为查询向量与文档向量的余弦相似度；当文档未携带原始向量时，回退到检索阶段记录的 dense score
 
 准入规则（满足任一即可通过）：
 
@@ -669,9 +669,9 @@ r_{\mathrm{overlap}} \ge 0.25 \;\land\; \mathrm{original\_score} \ge 0.3 & \text
 \end{cases}
 $$
 
-跨语言桥接通道解决了一个关键问题：中文查询"最大流"与英文材料"max flow"在 `text-embedding-v4` 的向量空间中重叠较弱，但 LLM 翻译后的子查询通过 dense recall 能召回相关 chunk。此时 *r*`<sub>`overlap`</sub>` 可能接近 0，但 *s*`<sub>`embedding`</sub>` 仍然较高，桥接通道防止这类有效跨语言结果被词面匹配误杀。
+跨语言桥接通道解决了一个关键问题：中文查询"最大流"与英文材料"max flow"在 `text-embedding-v4` 的向量空间中重叠较弱，但 LLM 翻译后的子查询通过 dense recall 能召回相关 chunk。此时 $r_{\text{overlap}}$ 可能接近 0，但 $s_{\text{embedding}}$ 仍然较高，桥接通道防止这类有效跨语言结果被词面匹配误杀。
 
-> **设计意图（为什么这么做）**：这是一个专为"跨语言墙"设计的破局漏斗。中文查询和英文材料往往字面毫无交集（overlap=0），但高维语义极高。通过设立基于 *s*`<sub>`embedding`</sub>` ≥ 0.45 的跨语言桥接豁免通道，巧妙修补了纯词面匹配（BM25）在面对翻译差异时的严重误杀问题。
+> **设计意图（为什么这么做）**：这是一个专为"跨语言墙"设计的破局漏斗。中文查询和英文材料往往字面毫无交集（overlap=0），但高维语义极高。通过设立基于 $s_{\text{embedding}}$ ≥ 0.45 的跨语言桥接豁免通道，巧妙修补了纯词面匹配（BM25）在面对翻译差异时的严重误杀问题。
 
 ### EvidenceEvaluator（前置证据评估层）
 
@@ -757,26 +757,26 @@ erDiagram
     Course ||--o{ Document : has
     Document ||--o{ DocumentVersion : versions
     DocumentVersion ||--o{ Chunk : chunks
-    Chunk --o{ Chunk : children
+    Chunk ||--o{ Chunk : children
     Course ||--o{ Concept : has
     Concept ||--o{ ConceptAlias : aliases
-    Concept --o{ ConceptRelation : source
-    Concept --o{ ConceptRelation : target
+    Concept ||--o{ ConceptRelation : source
+    Concept ||--o{ ConceptRelation : target
     Course ||--o{ IngestionBatch : batches
     IngestionBatch ||--o{ IngestionJob : jobs
-    Course --o{ QualityProfile : profiles
+    Course ||--o{ QualityProfile : profiles
     Course ||--o{ QASession : sessions
-    QASession --o{ AgentRun : runs
-    AgentRun --o{ AgentTraceEvent : traces
-    Course --o{ CourseModelHyperparameter : hyperparameters
-    Course --o{ GraphExtractionRun : extraction_runs
+    QASession ||--o{ AgentRun : runs
+    AgentRun ||--o{ AgentTraceEvent : traces
+    Course ||--o{ CourseModelHyperparameter : hyperparameters
+    Course ||--o{ GraphExtractionRun : extraction_runs
     GraphExtractionRun ||--o{ GraphExtractionChunkTask : tasks
-    Course --o{ GraphHpoJudgeSample : hpo_judge_samples
-    Course --o{ GraphHpoObjectiveModel : hpo_objective_models
-    Concept --o{ EntityMention : mentions
-    Concept --o{ EntityMergeCandidate : merge_candidates
-    Concept --o{ GraphRelationCandidate : relation_candidates
-    Concept --o{ GraphCommunitySummary : community_summaries
+    Course ||--o{ GraphHpoJudgeSample : hpo_judge_samples
+    Course ||--o{ GraphHpoObjectiveModel : hpo_objective_models
+    Concept ||--o{ EntityMention : mentions
+    Concept ||--o{ EntityMergeCandidate : merge_candidates
+    Concept ||--o{ GraphRelationCandidate : relation_candidates
+    Concept ||--o{ GraphCommunitySummary : community_summaries
 ```
 
 | 表                                                  | 作用                                                             |
@@ -965,13 +965,13 @@ SymboGraph 在通用 GraphRAG 方向上的核心创新可概括为以下七点�
 区别于传统系统的单一阈值过滤，SymboGraph 建立了信号-策略-画像-裁判四级质量体系。Chunk 不再只有"保留/丢弃"两种命运，而是被路由到 `discard`、`summary_only`、`evidence_only`、`retrieval_candidate`、`graph_candidate`、`embed_only` 六种下游路径；Concept 和 Relation 同样经过差异化策略过滤。领域质量画像让每个知识库拥有自适应的质量基线，而非依赖全局固定阈值。
 
 **2. 概念向量质心化与动态稀疏构图**
-概念向量由其证据 chunk 向量求质心生成，而非由 LLM 提取的概念名直接嵌入，从根本上消除了概念漂移。动态 KNN + 语义阈值 + 互近邻/反向入边配额稀疏构图算法基于证据量 *m*`<sub>`i`</sub>` 和章节覆盖 *r*`<sub>`i`</sub>` 做候选边收发限制，保证边数随节点数近线性增长，天然抑制 Hubness Problem。
+概念向量由其证据 chunk 向量求质心生成，而非由 LLM 提取的概念名直接嵌入，从根本上消除了概念漂移。动态 KNN + 语义阈值 + 互近邻/反向入边配额稀疏构图算法基于证据量 $m_i$ 和章节覆盖 $r_i$ 做候选边收发限制，保证边数随节点数近线性增长，天然抑制 Hubness Problem。
 
 **3. Evidence-first Agentic RAG**
 问答链路不是简单的"检索→生成"，而是 Perception → RetrievalPlanner → BaseRetrieval → EvidenceAnchorSelector → EvidenceChainPlanner → ControlledGraphEnhancer → EvidenceAssembler → DocumentGrader → EvidenceEvaluator → Generation 的完整 Agent 工作流。前置 `EvidenceEvaluator` 赋予系统"知道自己不知道"的能力，在生成前拦截低质检索。
 
 **4. 跨语言鲁棒检索的三重机制**
-LLM 显式翻译扩展生成双语子查询、Embedding Similarity 桥接跨越语言壁垒、DocumentGrader 的 *s*`<sub>`embedding`</sub>` ≥ 0.45 跨语言桥接通道豁免词面误杀——三重机制共同构建了一个不依赖单一多语言 Embedding 模型对齐质量的鲁棒检索系统。
+LLM 显式翻译扩展生成双语子查询、Embedding Similarity 桥接跨越语言壁垒、DocumentGrader 的 $s_{\text{embedding}}$ ≥ 0.45 跨语言桥接通道豁免词面误杀——三重机制共同构建了一个不依赖单一多语言 Embedding 模型对齐质量的鲁棒检索系统。
 
 **5. Small-to-Big 上下文装配与父子块解耦**
 检索阶段只让最小粒度单元（child chunks）进入 dense/BM25/recall/rerank，避免 parent 和 child 在候选池中竞争；生成阶段再通过 `parent_chunk_id` 装配完整 parent context。这彻底解耦了"召回单元"与"生成单元"，同时兼顾精度与上下文完整性。
