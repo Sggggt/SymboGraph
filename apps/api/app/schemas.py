@@ -339,7 +339,17 @@ class DeleteCourseResponse(BaseModel):
     deleted_ingestion_logs: int = 0
     deleted_compensations: int = 0
     deleted_jobs: int = 0
+    deleted_graph_extraction_tasks: int = 0
+    deleted_graph_extraction_runs: int = 0
     deleted_batches: int = 0
+    deleted_hpo_judge_samples: int = 0
+    deleted_hpo_objective_models: int = 0
+    deleted_model_hyperparameters: int = 0
+    deleted_quality_profiles: int = 0
+    deleted_community_summaries: int = 0
+    deleted_relation_candidates: int = 0
+    deleted_mentions: int = 0
+    deleted_merge_candidates: int = 0
     deleted_relations: int = 0
     deleted_aliases: int = 0
     deleted_concepts: int = 0
@@ -380,6 +390,7 @@ class ModelSettingsResponse(BaseModel):
     reranker_url: str = ""
     semantic_chunking_enabled: bool = True
     semantic_chunking_min_length: int = 2000
+    enable_auto_hpo: bool = False
     has_api_key: bool
     has_embedding_api_key: bool
     degraded_mode: bool
@@ -410,6 +421,7 @@ class ModelSettingsUpdate(BaseModel):
     reranker_device: str | None = None
     semantic_chunking_enabled: bool | None = None
     semantic_chunking_min_length: int | None = Field(default=None, ge=500, le=5000)
+    enable_auto_hpo: bool | None = None
     embedding_api_key: str | None = None
     clear_embedding_api_key: bool = False
 

@@ -29,6 +29,80 @@ class Course(TimestampMixin, Base):
     documents: Mapped[list["Document"]] = relationship(back_populates="course")
     concepts: Mapped[list["Concept"]] = relationship(back_populates="course")
     batches: Mapped[list["IngestionBatch"]] = relationship(back_populates="course")
+    model_hyperparameters: Mapped[list["CourseModelHyperparameter"]] = relationship(back_populates="course")
+
+
+class CourseModelHyperparameter(TimestampMixin, Base):
+    __tablename__ = "course_model_hyperparameters"
+
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), primary_key=True)
+    llm_model_name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    embedding_model_name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    embedding_text_version: Mapped[str] = mapped_column(String(32), primary_key=True)
+    model_name: Mapped[str | None] = mapped_column(String(384), nullable=True)
+    graph_version: Mapped[str] = mapped_column(String(128), default="active")
+
+    min_relation_confidence: Mapped[float] = mapped_column(Float, default=0.72)
+    min_accepted_relation_weight: Mapped[float] = mapped_column(Float, default=0.62)
+    dijkstra_semantic_threshold: Mapped[float] = mapped_column(Float, default=0.78)
+
+    w_degree: Mapped[float] = mapped_column(Float, default=0.25)
+    w_weighted_degree: Mapped[float] = mapped_column(Float, default=0.25)
+    w_pagerank: Mapped[float] = mapped_column(Float, default=0.20)
+    w_betweenness: Mapped[float] = mapped_column(Float, default=0.20)
+    w_closeness: Mapped[float] = mapped_column(Float, default=0.10)
+
+    w_centrality: Mapped[float] = mapped_column(Float, default=0.50)
+    w_llm_importance: Mapped[float] = mapped_column(Float, default=0.25)
+    w_evidence: Mapped[float] = mapped_column(Float, default=0.25)
+
+    hpo_status: Mapped[str] = mapped_column(String(32), default="pending")
+    last_optimized_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    optuna_history: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    course: Mapped["Course"] = relationship(back_populates="model_hyperparameters")
+
+
+class GraphHpoJudgeSample(TimestampMixin, Base):
+    __tablename__ = "graph_hpo_judge_samples"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), index=True)
+    llm_model_name: Mapped[str] = mapped_column(String(128), index=True)
+    embedding_model_name: Mapped[str] = mapped_column(String(128), index=True)
+    embedding_text_version: Mapped[str] = mapped_column(String(32), index=True)
+    model_key: Mapped[str] = mapped_column(String(384), index=True)
+    payload_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    prompt_version: Mapped[str] = mapped_column(String(128), index=True)
+    judge_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    candidate_a_params: Mapped[dict] = mapped_column(JSON, default=dict)
+    candidate_b_params: Mapped[dict] = mapped_column(JSON, default=dict)
+    candidate_a_features: Mapped[dict] = mapped_column(JSON, default=dict)
+    candidate_b_features: Mapped[dict] = mapped_column(JSON, default=dict)
+    winner: Mapped[str] = mapped_column(String(16), index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
+    safety_flags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    raw_response: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class GraphHpoObjectiveModel(TimestampMixin, Base):
+    __tablename__ = "graph_hpo_objective_models"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), index=True)
+    llm_model_name: Mapped[str] = mapped_column(String(128), index=True)
+    embedding_model_name: Mapped[str] = mapped_column(String(128), index=True)
+    embedding_text_version: Mapped[str] = mapped_column(String(32), index=True)
+    model_key: Mapped[str] = mapped_column(String(384), index=True)
+    objective_version: Mapped[str] = mapped_column(String(128), index=True)
+    payload_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    feature_names: Mapped[list[str]] = mapped_column(JSON, default=list)
+    weights_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    normalization_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    label_count: Mapped[int] = mapped_column(Integer, default=0)
+    training_audit: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="completed", index=True)
 
 
 class Document(TimestampMixin, Base):

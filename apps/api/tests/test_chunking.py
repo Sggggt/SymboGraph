@@ -102,3 +102,28 @@ def test_embedding_text_adds_metadata_without_changing_content():
     assert "Content Kind: markdown" in text
     assert text.endswith("Degree centrality counts incident edges.")
     assert EMBEDDING_TEXT_VERSION == "metadata_enriched_v1"
+
+
+def test_continuous_chunk_adaptation_does_not_emit_fixed_document_type():
+    from app.services.chunk_adaptation import choose_chunking_profile
+
+    proof_like = (
+        "Let A be a matrix. A vector v is an eigenvector if Av = lambda v. "
+        "The characteristic polynomial det(A - lambda I)=0 defines eigenvalues. "
+    ) * 12
+    prose_like = (
+        "This section explains how a course project should be planned. "
+        "It connects goals, milestones, evaluation criteria, and reflection in a coherent narrative. "
+    ) * 12
+
+    proof_profile = choose_chunking_profile(proof_like, title="Eigenvalues")
+    prose_profile = choose_chunking_profile(prose_like, title="Project Notes")
+
+    assert "document_type" not in proof_profile.metadata()
+    assert "document_type" not in prose_profile.metadata()
+    assert proof_profile.feature_summary != prose_profile.feature_summary
+    assert (proof_profile.chunk_size, proof_profile.chunk_overlap, proof_profile.strategy) != (
+        prose_profile.chunk_size,
+        prose_profile.chunk_overlap,
+        prose_profile.strategy,
+    )

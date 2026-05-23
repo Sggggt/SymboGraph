@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     reranker_max_length: int = Field(default=512, ge=64, le=2048)
     semantic_chunking_enabled: bool = True
     semantic_chunking_min_length: int = Field(default=2000, ge=500, le=5000)
+    enable_auto_hpo: bool = Field(default=False)
+    hpo_objective_mode: str = "judge_learned"
+    hpo_judge_max_candidates: int = Field(default=10, ge=2, le=50)
+    hpo_judge_max_pairs: int = Field(default=12, ge=1, le=100)
+    hpo_judge_min_labels: int = Field(default=6, ge=1, le=100)
+    hpo_judge_max_tokens_per_pair: int = Field(default=6000, ge=1000, le=50000)
+    hpo_judge_concurrency: int = Field(default=1, ge=1, le=4)
     model_cache_root: Path = Field(default=WORKSPACE_ROOT / "models" / "huggingface")
 
     # Retrieval Layering & Agentic RAG
@@ -159,6 +166,9 @@ def get_settings() -> Settings:
     embedding_base_url = os.getenv("EMBEDDING_BASE_URL")
     if embedding_base_url:
         settings.embedding_base_url = embedding_base_url
+    elif model_bridge_enabled:
+        settings.embedding_base_url = f"http://host.docker.internal:{settings.model_bridge_port}"
+        settings.embedding_resolve_ip = "__none__"
     elif env_entries.get("EMBEDDING_BASE_URL"):
         settings.embedding_base_url = env_entries["EMBEDDING_BASE_URL"]
     elif "EMBEDDING_BASE_URL" in os.environ:
@@ -167,6 +177,8 @@ def get_settings() -> Settings:
     embedding_resolve_ip = os.getenv("EMBEDDING_RESOLVE_IP")
     if embedding_resolve_ip:
         settings.embedding_resolve_ip = embedding_resolve_ip
+    elif model_bridge_enabled:
+        settings.embedding_resolve_ip = "__none__"
     elif env_entries.get("EMBEDDING_RESOLVE_IP") is not None:
         settings.embedding_resolve_ip = env_entries.get("EMBEDDING_RESOLVE_IP")
     elif "EMBEDDING_RESOLVE_IP" in os.environ:
@@ -177,6 +189,27 @@ def get_settings() -> Settings:
         settings.embedding_api_key = embedding_api_key
     elif env_entries.get("EMBEDDING_API_KEY"):
         settings.embedding_api_key = env_entries["EMBEDDING_API_KEY"]
+
+    enable_auto_hpo = os.getenv("ENABLE_AUTO_HPO") or env_entries.get("ENABLE_AUTO_HPO")
+    if enable_auto_hpo is not None:
+        settings.enable_auto_hpo = str(enable_auto_hpo).lower() in {"true", "1", "yes", "on"}
+    hpo_objective_mode = os.getenv("HPO_OBJECTIVE_MODE") or env_entries.get("HPO_OBJECTIVE_MODE")
+    if hpo_objective_mode:
+        settings.hpo_objective_mode = hpo_objective_mode
+    for env_key, attr in {
+        "HPO_JUDGE_MAX_CANDIDATES": "hpo_judge_max_candidates",
+        "HPO_JUDGE_MAX_PAIRS": "hpo_judge_max_pairs",
+        "HPO_JUDGE_MIN_LABELS": "hpo_judge_min_labels",
+        "HPO_JUDGE_MAX_TOKENS_PER_PAIR": "hpo_judge_max_tokens_per_pair",
+        "HPO_JUDGE_CONCURRENCY": "hpo_judge_concurrency",
+    }.items():
+        raw_value = os.getenv(env_key) or env_entries.get(env_key)
+        if raw_value is None:
+            continue
+        try:
+            setattr(settings, attr, int(raw_value))
+        except ValueError:
+            pass
 
     settings.data_root.mkdir(parents=True, exist_ok=True)
     settings.course_data_root_path.mkdir(parents=True, exist_ok=True)

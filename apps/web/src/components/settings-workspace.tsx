@@ -49,6 +49,7 @@ type SettingsForm = {
   reranker_max_length: string;
   semantic_chunking_enabled: boolean;
   semantic_chunking_min_length: string;
+  enable_auto_hpo: boolean;
 };
 
 type ErrorDialogState = {
@@ -171,6 +172,7 @@ export function SettingsWorkspace() {
       reranker_max_length: String(settingsQuery.data.reranker_max_length ?? 512),
       semantic_chunking_enabled: settingsQuery.data.semantic_chunking_enabled ?? true,
       semantic_chunking_min_length: String(settingsQuery.data.semantic_chunking_min_length ?? 2000),
+      enable_auto_hpo: settingsQuery.data.enable_auto_hpo ?? false,
     });
     setApiKeyEditing(false);
     setEmbeddingApiKeyEditing(false);
@@ -212,7 +214,6 @@ export function SettingsWorkspace() {
     const graphConcurrency = Number.parseInt(form.graph_extraction_concurrency, 10);
     const graphResumeBatchSize = Number.parseInt(form.graph_extraction_resume_batch_size, 10);
     const rerankerMaxLength = Number.parseInt(form.reranker_max_length, 10);
-    const semanticMinLength = Number.parseInt(form.semantic_chunking_min_length, 10);
     return {
       chat_base_url: form.chat_base_url.trim(),
       embedding_base_url: form.embedding_base_url.trim(),
@@ -231,8 +232,9 @@ export function SettingsWorkspace() {
       model_bridge_enabled: form.model_bridge_enabled,
       reranker_enabled: form.reranker_enabled,
       reranker_max_length: Number.isFinite(rerankerMaxLength) ? rerankerMaxLength : undefined,
-      semantic_chunking_enabled: form.semantic_chunking_enabled,
-      semantic_chunking_min_length: Number.isFinite(semanticMinLength) ? semanticMinLength : undefined,
+      semantic_chunking_enabled: true,
+      semantic_chunking_min_length: 2000,
+      enable_auto_hpo: form.enable_auto_hpo,
     };
   };
 
@@ -333,35 +335,33 @@ export function SettingsWorkspace() {
                 <Input type="number" min={64} max={2048} value={form.reranker_max_length} onChange={(event) => updateForm("reranker_max_length", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
               </label>
 
-              <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-white/10 bg-white/[0.035] p-5">
+              <div className="flex flex-wrap items-center justify-between gap-4 md:col-span-2 rounded-2xl border border-white/10 bg-white/[0.035] p-5">
                 <div>
                   <p className="flex items-center gap-2 text-sm font-semibold text-white">
                     <SlidersHorizontal className="size-4 text-cyan-100/70" />
-                    语义切块
+                    自适应 HPO 自动调参 (Auto HPO)
+                  </p>
+                  <p className="mt-2 text-sm leading-6 text-white/58">
+                    开启后，系统在每一次解析新文件或重建图谱时，都会同步自动运行 Optuna 寻优算法，为当前课程提炼最佳的图谱特征比例与过滤阈值。
                   </p>
                 </div>
                 <button
                   type="button"
                   role="switch"
-                  aria-checked={form.semantic_chunking_enabled}
+                  aria-checked={form.enable_auto_hpo}
                   disabled={saveMutation.isPending}
-                  onClick={() => updateForm("semantic_chunking_enabled", !form.semantic_chunking_enabled)}
+                  onClick={() => updateForm("enable_auto_hpo", !form.enable_auto_hpo)}
                   className={`relative h-8 w-16 rounded-full border transition ${
-                    form.semantic_chunking_enabled ? "border-cyan-100/40 bg-cyan-300/70" : "border-white/14 bg-white/10"
+                    form.enable_auto_hpo ? "border-cyan-100/40 bg-cyan-300/70" : "border-white/14 bg-white/10"
                   } disabled:cursor-not-allowed disabled:opacity-60`}
                 >
                   <span
                     className={`absolute top-1 size-6 rounded-full bg-white shadow transition ${
-                      form.semantic_chunking_enabled ? "left-9" : "left-1"
+                      form.enable_auto_hpo ? "left-9" : "left-1"
                     }`}
                   />
                 </button>
               </div>
-
-              <label className="flex flex-col gap-2">
-                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">语义切块最小长度</span>
-                <Input type="number" min={500} max={5000} value={form.semantic_chunking_min_length} onChange={(event) => updateForm("semantic_chunking_min_length", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
-              </label>
 
               <div className="flex flex-wrap items-center justify-between gap-4 md:col-span-2 rounded-2xl border border-white/10 bg-white/[0.035] p-5">
                 <div>

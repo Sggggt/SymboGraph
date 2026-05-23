@@ -31,12 +31,19 @@ from app.models import (
     GraphExtractionChunkTask,
     GraphExtractionRun,
     GraphRelationCandidate,
+    IngestionBatch,
 )
 from app.schemas import Citation, GraphExtractionPayload
 from app.services.embeddings import ChatProvider
 from app.services.graph_algorithms import enrich_course_graph
 from app.services.ingestion_logs import emit_ingestion_log
 from app.services.parsers import canonical_chapter_label, derive_chapter, is_invalid_chapter_label
+
+
+def _safe_emit_log(batch_id: str | None, event: str, message: str, **payload: Any) -> None:
+    """Defensive wrapper for emit_ingestion_log to guard against UnboundLocalError in async contexts."""
+    import app.services.ingestion_logs as _il
+    return _il.emit_ingestion_log(batch_id, event, message, **payload)
 from app.services.quality.policies import ConceptQualityPolicy
 from app.services.quality.signals import build_quality_signals
 
@@ -1791,8 +1798,11 @@ async def run_llm_graph_extraction(chunks: list[Chunk], batch_id: str | None = N
     return extraction_result, {}
 
 
+TERMINAL_GRAPH_BATCH_STATES = {"completed", "failed", "partial_failed", "skipped"}
+
+
 def has_resumable_graph_extraction(db: Session, course_id: str) -> bool:
-    run = db.scalar(
+    runs = db.scalars(
         select(GraphExtractionRun)
         .where(
             GraphExtractionRun.course_id == course_id,
@@ -1800,19 +1810,23 @@ def has_resumable_graph_extraction(db: Session, course_id: str) -> bool:
             GraphExtractionRun.status.in_(["planned", "running", "partial_failed", "failed"]),
         )
         .order_by(GraphExtractionRun.created_at.desc())
-    )
-    if run is None:
-        return False
-    return bool(
-        db.scalar(
+        .limit(10)
+    ).all()
+    for run in runs:
+        if run.batch_id:
+            batch_status = db.scalar(select(IngestionBatch.status).where(IngestionBatch.id == run.batch_id))
+            if batch_status is None or batch_status in TERMINAL_GRAPH_BATCH_STATES:
+                continue
+        if db.scalar(
             select(GraphExtractionChunkTask.id)
             .where(
                 GraphExtractionChunkTask.run_id == run.id,
                 GraphExtractionChunkTask.status.in_(["pending", "failed"]),
             )
             .limit(1)
-        )
-    )
+        ):
+            return True
+    return False
 
 
 def _latest_reusable_task_payloads(
@@ -2341,7 +2355,7 @@ async def rebuild_graph_community_summaries(db: Session, course_id: str, *, batc
         )
         created += 1
         if batch_id:
-            emit_ingestion_log(
+            _safe_emit_log(
                 batch_id,
                 "batch_graph_community_summary",
                 f"社区摘要 {created}/{len(communities)} 已生成",
@@ -2356,14 +2370,51 @@ async def rebuild_graph_community_summaries(db: Session, course_id: str, *, batc
     }
 
 
-async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None = None) -> dict:
+async def _run_auto_hpo_after_graph_upsert(
+    db: Session,
+    *,
+    course_id: str,
+    batch_id: str | None,
+    probe_chunks: list[Chunk],
+    payloads: dict[str, dict],
+    baseline_context_chunks: list[Chunk],
+) -> dict[str, Any]:
     settings = get_settings()
+    if not settings.enable_auto_hpo or not batch_id:
+        return {"hpo_auto_enabled": False}
+    from app.services.hpo_engine import HyperparameterTuningService
+
+    _safe_emit_log(batch_id, "hpo_started", "正在基于本轮图谱抽取结果优化图谱超参数 (Auto HPO)...")
+    try:
+        hpo_results = await HyperparameterTuningService.tune_corpus_parameters(
+            db=db,
+            course_id=course_id,
+            llm_model_name=settings.chat_model,
+            probe_chunks=probe_chunks,
+            payloads=payloads,
+            baseline_context_chunks=baseline_context_chunks,
+            batch_id=batch_id,
+            commit=False,
+        )
+        params = hpo_results.get("hyperparameters", {})
+        _safe_emit_log(
+            batch_id,
+            "hpo_completed",
+            f"超参优化完成：Dijkstra={params.get('dijkstra_semantic_threshold')}, relation={params.get('min_relation_confidence')}",
+            **hpo_results,
+        )
+        return {"hpo_auto_enabled": True, "hpo_status": "completed", "hpo": hpo_results}
+    except Exception as exc:
+        _safe_emit_log(batch_id, "hpo_failed", f"自动调参失败，使用上次成功参数或默认值: {exc}")
+        return {"hpo_auto_enabled": True, "hpo_status": "failed", "hpo_error": str(exc)}
+
+
+async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None = None) -> dict:
     course = db.get(Course, course_id)
     sync_graph_chapter_labels(db, course_id)
     active_documents = db.scalars(select(Document).where(Document.course_id == course_id, Document.is_active.is_(True))).all()
     graph_documents = filter_graph_documents(course, active_documents)
     graph_document_ids = {document.id for document in graph_documents}
-    document_chapters = {document.id: document_chapter_label(document, course.name if course else None) for document in graph_documents}
     chunks = db.scalars(
         select(Chunk)
         .where(Chunk.course_id == course_id, Chunk.is_active.is_(True), Chunk.document_id.in_(graph_document_ids))
@@ -2385,7 +2436,7 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
     llm_chunk_ids = set(plan.selected_chunk_ids)
     selected_llm_chunks = [chunk for chunk in chunks if chunk.id in llm_chunk_ids]
     if batch_id:
-        emit_ingestion_log(
+        _safe_emit_log(
             batch_id,
             "batch_graph_plan_created",
             f"自适应图谱抽取计划已创建：选择 {len(selected_llm_chunks)} / {len(chunks)} 个片段",
@@ -2430,6 +2481,14 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         db.query(ConceptAlias).filter(ConceptAlias.concept_id.in_(concept_ids)).delete(synchronize_session=False)
         db.query(Concept).filter(Concept.id.in_(concept_ids)).delete(synchronize_session=False)
 
+    _safe_emit_log(
+        batch_id,
+        "graph_upsert_started",
+        "正在写入本轮图谱候选和实体证据",
+        stage="graph_upsert",
+        graph_extraction_completed_chunks=extraction_stats.get("completed_chunks", len(llm_payloads)),
+        graph_llm_success_chunks=len(llm_payloads),
+    )
     upsert_stats = await upsert_graph_candidates_from_chunks(
         db,
         course_id,
@@ -2437,11 +2496,45 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         llm_payloads=llm_payloads,
         run_llm_merge=batch_id is not None,
     )
+    _safe_emit_log(
+        batch_id,
+        "graph_upsert_completed",
+        "图谱候选和实体证据已写入",
+        stage="graph_upsert",
+        concepts=upsert_stats["created_concepts"],
+        relations=upsert_stats["relations"],
+        graph_llm_success_chunks=upsert_stats["llm_success_chunks"],
+        graph_rejected_concepts=upsert_stats["rejected_concepts"],
+    )
     concept_count = upsert_stats["created_concepts"]
     relation_count = upsert_stats["relations"]
     llm_success_chunks = upsert_stats["llm_success_chunks"]
+    hpo_stats = await _run_auto_hpo_after_graph_upsert(
+        db,
+        course_id=course_id,
+        batch_id=batch_id,
+        probe_chunks=selected_llm_chunks,
+        payloads=llm_payloads,
+        baseline_context_chunks=chunks,
+    )
+    _safe_emit_log(batch_id, "graph_enrichment_started", "正在刷新图谱拓扑指标", stage="graph_enrichment")
     graph_algorithm_stats = await enrich_course_graph(db, course_id)
+    _safe_emit_log(
+        batch_id,
+        "graph_enrichment_completed",
+        "图谱拓扑指标已刷新",
+        stage="graph_enrichment",
+        **graph_algorithm_stats,
+    )
+    _safe_emit_log(batch_id, "graph_community_started", "正在生成图谱社区摘要", stage="graph_community")
     community_summary_stats = await rebuild_graph_community_summaries(db, course_id, batch_id=batch_id)
+    _safe_emit_log(
+        batch_id,
+        "graph_community_completed",
+        "图谱社区摘要已生成",
+        stage="graph_community",
+        **community_summary_stats,
+    )
     db.commit()
     graph = get_graph_payload(db, course_id, graph_type="semantic")
     return {
@@ -2473,6 +2566,7 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         "graph_probe_chunks": min(3, len(selected_llm_chunks)),
         "graph_probe_success_chunks": min(3, len([chunk for chunk in selected_llm_chunks if chunk.id in llm_payloads])),
         "graph_probe_failed_chunks": len([chunk for chunk in selected_llm_chunks[:3] if chunk.id in llm_errors]),
+        **hpo_stats,
         **graph_algorithm_stats,
         **community_summary_stats,
         "graph_total_active_chunks": len(chunks),
@@ -2572,66 +2666,15 @@ async def incremental_update_course_graph(
     changed_document_ids: list[str],
     batch_id: str | None = None,
 ) -> dict:
-    settings = get_settings()
     course = db.get(Course, course_id)
     if not changed_document_ids:
         return {"graph_rebuilt": False, "reason": "no_changed_documents"}
 
     sync_graph_chapter_labels(db, course_id)
 
-    # 1. Identify and prune concepts/relations sourced only from changed documents
-    all_concepts = db.scalars(select(Concept).where(Concept.course_id == course_id)).all()
-    all_relations = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course_id)).all()
-
-    concepts_to_delete: set[str] = set()
-    concepts_to_retain: set[str] = set()
-    for concept in all_concepts:
-        sources = set(concept.source_document_ids or [])
-        if not sources:
-            concepts_to_delete.add(concept.id)
-        elif sources.issubset(set(changed_document_ids)):
-            concepts_to_delete.add(concept.id)
-        elif sources.intersection(set(changed_document_ids)):
-            # Remove changed doc ids from source list, keep concept
-            concept.source_document_ids = sorted(sources - set(changed_document_ids))
-            concepts_to_retain.add(concept.id)
-        else:
-            concepts_to_retain.add(concept.id)
-
-    relations_to_delete: set[str] = set()
-    for relation in all_relations:
-        sources = set(relation.source_document_ids or [])
-        if not sources:
-            relations_to_delete.add(relation.id)
-        elif sources.issubset(set(changed_document_ids)):
-            relations_to_delete.add(relation.id)
-        elif sources.intersection(set(changed_document_ids)):
-            relation.source_document_ids = sorted(sources - set(changed_document_ids))
-        # else: untouched
-
-    if concepts_to_delete:
-        db.query(ConceptAlias).filter(ConceptAlias.concept_id.in_(list(concepts_to_delete))).delete(synchronize_session=False)
-        db.query(ConceptRelation).filter(
-            or_(
-                ConceptRelation.source_concept_id.in_(list(concepts_to_delete)),
-                ConceptRelation.target_concept_id.in_(list(concepts_to_delete)),
-            )
-        ).delete(synchronize_session=False)
-        db.query(GraphRelationCandidate).filter(
-            or_(
-                GraphRelationCandidate.source_concept_id.in_(list(concepts_to_delete)),
-                GraphRelationCandidate.target_concept_id.in_(list(concepts_to_delete)),
-            )
-        ).delete(synchronize_session=False)
-        db.query(Concept).filter(Concept.id.in_(list(concepts_to_delete))).delete(synchronize_session=False)
-
-    if relations_to_delete:
-        db.query(ConceptRelation).filter(ConceptRelation.id.in_(list(relations_to_delete))).delete(synchronize_session=False)
-        db.query(GraphRelationCandidate).filter(GraphRelationCandidate.evidence_chunk_id.is_(None), GraphRelationCandidate.course_id == course_id).delete(synchronize_session=False)
-
-    db.flush()
-
-    # 2. Re-extract from changed documents' active chunks
+    # 1. Re-extract from changed documents' active chunks before pruning old graph
+    # evidence, so the visible graph does not spend model latency in a half-deleted
+    # state.
     active_documents = db.scalars(
         select(Document).where(Document.id.in_(changed_document_ids), Document.is_active.is_(True))
     ).all()
@@ -2644,7 +2687,27 @@ async def incremental_update_course_graph(
     ).all()
 
     if not chunks:
-        return {"graph_rebuilt": False, "reason": "no_active_chunks_for_changed_documents"}
+        from app.services.maintenance import delete_document_graph_incremental
+
+        graph_gc_stats: dict[str, int] = {}
+        for document_id in changed_document_ids:
+            stats = delete_document_graph_incremental(db, course_id, document_id)
+            graph_gc_stats = {key: graph_gc_stats.get(key, 0) + value for key, value in stats.items()}
+        from app.services.graph_algorithms import enrich_course_graph
+        graph_algorithm_stats = await enrich_course_graph(db, course_id, run_relation_completion=False, run_dijkstra=False)
+        db.commit()
+        return {
+            "graph_rebuilt": True,
+            "mode": "incremental",
+            "concepts": 0,
+            "relations": 0,
+            "graph_nodes": 0,
+            "graph_edges": 0,
+            "graph_extraction_provider": graph_extraction_provider(),
+            "reason": "no_active_chunks_for_changed_documents",
+            **graph_gc_stats,
+            **graph_algorithm_stats,
+        }
 
     from app.services.quality.profiles import rebuild_domain_quality_profile
 
@@ -2663,7 +2726,7 @@ async def incremental_update_course_graph(
     selected_llm_chunks = [chunk for chunk in chunks if chunk.id in llm_chunk_ids]
 
     if batch_id:
-        emit_ingestion_log(
+        _safe_emit_log(
             batch_id,
             "batch_graph_plan_created",
             f"增量自适应图谱抽取计划已创建：选择 {len(selected_llm_chunks)} / {len(chunks)} 个片段",
@@ -2683,15 +2746,64 @@ async def incremental_update_course_graph(
         batch_id=batch_id,
     )
 
+    from app.services.maintenance import delete_document_graph_incremental
+
+    graph_gc_stats: dict[str, int] = {}
+    for document_id in changed_document_ids:
+        stats = delete_document_graph_incremental(db, course_id, document_id)
+        graph_gc_stats = {key: graph_gc_stats.get(key, 0) + value for key, value in stats.items()}
+
+    _safe_emit_log(
+        batch_id,
+        "graph_upsert_started",
+        "正在写入本轮最小更新图谱证据",
+        stage="graph_upsert",
+        changed_documents=len(changed_document_ids),
+        graph_llm_success_chunks=len(llm_payloads),
+    )
     upsert_stats = await upsert_graph_candidates_from_chunks(db, course_id, chunks, llm_payloads=llm_payloads, run_llm_merge=False)
+    _safe_emit_log(
+        batch_id,
+        "graph_upsert_completed",
+        "最小更新图谱证据已写入",
+        stage="graph_upsert",
+        concepts=upsert_stats["created_concepts"],
+        relations=upsert_stats["relations"],
+        graph_llm_success_chunks=upsert_stats["llm_success_chunks"],
+        graph_rejected_concepts=upsert_stats["rejected_concepts"],
+    )
     concept_count = upsert_stats["created_concepts"]
     relation_count = upsert_stats["relations"]
     llm_success_chunks = upsert_stats["llm_success_chunks"]
+    hpo_stats = await _run_auto_hpo_after_graph_upsert(
+        db,
+        course_id=course_id,
+        batch_id=batch_id,
+        probe_chunks=selected_llm_chunks,
+        payloads=llm_payloads,
+        baseline_context_chunks=chunks,
+    )
 
     # 3. Enrich: run full algorithms but skip expensive LLM completion and Dijkstra for speed
     from app.services.graph_algorithms import enrich_course_graph
+    _safe_emit_log(batch_id, "graph_enrichment_started", "正在刷新最小更新后的图谱拓扑指标", stage="graph_enrichment")
     graph_algorithm_stats = await enrich_course_graph(db, course_id, run_relation_completion=False, run_dijkstra=False)
+    _safe_emit_log(
+        batch_id,
+        "graph_enrichment_completed",
+        "最小更新图谱拓扑指标已刷新",
+        stage="graph_enrichment",
+        **graph_algorithm_stats,
+    )
+    _safe_emit_log(batch_id, "graph_community_started", "正在生成图谱社区摘要", stage="graph_community")
     community_summary_stats = await rebuild_graph_community_summaries(db, course_id, batch_id=batch_id)
+    _safe_emit_log(
+        batch_id,
+        "graph_community_completed",
+        "图谱社区摘要已生成",
+        stage="graph_community",
+        **community_summary_stats,
+    )
     db.commit()
     graph = get_graph_payload(db, course_id, graph_type="semantic")
     return {
@@ -2714,6 +2826,8 @@ async def incremental_update_course_graph(
         "graph_llm_success_chunks": llm_success_chunks,
         "graph_llm_failed_chunks": len(llm_errors),
         "graph_rejected_concepts": upsert_stats["rejected_concepts"],
+        **graph_gc_stats,
+        **hpo_stats,
         "graph_concept_specificity_threshold": upsert_stats.get("graph_concept_specificity_threshold"),
         "graph_concept_specificity_threshold_audit": upsert_stats.get("graph_concept_specificity_threshold_audit"),
         "graph_llm_verified_merges": upsert_stats["llm_verified_merges"],

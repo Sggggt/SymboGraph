@@ -141,8 +141,7 @@ def resolve_target_ip(hostname: str) -> str | None:
         return cached[0]
 
     ip = resolve_public_a_record(hostname)
-    if ip:
-        BridgeConfig.resolved_ip_cache = (ip, now + 300)
+    BridgeConfig.resolved_ip_cache = (ip, now + 300)
     return ip
 
 

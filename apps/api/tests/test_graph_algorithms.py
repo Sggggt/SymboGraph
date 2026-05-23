@@ -167,6 +167,75 @@ def test_dijkstra_infers_hidden_relation_and_marks_source():
     assert inferred[0].metadata["path"] == ["a", "b", "c"]
 
 
+def test_dijkstra_respects_course_hyperparameter_threshold():
+    from app.services.graph_algorithms import GraphHyperparameters, WeightedEdge, analyze_graph, infer_dijkstra_edges
+
+    concepts = [
+        signal("a", 6, ("L1",), (1.0, 0.0, 0.0)),
+        signal("b", 6, ("L1",), (0.96, 0.04, 0.0)),
+        signal("c", 6, ("L1",), (0.93, 0.07, 0.0)),
+    ]
+    edges = [
+        WeightedEdge("a", "b", "used_for", 0.85, 0.9, 2, 0.9, None, "llm", False, {}),
+        WeightedEdge("b", "c", "used_for", 0.85, 0.9, 2, 0.9, None, "llm", False, {}),
+    ]
+    params = GraphHyperparameters(dijkstra_semantic_threshold=1.0)
+    _metrics, graph = analyze_graph(concepts, edges, hyperparameters=params)
+
+    assert infer_dijkstra_edges(graph, concepts, edges, hyperparameters=params) == []
+
+
+def test_analyze_graph_uses_supplied_rank_weights():
+    from app.services.graph_algorithms import GraphHyperparameters, RelationSignal, analyze_graph, build_sparse_edges
+
+    concepts = [
+        signal("hub", 1, ("L1",), (1.0, 0.0)),
+        signal("leaf", 9, ("L1",), (0.98, 0.02)),
+        signal("other", 1, ("L1",), (0.97, 0.03)),
+    ]
+    relations = [
+        RelationSignal("hub", "leaf", "used_for", 0.95, evidence_chunk_id="hl", metadata={"evidence_support": True}),
+        RelationSignal("hub", "other", "used_for", 0.95, evidence_chunk_id="ho", metadata={"evidence_support": True}),
+    ]
+    edges = build_sparse_edges(concepts, relations)
+    evidence_only = GraphHyperparameters(w_centrality=0.0, w_llm_importance=0.0, w_evidence=1.0, source="unit").normalized()
+    metrics, _graph = analyze_graph(concepts, edges, hyperparameters=evidence_only)
+
+    assert metrics["leaf"]["graph_rank_score"] > metrics["hub"]["graph_rank_score"]
+    assert metrics["leaf"]["centrality"]["hyperparameter_source"] == "unit"
+
+
+def test_load_course_graph_hyperparameters_uses_llm_and_embedding_key(db_session, sample_course):
+    from app.models import CourseModelHyperparameter
+    from app.services.graph_algorithms import build_course_model_hyperparameter_key, load_course_graph_hyperparameters
+
+    model_key = build_course_model_hyperparameter_key("unit-llm", "unit-embedding", "unit-text-v1")
+    db_session.add(
+        CourseModelHyperparameter(
+            course_id=sample_course.id,
+            llm_model_name="unit-llm",
+            embedding_model_name="unit-embedding",
+            embedding_text_version="unit-text-v1",
+            model_name=model_key,
+            min_relation_confidence=0.51,
+            dijkstra_semantic_threshold=0.66,
+        )
+    )
+    db_session.commit()
+
+    params = load_course_graph_hyperparameters(
+        db_session,
+        sample_course.id,
+        llm_model_name="unit-llm",
+        embedding_model_name="unit-embedding",
+        embedding_text_version="unit-text-v1",
+    )
+
+    assert params.min_relation_confidence == 0.51
+    assert params.dijkstra_semantic_threshold == 0.66
+    assert params.source == f"course_model_hyperparameters:{model_key}"
+
+
 def test_pruning_keeps_minimum_available_nodes():
     from app.services.graph_algorithms import analyze_graph, select_concepts_to_keep
 

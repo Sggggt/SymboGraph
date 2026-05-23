@@ -95,9 +95,161 @@ class WeightedEdge:
 @dataclass(frozen=True)
 class GraphQualityThresholds:
     relation_confidence: float
+    min_accepted_relation_weight: float
+    dijkstra_semantic_threshold: float
     concept_keep_min: int
     concept_keep_max: int
     audit: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class GraphHyperparameters:
+    min_relation_confidence: float = MIN_RELATION_CONFIDENCE
+    min_accepted_relation_weight: float = MIN_ACCEPTED_RELATION_WEIGHT
+    dijkstra_semantic_threshold: float = DIJKSTRA_SEMANTIC_THRESHOLD
+    w_degree: float = 0.25
+    w_weighted_degree: float = 0.25
+    w_pagerank: float = 0.20
+    w_betweenness: float = 0.20
+    w_closeness: float = 0.10
+    w_centrality: float = 0.50
+    w_llm_importance: float = 0.25
+    w_evidence: float = 0.25
+    source: str = "defaults"
+
+    @classmethod
+    def from_record(cls, record: Any | None) -> "GraphHyperparameters":
+        if record is None:
+            return cls()
+        return cls(
+            min_relation_confidence=float(getattr(record, "min_relation_confidence", MIN_RELATION_CONFIDENCE) or MIN_RELATION_CONFIDENCE),
+            min_accepted_relation_weight=float(getattr(record, "min_accepted_relation_weight", MIN_ACCEPTED_RELATION_WEIGHT) or MIN_ACCEPTED_RELATION_WEIGHT),
+            dijkstra_semantic_threshold=float(getattr(record, "dijkstra_semantic_threshold", DIJKSTRA_SEMANTIC_THRESHOLD) or DIJKSTRA_SEMANTIC_THRESHOLD),
+            w_degree=float(getattr(record, "w_degree", 0.25) or 0.25),
+            w_weighted_degree=float(getattr(record, "w_weighted_degree", 0.25) or 0.25),
+            w_pagerank=float(getattr(record, "w_pagerank", 0.20) or 0.20),
+            w_betweenness=float(getattr(record, "w_betweenness", 0.20) or 0.20),
+            w_closeness=float(getattr(record, "w_closeness", 0.10) or 0.10),
+            w_centrality=float(getattr(record, "w_centrality", 0.50) or 0.50),
+            w_llm_importance=float(getattr(record, "w_llm_importance", 0.25) or 0.25),
+            w_evidence=float(getattr(record, "w_evidence", 0.25) or 0.25),
+            source=f"course_model_hyperparameters:{course_model_hyperparameter_key(record)}",
+        ).normalized()
+
+    def normalized(self) -> "GraphHyperparameters":
+        centrality = _normalize_weights(
+            [self.w_degree, self.w_weighted_degree, self.w_pagerank, self.w_betweenness, self.w_closeness],
+            [0.25, 0.25, 0.20, 0.20, 0.10],
+        )
+        rank = _normalize_weights([self.w_centrality, self.w_llm_importance, self.w_evidence], [0.50, 0.25, 0.25])
+        return GraphHyperparameters(
+            min_relation_confidence=clamp(float(self.min_relation_confidence), 0.0, 1.0),
+            min_accepted_relation_weight=clamp(float(self.min_accepted_relation_weight), 0.0, 1.0),
+            dijkstra_semantic_threshold=clamp(float(self.dijkstra_semantic_threshold), -1.0, 1.0),
+            w_degree=centrality[0],
+            w_weighted_degree=centrality[1],
+            w_pagerank=centrality[2],
+            w_betweenness=centrality[3],
+            w_closeness=centrality[4],
+            w_centrality=rank[0],
+            w_llm_importance=rank[1],
+            w_evidence=rank[2],
+            source=self.source,
+        )
+
+    def audit(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "min_relation_confidence": round(self.min_relation_confidence, 4),
+            "min_accepted_relation_weight": round(self.min_accepted_relation_weight, 4),
+            "dijkstra_semantic_threshold": round(self.dijkstra_semantic_threshold, 4),
+            "centrality_weights": {
+                "degree": round(self.w_degree, 4),
+                "weighted_degree": round(self.w_weighted_degree, 4),
+                "pagerank": round(self.w_pagerank, 4),
+                "betweenness": round(self.w_betweenness, 4),
+                "closeness": round(self.w_closeness, 4),
+            },
+            "rank_weights": {
+                "centrality": round(self.w_centrality, 4),
+                "llm_importance": round(self.w_llm_importance, 4),
+                "evidence": round(self.w_evidence, 4),
+            },
+        }
+
+
+def _normalize_weights(values: list[float], defaults: list[float]) -> tuple[float, ...]:
+    cleaned: list[float] = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = 0.0
+        cleaned.append(number if math.isfinite(number) and number >= 0 else 0.0)
+    total = sum(cleaned)
+    if total <= 1e-12:
+        cleaned = defaults[:]
+        total = sum(cleaned)
+    return tuple(value / total for value in cleaned)
+
+
+def build_course_model_hyperparameter_key(
+    llm_model_name: str,
+    embedding_model_name: str,
+    embedding_text_version: str,
+) -> str:
+    return "|".join(
+        [
+            f"llm:{llm_model_name}",
+            f"embedding:{embedding_model_name}",
+            f"text:{embedding_text_version}",
+        ]
+    )
+
+
+def course_model_hyperparameter_key(record: Any) -> str:
+    legacy = getattr(record, "model_name", None)
+    llm_model_name = getattr(record, "llm_model_name", None)
+    embedding_model_name = getattr(record, "embedding_model_name", None)
+    embedding_text_version = getattr(record, "embedding_text_version", None)
+    if llm_model_name and embedding_model_name and embedding_text_version:
+        return build_course_model_hyperparameter_key(llm_model_name, embedding_model_name, embedding_text_version)
+    return str(legacy or "unknown")
+
+
+def load_course_graph_hyperparameters(
+    db: Session,
+    course_id: str,
+    llm_model_name: str | None = None,
+    embedding_model_name: str | None = None,
+    embedding_text_version: str | None = None,
+) -> GraphHyperparameters:
+    from app.core.config import get_settings
+    from app.models import CourseModelHyperparameter
+    from app.services.chunking import CURRENT_EMBEDDING_TEXT_VERSION
+
+    settings = get_settings()
+    selected_llm = llm_model_name or settings.chat_model
+    selected_embedding = embedding_model_name or settings.embedding_model
+    selected_text_version = embedding_text_version or CURRENT_EMBEDDING_TEXT_VERSION
+    model_key = build_course_model_hyperparameter_key(selected_llm, selected_embedding, selected_text_version)
+    record = db.get(
+        CourseModelHyperparameter,
+        {
+            "course_id": course_id,
+            "llm_model_name": selected_llm,
+            "embedding_model_name": selected_embedding,
+            "embedding_text_version": selected_text_version,
+        },
+    )
+    if record is None:
+        record = db.scalar(
+            select(CourseModelHyperparameter).where(
+                CourseModelHyperparameter.course_id == course_id,
+                CourseModelHyperparameter.model_name == model_key,
+            )
+        )
+    return GraphHyperparameters.from_record(record)
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -110,7 +262,11 @@ def _percentile(values: list[float], percentile: float) -> float:
     return float(np.percentile(np.array(values, dtype=float), percentile))
 
 
-def adaptive_relation_confidence_threshold(relations: list[RelationSignal]) -> dict[str, Any]:
+def adaptive_relation_confidence_threshold(
+    relations: list[RelationSignal],
+    hyperparameters: GraphHyperparameters | None = None,
+) -> dict[str, Any]:
+    hyperparameters = (hyperparameters or GraphHyperparameters()).normalized()
     usable = [
         float(relation.confidence)
         for relation in relations
@@ -122,7 +278,7 @@ def adaptive_relation_confidence_threshold(relations: list[RelationSignal]) -> d
     ]
     base = {
         "name": "relation_confidence",
-        "default_threshold": MIN_RELATION_CONFIDENCE,
+        "default_threshold": hyperparameters.min_relation_confidence,
         "sample_count": len(usable),
         "min_sample_count": ADAPTIVE_RELATION_CONFIDENCE_MIN_SAMPLE,
         "floor": ADAPTIVE_RELATION_CONFIDENCE_FLOOR,
@@ -132,7 +288,7 @@ def adaptive_relation_confidence_threshold(relations: list[RelationSignal]) -> d
         return {
             **base,
             "enabled": False,
-            "threshold": MIN_RELATION_CONFIDENCE,
+            "threshold": hyperparameters.min_relation_confidence,
             "fallback_reason": "insufficient_samples",
         }
     p25 = _percentile(usable, 25)
@@ -182,15 +338,23 @@ def adaptive_concept_keep_bounds(concepts: list[ConceptSignal]) -> dict[str, Any
     }
 
 
-def adaptive_graph_quality_thresholds(concepts: list[ConceptSignal], relations: list[RelationSignal]) -> GraphQualityThresholds:
-    relation_audit = adaptive_relation_confidence_threshold(relations)
+def adaptive_graph_quality_thresholds(
+    concepts: list[ConceptSignal],
+    relations: list[RelationSignal],
+    hyperparameters: GraphHyperparameters | None = None,
+) -> GraphQualityThresholds:
+    hyperparameters = (hyperparameters or GraphHyperparameters()).normalized()
+    relation_audit = adaptive_relation_confidence_threshold(relations, hyperparameters)
     concept_audit = adaptive_concept_keep_bounds(concepts)
     audit = {
         "relation_confidence": relation_audit,
         "concept_keep_bounds": concept_audit,
+        "hyperparameters": hyperparameters.audit(),
     }
     return GraphQualityThresholds(
         relation_confidence=float(relation_audit["threshold"]),
+        min_accepted_relation_weight=hyperparameters.min_accepted_relation_weight,
+        dijkstra_semantic_threshold=hyperparameters.dijkstra_semantic_threshold,
         concept_keep_min=int(concept_audit["keep_min"]),
         concept_keep_max=int(concept_audit["keep_max"]),
         audit=audit,
@@ -382,7 +546,7 @@ def relation_hard_gate(
             return False, "invalid_weight"
         if relation_type == "related_to" and weight < MIN_RELATED_TO_DISPLAY_WEIGHT:
             return False, "related_to_below_display_threshold"
-        if weight < MIN_ACCEPTED_RELATION_WEIGHT:
+        if weight < thresholds.min_accepted_relation_weight:
             return False, "weight_below_threshold"
     return True, "passed"
 
@@ -429,8 +593,9 @@ def build_sparse_edges(
     concepts: list[ConceptSignal],
     relations: list[RelationSignal],
     thresholds: GraphQualityThresholds | None = None,
+    hyperparameters: GraphHyperparameters | None = None,
 ) -> list[WeightedEdge]:
-    thresholds = thresholds or adaptive_graph_quality_thresholds(concepts, relations)
+    thresholds = thresholds or adaptive_graph_quality_thresholds(concepts, relations, hyperparameters)
     concept_index = {concept.concept_id: concept for concept in concepts}
     relation_candidates: dict[tuple[str, str], list[RelationSignal]] = defaultdict(list)
     for relation in relations:
@@ -631,7 +796,12 @@ def spectral_labels_for_graph(graph: nx.Graph) -> dict[str, int]:
     return labels
 
 
-def analyze_graph(concepts: list[ConceptSignal], edges: list[WeightedEdge]) -> tuple[dict[str, dict[str, Any]], nx.Graph]:
+def analyze_graph(
+    concepts: list[ConceptSignal],
+    edges: list[WeightedEdge],
+    hyperparameters: GraphHyperparameters | None = None,
+) -> tuple[dict[str, dict[str, Any]], nx.Graph]:
+    hyperparameters = (hyperparameters or GraphHyperparameters()).normalized()
     graph = graph_from_edges(concepts, edges)
     if graph.number_of_nodes() == 0:
         return {}, graph
@@ -665,16 +835,18 @@ def analyze_graph(concepts: list[ConceptSignal], edges: list[WeightedEdge]) -> t
         signal = concept_index[node_id]
         weighted_degree_norm = weighted_degree[node_id] / max_weighted_degree
         centrality_score = clamp(
-            0.25 * degree.get(node_id, 0.0)
-            + 0.25 * weighted_degree_norm
-            + 0.20 * pagerank.get(node_id, 0.0)
-            + 0.20 * betweenness.get(node_id, 0.0)
-            + 0.10 * closeness.get(node_id, 0.0),
+            hyperparameters.w_degree * degree.get(node_id, 0.0)
+            + hyperparameters.w_weighted_degree * weighted_degree_norm
+            + hyperparameters.w_pagerank * pagerank.get(node_id, 0.0)
+            + hyperparameters.w_betweenness * betweenness.get(node_id, 0.0)
+            + hyperparameters.w_closeness * closeness.get(node_id, 0.0),
             0.0,
             1.0,
         )
         graph_rank_score = clamp(
-            0.50 * centrality_score + 0.25 * signal.importance + 0.25 * clamp(math.log1p(signal.evidence_count) / math.log1p(10), 0.0, 1.0),
+            hyperparameters.w_centrality * centrality_score
+            + hyperparameters.w_llm_importance * signal.importance
+            + hyperparameters.w_evidence * clamp(math.log1p(signal.evidence_count) / math.log1p(10), 0.0, 1.0),
             0.0,
             1.0,
         )
@@ -692,13 +864,20 @@ def analyze_graph(concepts: list[ConceptSignal], edges: list[WeightedEdge]) -> t
                 "betweenness": _safe_jsonb_float(betweenness.get(node_id, 0.0)),
                 "closeness": _safe_jsonb_float(closeness.get(node_id, 0.0)),
                 "centrality_score": _safe_jsonb_float(centrality_score),
+                "hyperparameter_source": hyperparameters.source,
             },
             "graph_rank_score": _safe_jsonb_float(graph_rank_score),
         }
     return metrics, graph
 
 
-def infer_dijkstra_edges(graph: nx.Graph, concepts: list[ConceptSignal], existing_edges: list[WeightedEdge]) -> list[WeightedEdge]:
+def infer_dijkstra_edges(
+    graph: nx.Graph,
+    concepts: list[ConceptSignal],
+    existing_edges: list[WeightedEdge],
+    hyperparameters: GraphHyperparameters | None = None,
+) -> list[WeightedEdge]:
+    hyperparameters = (hyperparameters or GraphHyperparameters()).normalized()
     concept_index = {concept.concept_id: concept for concept in concepts}
     existing_pairs = {edge_key(edge.source_id, edge.target_id) for edge in existing_edges}
     inferred: list[WeightedEdge] = []
@@ -720,7 +899,7 @@ def infer_dijkstra_edges(graph: nx.Graph, concepts: list[ConceptSignal], existin
             left = concept_index[source_id]
             right = concept_index[target_id]
             semantic = similarity(left.vector, right.vector)
-            if semantic < DIJKSTRA_SEMANTIC_THRESHOLD:
+            if semantic < hyperparameters.dijkstra_semantic_threshold:
                 continue
             path_weight = 1 / (1 + float(lengths[target_id]))
             edge_weight = weighted_score(left, right, path_weight, semantic)
@@ -1139,6 +1318,7 @@ async def enrich_course_graph(db: Session, course_id: str, *, run_relation_compl
     relations = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course_id)).all()
     if not concepts:
         return {"graph_algorithm_nodes": 0, "graph_algorithm_edges": 0}
+    hyperparameters = load_course_graph_hyperparameters(db, course_id)
     evidence_chunk_ids = {relation.evidence_chunk_id for relation in relations if relation.evidence_chunk_id}
     chunks_by_id = {
         chunk.id: chunk
@@ -1147,9 +1327,9 @@ async def enrich_course_graph(db: Session, course_id: str, *, run_relation_compl
 
     signals = collect_concept_signals(db, course, concepts, relations)
     relation_signals = relation_signals_from_db(relations, concepts, chunks_by_id)
-    thresholds = adaptive_graph_quality_thresholds(signals, relation_signals)
-    edges = build_sparse_edges(signals, relation_signals, thresholds=thresholds)
-    metrics, graph = analyze_graph(signals, edges)
+    thresholds = adaptive_graph_quality_thresholds(signals, relation_signals, hyperparameters)
+    edges = build_sparse_edges(signals, relation_signals, thresholds=thresholds, hyperparameters=hyperparameters)
+    metrics, graph = analyze_graph(signals, edges, hyperparameters=hyperparameters)
     completion_error: str | None = None
     completion_count = 0
     if run_relation_completion:
@@ -1167,16 +1347,16 @@ async def enrich_course_graph(db: Session, course_id: str, *, run_relation_compl
         completion_count = len(completion_signals)
         if completion_signals:
             relation_signals = [*relation_signals, *completion_signals]
-            thresholds = adaptive_graph_quality_thresholds(signals, relation_signals)
-            edges = build_sparse_edges(signals, relation_signals, thresholds=thresholds)
-            metrics, graph = analyze_graph(signals, edges)
+            thresholds = adaptive_graph_quality_thresholds(signals, relation_signals, hyperparameters)
+            edges = build_sparse_edges(signals, relation_signals, thresholds=thresholds, hyperparameters=hyperparameters)
+            metrics, graph = analyze_graph(signals, edges, hyperparameters=hyperparameters)
 
     inferred_edges: list[WeightedEdge] = []
     if run_dijkstra:
-        inferred_edges = infer_dijkstra_edges(graph, signals, edges)
+        inferred_edges = infer_dijkstra_edges(graph, signals, edges, hyperparameters=hyperparameters)
         if inferred_edges:
             edges = [*edges, *inferred_edges]
-            metrics, graph = analyze_graph(signals, edges)
+            metrics, graph = analyze_graph(signals, edges, hyperparameters=hyperparameters)
     keep_ids = select_concepts_to_keep(signals, metrics, graph, thresholds=thresholds)
     edge_updates = upsert_weighted_edges(db, course_id, edges)
     concept_updates = write_concept_metrics(db, concepts, signals, metrics, keep_ids)
@@ -1190,6 +1370,7 @@ async def enrich_course_graph(db: Session, course_id: str, *, run_relation_compl
         "graph_relation_completion_edges": completion_count,
         "graph_relation_completion_error": completion_error,
         "graph_quality_thresholds": thresholds.audit,
+        "graph_hyperparameter_source": hyperparameters.source,
     }
 
 

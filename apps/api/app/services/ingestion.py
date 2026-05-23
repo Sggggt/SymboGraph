@@ -413,6 +413,11 @@ async def run_graph_rebuild(batch_id: str, course_id: str, mode: str = "full") -
         session.close()
 
 
+def run_graph_rebuild_background(batch_id: str, course_id: str, mode: str = "full") -> dict:
+    """Run graph rebuild from FastAPI BackgroundTasks without blocking the API event loop."""
+    return asyncio.run(run_graph_rebuild(batch_id, course_id, mode))
+
+
 def embedding_audit_payload(provider: str, external_called: bool, fallback_reason: str | None, vector_count: int) -> dict:
     return {
         "embedding_provider": provider,
@@ -789,6 +794,9 @@ def remove_course_file(db: Session, course: Course, source_path: str) -> bool:
         ]
         db.query(DocumentVersion).filter(DocumentVersion.document_id == document.id).update({"is_active": False})
         db.query(Chunk).filter(Chunk.document_id == document.id).update({"is_active": False})
+        from app.services.maintenance import delete_document_graph_incremental
+
+        delete_document_graph_incremental(db, course.id, document.id)
         removed = True
 
     for job in jobs:
@@ -1112,7 +1120,7 @@ async def _ingest_file_locked(
     extracted_json.write_text(json.dumps(sections_to_json(sections), ensure_ascii=False, indent=2), encoding="utf-8")
 
     set_job_state(db, job, "chunking", batch_id=batch_id)
-    chunk_payloads, chunking_stats = await chunk_sections_hierarchical_async(sections, chapter=chapter, source_type=source_type)
+    chunk_payloads, chunking_stats = await chunk_sections_hierarchical_async(sections, chapter=chapter, source_type=source_type, batch_id=batch_id)
     existing_hashes = active_chunk_hashes_for_course(db, course.id, excluded_document_id=document.id)
     seen_parent_hashes = set(existing_hashes)
     seen_child_hashes = set(existing_hashes)

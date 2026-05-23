@@ -67,6 +67,7 @@ def model_settings_payload() -> dict:
         "reranker_url": "",
         "semantic_chunking_enabled": settings.semantic_chunking_enabled,
         "semantic_chunking_min_length": settings.semantic_chunking_min_length,
+        "enable_auto_hpo": read_env_bool("ENABLE_AUTO_HPO", settings.enable_auto_hpo),
         "has_api_key": bool(settings.openai_api_key),
         "degraded_mode": not settings.openai_api_key or not settings.embedding_api_key or not settings.embedding_base_url,
         "embedding_base_url": settings.embedding_base_url,
@@ -326,6 +327,7 @@ def update_model_settings(payload: dict) -> dict:
         "reranker_max_length": "reranker_max_length",
         "semantic_chunking_enabled": "semantic_chunking_enabled",
         "semantic_chunking_min_length": "semantic_chunking_min_length",
+        "enable_auto_hpo": "enable_auto_hpo",
     }
     nullable_setting_keys = {
         "graph_extraction_max_input_tokens_per_run",

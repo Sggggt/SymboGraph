@@ -62,9 +62,9 @@ from app.services.ingestion import (
     register_uploaded_file,
     resolve_course,
     run_batch_ingestion,
+    run_graph_rebuild_background,
     run_ingestion_job,
     run_uploaded_files_ingestion,
-    run_graph_rebuild,
     remove_course_file,
     summarize_course,
 )
@@ -226,7 +226,7 @@ async def rebuild_graph_endpoint(
     db.add(batch)
     db.commit()
     db.refresh(batch)
-    background_tasks.add_task(run_graph_rebuild, batch.id, course.id, request.mode)
+    background_tasks.add_task(run_graph_rebuild_background, batch.id, course.id, request.mode)
     return {
         "batch_id": batch.id,
         "state": "extracting_graph",
@@ -294,8 +294,12 @@ async def enqueue_batch(batch_id: str) -> None:
         await run_batch_ingestion(batch_id)
 
 
-async def enqueue_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False) -> None:
-    await run_uploaded_files_ingestion(batch_id, file_paths, force=force)
+def enqueue_batch_background(batch_id: str) -> None:
+    asyncio.run(enqueue_batch(batch_id))
+
+
+def enqueue_uploaded_batch_background(batch_id: str, file_paths: list[str], force: bool = False) -> None:
+    asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths, force=force))
 
 
 @router.post("/files/upload", response_model=UploadFileResponse)
@@ -339,7 +343,7 @@ async def parse_uploaded_files(
         seen_paths.add(path)
         file_paths.append(path)
     batch = create_uploaded_files_batch(db, course.id, file_paths, force=request.force)
-    background_tasks.add_task(enqueue_uploaded_batch, batch.id, [str(path) for path in file_paths], request.force)
+    background_tasks.add_task(enqueue_uploaded_batch_background, batch.id, [str(path) for path in file_paths], request.force)
     return {"batch_id": batch.id, "state": "queued"}
 
 
@@ -351,7 +355,7 @@ async def parse_storage_directory(background_tasks: BackgroundTasks, course_id: 
     if not root.exists():
         raise HTTPException(status_code=404, detail=f"Storage root not found: {root}")
     batch = create_sync_batch(db, course.id, root, trigger_source="storage")
-    background_tasks.add_task(enqueue_batch, batch.id)
+    background_tasks.add_task(enqueue_batch_background, batch.id)
     return {"batch_id": batch.id, "state": "queued"}
 
 

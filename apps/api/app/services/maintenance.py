@@ -15,15 +15,23 @@ from app.models import (
     ConceptAlias,
     ConceptRelation,
     Course,
+    CourseModelHyperparameter,
     Document,
     DocumentVersion,
+    EntityMergeCandidate,
+    EntityMention,
     GraphExtractionChunkTask,
+    GraphExtractionRun,
+    GraphCommunitySummary,
+    GraphHpoJudgeSample,
+    GraphHpoObjectiveModel,
     GraphRelationCandidate,
     IngestionBatch,
     IngestionCompensationLog,
     IngestionJob,
     IngestionLog,
     QASession,
+    QualityProfile,
 )
 from app.services.concept_graph import is_valid_concept, normalize_relation_type
 from app.services.ingestion import active_batch_for_course
@@ -160,6 +168,262 @@ def cleanup_stale_graph(db: Session, course_id: str) -> dict[str, int]:
     return stats.as_dict()
 
 
+def _metadata_chunk_ids(metadata: dict | None) -> set[str]:
+    values: set[str] = set()
+    if not isinstance(metadata, dict):
+        return values
+    for key in ("chunk_ids", "evidence_chunk_ids", "support_chunk_ids"):
+        raw = metadata.get(key)
+        if isinstance(raw, str):
+            values.add(raw)
+        elif isinstance(raw, list):
+            values.update(str(item) for item in raw if item)
+    return values
+
+
+def _active_chunk_ids(db: Session, course_id: str, chunk_ids: set[str]) -> set[str]:
+    if not chunk_ids:
+        return set()
+    return set(
+        db.scalars(
+            select(Chunk.id).where(
+                Chunk.course_id == course_id,
+                Chunk.id.in_(chunk_ids),
+                Chunk.is_active.is_(True),
+            )
+        ).all()
+    )
+
+
+def _concept_mention_chunk_ids(
+    db: Session,
+    course_id: str,
+    concept_id: str | None,
+    source_document_ids: set[str],
+) -> set[str]:
+    if not concept_id:
+        return set()
+    query = select(EntityMention.chunk_id).where(
+        EntityMention.course_id == course_id,
+        EntityMention.concept_id == concept_id,
+        EntityMention.chunk_id.is_not(None),
+    )
+    if source_document_ids:
+        query = query.where(EntityMention.document_id.in_(source_document_ids))
+    return {str(chunk_id) for chunk_id in db.scalars(query).all() if chunk_id}
+
+
+def _recalculate_edge_support_count(
+    db: Session,
+    *,
+    course_id: str,
+    source_concept_id: str,
+    target_concept_id: str | None,
+    source_document_ids: list[str] | None,
+    evidence_chunk_id: str | None,
+    metadata_json: dict | None,
+) -> int:
+    source_ids = {str(item) for item in (source_document_ids or []) if item}
+    evidence_chunk_ids = _metadata_chunk_ids(metadata_json)
+    if evidence_chunk_id:
+        evidence_chunk_ids.add(str(evidence_chunk_id))
+
+    source_chunks = _concept_mention_chunk_ids(db, course_id, source_concept_id, source_ids)
+    if target_concept_id:
+        target_chunks = _concept_mention_chunk_ids(db, course_id, target_concept_id, source_ids)
+        co_mention_chunks = source_chunks.intersection(target_chunks)
+        evidence_chunk_ids.update(co_mention_chunks)
+    else:
+        evidence_chunk_ids.update(source_chunks)
+
+    active_evidence_chunks = _active_chunk_ids(db, course_id, evidence_chunk_ids)
+    if active_evidence_chunks:
+        return len(active_evidence_chunks)
+    return max(1, len(source_ids))
+
+
+def delete_document_graph_incremental(db: Session, course_id: str, document_id: str) -> dict[str, int]:
+    """Remove one document's graph evidence without committing.
+
+    Concepts and relations shared with other documents are retained with the
+    document_id stripped from their source lists. Orphan concepts and dangling
+    relation/candidate rows are physically removed.
+    """
+    document_ids = {document_id}
+    chunk_ids = set(db.scalars(select(Chunk.id).where(Chunk.course_id == course_id, Chunk.document_id == document_id)).all())
+    affected_concept_ids = set(
+        db.scalars(
+            select(EntityMention.concept_id).where(
+                EntityMention.course_id == course_id,
+                EntityMention.document_id == document_id,
+                EntityMention.concept_id.is_not(None),
+            )
+        ).all()
+    )
+    affected_concept_ids.discard(None)
+    removed_mentions = db.query(EntityMention).filter(
+        EntityMention.course_id == course_id,
+        EntityMention.document_id == document_id,
+    ).delete(synchronize_session=False)
+
+    removed_relations = 0
+    for relation in db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course_id)).all():
+        sources = set(relation.source_document_ids or [])
+        evidence_from_document = bool(relation.evidence_chunk_id and relation.evidence_chunk_id in chunk_ids)
+        affected_concept_ids.add(relation.source_concept_id)
+        if relation.target_concept_id:
+            affected_concept_ids.add(relation.target_concept_id)
+        if not sources and evidence_from_document:
+            db.delete(relation)
+            removed_relations += 1
+            continue
+        if sources and sources.issubset(document_ids):
+            db.delete(relation)
+            removed_relations += 1
+            continue
+        if sources.intersection(document_ids):
+            relation.source_document_ids = sorted(sources - document_ids)
+            if evidence_from_document:
+                relation.evidence_chunk_id = None
+            relation.support_count = _recalculate_edge_support_count(
+                db,
+                course_id=course_id,
+                source_concept_id=relation.source_concept_id,
+                target_concept_id=relation.target_concept_id,
+                source_document_ids=relation.source_document_ids,
+                evidence_chunk_id=relation.evidence_chunk_id,
+                metadata_json=relation.metadata_json,
+            )
+
+    removed_candidates = 0
+    for candidate in db.scalars(select(GraphRelationCandidate).where(GraphRelationCandidate.course_id == course_id)).all():
+        sources = set(candidate.source_document_ids or [])
+        evidence_from_document = bool(candidate.evidence_chunk_id and candidate.evidence_chunk_id in chunk_ids)
+        affected_concept_ids.add(candidate.source_concept_id)
+        if candidate.target_concept_id:
+            affected_concept_ids.add(candidate.target_concept_id)
+        if (not sources and evidence_from_document) or (sources and sources.issubset(document_ids)):
+            db.delete(candidate)
+            removed_candidates += 1
+        elif sources.intersection(document_ids):
+            candidate.source_document_ids = sorted(sources - document_ids)
+            if evidence_from_document:
+                candidate.evidence_chunk_id = None
+            candidate.support_count = _recalculate_edge_support_count(
+                db,
+                course_id=course_id,
+                source_concept_id=candidate.source_concept_id,
+                target_concept_id=candidate.target_concept_id,
+                source_document_ids=candidate.source_document_ids,
+                evidence_chunk_id=candidate.evidence_chunk_id,
+                metadata_json=candidate.metadata_json,
+            )
+
+    removed_concepts = 0
+    removed_aliases = 0
+    concepts_to_delete: set[str] = set()
+    for concept in db.scalars(select(Concept).where(Concept.course_id == course_id)).all():
+        sources = set(concept.source_document_ids or [])
+        if sources.intersection(document_ids):
+            affected_concept_ids.add(concept.id)
+            sources -= document_ids
+        if concept.id in affected_concept_ids:
+            mention_rows = db.execute(
+                select(EntityMention.document_id, EntityMention.chunk_id).where(
+                    EntityMention.course_id == course_id,
+                    EntityMention.concept_id == concept.id,
+                )
+            ).all()
+            mention_doc_ids = {row[0] for row in mention_rows if row[0]}
+            mention_chunk_ids = {row[1] for row in mention_rows if row[1]}
+            sources.update(mention_doc_ids)
+            concept.source_document_ids = sorted(sources)
+            concept.evidence_count = max(len(mention_rows), len(mention_chunk_ids), len(sources))
+
+    db.flush()
+    incident_relation_ids = set(
+        db.scalars(
+            select(ConceptRelation.source_concept_id).where(ConceptRelation.course_id == course_id)
+        ).all()
+    )
+    incident_relation_ids.update(
+        concept_id
+        for concept_id in db.scalars(
+            select(ConceptRelation.target_concept_id).where(
+                ConceptRelation.course_id == course_id,
+                ConceptRelation.target_concept_id.is_not(None),
+            )
+        ).all()
+        if concept_id
+    )
+    incident_relation_ids.update(
+        db.scalars(
+            select(GraphRelationCandidate.source_concept_id).where(GraphRelationCandidate.course_id == course_id)
+        ).all()
+    )
+    incident_relation_ids.update(
+        concept_id
+        for concept_id in db.scalars(
+            select(GraphRelationCandidate.target_concept_id).where(
+                GraphRelationCandidate.course_id == course_id,
+                GraphRelationCandidate.target_concept_id.is_not(None),
+            )
+        ).all()
+        if concept_id
+    )
+    for concept in db.scalars(select(Concept).where(Concept.course_id == course_id)).all():
+        if concept.source_document_ids or concept.evidence_count > 0:
+            continue
+        if concept.id in incident_relation_ids:
+            continue
+        has_mentions = db.scalar(
+            select(EntityMention.id).where(EntityMention.course_id == course_id, EntityMention.concept_id == concept.id).limit(1)
+        )
+        if has_mentions:
+            continue
+        concepts_to_delete.add(concept.id)
+
+    if concepts_to_delete:
+        deleted_concepts = db.scalars(select(Concept).where(Concept.id.in_(concepts_to_delete))).all()
+        deleted_keys = {concept.normalized_name for concept in deleted_concepts if concept.normalized_name}
+        removed_relations += db.query(ConceptRelation).filter(
+            ConceptRelation.course_id == course_id,
+            (
+                ConceptRelation.source_concept_id.in_(concepts_to_delete)
+                | ConceptRelation.target_concept_id.in_(concepts_to_delete)
+            ),
+        ).delete(synchronize_session=False)
+        removed_candidates += db.query(GraphRelationCandidate).filter(
+            GraphRelationCandidate.course_id == course_id,
+            (
+                GraphRelationCandidate.source_concept_id.in_(concepts_to_delete)
+                | GraphRelationCandidate.target_concept_id.in_(concepts_to_delete)
+            ),
+        ).delete(synchronize_session=False)
+        removed_aliases = db.query(ConceptAlias).filter(ConceptAlias.concept_id.in_(concepts_to_delete)).delete(synchronize_session=False)
+        if deleted_keys:
+            db.query(EntityMergeCandidate).filter(
+                EntityMergeCandidate.course_id == course_id,
+                (
+                    EntityMergeCandidate.left_key.in_(deleted_keys)
+                    | EntityMergeCandidate.right_key.in_(deleted_keys)
+                ),
+            ).delete(synchronize_session=False)
+        removed_concepts = db.query(Concept).filter(
+            Concept.course_id == course_id,
+            Concept.id.in_(concepts_to_delete),
+        ).delete(synchronize_session=False)
+
+    db.flush()
+    return {
+        "graph_removed_mentions": removed_mentions,
+        "graph_removed_relations": removed_relations,
+        "graph_removed_candidates": removed_candidates,
+        "graph_removed_aliases": removed_aliases,
+        "graph_removed_concepts": removed_concepts,
+    }
+
+
 def cleanup_stale_data(db: Session, course_id: str, course_name: str) -> dict[str, int]:
     from app.services.ingestion import create_vector_compensation_log, mark_vector_compensation_log
 
@@ -245,12 +509,12 @@ def delete_course_data(db: Session, course: Course) -> dict[str, int]:
 
     vector_store = VectorStore(course_name=course.name)
     vector_ids = vector_store.list_ids(course.id)
-    vector_store.delete(vector_ids)
 
     run_ids = db.scalars(select(AgentRun.id).where(AgentRun.course_id == course.id)).all()
     batch_ids = db.scalars(select(IngestionBatch.id).where(IngestionBatch.course_id == course.id)).all()
     concept_ids = db.scalars(select(Concept.id).where(Concept.course_id == course.id)).all()
     document_ids = db.scalars(select(Document.id).where(Document.course_id == course.id)).all()
+    graph_run_ids = db.scalars(select(GraphExtractionRun.id).where(GraphExtractionRun.course_id == course.id)).all()
 
     deleted_trace_events = db.query(AgentTraceEvent).filter(AgentTraceEvent.run_id.in_(run_ids)).delete(synchronize_session=False) if run_ids else 0
     deleted_agent_runs = db.query(AgentRun).filter(AgentRun.course_id == course.id).delete(synchronize_session=False)
@@ -259,8 +523,18 @@ def delete_course_data(db: Session, course: Course) -> dict[str, int]:
     deleted_ingestion_logs = db.query(IngestionLog).filter(IngestionLog.batch_id.in_(batch_ids)).delete(synchronize_session=False) if batch_ids else 0
     deleted_compensations = db.query(IngestionCompensationLog).filter(IngestionCompensationLog.course_id == course.id).delete(synchronize_session=False)
     deleted_jobs = db.query(IngestionJob).filter(IngestionJob.course_id == course.id).delete(synchronize_session=False)
+    deleted_graph_extraction_tasks = db.query(GraphExtractionChunkTask).filter(GraphExtractionChunkTask.course_id == course.id).delete(synchronize_session=False)
+    deleted_graph_extraction_runs = db.query(GraphExtractionRun).filter(GraphExtractionRun.id.in_(graph_run_ids)).delete(synchronize_session=False) if graph_run_ids else 0
     deleted_batches = db.query(IngestionBatch).filter(IngestionBatch.course_id == course.id).delete(synchronize_session=False)
 
+    deleted_hpo_judge_samples = db.query(GraphHpoJudgeSample).filter(GraphHpoJudgeSample.course_id == course.id).delete(synchronize_session=False)
+    deleted_hpo_objective_models = db.query(GraphHpoObjectiveModel).filter(GraphHpoObjectiveModel.course_id == course.id).delete(synchronize_session=False)
+    deleted_model_hyperparameters = db.query(CourseModelHyperparameter).filter(CourseModelHyperparameter.course_id == course.id).delete(synchronize_session=False)
+    deleted_quality_profiles = db.query(QualityProfile).filter(QualityProfile.course_id == course.id).delete(synchronize_session=False)
+    deleted_community_summaries = db.query(GraphCommunitySummary).filter(GraphCommunitySummary.course_id == course.id).delete(synchronize_session=False)
+    deleted_relation_candidates = db.query(GraphRelationCandidate).filter(GraphRelationCandidate.course_id == course.id).delete(synchronize_session=False)
+    deleted_mentions = db.query(EntityMention).filter(EntityMention.course_id == course.id).delete(synchronize_session=False)
+    deleted_merge_candidates = db.query(EntityMergeCandidate).filter(EntityMergeCandidate.course_id == course.id).delete(synchronize_session=False)
     deleted_relations = db.query(ConceptRelation).filter(ConceptRelation.course_id == course.id).delete(synchronize_session=False)
     deleted_aliases = db.query(ConceptAlias).filter(ConceptAlias.concept_id.in_(concept_ids)).delete(synchronize_session=False) if concept_ids else 0
     deleted_concepts = db.query(Concept).filter(Concept.course_id == course.id).delete(synchronize_session=False)
@@ -271,6 +545,8 @@ def delete_course_data(db: Session, course: Course) -> dict[str, int]:
 
     db.delete(course)
     db.commit()
+
+    vector_store.delete(vector_ids)
 
     deleted_directory = 0
     if course_root.exists():
@@ -285,7 +561,17 @@ def delete_course_data(db: Session, course: Course) -> dict[str, int]:
         "deleted_ingestion_logs": deleted_ingestion_logs,
         "deleted_compensations": deleted_compensations,
         "deleted_jobs": deleted_jobs,
+        "deleted_graph_extraction_tasks": deleted_graph_extraction_tasks,
+        "deleted_graph_extraction_runs": deleted_graph_extraction_runs,
         "deleted_batches": deleted_batches,
+        "deleted_hpo_judge_samples": deleted_hpo_judge_samples,
+        "deleted_hpo_objective_models": deleted_hpo_objective_models,
+        "deleted_model_hyperparameters": deleted_model_hyperparameters,
+        "deleted_quality_profiles": deleted_quality_profiles,
+        "deleted_community_summaries": deleted_community_summaries,
+        "deleted_relation_candidates": deleted_relation_candidates,
+        "deleted_mentions": deleted_mentions,
+        "deleted_merge_candidates": deleted_merge_candidates,
         "deleted_relations": deleted_relations,
         "deleted_aliases": deleted_aliases,
         "deleted_concepts": deleted_concepts,

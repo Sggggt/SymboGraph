@@ -24,7 +24,7 @@
 | 缓存与协调 | Redis 7                                                                                                       |
 | 模型接口   | OpenAI 兼容 Embedding / Chat API，Embedding 与 Chat 端点独立配置                                              |
 | 检索       | Evidence-first 检索：dense + BM25 + rerank 基础召回，证据锚点选择，受控图导航增强，再装配 parent context      |
-| 图谱       | LLM 抽候选，chunk 向量建语义图，图算法做构图、消冗、社区、中心性和隐式关系；支持增量更新与全量重建            |
+| 图谱       | LLM 抽候选，chunk 向量建语义图，图算法做构图、消冗、社区、中心性和隐式关系；自适应最佳优先 chunk 选择；TPE 超参自动优化；支持增量更新与全量重建            |
 | 质量系统   | 信号-策略-画像-裁判四级质量架构：对 chunk、concept、relation 做自适应分级过滤与路由                           |
 | 问答       | Agentic RAG：Perception → Planning → Retrieval → EvidenceEvaluator → Generation，支持跨语言检索与前置证据评估 |
 
@@ -35,6 +35,7 @@
 | 前端       | Next.js 16.2.4、React 19、TypeScript、TanStack Query、ECharts      | 知识库管理、上传解析、搜索、问答、图谱浏览、运行时配置          |
 | API        | FastAPI、Pydantic、SQLAlchemy、LangGraph                           | REST / SSE 接口、强类型校验、事务编排、导入任务、检索与问答编排 |
 | 图算法     | NetworkX、NumPy、SciPy                                             | 稀疏构图、连通分量、Louvain、谱聚类、中心性、Dijkstra 隐式关系  |
+| 超参优化   | Optuna TPE（Tree-structured Parzen Estimator）                      | 自动搜索图算法最优阈值与权重组合，持久化最优参数                  |
 | 质量系统   | 信号工程、规则策略、领域画像、LLM-as-judge                         | Chunk/Concept/Relation 分级过滤、自适应领域基线、缓存裁判       |
 | 数据库     | PostgreSQL 16                                                      | 知识库、文件版本、chunks、图谱、问答会话、运行轨迹和补偿记录    |
 | 向量检索   | Qdrant 1.17.1                                                      | parent / child chunk 向量、dense recall、向量健康检查           |
@@ -61,6 +62,8 @@
 | 自适应质量系统 | 基于领域画像的信号-策略分层过滤，对 chunk、concept、relation 做差异化路由           |
 | 可观测问答     | 保存检索审计、模型调用审计、agent trace、引用和失败原因                             |
 | 运行时检查     | 暴露健康检查、runtime-check、fallback 状态、Qdrant 状态和模型端点状态               |
+| 自动超参优化   | `ENABLE_AUTO_HPO=true` 时，图谱重建前自动运行 TPE 寻优最优阈值和权重组合            |
+| 增量图谱更新   | 仅对变更文档关联的图谱局部重算，避免无必要全量重建                                   |
 
 ## 系统架构
 
@@ -74,19 +77,20 @@ flowchart TB
         API --> RETRIEVAL["检索流水线<br/>dense/BM25 -> 融合 -> 精排 -> parent context"]
         API --> GRAPH["图谱流水线<br/>LLM候选 -> 质量过滤 -> 向量相似图 -> 稀疏构图 -> 社区/中心性/推断"]
         API --> QA["Agentic 问答<br/>Perception -> Planning -> Retrieval -> EvidenceEvaluator -> Generation"]
-        API --> QUALITY["质量系统<br/>信号提取 -> 策略决策 -> 领域画像 -> LLM裁判"]
+        API -.-> QUALITY["质量系统<br/>被各流水线调用的内部库"]
     end
 
     subgraph STORE["存储与运行态"]
         PG[("PostgreSQL<br/>元数据、文本块、稀疏图、审计记录、质量画像")]
         QD[("Qdrant<br/>chunk 向量与相似召回")]
-        RD[("Redis<br/>运行态缓存、embedding / 检索结果缓存、裁判缓存、任务协调")]
+        RD[("Redis<br/>运行态缓存、embedding / 检索结果缓存、裁判缓存、分布式锁、Celery broker")]
         FS["data/<br/>知识库文件、解析产物、本地持久化"]
     end
 
     subgraph MODEL["模型接口"]
         EMB["OpenAI 兼容 Embedding API<br/>独立端点配置"]
         CHAT["OpenAI 兼容 Chat API<br/>独立端点配置"]
+        MB["Model Bridge<br/>宿主机模型桥接（可选）"]
     end
 
     API --> PG
@@ -95,6 +99,7 @@ flowchart TB
     API --> FS
     API --> EMB
     API --> CHAT
+    API --> MB
 ```
 
 ## 数据流
@@ -114,16 +119,23 @@ sequenceDiagram
     API->>DB: 创建 batch、job、document/version 状态
     API->>文件: 保存原始文件与解析产物
     API->>API: 解析章节、页面、表格、公式和 Notebook 单元
-    API->>API: 生成 parent/child chunks 与上下文增强文本
-    API->>API: 质量信号提取与策略路由（discard/summary/retrieval/graph）
-    API->>Model: 生成摘要、关键词和 embeddings
-    API->>Vector: 写入 active chunk 向量
+    API->>API: 生成 parent/child chunks（内部含质量信号提取与 discard）
+    API->>API: 自适应切片：按 section 动态选择 chunk_size / overlap / strategy
+    API->>Model: 生成 parent chunk 摘要和关键词（ChatProvider）
+    API->>API: 生成上下文增强文本（contextual_embedding_text）
+    API->>Model: 生成所有 chunk 的 embeddings（EmbeddingProvider）
+    API->>Vector: 写入 active chunk 向量（含零向量校验与补偿）
     API->>DB: 激活 document version 与 chunks
-    API->>Model: 抽取实体/关系候选
-    API->>API: 质量过滤（concept accept/reject、relation accept/candidate）
-    API->>API: 运行稀疏图构建、社区、中心性和推断
-    API->>DB: 保存 concepts、relations、证据和图算法字段
-    API->>DB: 增量更新：仅变更文档关联的图谱局部重算
+    API->>Model: 抽取实体/关系候选（自适应最佳优先 chunk 子集）
+    API->>DB: 保存 concepts、relations、证据（内部含质量过滤）
+    API->>API: 自动超参优化（可选）：TPE 迭代寻优 Dijkstra 阈值、PageRank 权重等
+    alt 全量重建
+        API->>API: 运行稀疏图构建、社区、中心性和推断
+        API->>DB: 保存图算法字段（中心性、社区、排序）
+        API->>API: 生成社区摘要
+    else 增量更新
+        API->>DB: 仅变更文档关联的图谱局部重算
+    end
     API-->>Web: SSE 推送日志、进度、retry 和失败状态
 ```
 
@@ -140,6 +152,93 @@ sequenceDiagram
 5. 当 `SEMANTIC_CHUNKING_ENABLED=true` 且文本长度达到 `SEMANTIC_CHUNKING_MIN_LENGTH` 时，系统可使用 embedding 相似度辅助切分边界。
 
 > **设计意图（为什么这么做）**：普通的固定长度切块会导致严重的内容割裂（断章取义）。采用父子分层与语义切分，使得模型在检索阶段能利用子块的高精确度，而在生成阶段又能获取父块的完整上下文，彻底解耦了"召回单元"与"生成单元"。
+
+### 自适应切片参数选择
+
+上述分层策略并非使用全局固定的 `chunk_size` 和 `chunk_overlap`。对于每个 `ParsedSection`，系统在切块前动态分析其内容特征，从候选配置空间中选择最优的切块参数组合。该过程通过 SSE 推送 `chunk_adaptive` 事件。
+
+**文档特征向量**：对每个 section 提取 12 维归一化特征：
+
+| 特征维度 | 计算方式 | 说明 |
+|---------|---------|------|
+| 文本长度 | $\min(1, L_{\text{tokens}} / 1800)$ | 归一化 token 数 |
+| 语义单元均长 | $\min(1, \bar{l}_{\text{unit}} / 80)$ | 语义单元平均 token 长度 |
+| 长度变异系数 | $\min(1, \sigma_l / \max(\bar{l}_{\text{unit}}, 1))$ | 语义单元长度离散程度 |
+| 定义密度 | 来自语义密度信号 | 定义性语句占比 |
+| 实体密度 | 来自语义密度信号 | 命名实体占比 |
+| 术语密度 | 来自语义密度信号 | 领域术语占比 |
+| 唯一 token 比例 | 来自语义密度信号 | 文本去重后的词汇丰富度 |
+| 公式信号 | $\min\bigl(1, \frac{12 N_{\text{formula}}}{L_{\text{tokens}}} + 0.35 \cdot \mathbf{1}_{\text{has\_formula}}\bigr)$ | 公式密集程度 |
+| 表格信号 | $\mathbf{1}_{\text{has\_table}}$ | 是否包含表格 |
+| 代码标记比例 | 代码行 / 总行数 | `def`/`class`/`import` 等标记占比 |
+| 符号比例 | $\min(1, \frac{4 N_{\text{symbol}}}{L_{\text{chars}}})$ | 非字母数字符号占比 |
+| 结构噪声 | $\max(S_{\text{structural}}, 20 R_{\text{mojibake}})$ | 结构异常与乱码风险 |
+
+**谱形状分析**：将 section 分割成语义单元，每个单元提取特征向量，构建协方差矩阵并计算特征值与特征向量：
+
+$$
+\lambda_1 \ge \lambda_2 \ge \lambda_3 \ge \lambda_4,\qquad
+\tilde{\lambda}_k = \frac{\lambda_k}{\sum_{j=1}^4 \lambda_j}
+$$
+
+谱间隙 $\rho = \tilde{\lambda}_1 - \tilde{\lambda}_2$ 衡量语义一致性；语义曲率 $\kappa$ 衡量相邻语义单元间的特征漂移幅度。
+
+**候选配置空间**（chunk_size, overlap, strategy）：
+
+| chunk_size | overlap | strategy |
+|-----------|---------|----------|
+| 512 | 64 | `sentence_aware` |
+| 640 | 96 | `sentence_aware` |
+| 800 | 120 | `semantic_or_sentence` |
+| 960 | 144 | `semantic_or_sentence` |
+| 700 | 160 | `recursive_structure_preserving` |
+
+**评分机制**：对每组候选参数计算综合得分。
+
+复杂度（内容结构混乱程度）：
+
+$$
+\gamma = \min\!\Bigl(1,\; 0.22 \cdot c_v + 0.18 \cdot f + 0.16 \cdot t + 0.18 \cdot r_{\text{code}} + 0.16 \cdot r_{\text{sym}} + 0.10 \cdot \kappa\Bigr)
+$$
+
+密度（知识含量）：
+
+$$
+\delta = \min\!\Bigl(1,\; 0.35 \cdot d_{\text{term}} + 0.30 \cdot d_{\text{entity}} + 0.20 \cdot d_{\text{def}} + 0.15 \cdot r_{\text{unique}}\Bigr)
+$$
+
+目标大小与重叠（由复杂度和密度驱动）：
+
+$$
+S^* = 920 - 380\,\gamma + 160\,\delta + 100\,\rho,\qquad
+O^* = 80 + 130\,\gamma + 40\,\kappa
+$$
+
+拟合度：
+
+$$
+\phi_{\text{size}} = 1 - \min\!\Bigl(1, \frac{|S - S^*|}{700}\Bigr),\qquad
+\phi_{\text{overlap}} = 1 - \min\!\Bigl(1, \frac{|O - O^*|}{220}\Bigr)
+$$
+
+策略奖励：
+
+$$
+\beta =
+\begin{cases}
+0.08 \cdot \max(\kappa, \delta) & \text{if strategy} = \text{`semantic\_or\_sentence'} \\
+0.10 \cdot r_{\text{code}} + 0.05 \cdot f & \text{if strategy} = \text{`recursive\_structure\_preserving'} \\
+0 & \text{otherwise}
+\end{cases}
+$$
+
+综合得分：
+
+$$
+\mathcal{F} = \max(0, \min(1,\; 0.54\,\phi_{\text{size}} + 0.26\,\phi_{\text{overlap}} + 0.14\,\delta - 0.10\,\nu + \beta))
+$$
+
+其中 $\nu$ 为结构噪声。得分最高者被选为当前 section 的切块参数，并持久化到 chunk metadata 中。
 
 ### 上下文增强向量
 
@@ -255,35 +354,66 @@ $$
 
 SymboGraph 的图谱生成不是单一的 KNN 或 LLM 抽取流程，而是一条 evidence-first 的多阶段构图流水线。LLM 负责发现候选实体和显式语义关系，质量门禁负责事实约束，向量相似图负责提供可控的语义候选，传统图算法负责结构分析，LLM 证据补全和 Dijkstra 推断只在受控边界内修补局部结构。PostgreSQL 是概念、关系和生命周期状态的事实源；Qdrant 只提供 chunk 向量与相似度信号，不能单独决定事实关系。
 
+本次更新引入了**自适应最佳优先 chunk 选择**、**TPE 自动超参优化**和**增量图谱更新**三大能力：
+- **自适应最佳优先**：根据文档覆盖、章节覆盖、段落覆盖、内容类型覆盖、embedding 簇代理覆盖和低频术语覆盖六维信号，动态选择最具信息增益的 chunks 进行 LLM 抽取，避免对所有 chunks 做无差别调用。
+- **TPE 超参优化**：重建前可选运行 Auto HPO，用 Optuna 的 `TPESampler` 在 30 轮 trial 中自动搜索最优的 Dijkstra 语义阈值、关系置信度阈值和图算法权重组合。
+- **增量更新**：仅对变更文档关联的图谱局部重算，保留未变更文档的概念和关系，大幅降低更新成本。
+
 ```mermaid
 flowchart TB
     CHUNK["Active child chunks<br/>通过 ChunkQualityPolicy"] --> VEC["Qdrant chunk vectors<br/>派生向量信号"]
     CHUNK --> LLM["LLM 抽取<br/>候选实体 + 显式关系"]
 
-    LLM --> CONCEPT_GATE["ConceptQualityPolicy<br/>实体质量过滤"]
-    LLM --> REL_GATE["RelationQualityPolicy + hard gate<br/>关系类型/置信度/证据匹配"]
-    CONCEPT_GATE --> MERGE["Concept merge<br/>规范名、别名、去重、章节引用"]
-    REL_GATE --> EXPLICIT["Verified explicit relations<br/>有证据支撑的事实边"]
+    LLM --> MERGE["Concept merge<br/>规范名、别名、去重、章节引用"]
+    MERGE --> CONCEPT_GATE["ConceptQualityPolicy<br/>实体质量过滤"]
+    CONCEPT_GATE --> UPSERT["Upsert graph candidates<br/>concepts、relations、evidence（含 hard gate）"]
 
     VEC --> CENTROID["Concept vector centroid<br/>证据 chunk 向量质心 + L2 归一化"]
-    MERGE --> CENTROID
+    UPSERT --> CENTROID
     CENTROID --> SPARSE["Semantic sparse candidates<br/>动态 KNN + 语义阈值 + 互近邻/反向入边配额"]
-    SPARSE --> CANDIDATE["semantic_sparse candidates<br/>candidate_only，不直接当事实边"]
+    SPARSE --> CANDIDATE["GraphRelationCandidate<br/>candidate_only，不直接当事实边"]
 
-    EXPLICIT --> GRAPH["Verified graph<br/>默认中心性/社区分析图"]
-    CANDIDATE --> GRAPH_AUDIT["候选池/审计/补边线索"]
-    GRAPH --> ANALYZE["Graph algorithms<br/>连通分量、Louvain、谱聚类、中心性、剪枝"]
-    ANALYZE --> COMPLETE["LLM relation completion<br/>只基于高排名邻域的 evidence snippets"]
-    COMPLETE --> REL_GATE
-    ANALYZE --> DIJK["Dijkstra inferred links<br/>2-3 hop 结构假设"]
-    DIJK --> INFERRED["dijkstra_inferred<br/>推断边/导航线索"]
-    INFERRED --> GRAPH_AUDIT
+    UPSERT --> EXPLICIT["Verified explicit relations<br/>有证据支撑的事实边"]
+    CANDIDATE --> GRAPH["Verified graph + candidates<br/>中心性/社区分析输入"]
+    EXPLICIT --> GRAPH
 
-    ANALYZE --> PG["PostgreSQL graph tables<br/>概念、验证关系、候选关系、指标"]
-    GRAPH_AUDIT --> PG
+    UPSERT --> HPO["Auto HPO（可选）<br/>基于 probe chunks 的 TPE 优化"]
+    GRAPH --> ENRICH["enrich_course_graph<br/>build_sparse_edges → analyze → complete → dijkstra → final analyze"]
+    HPO --> ENRICH
+    ENRICH --> COMMUNITY["Community summaries<br/>rebuild_graph_community_summaries"]
+    ENRICH --> PG["PostgreSQL graph tables<br/>概念、验证关系、候选关系、指标"]
+
     PG --> RETRIEVAL["Evidence-first retrieval<br/>只沿可审计证据扩展"]
     PG --> UI["Community-aware graph UI"]
 ```
+
+### 0. 自适应最佳优先 Chunk 选择（Adaptive Best-First）
+
+在 LLM 抽取之前，系统不会盲目对所有 active chunks 调用模型，而是构建一个**自适应抽取计划**，按信息增益优先选择 chunks：
+
+$$
+\Delta_{\text{cov}}(c) = \sum_{d \in \text{new}(c)} w_d + \sum_{h \in \text{new}(c)} w_h + \sum_{s \in \text{new}(c)} w_s + \sum_{k \in \text{new}(c)} w_k + \sum_{e \in \text{new}(c)} w_e + \sum_{t \in \text{new}(c)} w_t
+$$
+
+其中 $\text{new}(c)$ 表示加入 chunk $c$ 后新覆盖的文档、章节、段落、内容类型、embedding 簇代理和低频术语。各维度权重为：
+
+| 维度 | 权重 | 说明 |
+|------|------|------|
+| 文档覆盖 | $0.18$ | 新文档首次被覆盖 |
+| 章节覆盖 | $0.16$ | 新章节首次被覆盖 |
+| 段落覆盖 | $0.10$ | 新段落首次被覆盖 |
+| 内容类型覆盖 | $0.08$ | 新内容类型首次被覆盖 |
+| Embedding 簇代理 | $0.12$ | 新簇首次被覆盖 |
+| 低频术语覆盖 | $\min(0.18, 0.015 \cdot n_{\text{rare}})$ | 新稀有术语数量加权 |
+| 图谱缺口填补 | $0.08$ | 当前图谱缺失该 chunk 关联概念时额外奖励 |
+
+选择采用**贪心最佳优先**策略，每次从未选 chunks 中挑选 $\Delta_{\text{cov}}$ 最大者，直到满足以下任一停止条件：
+- 累积覆盖率超过阈值（默认 $0.85$）
+- 边际增益 $\Delta_{\text{cov}} < 0.03$
+- 达到软启动预算（`GRAPH_EXTRACTION_SOFT_START_BUDGET`，默认 120）
+- 所有 chunks 已选
+
+被选中的 chunks 进入 LLM 图谱抽取，其余 chunks 仍保留在向量库和检索系统中，但不消耗模型调用预算。
 
 ### 1. 实体与证据
 
@@ -294,7 +424,7 @@ $$
 \mathbf{x}_i = \frac{\bar{\mathbf{x}}_i}{\lVert \bar{\mathbf{x}}_i\rVert_2}
 $$
 
-其中 *C*`<sub>`i`</sub>` 是支撑概念 *i* 的 active child chunks，\(\mathbf{z}_c\) 是 chunk embedding。这样做的目标是让概念向量忠实于本地课程材料，而不是偏向 LLM 对概念名的通用预训练语义。
+其中 *C*`<sub>`i`</sub>` 是支撑概念 *i* 的 active child chunks，$\mathbf{z}_c$ 是 chunk embedding。这样做的目标是让概念向量忠实于本地课程材料，而不是偏向 LLM 对概念名的通用预训练语义。
 
 ### 2. LLM 显式关系与质量门禁
 
@@ -357,7 +487,64 @@ $$
 
 当端点语义相似度足够高且路径代价足够低时，系统可写入 `relation_source="dijkstra_inferred"` 的推断边。推断边用于导航、审计和候选补全，不应被视为无条件事实；回答仍必须回到原文 chunk 证据。
 
-### 6. 协作边界与注意事项
+### 6. TPE 自动超参优化（Auto HPO）
+
+当 `ENABLE_AUTO_HPO=true` 时，系统在**全量重建**前自动运行超参寻优。HPO 不直接在全量图谱上 trial（成本过高），而是基于少量 **probe chunks**（默认 5 个）的预抽取结果构建代理评估：
+
+**Phase 1 — 候选生成与特征提取**：
+从多组种子超参（保守型、激进型、均衡型及随机插值）中生成候选参数空间，对每组参数用预抽取的 probe payloads 构建 mock 图谱，提取以下特征：
+- 图规模特征：节点数、边数、连通分量数、平均度
+- 结构质量特征：社区模块化度、聚类系数、中心性分布熵
+- 语义特征：Dijkstra 推断边占比、LLM 显式关系占比、语义稀疏边占比
+- 硬约束检查：孤立节点过多、边数爆炸、社区退化等
+
+**Phase 2 — 成对裁判（Pairwise Judge）**：
+让 LLM 作为裁判对候选参数做成对比较（A vs B），输出 `winner`、`confidence` 和 `reasons`。系统收集至少 `HPO_JUDGE_MIN_LABELS`（默认 6）个有效标签后，训练一个**裁判学习代理目标函数**（judge-learned surrogate objective）：
+
+$$
+\mathcal{L}(\mathbf{f}, \mathbf{w}, b) = \sum_{(i,j) \in \mathcal{P}} \mathbb{1}[\hat{y}_{ij} = y_{ij}] \cdot \max(0, \; |s_i - s_j| - \epsilon)
+$$
+
+其中 $\mathcal{P}$ 是裁判标记的候选对集合，$\mathbf{f}$ 是特征向量，$\mathbf{w}$ 是学习权重，$s_i = \mathbf{w}^\top \mathbf{f}_i + b$ 是候选得分。代理目标函数把高维特征映射为标量质量分，使得后续 TPE 只需优化一个标量目标。
+
+**Phase 3 — TPE 迭代优化**：
+使用 Optuna 的 `TPESampler`（Tree-structured Parzen Estimator）在 30 轮 trial 中最大化代理目标函数：
+
+$$
+\theta^* = \arg\max_{\theta \in \Theta} \; g_{\text{surrogate}}(\theta; \mathcal{D}_{\text{probe}})
+$$
+
+其中 $\theta$ 是 11 维超参向量：
+
+| 超参 | 搜索范围 | 默认值 | 说明 |
+|------|----------|--------|------|
+| `min_relation_confidence` | $[0.50, 0.85]$ | $0.62$ | 关系最低置信度 |
+| `min_accepted_relation_weight` | $[0.45, 0.78]$ | $0.56$ | 关系最小接受权重 |
+| `dijkstra_semantic_threshold` | $[0.65, 0.88]$ | $0.74$ | Dijkstra 推断语义阈值 |
+| `w_pagerank` | $[0.05, 0.50]$ | $0.20$ | PageRank 权重 |
+| `w_betweenness` | $[0.05, 0.50]$ | $0.20$ | Betweenness 权重 |
+| `w_degree` | $[0.05, 0.50]$ | $0.25$ | Degree 权重 |
+| `w_weighted_degree` | $[0.05, 0.50]$ | $0.25$ | Weighted degree 权重 |
+| `w_closeness` | $[0.05, 0.30]$ | $0.10$ | Closeness 权重 |
+| `w_centrality` | $[0.10, 0.80]$ | $0.50$ | 综合中心性权重 |
+| `w_llm_importance` | $[0.05, 0.60]$ | $0.25$ | LLM 重要度权重 |
+| `w_evidence` | $[0.05, 0.60]$ | $0.25$ | 证据量权重 |
+
+最优参数持久化到 `course_model_hyperparameters` 表，并在全量重建时注入 `GraphHyperparameters`。如果 HPO 失败，系统回退到上次成功参数或默认值。
+
+### 7. 增量图谱更新
+
+对于知识库的局部变更（如修改或删除少量文档），系统支持**增量图谱更新**，避免无必要全量重建：
+
+1. **变更检测**：对比变更文档的 chunks 与当前图谱证据，识别受影响的 concepts 和 relations。
+2. **局部清理**：调用 `delete_document_graph_incremental` 删除仅由变更文档支撑的概念、别名和关系；保留其他文档支撑的概念和关系不受影响。
+3. **局部重抽**：对变更文档的 active chunks 运行自适应最佳优先选择和 LLM 抽取。
+4. **局部重算**：运行图算法（社区、中心性）时仅重算受影响的子图，未受影响的节点和边保持原有指标。
+5. **事务一致性**：所有清理和重抽操作在显式事务中完成，失败时回滚，保证图谱不会处于半删除状态。
+
+增量更新的时间复杂度与变更文档数量成正比，而非与全库 chunks 数成正比。当变更文档过多或首次构建时，系统会自动回退到全量重建。
+
+### 8. 协作边界与注意事项
 
 这套架构的核心不是让某个算法单独决定图谱，而是让多种信号互相制衡：
 
@@ -559,7 +746,7 @@ $$
 | 可审计           | 保存 batch/job/log、模型调用、检索分数、fallback 状态和引用                                        |
 | 可恢复           | PostgreSQL 保存生命周期状态，Qdrant / Redis 可从持久记录修复                                       |
 | 无静默降级       | 模型、数据库、Qdrant 不可用时快速失败并给出错误上下文                                              |
-| 可扩展           | 精排、语义切分、图谱增强和模型端点通过配置与服务层隔离                                             |
+| 可扩展           | 精排、语义切分、图谱增强、超参优化和模型端点通过配置与服务层隔离                                   |
 | Agent 架构清晰   | Perception-Planning-Retrieval-EvidenceEvaluator-Generation 五阶段分离，每层可独立观测与调优        |
 | 跨语言鲁棒       | LLM 翻译查询扩展 + embedding similarity 桥接 + 跨语言准入通道，缓解单语言 embedding 模型的对齐缺陷 |
 
@@ -570,17 +757,26 @@ erDiagram
     Course ||--o{ Document : has
     Document ||--o{ DocumentVersion : versions
     DocumentVersion ||--o{ Chunk : chunks
-    Chunk ||--o{ Chunk : children
+    Chunk --o{ Chunk : children
     Course ||--o{ Concept : has
     Concept ||--o{ ConceptAlias : aliases
-    Concept ||--o{ ConceptRelation : source
-    Concept ||--o{ ConceptRelation : target
+    Concept --o{ ConceptRelation : source
+    Concept --o{ ConceptRelation : target
     Course ||--o{ IngestionBatch : batches
     IngestionBatch ||--o{ IngestionJob : jobs
-    Course ||--o{ QualityProfile : profiles
+    Course --o{ QualityProfile : profiles
     Course ||--o{ QASession : sessions
-    QASession ||--o{ AgentRun : runs
-    AgentRun ||--o{ AgentTraceEvent : traces
+    QASession --o{ AgentRun : runs
+    AgentRun --o{ AgentTraceEvent : traces
+    Course --o{ CourseModelHyperparameter : hyperparameters
+    Course --o{ GraphExtractionRun : extraction_runs
+    GraphExtractionRun ||--o{ GraphExtractionChunkTask : tasks
+    Course --o{ GraphHpoJudgeSample : hpo_judge_samples
+    Course --o{ GraphHpoObjectiveModel : hpo_objective_models
+    Concept --o{ EntityMention : mentions
+    Concept --o{ EntityMergeCandidate : merge_candidates
+    Concept --o{ GraphRelationCandidate : relation_candidates
+    Concept --o{ GraphCommunitySummary : community_summaries
 ```
 
 | 表                                                  | 作用                                                             |
@@ -595,6 +791,12 @@ erDiagram
 | `ingestion_batches` / `ingestion_jobs`              | 批量导入与单文件任务                                             |
 | `ingestion_logs` / `ingestion_compensation_logs`    | 事件日志与跨存储补偿记录                                         |
 | `qa_sessions` / `agent_runs` / `agent_trace_events` | 问答会话、智能体运行和可观测轨迹                                 |
+| `course_model_hyperparameters`                      | 课程级 HPO 超参记录（版本化、可审计、可回退）                    |
+| `graph_extraction_runs` / `graph_extraction_chunk_tasks` | 自适应图谱抽取运行状态与 chunk 级任务跟踪                    |
+| `graph_hpo_judge_samples` / `graph_hpo_objective_models` | HPO 裁判样本与代理目标函数模型持久化                            |
+| `entity_mentions` / `entity_merge_candidates`         | 实体提及记录与 LLM 验证的合并候选                                 |
+| `graph_relation_candidates`                           | 语义稀疏图产生的候选关系（非事实边）                              |
+| `graph_community_summaries`                           | 社区摘要文本与社区级聚合指标                                      |
 
 ## 配置
 
@@ -632,6 +834,10 @@ Copy-Item .env.example .env
 | `CITATION_VERIFICATION_SAMPLE_MAX`                                                                           | 每答案引用验证抽样数，默认 `3`                                              |
 | `REFLECTION_MAX_RETRIES`                                                                                     | 反思触发修正的最大重试次数，默认 `2`                                        |
 | `MODEL_BRIDGE_ENABLED` / `MODEL_BRIDGE_PORT`                                                                 | 宿主机模型桥接开关和端口                                                    |
+| `ENABLE_AUTO_HPO`                                                                                            | 图谱重建前自动运行 TPE 超参优化，默认 `false`                               |
+| `HPO_JUDGE_MAX_CANDIDATES` / `HPO_JUDGE_MAX_PAIRS` / `HPO_JUDGE_MIN_LABELS`                                  | HPO 裁判候选数、成对比较数、最小有效标签数                                   |
+| `HPO_JUDGE_MAX_TOKENS_PER_PAIR` / `HPO_JUDGE_CONCURRENCY`                                                    | 每对裁判最大 token 数和并发数                                               |
+| `GRAPH_EXTRACTION_SOFT_START_BUDGET` / `GRAPH_EXTRACTION_RESUME_BATCH_SIZE`                                  | 自适应图谱抽取初始预算和每批模型调用 chunk 数                               |
 
 Docker Compose 会在 API 容器内使用服务名覆盖基础设施地址：
 
@@ -753,7 +959,7 @@ docker exec course-kg-api python /app/scripts/reingest_all_courses.py --course-n
 
 ## 核心创新点
 
-SymboGraph 在通用 GraphRAG 方向上的核心创新可概括为以下六点：
+SymboGraph 在通用 GraphRAG 方向上的核心创新可概括为以下七点：
 
 **1. 四级自适应质量架构**
 区别于传统系统的单一阈值过滤，SymboGraph 建立了信号-策略-画像-裁判四级质量体系。Chunk 不再只有"保留/丢弃"两种命运，而是被路由到 `discard`、`summary_only`、`evidence_only`、`retrieval_candidate`、`graph_candidate`、`embed_only` 六种下游路径；Concept 和 Relation 同样经过差异化策略过滤。领域质量画像让每个知识库拥有自适应的质量基线，而非依赖全局固定阈值。
@@ -772,6 +978,9 @@ LLM 显式翻译扩展生成双语子查询、Embedding Similarity 桥接跨越�
 
 **6. 图论算法对冲 LLM 随机性**
 Louvain 社区发现、谱聚类、连通分量消融、多维中心性（degree / PageRank / betweenness / closeness）和 Dijkstra 隐式关系发现共同构成对传统 LLM 抽取噪声的系统性对冲。图谱不是 LLM 输出的被动容器，而是经过严格图论清洗后的稀疏知识骨架。
+
+**7. TPE 自动超参优化与增量更新**
+传统 GraphRAG 系统使用固定超参（阈值、权重）处理所有知识库，无法适应不同领域的语义密度和概念分布差异。SymboGraph 引入 Optuna TPE 自动寻优：基于 probe chunks 预抽取、LLM 成对裁判和代理目标函数，在 30 轮 trial 中自动搜索最优的 Dijkstra 阈值、关系置信度和图算法权重。最优参数版本化持久化，失败时自动回退。同时支持增量图谱更新，仅对变更文档局部重算，避免全量重建的冗余成本。
 
 ## 版本库规则
 

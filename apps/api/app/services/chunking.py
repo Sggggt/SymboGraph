@@ -573,15 +573,32 @@ def chunk_sections_hierarchical(sections: Iterable[ParsedSection], chapter: str,
     return chunks, stats
 
 
-async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], chapter: str, source_type: str) -> tuple[list[dict], dict[str, int]]:
+async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], chapter: str, source_type: str, batch_id: str | None = None) -> tuple[list[dict], dict[str, int]]:
     """Async hierarchical chunking that can use real embeddings for long semantic splits."""
+    from app.services.chunk_adaptation import choose_chunking_profile
+
     chunks: list[dict] = []
-    stats = {"chunks_before_filter": 0, "chunks_filtered": 0, "parents_created": 0, "children_created": 0, "semantic_embedding_splits": 0}
+    stats = {"chunks_before_filter": 0, "chunks_filtered": 0, "parents_created": 0, "children_created": 0, "semantic_embedding_splits": 0, "adaptive_profiles": 0}
     for section_index, section in enumerate(sections, start=1):
         section_text = normalize_text(section.text)
         section_title = normalize_text(section.title)
         section_name = normalize_text(section.section or section.title)
         content_kind = infer_content_kind(section_text, section.metadata.get("content_kind") if section.metadata else None, section.metadata)
+        profile = choose_chunking_profile(
+            section_text,
+            title=section_title,
+            section=section_name,
+            content_kind=content_kind,
+            metadata=section.metadata,
+        )
+        if batch_id:
+            from app.services.ingestion_logs import emit_ingestion_log
+            emit_ingestion_log(
+                batch_id,
+                "chunk_adaptive",
+                f"章节 [{section_title}] 动态特征分析：自适应大小={profile.chunk_size}，重叠={profile.chunk_overlap}，策略={profile.strategy} (F1得分 {profile.score:.3f})"
+            )
+        stats["adaptive_profiles"] += 1
         parent_decision = chunk_quality_decision(section_text, content_kind, section_name, section_title, section.metadata)
 
         parent_payload = {
@@ -597,6 +614,7 @@ async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], c
                 "chunk_index": 0,
                 "content_kind": content_kind,
                 "chunking_strategy": "hierarchical_parent_v2",
+                "chunking_profile": profile.metadata(),
                 "is_parent": True,
                 **quality_metadata(parent_decision),
                 **section.metadata,
@@ -607,14 +625,18 @@ async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], c
         chunks.append(parent_payload)
         stats["parents_created"] += 1
 
-        unit_size = CODE_CHUNK_SIZE if content_kind == "code" else DEFAULT_CHUNK_SIZE
-        overlap = CODE_CHUNK_OVERLAP if content_kind == "code" else DEFAULT_CHUNK_OVERLAP
+        unit_size = profile.chunk_size
+        overlap = profile.chunk_overlap
         used_embedding_split = (
-            source_type not in ("md", "markdown", "ipynb", "notebook", "code")
+            profile.strategy == "semantic_or_sentence"
+            and source_type not in ("md", "markdown", "ipynb", "notebook", "code")
             and get_settings().semantic_chunking_enabled
             and len(section_text) >= get_settings().semantic_chunking_min_length
         )
-        split_results = await split_text_semantic_async(section_text, source_type, unit_size, overlap)
+        if profile.strategy == "recursive_structure_preserving":
+            split_results = split_text(section_text, unit_size, overlap)
+        else:
+            split_results = await split_text_semantic_async(section_text, source_type, unit_size, overlap)
         if used_embedding_split:
             stats["semantic_embedding_splits"] += 1
 
@@ -625,9 +647,9 @@ async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], c
                 stats["chunks_filtered"] += 1
                 continue
             snippet = content[:280].strip()
-            strategy = "hierarchical_child_semantic_embedding_v2" if used_embedding_split else "hierarchical_child_v2"
+            strategy = "hierarchical_child_semantic_embedding_v2" if used_embedding_split else "hierarchical_child_adaptive_v1"
             if source_type in ("md", "markdown"):
-                strategy = "hierarchical_child_markdown_v2"
+                strategy = "hierarchical_child_markdown_adaptive_v1"
             child_payload = {
                 "content": content,
                 "snippet": snippet,
@@ -641,6 +663,7 @@ async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], c
                     "chunk_index": chunk_index,
                     "content_kind": content_kind,
                     "chunking_strategy": strategy,
+                    "chunking_profile": profile.metadata(),
                     "is_parent": False,
                     **quality_metadata(decision),
                     **section.metadata,

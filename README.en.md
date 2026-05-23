@@ -24,7 +24,7 @@ As a general GraphRAG platform, SymboGraph's knowledge-base concept is not limit
 | Cache And Coordination | Redis 7                                                                                                                                                                                |
 | Model API              | OpenAI-compatible Embedding / Chat API, with independent endpoint configuration                                                                                                        |
 | Retrieval              | Evidence-first retrieval: dense + BM25 + rerank base recall, evidence anchors, controlled graph navigation, then parent context assembly                                               |
-| Graph                  | LLM candidates, chunk-vector semantic graph, graph algorithms for sparse construction, deduplication, communities, centrality, and hidden links; supports incremental and full rebuild |
+| Graph                  | LLM candidates, chunk-vector semantic graph, graph algorithms for sparse construction, deduplication, communities, centrality, and hidden links; adaptive best-first chunk selection; TPE hyperparameter auto-optimization; supports incremental and full rebuild |
 | Quality System         | Signal-policy-profile-judge four-tier quality architecture: adaptive tiered filtering and routing for chunks, concepts, and relations                                                  |
 | QA                     | Agentic RAG: Perception → Planning → Retrieval → EvidenceEvaluator → Generation, with cross-lingual retrieval and pre-generation evidence assessment                                   |
 
@@ -43,6 +43,7 @@ As a general GraphRAG platform, SymboGraph's knowledge-base concept is not limit
 | Parsing                | PyMuPDF, PPTX / DOCX / Markdown / HTML / Notebook parsers, OCR path | Convert heterogeneous documents into structured sections and text                                          |
 | Model API              | OpenAI-compatible Embedding / Chat API                              | Embeddings, summaries, keywords, entity candidates, relation candidates, answer generation                 |
 | Reranking              | Lightweight reranker, optional Cross-Encoder                        | Reorder fused candidates by relevance                                                                      |
+| Hyperparameter Optimization | Optuna TPE (Tree-structured Parzen Estimator)                  | Auto-search optimal thresholds and weights for graph algorithms, persist best params                       |
 | Deployment             | Docker Compose                                                      | Fixed service boundaries, dependency versions, local persistence                                           |
 | Testing                | pytest, Vitest, Next build, Docker smoke                            | Behavioral regression, frontend/backend contracts, no-fallback quality gates                               |
 
@@ -61,6 +62,8 @@ As a general GraphRAG platform, SymboGraph's knowledge-base concept is not limit
 | Adaptive quality system      | Signal-policy-profile-judge tiered filtering with domain-aware baselines for chunk, concept, and relation quality                                |
 | Observable QA                | Retrieval audits, model-call audits, agent traces, citations, and failure reasons are stored                                                     |
 | Runtime checks               | Health checks, runtime checks, fallback state, Qdrant status, and model endpoint status are exposed                                              |
+| Auto HPO                     | When `ENABLE_AUTO_HPO=true`, automatically runs TPE optimization before graph rebuild to find optimal thresholds and weight combinations     |
+| Incremental graph update     | Recomputes only subgraphs tied to changed documents, avoiding unnecessary full rebuilds                                                          |
 
 ## System Architecture
 
@@ -74,19 +77,20 @@ flowchart TB
         API --> RETRIEVAL["Retrieval Pipeline<br/>dense/BM25 -> fusion -> rerank -> parent context"]
         API --> GRAPH["Graph Pipeline<br/>LLM candidates -> quality filter -> vector similarity graph -> sparse graph -> communities/centrality/inference"]
         API --> QA["Agentic QA<br/>Perception -> Planning -> Retrieval -> EvidenceEvaluator -> Generation"]
-        API --> QUALITY["Quality System<br/>signal extraction -> policy decision -> domain profile -> LLM judge"]
+        API -.-> QUALITY["Quality System<br/>internal library invoked by pipelines"]
     end
 
     subgraph STORE["Storage And Runtime"]
         PG[("PostgreSQL<br/>metadata, chunks, sparse graph, audit records, quality profiles")]
         QD[("Qdrant<br/>chunk vectors and similarity recall")]
-        RD[("Redis<br/>runtime cache, embedding / retrieval cache, judge cache, task coordination")]
+        RD[("Redis<br/>runtime cache, embedding / retrieval cache, judge cache, distributed locks, Celery broker")]
         FS["data/<br/>knowledge-base files, parser artifacts, local persistence"]
     end
 
     subgraph MODEL["Model API"]
         EMB["OpenAI-compatible Embedding API<br/>independent endpoint config"]
         CHAT["OpenAI-compatible Chat API<br/>independent endpoint config"]
+        MB["Model Bridge<br/>host model bridge (optional)"]
     end
 
     API --> PG
@@ -95,6 +99,7 @@ flowchart TB
     API --> FS
     API --> EMB
     API --> CHAT
+    API --> MB
 ```
 
 ## Data Flow
@@ -114,16 +119,23 @@ sequenceDiagram
     API->>DB: Create batch, job, document/version state
     API->>Files: Store original file and parser artifacts
     API->>API: Parse chapters, pages, tables, formulas, and Notebook cells
-    API->>API: Create parent/child chunks and context-enriched text
-    API->>API: Quality signal extraction and policy routing (discard/summary/retrieval/graph)
-    API->>Model: Generate summaries, keywords, and embeddings
-    API->>Vector: Upsert active chunk vectors
+    API->>API: Create parent/child chunks (with inline quality signal extraction and discard)
+    API->>API: Adaptive chunking: dynamically select chunk_size / overlap / strategy per section
+    API->>Model: Generate parent chunk summaries and keywords (ChatProvider)
+    API->>API: Generate context-enriched text (contextual_embedding_text)
+    API->>Model: Generate embeddings for all chunks (EmbeddingProvider)
+    API->>Vector: Upsert active chunk vectors (with zero-vector check and compensation)
     API->>DB: Activate document version and chunks
-    API->>Model: Extract entity/relation candidates
-    API->>API: Quality filtering (concept accept/reject, relation accept/candidate)
-    API->>API: Run sparse graph construction, communities, centrality, and inference
-    API->>DB: Store concepts, relations, evidence, and graph-algorithm fields
-    API->>DB: Incremental update: recompute only subgraphs tied to changed documents
+    API->>Model: Extract entity/relation candidates (adaptive best-first chunk subset)
+    API->>DB: Store concepts, relations, and evidence (with internal quality filtering)
+    API->>API: Auto hyperparameter optimization (optional): TPE iterative search
+    alt Full rebuild
+        API->>API: Run sparse graph construction, communities, centrality, and inference
+        API->>DB: Store graph-algorithm fields (centrality, communities, ranks)
+        API->>API: Generate community summaries
+    else Incremental update
+        API->>DB: Recompute only subgraphs tied to changed documents
+    end
     API-->>Web: Stream logs, progress, retry, and failure state over SSE
 ```
 
@@ -140,6 +152,93 @@ Ingestion uses explicit batch / job state and file-level locks. A knowledge base
 5. When `SEMANTIC_CHUNKING_ENABLED=true` and text length reaches `SEMANTIC_CHUNKING_MIN_LENGTH`, embedding similarity can assist chunk boundary selection.
 
 > **Design Intent (Why we do this)**: Fixed-size chunking leads to severe context fragmentation. Using a parent-child hierarchy and semantic chunking ensures the model leverages the high precision of child chunks during retrieval, while accessing the full context of parent chunks during generation. This completely decouples the "retrieval unit" from the "generation unit".
+
+### Adaptive Chunking Profile Selection
+
+The hierarchical strategy above does not use globally fixed `chunk_size` and `chunk_overlap`. For each `ParsedSection`, the system dynamically analyzes its content features before chunking and selects the optimal parameter combination from a candidate configuration space. This process emits a `chunk_adaptive` SSE event.
+
+**Document Feature Vector**: A 12-dimensional normalized feature vector is extracted for each section:
+
+| Feature | Formula | Description |
+|---------|---------|-------------|
+| Text length | $\min(1, L_{\text{tokens}} / 1800)$ | Normalized token count |
+| Mean semantic-unit length | $\min(1, \bar{l}_{\text{unit}} / 80)$ | Average token length per semantic unit |
+| Length coefficient of variation | $\min(1, \sigma_l / \max(\bar{l}_{\text{unit}}, 1))$ | Dispersion of semantic-unit lengths |
+| Definition density | From semantic-density signals | Ratio of definitional statements |
+| Entity density | From semantic-density signals | Ratio of named entities |
+| Term density | From semantic-density signals | Ratio of domain terms |
+| Unique-token ratio | From semantic-density signals | Lexical richness after deduplication |
+| Formula signal | $\min\bigl(1, \frac{12 N_{\text{formula}}}{L_{\text{tokens}}} + 0.35 \cdot \mathbf{1}_{\text{has\_formula}}\bigr)$ | Formula density |
+| Table signal | $\mathbf{1}_{\text{has\_table}}$ | Whether the section contains tables |
+| Code-marker ratio | Code lines / total lines | Fraction of lines with `def`/`class`/`import` etc. |
+| Symbol ratio | $\min(1, \frac{4 N_{\text{symbol}}}{L_{\text{chars}}})$ | Fraction of non-alphanumeric symbols |
+| Structural noise | $\max(S_{\text{structural}}, 20 R_{\text{mojibake}})$ | Structural anomalies and mojibake risk |
+
+**Spectral Document Shape**: The section is split into semantic units; each unit produces a feature vector. A covariance matrix is built from these vectors and eigendecomposed:
+
+$$
+\lambda_1 \ge \lambda_2 \ge \lambda_3 \ge \lambda_4,\qquad
+\tilde{\lambda}_k = \frac{\lambda_k}{\sum_{j=1}^4 \lambda_j}
+$$
+
+The spectral gap $\rho = \tilde{\lambda}_1 - \tilde{\lambda}_2$ measures semantic consistency; the semantic curvature $\kappa$ measures feature drift between adjacent semantic units.
+
+**Candidate Configuration Space** (chunk_size, overlap, strategy):
+
+| chunk_size | overlap | strategy |
+|-----------|---------|----------|
+| 512 | 64 | `sentence_aware` |
+| 640 | 96 | `sentence_aware` |
+| 800 | 120 | `semantic_or_sentence` |
+| 960 | 144 | `semantic_or_sentence` |
+| 700 | 160 | `recursive_structure_preserving` |
+
+**Scoring Mechanism**: A composite score is computed for each candidate.
+
+Complexity (structural disorder of the content):
+
+$$
+\gamma = \min\!\Bigl(1,\; 0.22 \cdot c_v + 0.18 \cdot f + 0.16 \cdot t + 0.18 \cdot r_{\text{code}} + 0.16 \cdot r_{\text{sym}} + 0.10 \cdot \kappa\Bigr)
+$$
+
+Density (knowledge richness):
+
+$$
+\delta = \min\!\Bigl(1,\; 0.35 \cdot d_{\text{term}} + 0.30 \cdot d_{\text{entity}} + 0.20 \cdot d_{\text{def}} + 0.15 \cdot r_{\text{unique}}\Bigr)
+$$
+
+Target size and overlap (driven by complexity and density):
+
+$$
+S^* = 920 - 380\,\gamma + 160\,\delta + 100\,\rho,\qquad
+O^* = 80 + 130\,\gamma + 40\,\kappa
+$$
+
+Fitness scores:
+
+$$
+\phi_{\text{size}} = 1 - \min\!\Bigl(1, \frac{|S - S^*|}{700}\Bigr),\qquad
+\phi_{\text{overlap}} = 1 - \min\!\Bigl(1, \frac{|O - O^*|}{220}\Bigr)
+$$
+
+Strategy bonus:
+
+$$
+\beta =
+\begin{cases}
+0.08 \cdot \max(\kappa, \delta) & \text{if strategy} = \text{`semantic\_or\_sentence'} \\
+0.10 \cdot r_{\text{code}} + 0.05 \cdot f & \text{if strategy} = \text{`recursive\_structure\_preserving'} \\
+0 & \text{otherwise}
+\end{cases}
+$$
+
+Composite score:
+
+$$
+\mathcal{F} = \max(0, \min(1,\; 0.54\,\phi_{\text{size}} + 0.26\,\phi_{\text{overlap}} + 0.14\,\delta - 0.10\,\nu + \beta))
+$$
+
+where $\nu$ is structural noise. The candidate with the highest $\mathcal{F}$ is selected as the chunking profile for the current section and persisted into chunk metadata.
 
 ### Context-Enriched Embeddings
 
@@ -255,35 +354,66 @@ The judge layer is an optional LLM-as-judge enhancement:
 
 SymboGraph graph construction is not a single KNN or LLM extraction procedure. It is an evidence-first, multi-stage pipeline: the LLM discovers candidate entities and explicit semantic relations, quality gates enforce factual constraints, vector similarity provides controlled semantic candidates, classic graph algorithms analyze structure, and LLM evidence completion plus Dijkstra inference repair only local structure within audited boundaries. PostgreSQL is the source of truth for concepts, relations, and lifecycle state; Qdrant provides chunk vectors and similarity signals, but does not decide factual relations by itself.
 
+This update introduces three major capabilities: **adaptive best-first chunk selection**, **TPE automatic hyperparameter optimization**, and **incremental graph updates**:
+- **Adaptive Best-First**: Dynamically selects the most information-gain chunks for LLM extraction based on six coverage signals (document, chapter, section, content kind, embedding cluster proxy, and low-frequency terms), avoiding indiscriminate calls to all chunks.
+- **TPE Hyperparameter Optimization**: Optionally runs Auto HPO before full rebuild, using Optuna's `TPESampler` over 30 trials to automatically search for the optimal Dijkstra semantic threshold, relation confidence threshold, and graph algorithm weight combinations.
+- **Incremental Update**: Only recomputes subgraphs tied to changed documents, preserving concepts and relations from unchanged documents, significantly reducing update costs.
+
 ```mermaid
 flowchart TB
     CHUNK["Active child chunks<br/>passed ChunkQualityPolicy"] --> VEC["Qdrant chunk vectors<br/>derived vector signals"]
     CHUNK --> LLM["LLM extraction<br/>candidate entities + explicit relations"]
 
-    LLM --> CONCEPT_GATE["ConceptQualityPolicy<br/>entity quality filter"]
-    LLM --> REL_GATE["RelationQualityPolicy + hard gate<br/>relation type / confidence / evidence match"]
-    CONCEPT_GATE --> MERGE["Concept merge<br/>canonical name, aliases, dedupe, chapter refs"]
-    REL_GATE --> EXPLICIT["Verified explicit relations<br/>evidence-supported factual edges"]
+    LLM --> MERGE["Concept merge<br/>canonical name, aliases, dedupe, chapter refs"]
+    MERGE --> CONCEPT_GATE["ConceptQualityPolicy<br/>entity quality filter"]
+    CONCEPT_GATE --> UPSERT["Upsert graph candidates<br/>concepts, relations, evidence with hard gate"]
 
     VEC --> CENTROID["Concept vector centroid<br/>evidence chunk centroid + L2 normalization"]
-    MERGE --> CENTROID
+    UPSERT --> CENTROID
     CENTROID --> SPARSE["Semantic sparse candidates<br/>dynamic KNN + semantic threshold + mutual/inbound quota"]
-    SPARSE --> CANDIDATE["semantic_sparse candidates<br/>candidate_only, not factual edges by default"]
+    SPARSE --> CANDIDATE["GraphRelationCandidate<br/>candidate_only, not factual edges by default"]
 
-    EXPLICIT --> GRAPH["Verified graph<br/>default graph for centrality/community analysis"]
-    CANDIDATE --> GRAPH_AUDIT["candidate pool / audit / repair hints"]
-    GRAPH --> ANALYZE["Graph algorithms<br/>components, Louvain, spectral, centrality, pruning"]
-    ANALYZE --> COMPLETE["LLM relation completion<br/>only from evidence snippets in high-rank neighborhoods"]
-    COMPLETE --> REL_GATE
-    ANALYZE --> DIJK["Dijkstra inferred links<br/>2-3 hop structural hypotheses"]
-    DIJK --> INFERRED["dijkstra_inferred<br/>inferred edges / navigation hints"]
-    INFERRED --> GRAPH_AUDIT
+    UPSERT --> EXPLICIT["Verified explicit relations<br/>evidence-supported factual edges"]
+    CANDIDATE --> GRAPH["Verified graph + candidates<br/>input for centrality/community analysis"]
+    EXPLICIT --> GRAPH
 
-    ANALYZE --> PG["PostgreSQL graph tables<br/>concepts, verified relations, candidates, metrics"]
-    GRAPH_AUDIT --> PG
+    UPSERT --> HPO["Auto HPO (optional)<br/>TPE from probe chunks"]
+    GRAPH --> ENRICH["enrich_course_graph<br/>build_sparse_edges → analyze → complete → dijkstra → final analyze"]
+    HPO --> ENRICH
+    ENRICH --> COMMUNITY["Community summaries<br/>rebuild_graph_community_summaries"]
+    ENRICH --> PG["PostgreSQL graph tables<br/>concepts, verified relations, candidates, metrics"]
+
     PG --> RETRIEVAL["Evidence-first retrieval<br/>expands only along auditable evidence"]
     PG --> UI["Community-aware graph UI"]
 ```
+
+### 0. Adaptive Best-First Chunk Selection
+
+Before LLM extraction, the system does not blindly call the model on all active chunks. Instead, it builds an **adaptive extraction plan** that prioritizes chunks by information gain:
+
+$$
+\Delta_{\text{cov}}(c) = \sum_{d \in \text{new}(c)} w_d + \sum_{h \in \text{new}(c)} w_h + \sum_{s \in \text{new}(c)} w_s + \sum_{k \in \text{new}(c)} w_k + \sum_{e \in \text{new}(c)} w_e + \sum_{t \in \text{new}(c)} w_t
+$$
+
+Where $\text{new}(c)$ denotes newly covered dimensions when chunk $c$ is added. The coverage dimensions and weights are:
+
+| Dimension | Weight | Description |
+|-----------|--------|-------------|
+| Document coverage | $0.18$ | First time a document is covered |
+| Chapter coverage | $0.16$ | First time a chapter is covered |
+| Section coverage | $0.10$ | First time a section is covered |
+| Content kind coverage | $0.08$ | First time a content kind is covered |
+| Embedding cluster proxy | $0.12$ | First time a cluster is covered |
+| Low-frequency terms | $\min(0.18, 0.015 \cdot n_{\text{rare}})$ | Weighted by number of new rare terms |
+| Graph gap fill | $0.08$ | Bonus when the current graph lacks concepts linked to this chunk |
+
+Selection uses a **greedy best-first** strategy: at each step, pick the unselected chunk with maximum $\Delta_{\text{cov}}$. Stopping criteria:
+- Cumulative coverage exceeds threshold (default $0.85$)
+- Marginal gain $\Delta_{\text{cov}} < 0.03$
+- Soft-start budget reached (`GRAPH_EXTRACTION_SOFT_START_BUDGET`, default 120)
+- All chunks selected
+
+Selected chunks enter LLM graph extraction; remaining chunks stay in the vector store and retrieval system but do not consume model call budget.
 
 ### 1. Entities And Evidence
 
@@ -294,7 +424,7 @@ $$
 \mathbf{x}_i = \frac{\bar{\mathbf{x}}_i}{\lVert \bar{\mathbf{x}}_i\rVert_2}
 $$
 
-*C*`<sub>`i`</sub>` is the set of active child chunks supporting concept *i*, and \(\mathbf{z}_c\) is the chunk embedding. The purpose is to keep concept vectors faithful to the local course material instead of the LLM's generic pre-training semantics for the concept name.
+*C*`<sub>`i`</sub>` is the set of active child chunks supporting concept *i*, and $\mathbf{z}_c$ is the chunk embedding. The purpose is to keep concept vectors faithful to the local course material instead of the LLM's generic pre-training semantics for the concept name.
 
 ### 2. Explicit LLM Relations And Quality Gates
 
@@ -357,7 +487,64 @@ $$
 
 If endpoint semantic similarity is high and path cost is low, the system may write an inferred edge with `relation_source="dijkstra_inferred"`. Inferred edges are navigation, audit, and candidate-completion hints; they are not unconditional facts. Answers must still return to original chunk evidence.
 
-### 6. Collaboration Boundaries And Caveats
+### 6. TPE Automatic Hyperparameter Optimization (Auto HPO)
+
+When `ENABLE_AUTO_HPO=true`, the system automatically runs hyperparameter optimization before a **full rebuild**. HPO does not trial directly on the full graph (too expensive); instead, it builds a surrogate evaluation from a small set of **probe chunks** (default 5):
+
+**Phase 1 — Candidate Generation and Feature Extraction**:
+Generate candidate parameter sets from multiple seeds (conservative, aggressive, balanced, and random interpolations). For each parameter set, build a mock graph from pre-extracted probe payloads and extract features:
+- Graph scale features: node count, edge count, connected component count, average degree
+- Structural quality features: community modularity, clustering coefficient, centrality distribution entropy
+- Semantic features: Dijkstra inferred edge ratio, LLM explicit relation ratio, semantic sparse edge ratio
+- Hard constraint checks: excessive isolated nodes, edge count explosion, community degradation
+
+**Phase 2 — Pairwise Judge**:
+Use LLM as a judge to perform pairwise comparisons (A vs B) of candidate parameters, outputting `winner`, `confidence`, and `reasons`. After collecting at least `HPO_JUDGE_MIN_LABELS` (default 6) valid labels, train a **judge-learned surrogate objective function**:
+
+$$
+\mathcal{L}(\mathbf{f}, \mathbf{w}, b) = \sum_{(i,j) \in \mathcal{P}} \mathbb{1}[\hat{y}_{ij} = y_{ij}] \cdot \max(0, \; |s_i - s_j| - \epsilon)
+$$
+
+Where $\mathcal{P}$ is the set of judge-labeled candidate pairs, $\mathbf{f}$ is the feature vector, $\mathbf{w}$ is the learned weight vector, and $s_i = \mathbf{w}^\top \mathbf{f}_i + b$ is the candidate score. The surrogate objective maps high-dimensional features to a scalar quality score, so subsequent TPE only needs to optimize a scalar target.
+
+**Phase 3 — TPE Iterative Optimization**:
+Use Optuna's `TPESampler` (Tree-structured Parzen Estimator) to maximize the surrogate objective over 30 trials:
+
+$$
+\theta^* = \arg\max_{\theta \in \Theta} \; g_{\text{surrogate}}(\theta; \mathcal{D}_{\text{probe}})
+$$
+
+Where $\theta$ is an 11-dimensional hyperparameter vector:
+
+| Hyperparameter | Search Range | Default | Description |
+|----------------|--------------|---------|-------------|
+| `min_relation_confidence` | $[0.50, 0.85]$ | $0.62$ | Minimum relation confidence |
+| `min_accepted_relation_weight` | $[0.45, 0.78]$ | $0.56$ | Minimum accepted relation weight |
+| `dijkstra_semantic_threshold` | $[0.65, 0.88]$ | $0.74$ | Dijkstra inference semantic threshold |
+| `w_pagerank` | $[0.05, 0.50]$ | $0.20$ | PageRank weight |
+| `w_betweenness` | $[0.05, 0.50]$ | $0.20$ | Betweenness weight |
+| `w_degree` | $[0.05, 0.50]$ | $0.25$ | Degree weight |
+| `w_weighted_degree` | $[0.05, 0.50]$ | $0.25$ | Weighted degree weight |
+| `w_closeness` | $[0.05, 0.30]$ | $0.10$ | Closeness weight |
+| `w_centrality` | $[0.10, 0.80]$ | $0.50$ | Combined centrality weight |
+| `w_llm_importance` | $[0.05, 0.60]$ | $0.25$ | LLM importance weight |
+| `w_evidence` | $[0.05, 0.60]$ | $0.25$ | Evidence weight |
+
+The optimal parameters are persisted to the `course_model_hyperparameters` table and injected into `GraphHyperparameters` during full rebuild. If HPO fails, the system falls back to the last successful parameters or defaults.
+
+### 7. Incremental Graph Updates
+
+For partial knowledge-base changes (e.g., modifying or deleting a few documents), the system supports **incremental graph updates**, avoiding unnecessary full rebuilds:
+
+1. **Change Detection**: Compare changed document chunks with current graph evidence to identify affected concepts and relations.
+2. **Local Cleanup**: Call `delete_document_graph_incremental` to remove concepts, aliases, and relations supported only by changed documents; concepts and relations supported by other documents remain unaffected.
+3. **Local Re-extraction**: Run adaptive best-first selection and LLM extraction on changed documents' active chunks.
+4. **Local Recomputation**: When running graph algorithms (communities, centrality), only recompute affected subgraphs; unaffected nodes and edges retain their original metrics.
+5. **Transaction Consistency**: All cleanup and re-extraction operations are performed within an explicit transaction; on failure, rollback ensures the graph never ends up in a half-deleted state.
+
+Incremental update time complexity is proportional to the number of changed documents, not the total chunk count. When too many documents change or for initial construction, the system automatically falls back to full rebuild.
+
+### 8. Collaboration Boundaries And Caveats
 
 The architecture does not let any single algorithm decide the graph alone. Its signals constrain each other:
 
@@ -570,17 +757,26 @@ erDiagram
     Course ||--o{ Document : has
     Document ||--o{ DocumentVersion : versions
     DocumentVersion ||--o{ Chunk : chunks
-    Chunk ||--o{ Chunk : children
+    Chunk --o{ Chunk : children
     Course ||--o{ Concept : has
     Concept ||--o{ ConceptAlias : aliases
-    Concept ||--o{ ConceptRelation : source
-    Concept ||--o{ ConceptRelation : target
+    Concept --o{ ConceptRelation : source
+    Concept --o{ ConceptRelation : target
     Course ||--o{ IngestionBatch : batches
     IngestionBatch ||--o{ IngestionJob : jobs
-    Course ||--o{ QualityProfile : profiles
+    Course --o{ QualityProfile : profiles
     Course ||--o{ QASession : sessions
-    QASession ||--o{ AgentRun : runs
-    AgentRun ||--o{ AgentTraceEvent : traces
+    QASession --o{ AgentRun : runs
+    AgentRun --o{ AgentTraceEvent : traces
+    Course --o{ CourseModelHyperparameter : hyperparameters
+    Course --o{ GraphExtractionRun : extraction_runs
+    GraphExtractionRun ||--o{ GraphExtractionChunkTask : tasks
+    Course --o{ GraphHpoJudgeSample : hpo_judge_samples
+    Course --o{ GraphHpoObjectiveModel : hpo_objective_models
+    Concept --o{ EntityMention : mentions
+    Concept --o{ EntityMergeCandidate : merge_candidates
+    Concept --o{ GraphRelationCandidate : relation_candidates
+    Concept --o{ GraphCommunitySummary : community_summaries
 ```
 
 | Table                                               | Purpose                                                                                                          |
@@ -595,6 +791,12 @@ erDiagram
 | `ingestion_batches` / `ingestion_jobs`              | Batch ingestion and single-file jobs                                                                             |
 | `ingestion_logs` / `ingestion_compensation_logs`    | Event streams and cross-store compensation records                                                               |
 | `qa_sessions` / `agent_runs` / `agent_trace_events` | QA sessions, agent runs, and observable traces                                                                   |
+| `course_model_hyperparameters`                      | Course-level HPO hyperparameter records (versioned, auditable, fallback)                                         |
+| `graph_extraction_runs` / `graph_extraction_chunk_tasks` | Adaptive graph extraction run state and per-chunk task tracking                                             |
+| `graph_hpo_judge_samples` / `graph_hpo_objective_models` | HPO judge samples and surrogate objective model persistence                                                      |
+| `entity_mentions` / `entity_merge_candidates`         | Entity mention records and LLM-verified merge candidates                                                         |
+| `graph_relation_candidates`                           | Candidate relations from semantic sparse graph (not factual edges)                                               |
+| `graph_community_summaries`                           | Community summary text and community-level aggregate metrics                                                     |
 
 ## Configuration
 
@@ -632,6 +834,10 @@ Common variables:
 | `CITATION_VERIFICATION_SAMPLE_MAX`                                                                           | Citation verification sample size per answer, default `3`                                         |
 | `REFLECTION_MAX_RETRIES`                                                                                     | Max reflection-triggered correction retries, default `2`                                          |
 | `MODEL_BRIDGE_ENABLED` / `MODEL_BRIDGE_PORT`                                                                 | Host model-bridge switch and port                                                                 |
+| `ENABLE_AUTO_HPO`                                                                                            | Auto-run TPE hyperparameter optimization before graph rebuild, default `false`                    |
+| `HPO_JUDGE_MAX_CANDIDATES` / `HPO_JUDGE_MAX_PAIRS` / `HPO_JUDGE_MIN_LABELS`                                  | HPO judge candidate count, pairwise comparison count, minimum valid labels                        |
+| `HPO_JUDGE_MAX_TOKENS_PER_PAIR` / `HPO_JUDGE_CONCURRENCY`                                                    | Max tokens per judge pair and concurrency                                                         |
+| `GRAPH_EXTRACTION_SOFT_START_BUDGET` / `GRAPH_EXTRACTION_RESUME_BATCH_SIZE`                                  | Adaptive graph extraction initial budget and per-batch model-call chunk count                     |
 
 Docker Compose overrides infrastructure URLs inside the API container:
 
@@ -753,7 +959,7 @@ Validation focus:
 
 ## Core Innovations
 
-SymboGraph's core innovations in the general GraphRAG direction can be summarized in six points:
+SymboGraph's core innovations in the general GraphRAG direction can be summarized in seven points:
 
 **1. Four-Tier Adaptive Quality Architecture**
 Unlike traditional systems with single-threshold filtering, SymboGraph establishes a signal-policy-profile-judge four-tier quality system. Chunks are no longer limited to "keep/discard" binary fates; instead, they are routed to one of six downstream paths (`discard`, `summary_only`, `evidence_only`, `retrieval_candidate`, `graph_candidate`, `embed_only`). Concepts and relations undergo differentiated policy filtering as well. Domain quality profiles give each knowledge base an adaptive quality baseline rather than relying on global fixed thresholds.
@@ -772,6 +978,9 @@ At retrieval time, only the finest-grained units (child chunks) enter dense/BM25
 
 **6. Graph-Theoretic Algorithms Hedging LLM Stochasticity**
 Louvain community detection, spectral clustering, connected-component ablation, multidimensional centrality (degree / PageRank / betweenness / closeness), and Dijkstra hidden-link discovery together form a systematic hedge against LLM extraction noise. The graph is not a passive container for LLM output but a sparse knowledge skeleton rigorously cleaned by graph theory.
+
+**7. TPE Automatic Hyperparameter Optimization and Incremental Updates**
+Traditional GraphRAG systems use fixed hyperparameters (thresholds, weights) for all knowledge bases, unable to adapt to different domains' semantic density and concept distribution. SymboGraph introduces Optuna TPE auto-optimization: based on probe chunk pre-extraction, LLM pairwise judging, and a surrogate objective function, it searches for the optimal Dijkstra threshold, relation confidence, and graph algorithm weights over 30 trials. The best parameters are versioned and persisted, with automatic fallback on failure. Incremental graph updates are also supported, recomputing only subgraphs tied to changed documents and avoiding the redundant cost of full rebuilds.
 
 ## Version Control Rules
 

@@ -1,49 +1,22 @@
 "use client";
 
-import { useEffect, useMemo, useState, type MouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { motion } from "framer-motion";
-import type { CourseFileStatus, CourseFileSummary } from "@course-kg/shared";
+import { AnimatePresence, motion } from "framer-motion";
+import type { CourseFileStatus, CourseFileSummary, IngestionLogEvent } from "@course-kg/shared";
 import { AlertCircle, CheckCircle2, Clock3, Database, FileCheck2, Files, LoaderCircle, Network, PanelRightOpen, RefreshCcw, Trash2, UploadCloud, X } from "lucide-react";
 
-import { cleanupStaleData, cleanupStaleGraph, createBatchLogToken, fetchBatchStatus, fetchCourseFiles, fetchDashboard, getBatchLogUrl, parseUploadedFiles, removeCourseFile, uploadFile } from "@/lib/api";
+import { cleanupStaleData, cleanupStaleGraph, createBatchLogToken, fetchBatchStatus, fetchCourseFiles, fetchDashboard, getBatchLogUrl, parseUploadedFiles, rebuildGraph, removeCourseFile, uploadFile } from "@/lib/api";
 import { useCourseContext } from "@/components/course-context";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
+import { graphLogSummary, hpoLogSummary, logEventLabel as richLogEventLabel, logVisualTone } from "@/lib/ingestion-log-meta";
 
 type UploadedFile = {
   name: string;
   path: string;
-};
-
-type IngestionLogEvent = {
-  timestamp: string;
-  event: string;
-  message: string;
-  source_path?: string;
-  state?: string;
-  processed_files?: number;
-  total_files?: number;
-  success_count?: number;
-  failure_count?: number;
-  skipped_count?: number;
-  error?: string;
-  provider?: string;
-  model?: string;
-  external_called?: boolean;
-  fallback_reason?: string | null;
-  vector_count?: number;
-  embedding_provider?: string;
-  embedding_model?: string;
-  embedding_external_called?: boolean;
-  embedding_fallback_reason?: string | null;
-  embedding_fallback_method?: string | null;
-  graph_extraction_provider?: string;
-  graph_extraction_model?: string;
-  retry_count?: number;
-  max_retries?: number;
 };
 
 const terminalLogEvents = new Set(["batch_completed", "batch_failed", "batch_partial_failed", "batch_skipped", "batch_missing"]);
@@ -72,6 +45,10 @@ const logEventLabels: Record<string, string> = {
   batch_skipped: "批次跳过",
   batch_missing: "批次丢失",
   log_stream_retry: "日志重连",
+  chunk_adaptive: "分块自适应",
+  hpo_started: "自动调参开始",
+  hpo_completed: "自动调参完成",
+  hpo_failed: "自动调参失败",
 };
 
 function logEventLabel(event: string): string {
@@ -178,11 +155,29 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   const [activeLogBatchId, setActiveLogBatchId] = useLocalStorage<string | null>(`upload.activeLogBatchId.${storageScope}`, null);
   const [logOpen, setLogOpen] = useState(false);
   const [logs, setLogs] = useLocalStorage<IngestionLogEvent[]>(`upload.logs.${storageScope}`, []);
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
+    }
+  }, [logs]);
+
   const [selectedFilePathValues, setSelectedFilePathValues] = useLocalStorage<string[]>(`upload.selectedFilePaths.${storageScope}`, []);
   const [cleanupMessage, setCleanupMessage] = useState<string | null>(null);
   const [cleanupDialog, setCleanupDialog] = useState<"data" | "graph" | null>(null);
   const [failureDialog, setFailureDialog] = useState<{ title: string; message: string; details?: string | null } | null>(null);
   const [logStreamRetryCount, setLogStreamRetryCount] = useState(0);
+  const [rebuildMode, setRebuildMode] = useState<"incremental" | "full">("incremental");
+  const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string;
+    message: string;
+    onConfirm: () => void;
+    confirmText?: string;
+    variant?: "default" | "danger";
+  } | null>(null);
+  const [removeFileTarget, setRemoveFileTarget] = useState<FileBrowserItem | null>(null);
 
   const dashboardQuery = useQuery({
     queryKey: ["dashboard", selectedCourseId],
@@ -190,7 +185,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     enabled: Boolean(selectedCourseId),
   });
   const activeBatchCandidate = batchId ?? dashboardQuery.data?.batch_status?.batch_id ?? null;
-  const activeBatchId = activeBatchCandidate && activeBatchCandidate !== dismissedBatchId ? activeBatchCandidate : null;
+  const isBatchTerminal = dashboardQuery.data?.batch_status?.state && terminalBatchStates.has(dashboardQuery.data.batch_status.state);
+  const activeBatchId = activeBatchCandidate && (activeBatchCandidate !== dismissedBatchId || !isBatchTerminal) ? activeBatchCandidate : null;
   const batchQuery = useQuery({
     queryKey: ["batch", selectedCourseId, activeBatchId],
     queryFn: () => fetchBatchStatus(activeBatchId as string),
@@ -267,6 +263,29 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       setFailureDialog({
         title: "解析启动失败",
         message: error instanceof Error ? error.message : "解析任务启动失败，后端未返回错误详情。",
+      });
+    },
+  });
+
+  const rebuildGraphMutation = useMutation({
+    mutationFn: () => rebuildGraph(selectedCourseId, rebuildMode, false),
+    onSuccess: (data) => {
+      if (!data.batch_id) {
+        return;
+      }
+      setBatchId(data.batch_id);
+      setDismissedBatchId(null);
+      setActiveLogBatchId(data.batch_id);
+      setLogs([]);
+      setLogOpen(true);
+      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["graph", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["concepts", selectedCourseId] });
+    },
+    onError: (error) => {
+      setFailureDialog({
+        title: rebuildMode === "incremental" ? "图谱最小更新启动失败" : "图谱重建启动失败",
+        message: error instanceof Error ? error.message : "图谱重建任务启动失败，后端未返回错误详情。",
       });
     },
   });
@@ -385,6 +404,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
           return current;
         }
         setLogs([]);
+        setLogOpen(true);
         return activeBatchId;
       });
     });
@@ -456,11 +476,23 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         }
         retryCount = 0;
         setLogStreamRetryCount(0);
-        const item = JSON.parse(event.data) as IngestionLogEvent;
+        const rawItem = JSON.parse(event.data) as IngestionLogEvent;
+        const mappedMessage = rawItem.message
+          ? rawItem.message
+              .replace(/增量更新/g, "最小更新")
+              .replace(/增量重建/g, "最小重建")
+              .replace(/正在增量更新课程图谱/g, "正在最小更新课程图谱")
+              .replace(/增量图谱更新失败/g, "最小图谱更新失败")
+              .replace(/没有检测到变更文档，跳过增量更新/g, "没有检测到变更文档，跳过最小更新")
+          : rawItem.message;
+        const item = {
+          ...rawItem,
+          message: mappedMessage,
+        };
         appendLog(item);
         if (failureLogEvents.has(item.event)) {
           setFailureDialog({
-            title: item.event === "graph_failed" ? "图谱重建失败" : "解析失败",
+            title: item.event === "graph_failed" ? (item.message?.includes("最小") ? "图谱更新失败" : "图谱重建失败") : "解析失败",
             message: item.message || "任务失败，后端未返回错误详情。",
             details: item.error ?? null,
           });
@@ -572,8 +604,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   const cleanupTitle = cleanupDialog === "data" ? "清理数据库" : "清理图谱";
   const cleanupDescription =
     cleanupDialog === "data"
-      ? "清理当前资料库的 inactive 数据库记录和 Qdrant stale 向量，当前有效数据会保留。"
-      : "清理当前资料库的陈旧图谱关系和孤立概念，不会重建图谱。";
+      ? "清理当前资料库的旧版本/陈旧 inactive 数据库记录和 Qdrant 向量，仅保留当前最新版本的有效数据。"
+      : "清理当前资料库的旧版本/陈旧图谱关系和孤立概念，仅保留当前最新版本的有效图谱数据。";
 
   if (dashboardQuery.isLoading) {
     return <LoadingBlock rows={4} />;
@@ -598,7 +630,15 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
             <div className="flex flex-wrap gap-3">
               <button
                 type="button"
-                onClick={() => parseUploadsMutation.mutate({ paths: effectiveParseTargetPaths, force: false })}
+                onClick={() => {
+                  if (effectiveParseTargetPaths.length === 0) return;
+                  setConfirmDialog({
+                    title: "确认解析文件",
+                    message: `即将解析 ${effectiveParseTargetPaths.length} 个文件，包括切块、向量化和图谱更新。`,
+                    onConfirm: () => parseUploadsMutation.mutate({ paths: effectiveParseTargetPaths, force: false }),
+                    confirmText: "确认解析",
+                  });
+                }}
                 disabled={parseUploadsMutation.isPending || effectiveParseTargetPaths.length === 0}
                 className="rounded-full border border-emerald-300/35 bg-emerald-300/10 px-5 py-3 text-sm uppercase tracking-[0.24em] text-white disabled:opacity-50"
               >
@@ -607,13 +647,31 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               </button>
               <button
                 type="button"
-                onClick={() => parseUploadsMutation.mutate({ paths: parseTargetPaths, force: true })}
+                onClick={() => {
+                  if (parseTargetPaths.length === 0) return;
+                  setConfirmDialog({
+                    title: "确认全量重新解析",
+                    message: "强制重建当前资料库所有文件的片段、向量、Qdrant 向量记录和图谱。此操作会覆盖现有数据。",
+                    onConfirm: () => parseUploadsMutation.mutate({ paths: parseTargetPaths, force: true }),
+                    confirmText: "确认重建",
+                    variant: "danger",
+                  });
+                }}
                 disabled={parseUploadsMutation.isPending || parseTargetPaths.length === 0}
                 className="rounded-full border border-rose-300/30 bg-rose-300/8 px-4 py-3 text-xs uppercase tracking-[0.2em] text-rose-50/80 transition hover:text-white disabled:opacity-45"
                   title="强制重建当前资料库所有文件的片段、向量、Qdrant 向量记录和图谱"
               >
                 {parseUploadsMutation.isPending ? <LoaderCircle className="mr-2 inline size-3.5 animate-spin" /> : <RefreshCcw className="mr-2 inline size-3.5" />}
                 全量重新解析
+              </button>
+              <button
+                type="button"
+                onClick={() => setRebuildDialogOpen(true)}
+                disabled={rebuildGraphMutation.isPending || !selectedCourseId}
+                className="rounded-full border border-cyan-200/30 bg-cyan-300/10 px-4 py-3 text-xs uppercase tracking-[0.2em] text-cyan-50/80 transition hover:text-white disabled:opacity-45"
+              >
+                {rebuildGraphMutation.isPending ? <LoaderCircle className="mr-2 inline size-3.5 animate-spin" /> : <Network className="mr-2 inline size-3.5" />}
+                {rebuildGraphMutation.isPending ? "重建中..." : "重建图谱"}
               </button>
               <label
                 aria-disabled={uploadMutation.isPending}
@@ -646,9 +704,16 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                   }
                 }}
                 disabled={!activeBatchId}
-                className="rounded-full border border-white/12 px-4 py-3 text-white/72 transition hover:text-white disabled:opacity-40"
+                className={cn(
+                  "inline-flex items-center gap-2 rounded-full border px-5 py-3 text-sm uppercase tracking-[0.24em] transition disabled:opacity-40",
+                  activeBatchId
+                    ? "border-cyan-300/35 bg-cyan-300/10 text-cyan-50 hover:bg-cyan-300/20 hover:text-white"
+                    : "border-white/12 text-white/72"
+                )}
+                title={activeBatchId ? "查看实时日志" : "暂无活跃批次"}
               >
                 <PanelRightOpen className="size-4" />
+                {activeBatchId ? "查看实时日志" : "无活跃日志"}
               </button>
             </div>
             {selectedParseTargetPaths.length > 0 ? (
@@ -677,7 +742,14 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               <div className="max-w-2xl border-l border-cyan-200/20 bg-cyan-300/[0.035] py-3 pl-4 pr-2">
                 <div className="flex items-center justify-between gap-3">
                   <p className="text-xs uppercase tracking-[0.24em] text-white/45">已上传，待解析</p>
-                  <button type="button" className="text-xs uppercase tracking-[0.2em] text-white/48 hover:text-white" onClick={() => setUploadedFiles([])}>
+                  <button type="button" className="text-xs uppercase tracking-[0.2em] text-white/48 hover:text-white" onClick={() => {
+                    setConfirmDialog({
+                      title: "确认清空已上传文件",
+                      message: "即将清空待解析文件列表，已上传的文件不会从服务器删除。",
+                      onConfirm: () => setUploadedFiles([]),
+                      confirmText: "确认清空",
+                    });
+                  }}>
                     清空
                   </button>
                 </div>
@@ -800,7 +872,17 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                     type="button"
                     onClick={(event) => {
                       event.stopPropagation();
-                      handleRemoveFile(file);
+                      if (file.localOnly) {
+                        setConfirmDialog({
+                          title: "确认移除文件",
+                          message: `从待解析列表移除 ${file.title || fileNameFromPath(file.source_path)}？`,
+                          onConfirm: () => handleRemoveFile(file),
+                          confirmText: "确认移除",
+                          variant: "danger",
+                        });
+                      } else {
+                        setRemoveFileTarget(file);
+                      }
                     }}
                     disabled={file.status === "parsing" || removeFileMutation.isPending}
                     className="inline-flex shrink-0 items-center gap-2 rounded-full border border-white/10 px-3 py-2 text-xs text-white/62 transition hover:border-rose-200/35 hover:text-rose-100 disabled:pointer-events-none disabled:opacity-40"
@@ -927,6 +1009,136 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         </div>
       </section>
 
+      {/* 通用二次确认弹窗 */}
+      <Dialog open={confirmDialog !== null} onOpenChange={(open) => !open && setConfirmDialog(null)}>
+        <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.92)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl">
+          <DialogHeader className="border-b border-white/8 px-6 py-5">
+            <DialogTitle>{confirmDialog?.title ?? "确认操作"}</DialogTitle>
+            <DialogDescription>{confirmDialog?.message ?? "请确认是否继续执行此操作。"}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 px-6 py-5">
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmDialog(null)}
+                className="rounded-full border border-white/12 px-4 py-2 text-sm text-white/70 transition hover:text-white"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  confirmDialog?.onConfirm();
+                  setConfirmDialog(null);
+                }}
+                className={`rounded-full border px-4 py-2 text-sm transition hover:text-white ${
+                  confirmDialog?.variant === "danger"
+                    ? "border-rose-200/24 bg-rose-300/[0.08] text-rose-50/82 hover:bg-rose-300/12"
+                    : "border-cyan-200/24 bg-cyan-300/[0.08] text-cyan-50/82 hover:bg-cyan-300/12"
+                }`}
+              >
+                {confirmDialog?.confirmText ?? "确认"}
+              </button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* 移除文件确认弹窗 */}
+      <Dialog open={removeFileTarget !== null} onOpenChange={(open) => !open && setRemoveFileTarget(null)}>
+        <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.92)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl">
+          <DialogHeader className="border-b border-white/8 px-6 py-5">
+            <DialogTitle>确认移除文件</DialogTitle>
+            <DialogDescription>
+              即将从资料库移除 {removeFileTarget ? (removeFileTarget.title || fileNameFromPath(removeFileTarget.source_path)) : ""}，该文件的数据库记录、片段、向量和图谱关联将被清理。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 px-6 py-5">
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setRemoveFileTarget(null)}
+                className="rounded-full border border-white/12 px-4 py-2 text-sm text-white/70 transition hover:text-white"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (removeFileTarget) {
+                    handleRemoveFile(removeFileTarget);
+                  }
+                  setRemoveFileTarget(null);
+                }}
+                className="rounded-full border border-rose-200/24 bg-rose-300/[0.08] px-4 py-2 text-sm text-rose-50/82 transition hover:bg-rose-300/12 hover:text-white"
+              >
+                确认移除
+              </button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* 重建图谱模式选择弹窗 */}
+      <Dialog open={rebuildDialogOpen} onOpenChange={(open) => setRebuildDialogOpen(open)}>
+        <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.92)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl">
+          <DialogHeader className="border-b border-white/8 px-6 py-5">
+            <DialogTitle>重建课程图谱</DialogTitle>
+            <DialogDescription>
+              选择重建模式。重建会直接覆盖现有图谱数据，并通过日志流展示实时进度。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 px-6 py-5">
+            <label className={`flex cursor-pointer items-start gap-3 rounded-2xl border p-4 transition ${rebuildMode === "incremental" ? "border-cyan-200/30 bg-cyan-300/[0.06]" : "border-white/10 bg-white/[0.035] hover:bg-white/[0.05]"}`}>
+              <input
+                type="radio"
+                name="rebuild-mode"
+                className="mt-1"
+                checked={rebuildMode === "incremental"}
+                onChange={() => setRebuildMode("incremental")}
+              />
+              <div>
+                <p className="text-sm font-medium text-white">最小更新（推荐）</p>
+                <p className="mt-1 text-xs leading-5 text-white/60">仅更新变更文档相关的分块与图谱，直接覆盖且不备份，速度极快。</p>
+              </div>
+            </label>
+            <label className={`flex cursor-pointer items-start gap-3 rounded-2xl border p-4 transition ${rebuildMode === "full" ? "border-cyan-200/30 bg-cyan-300/[0.06]" : "border-white/10 bg-white/[0.035] hover:bg-white/[0.05]"}`}>
+              <input
+                type="radio"
+                name="rebuild-mode"
+                className="mt-1"
+                checked={rebuildMode === "full"}
+                onChange={() => setRebuildMode("full")}
+              />
+              <div>
+                <p className="text-sm font-medium text-white">全量重建</p>
+                <p className="mt-1 text-xs leading-5 text-white/60">完整重建当前资料库的 Semantic KG，耗时较长，会自动保留备份并在失败时回滚。</p>
+              </div>
+            </label>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setRebuildDialogOpen(false)}
+                className="rounded-full border border-white/12 px-4 py-2 text-sm text-white/70 transition hover:text-white"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={!selectedCourseId || rebuildGraphMutation.isPending}
+                onClick={() => {
+                  setRebuildDialogOpen(false);
+                  rebuildGraphMutation.mutate();
+                }}
+                className="rounded-full border border-cyan-200/24 bg-cyan-300/[0.08] px-4 py-2 text-sm text-cyan-50/82 transition hover:text-white disabled:pointer-events-none disabled:opacity-45"
+              >
+                {rebuildGraphMutation.isPending ? "启动中..." : "确认重建"}
+              </button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       <Dialog
         open={cleanupDialog !== null}
         onOpenChange={(open) => {
@@ -1006,15 +1218,22 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         </DialogContent>
       </Dialog>
 
-      {logOpen ? (
-        <div className="fixed inset-y-0 right-0 z-50 flex w-full justify-end bg-black/24 backdrop-blur-[2px] sm:w-auto sm:bg-transparent">
-          <motion.aside
-            initial={{ x: 420, opacity: 0 }}
-            animate={{ x: 0, opacity: 1 }}
-            exit={{ x: 420, opacity: 0 }}
-            className="h-full w-full max-w-[420px] border-l border-white/10 bg-[rgba(3,7,20,0.94)] p-5 text-white shadow-[0_0_60px_rgba(0,0,0,0.45)]"
+      <AnimatePresence>
+        {logOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-y-0 right-0 z-50 flex w-full justify-end bg-black/24 backdrop-blur-[2px] sm:w-auto sm:bg-transparent"
           >
-            <div className="flex items-start justify-between gap-4">
+            <motion.aside
+              initial={{ x: 420 }}
+              animate={{ x: 0 }}
+              exit={{ x: 420 }}
+              transition={{ type: "spring", damping: 25, stiffness: 200 }}
+              className="h-full w-full max-w-[420px] border-l border-white/10 bg-[rgba(3,7,20,0.94)] p-5 text-white shadow-[0_0_60px_rgba(0,0,0,0.45)]"
+            >
+              <div className="flex items-start justify-between gap-4">
               <div>
                 <p className="section-kicker">解析日志</p>
                 <h3 className="mt-2 text-xl font-semibold">导入日志流</h3>
@@ -1033,34 +1252,77 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               </p>
             ) : null}
 
-            <div className="mt-4 h-[calc(100%-132px)] overflow-y-auto pr-1">
+            <div ref={scrollContainerRef} className="mt-4 h-[calc(100%-132px)] overflow-y-auto pr-1">
               {logs.length > 0 ? (
                 <div className="space-y-3">
-                  {logs.map((item, index) => (
-                    <div key={`${item.timestamp}-${index}`} className="rounded-[18px] border border-white/8 bg-white/[0.03] px-4 py-3">
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="text-xs uppercase tracking-[0.2em] text-cyan-100/54">{logEventLabel(item.event)}</span>
-                        <span className="text-[11px] text-white/36">{new Date(item.timestamp).toLocaleTimeString()}</span>
-                      </div>
-                      <p className="mt-2 break-words text-sm leading-6 text-white/72">{item.message}</p>
-                      {typeof item.processed_files === "number" && typeof item.total_files === "number" ? (
-                        <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/8">
-                          <div
-                            className="h-full rounded-full bg-[linear-gradient(90deg,#64dfff,#7b7cff)] transition-[width] duration-300"
-                            style={{ width: `${item.total_files ? (item.processed_files / item.total_files) * 100 : 0}%` }}
-                          />
+                  {logs.map((item, index) => {
+                    const tone = logVisualTone(item);
+                    const hpoSummary = hpoLogSummary(item);
+                    const graphSummary = graphLogSummary(item);
+                    const phaseSummary = hpoSummary ?? graphSummary;
+                    const borderClass =
+                      tone === "adaptive"
+                        ? "border-cyan-500/20 bg-cyan-950/10"
+                        : tone === "graph"
+                        ? "border-sky-500/20 bg-sky-950/10"
+                        : tone === "hpo"
+                        ? "border-purple-500/20 bg-purple-950/10"
+                        : tone === "warning"
+                        ? "border-amber-400/22 bg-amber-950/10"
+                        : tone === "failure"
+                        ? "border-rose-400/24 bg-rose-950/12"
+                        : "border-white/8 bg-white/[0.03]";
+                    const tagColorClass =
+                      tone === "adaptive"
+                        ? "text-cyan-400 font-medium"
+                        : tone === "graph"
+                        ? "text-sky-300 font-medium"
+                        : tone === "hpo"
+                        ? "text-purple-300 font-semibold"
+                        : tone === "warning"
+                        ? "text-amber-200 font-semibold"
+                        : tone === "failure"
+                        ? "text-rose-200 font-semibold"
+                        : "text-cyan-100/54";
+                    const messageColorClass =
+                      tone === "hpo"
+                        ? "text-purple-100/90"
+                        : tone === "graph"
+                        ? "text-sky-100/90"
+                        : tone === "adaptive"
+                        ? "text-cyan-100/90"
+                        : tone === "failure"
+                        ? "text-rose-100/90"
+                        : "text-white/72";
+                    const renderedLabel = richLogEventLabel(item.event) || logEventLabel(item.event);
+                    return (
+                      <div key={`${item.timestamp}-${index}`} className={cn("rounded-[18px] border px-4 py-3 shadow-[inset_0_1px_1px_rgba(255,255,255,0.02)] transition-all duration-300", borderClass)}>
+                        <div className="flex items-center justify-between gap-3">
+                          <span className={cn("text-xs uppercase tracking-[0.2em]", tagColorClass)}>{renderedLabel}</span>
+                          <span className="text-[11px] text-white/36">{new Date(item.timestamp).toLocaleTimeString()}</span>
                         </div>
-                      ) : null}
-                    </div>
-                  ))}
+                        <p className={cn("mt-2 break-words text-sm leading-6", messageColorClass)}>{item.message}</p>
+                        {phaseSummary ? <p className="mt-2 text-xs leading-5 text-white/52">{phaseSummary}</p> : null}
+                        {typeof item.processed_files === "number" && typeof item.total_files === "number" ? (
+                          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/8">
+                            <div
+                              className="h-full rounded-full bg-[linear-gradient(90deg,#64dfff,#7b7cff)] transition-[width] duration-300"
+                              style={{ width: `${item.total_files ? (item.processed_files / item.total_files) * 100 : 0}%` }}
+                            />
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })}
                 </div>
               ) : (
                 <div className="rounded-[18px] border border-white/8 bg-white/[0.03] px-4 py-5 text-sm text-white/54">等待解析日志...</div>
               )}
             </div>
-          </motion.aside>
-        </div>
-      ) : null}
+            </motion.aside>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

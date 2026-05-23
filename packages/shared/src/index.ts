@@ -282,7 +282,17 @@ export interface DeleteCourseResponse {
   deleted_ingestion_logs: number;
   deleted_compensations: number;
   deleted_jobs: number;
+  deleted_graph_extraction_tasks: number;
+  deleted_graph_extraction_runs: number;
   deleted_batches: number;
+  deleted_hpo_judge_samples: number;
+  deleted_hpo_objective_models: number;
+  deleted_model_hyperparameters: number;
+  deleted_quality_profiles: number;
+  deleted_community_summaries: number;
+  deleted_relation_candidates: number;
+  deleted_mentions: number;
+  deleted_merge_candidates: number;
   deleted_relations: number;
   deleted_aliases: number;
   deleted_concepts: number;
@@ -323,6 +333,7 @@ export interface ModelSettingsResponse {
   semantic_chunking_enabled: boolean;
   semantic_chunking_min_length: number;
   model_bridge_enabled: boolean;
+  enable_auto_hpo: boolean;
   has_api_key: boolean;
   has_embedding_api_key: boolean;
   degraded_mode: boolean;
@@ -353,8 +364,57 @@ export interface ModelSettingsUpdate {
   semantic_chunking_enabled?: boolean | null;
   semantic_chunking_min_length?: number | null;
   model_bridge_enabled?: boolean | null;
+  enable_auto_hpo?: boolean | null;
   embedding_api_key?: string | null;
   clear_embedding_api_key?: boolean;
+}
+
+export interface IngestionLogEvent {
+  log_id?: string | null;
+  timestamp: string;
+  event: string;
+  message: string;
+  stage?: string;
+  objective_mode?: string;
+  source_path?: string;
+  state?: string;
+  processed_files?: number;
+  total_files?: number;
+  success_count?: number;
+  failure_count?: number;
+  skipped_count?: number;
+  error?: string;
+  provider?: string;
+  model?: string;
+  external_called?: boolean;
+  fallback_reason?: string | null;
+  vector_count?: number;
+  embedding_provider?: string;
+  embedding_model?: string;
+  embedding_external_called?: boolean;
+  embedding_fallback_reason?: string | null;
+  embedding_fallback_method?: string | null;
+  graph_extraction_provider?: string;
+  graph_extraction_model?: string;
+  graph_extraction_completed_chunks?: number;
+  graph_llm_success_chunks?: number;
+  graph_algorithm_nodes?: number;
+  graph_algorithm_edges?: number;
+  graph_rejected_concepts?: number;
+  concepts?: number;
+  relations?: number;
+  community_summary_count?: number;
+  retry_count?: number;
+  max_retries?: number;
+  candidate_count?: number;
+  pair_count?: number;
+  processed_pairs?: number;
+  effective_labels?: number;
+  min_labels?: number;
+  trial_count?: number;
+  best_value?: number;
+  objective_model_id?: string | null;
+  feature_summary?: Record<string, unknown>;
 }
 
 export interface RuntimeIssue {

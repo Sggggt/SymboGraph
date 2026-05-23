@@ -167,6 +167,70 @@ def test_adaptive_graph_extraction_run_reuses_completed_chunk_payloads(db_sessio
     assert second.stats_json["reused_completed_chunks"] >= 1
 
 
+def test_resumable_graph_extraction_ignores_terminal_batch_runs(db_session, sample_course, indexed_chunks):
+    from app.models import GraphExtractionChunkTask, GraphExtractionRun, IngestionBatch
+    from app.services.concept_graph import has_resumable_graph_extraction
+
+    _document, chunks = indexed_chunks
+    failed_batch = IngestionBatch(
+        course_id=sample_course.id,
+        source_root="unit",
+        trigger_source="rebuild_graph",
+        status="failed",
+    )
+    db_session.add(failed_batch)
+    db_session.flush()
+    stale_run = GraphExtractionRun(
+        course_id=sample_course.id,
+        batch_id=failed_batch.id,
+        strategy="adaptive_best_first",
+        status="running",
+    )
+    db_session.add(stale_run)
+    db_session.flush()
+    db_session.add(
+        GraphExtractionChunkTask(
+            run_id=stale_run.id,
+            course_id=sample_course.id,
+            chunk_id=chunks[0].id,
+            chunk_hash="stale",
+            status="pending",
+        )
+    )
+    db_session.commit()
+
+    assert has_resumable_graph_extraction(db_session, sample_course.id) is False
+
+    active_batch = IngestionBatch(
+        course_id=sample_course.id,
+        source_root="unit",
+        trigger_source="rebuild_graph",
+        status="extracting_graph",
+    )
+    db_session.add(active_batch)
+    db_session.flush()
+    active_run = GraphExtractionRun(
+        course_id=sample_course.id,
+        batch_id=active_batch.id,
+        strategy="adaptive_best_first",
+        status="running",
+    )
+    db_session.add(active_run)
+    db_session.flush()
+    db_session.add(
+        GraphExtractionChunkTask(
+            run_id=active_run.id,
+            course_id=sample_course.id,
+            chunk_id=chunks[1].id,
+            chunk_hash="active",
+            status="pending",
+        )
+    )
+    db_session.commit()
+
+    assert has_resumable_graph_extraction(db_session, sample_course.id) is True
+
+
 @pytest.mark.asyncio
 async def test_rebuild_course_graph_reports_real_llm_selection_stats(db_session, sample_course, monkeypatch):
     from app.core.config import get_settings
@@ -245,6 +309,70 @@ async def test_rebuild_course_graph_reports_real_llm_selection_stats(db_session,
     refreshed_chunk = db_session.scalar(select(Chunk).where(Chunk.document_id == refreshed_document.id))
     assert refreshed_document.tags == ["Lecture 1"]
     assert refreshed_chunk.chapter == "Lecture 1"
+
+
+@pytest.mark.asyncio
+async def test_auto_hpo_runs_after_graph_upsert_before_enrich(db_session, sample_course, indexed_chunks, monkeypatch):
+    from app.core.config import get_settings
+    from app.services import concept_graph
+
+    _document, _chunks = indexed_chunks
+    monkeypatch.setenv("ENABLE_AUTO_HPO", "true")
+    get_settings.cache_clear()
+    order: list[str] = []
+
+    async def fake_extract_payloads(chunks, **_kwargs):
+        order.append("extract")
+        return {
+            chunk.id: {
+                "concepts": [{"name": f"Concept {chunk.id}", "confidence": 0.9}],
+                "relations": [],
+            }
+            for chunk in chunks
+        }
+
+    async def fake_upsert_graph_candidates(db, course_id, chunks, *, llm_payloads, run_llm_merge=False):
+        order.append("upsert")
+        assert llm_payloads
+        return {
+            "created_concepts": 2,
+            "relations": 0,
+            "llm_success_chunks": len(llm_payloads),
+            "validation_warnings": {},
+            "rejected_concepts": 0,
+            "graph_concept_specificity_threshold": None,
+            "graph_concept_specificity_threshold_audit": {},
+            "llm_verified_merges": 0,
+        }
+
+    async def fake_hpo(db, *, course_id, batch_id, probe_chunks, payloads, baseline_context_chunks):
+        order.append("hpo")
+        assert payloads
+        assert probe_chunks
+        assert baseline_context_chunks
+        return {"hpo_auto_enabled": True, "hpo_status": "completed"}
+
+    async def fake_enrich(db, course_id):
+        order.append("enrich")
+        return {"concepts_analyzed": 2}
+
+    async def fake_community_summaries(db, course_id, batch_id=None):
+        return {
+            "community_summary_count": 0,
+            "community_summary_prompt_version": "community_summary_v1",
+        }
+
+    monkeypatch.setattr(concept_graph, "extract_llm_graph_payloads", fake_extract_payloads)
+    monkeypatch.setattr(concept_graph, "upsert_graph_candidates_from_chunks", fake_upsert_graph_candidates)
+    monkeypatch.setattr(concept_graph, "_run_auto_hpo_after_graph_upsert", fake_hpo)
+    monkeypatch.setattr(concept_graph, "enrich_course_graph", fake_enrich)
+    monkeypatch.setattr(concept_graph, "rebuild_graph_community_summaries", fake_community_summaries)
+    monkeypatch.setattr(concept_graph, "_backup_course_graph_tables", lambda db, cid: None)
+
+    stats = await concept_graph.rebuild_course_graph(db_session, sample_course.id)
+
+    assert order == ["extract", "upsert", "hpo", "enrich"]
+    assert stats["hpo_status"] == "completed"
 
 
 def test_choose_graph_probe_chunks_samples_short_middle_long():
