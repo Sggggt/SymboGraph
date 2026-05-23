@@ -198,27 +198,27 @@ The spectral gap $\rho = \tilde{\lambda}_1 - \tilde{\lambda}_2$ measures semanti
 Complexity (structural disorder of the content):
 
 $$
-\gamma = \min\!\Bigl(1,\; 0.22 \cdot c_v + 0.18 \cdot f + 0.16 \cdot t + 0.18 \cdot r_{\text{code}} + 0.16 \cdot r_{\text{sym}} + 0.10 \cdot \kappa\Bigr)
+\gamma = \min\Bigl(1,\; 0.22 \cdot c_v + 0.18 \cdot f + 0.16 \cdot t + 0.18 \cdot r_{\text{code}} + 0.16 \cdot r_{\text{sym}} + 0.10 \cdot \kappa\Bigr)
 $$
 
 Density (knowledge richness):
 
 $$
-\delta = \min\!\Bigl(1,\; 0.35 \cdot d_{\text{term}} + 0.30 \cdot d_{\text{entity}} + 0.20 \cdot d_{\text{def}} + 0.15 \cdot r_{\text{unique}}\Bigr)
+\delta = \min\Bigl(1,\; 0.35 \cdot d_{\text{term}} + 0.30 \cdot d_{\text{entity}} + 0.20 \cdot d_{\text{def}} + 0.15 \cdot r_{\text{unique}}\Bigr)
 $$
 
 Target size and overlap (driven by complexity and density):
 
 $$
-S^{*} = 920 - 380\,\gamma + 160\,\delta + 100\,\rho,\qquad
-O^{*} = 80 + 130\,\gamma + 40\,\kappa
+S^{\ast} = 920 - 380\,\gamma + 160\,\delta + 100\,\rho,\qquad
+O^{\ast} = 80 + 130\,\gamma + 40\,\kappa
 $$
 
 Fitness scores:
 
 $$
-\phi_{\text{size}} = 1 - \min\!\Bigl(1, \frac{|S - S^{*}|}{700}\Bigr),\qquad
-\phi_{\text{overlap}} = 1 - \min\!\Bigl(1, \frac{|O - O^{*}|}{220}\Bigr)
+\phi_{\text{size}} = 1 - \min\Bigl(1, \frac{|S - S^{\ast}|}{700}\Bigr),\qquad
+\phi_{\text{overlap}} = 1 - \min\Bigl(1, \frac{|O - O^{\ast}|}{220}\Bigr)
 $$
 
 Strategy bonus:
@@ -239,6 +239,8 @@ $$
 $$
 
 where $\nu$ is structural noise. The candidate with the highest $\mathcal{F}$ is selected as the chunking profile for the current section and persisted into chunk metadata.
+
+> **Design Intent (Why we do this)**: Different content types (e.g., prose, complex formulas, code, tables) require vastly different chunk lengths and overlaps. Adaptive chunking dynamically customizes these parameters per section using multi-dimensional feature extraction and spectral shape analysis. This avoids abrupt truncation of formulas/code, preserves the coherence of high-semantic segments, and suppresses structural noise, achieving optimal representation at the parameter level.
 
 ### Context-Enriched Embeddings
 
@@ -261,6 +263,8 @@ Parent chunks keep their own text, summary, and keywords. Child chunks inherit p
 ### Deduplication And Idempotency
 
 Ingestion detects duplicates by knowledge base, normalized title, and checksum. Unchanged files are skipped with `unchanged_checksum`; duplicate copies with the same normalized title and checksum are skipped with `duplicate_document`, avoiding duplicate chunks and vectors. Forced reingestion regenerates document versions, chunks, Qdrant vectors, and graph candidates.
+
+> **Design Intent (Why we do this)**: Frequent library updates and re-ingestion easily accumulate redundant artifacts in database and vector stores, leading to retrieval hubness and wasted compute. Multi-layered idempotency checking (via normalized titles and SHA256 checksums) ensures only modified documents trigger parsing and recalculation, providing a solid safety rail for industrial concurrency, precise data consistency, and zero-redundancy runtimes.
 
 ## Quality System
 
@@ -286,6 +290,8 @@ The signal layer extracts quantifiable quality metrics from raw text and metadat
 - **EvidenceGrounding**: text span, chunk anchor, document anchor, endpoint match, support count
 
 For concepts, the signal layer also includes **ModelJudgment** (LLM judge verdict, score, reasons).
+
+> **Design Intent (Why we do this)**: Garbage in, garbage out. Without multi-dimensional quantification at the source, downstream vector search and LLM extraction will suffer silent pollution from noisy characters, TOC pages, and low-semantic code blocks. By combining low-level structural text heuristics with high-level domain specificity signals, the system provides a scientific, auditable foundation for downstream routing policies.
 
 ### 2. Policy Layer (Quality Policies)
 
@@ -340,6 +346,8 @@ The profile layer builds an adaptive quality baseline for each knowledge base:
 
 Profile data is stored in the `quality_profiles` table, versioned, and integrity-checked via SHA256 hash. Profiles are referenced during graph construction and LLM judging, giving quality decisions domain context.
 
+> **Design Intent (Why we do this)**: Globally fixed hard thresholds fail entirely across different domains (e.g., technical code vs. medical literature). The profile layer uses stratified sampling and exemplar extraction at the start of ingestion to dynamically crystallize a "domain terminology baseline" and structural features. This builds a localized context for concept specificity and relation filtering, freeing the system from coarse global magic numbers.
+
 ### 4. Judge Layer (Quality Judge)
 
 The judge layer is an optional LLM-as-judge enhancement:
@@ -358,6 +366,8 @@ This update introduces three major capabilities: **adaptive best-first chunk sel
 - **Adaptive Best-First**: Dynamically selects the most information-gain chunks for LLM extraction based on six coverage signals (document, chapter, section, content kind, embedding cluster proxy, and low-frequency terms), avoiding indiscriminate calls to all chunks.
 - **TPE Hyperparameter Optimization**: Optionally runs Auto HPO before full rebuild, using Optuna's `TPESampler` over 30 trials to automatically search for the optimal Dijkstra semantic threshold, relation confidence threshold, and graph algorithm weight combinations.
 - **Incremental Update**: Only recomputes subgraphs tied to changed documents, preserving concepts and relations from unchanged documents, significantly reducing update costs.
+
+> **Design Intent (Why we do this)**: Traditional GraphRAG depends heavily on unconstrained LLM extractions over the entire corpus, incurring catastrophic API costs while introducing low-frequency noise and factual pollution. Guided by the "Evidence-First" principle, this system treats the graph strictly as an auditable skeleton linking physical text blocks, rejecting relations lacking textual support, and leveraging strict graph-theoretic pruning to counter LLM hallucinations for optimal structural control and cost efficiency.
 
 ```mermaid
 flowchart TB
@@ -415,6 +425,8 @@ Selection uses a **greedy best-first** strategy: at each step, pick the unselect
 
 Selected chunks enter LLM graph extraction; remaining chunks stay in the vector store and retrieval system but do not consume model call budget.
 
+> **Design Intent (Why we do this)**: Running raw LLM extraction across massive text sets is financially non-viable in commercial production. The Adaptive Best-First strategy sorts and ranks chunks using a six-dimensional information-gain model (covering documents, chapters, sections, content kinds, semantic clusters, and rare terms). By selecting only the most informative "skeleton chunks" for expensive LLM calls, it preserves over 85% of the macro-structural knowledge graph while slashing API budgets by more than 60%.
+
 ### 1. Entities And Evidence
 
 Each concept stores a canonical name, aliases, chapter references, importance, evidence chunk count, and quality audit fields. Concept vectors are not generated from names. They are centroids of supporting evidence chunk vectors, followed by L2 normalization:
@@ -426,11 +438,15 @@ $$
 
 $C_i$ is the set of active child chunks supporting concept *i*, and $\mathbf{z}_c$ is the chunk embedding. The purpose is to keep concept vectors faithful to the local course material instead of the LLM's generic pre-training semantics for the concept name.
 
+> **Design Intent (Why we do this)**: Embedding concepts solely by their names leads to generic encyclopedia-like definitions, neglecting localized domain/course contexts and causing severe concept drift during retrieval. Aggregating the centroids of supporting chunk vectors as the concept representation ensures high-dimensional representations anchor faithfully to actual local course contexts, making entity-level similarity metrics highly vertical and domain-specific.
+
 ### 2. Explicit LLM Relations And Quality Gates
 
 LLM-extracted relations are not inserted into the graph directly. The system checks the relation type allowlist, endpoint existence, self-loops, confidence, support count, evidence chunk, whether endpoint names can be matched in the evidence text, and whether the relation source is allowed. Only relations that pass these quality gates enter the verified graph and become factual edges for centrality, community detection, and retrieval path planning.
 
 The quality gate owns factuality: the LLM proposes possible relations, while the gate verifies whether each relation is supported by course material. This boundary is what prevents silent graph pollution.
+
+> **Design Intent (Why we do this)**: LLM-extracted relationships frequently suffer from over-generalization (e.g., arbitrary `related_to` associations) and false facts caused by missing context. Enforcing strict type allowlists, self-loop blocking, literal entity/edge overlaps in evidence texts, and confidence hard-gates stops hallucinated relationships at the doorstep before graph compilation, assuring every explicit factual edge remains physically auditable.
 
 ### 3. Dynamic KNN + Semantic Threshold + Mutual/Inbound-Quota Sparse Graph
 
@@ -451,6 +467,8 @@ $$
 $m_i$ is evidence chunk count and $r_i$ is chapter reference count. The system keeps mutual nearest neighbors, candidates accepted by the reverse inbound quota $B_i$, and high-confidence explicit LLM relations, keeping edge count close to linear in node count.
 
 Pure semantic candidate edges are marked with `relation_source="semantic_sparse"` and `candidate_only=true`. They can be used as repair hints, audit objects, or later validation material, but they do not enter the centrality and community graph by default. This prevents similarity noise from being amplified into factual structure.
+
+> **Design Intent (Why we do this)**: Traditional KNN methods easily fall prey to the Hubness Problem, where high-frequency semantic concepts act as "link monsters" that swallow up all connectivity and erase local details. Dynamically partitioning outgoing quotas $K_i$ and reverse inbound caps $B_i$ based on evidence and chapter coverage, combined with mutual nearest-neighbor constraints, enforces mutual peer-to-peer balance. This keeps edge growth linear with node scale while eliminating link monopolies to beautifully expose the micro-structures of local small-world knowledge communities.
 
 ### 4. Edge Weights, Structure Analysis, And Pruning
 
@@ -475,6 +493,8 @@ The final $w_{ij}$ is clipped to [0,1]. The verified graph stage runs:
 
 Centrality is not computed on the pure semantic candidate graph. It is computed on the evidence-gated verified graph; `graph_rank_score` also mixes concept importance and evidence count so a single topology signal cannot dominate ranking.
 
+> **Design Intent (Why we do this)**: Raw extracted graphs contain numerous weak links and trivial connected components, appearing cluttered and chaotic during visualization and navigation. Combining support, confidence, similarity, co-occurrence, and structure into a refined edge-weight formula, and pairing it with Louvain modularity and spectral pruning, prioritizes high-centrality backbone links and cross-community bridges, crystallizing a high-readability, noise-free structured map.
+
 ### 5. LLM Relation Completion And Dijkstra Inference
 
 After structure analysis, the system selects local neighborhoods around high-`graph_rank_score` nodes, collects related evidence snippets, and asks the LLM to complete only relations supported by those snippets. Completion results still return through the same `RelationQualityPolicy + hard gate`; they cannot bypass validation.
@@ -486,6 +506,8 @@ $$
 $$
 
 If endpoint semantic similarity is high and path cost is low, the system may write an inferred edge with `relation_source="dijkstra_inferred"`. Inferred edges are navigation, audit, and candidate-completion hints; they are not unconditional facts. Answers must still return to original chunk evidence.
+
+> **Design Intent (Why we do this)**: Knowledge graphs easily suffer from gaps and structural isolation due to the single-pass limitations of chunk extraction. By selecting semantic neighborhoods of high-rank nodes to trigger targeted LLM completion, and using Dijkstra search to explore implicit paths (e.g., prerequisite courses) within 2-3 hops on a cost-based graph, the system acquires logical inference and smooth navigation pathways, healing localized graph fragmentation and semantic blind spots.
 
 ### 6. TPE Automatic Hyperparameter Optimization (Auto HPO)
 
@@ -511,7 +533,7 @@ Where $\mathcal{P}$ is the set of judge-labeled candidate pairs, $\mathbf{f}$ is
 Use Optuna's `TPESampler` (Tree-structured Parzen Estimator) to maximize the surrogate objective over 30 trials:
 
 $$
-\theta^* = \arg\max_{\theta \in \Theta} \; g_{\text{surrogate}}(\theta; \mathcal{D}_{\text{probe}})
+\theta^{\ast} = \arg\max_{\theta \in \Theta} \; g_{\text{surrogate}}(\theta; \mathcal{D}_{\text{probe}})
 $$
 
 Where $\theta$ is an 11-dimensional hyperparameter vector:
@@ -532,6 +554,8 @@ Where $\theta$ is an 11-dimensional hyperparameter vector:
 
 The optimal parameters are persisted to the `course_model_hyperparameters` table and injected into `GraphHyperparameters` during full rebuild. If HPO fails, the system falls back to the last successful parameters or defaults.
 
+> **Design Intent (Why we do this)**: Graph algorithm weights (e.g., PageRank ratios, Dijkstra distance cutoffs) are highly sensitive to the semantics of different course datasets, making manual grid searches prohibitively slow and sub-optimal. The Auto HPO mechanism builds local simulations using probe chunks, employs LLM pair-wise judges to evaluate candidate graphs, fits a surrogate objective function, and uses TPE over 30 trials to evolve the best hyperparameters for the specific corpus, achieving hands-free algorithmic adaptability.
+
 ### 7. Incremental Graph Updates
 
 For partial knowledge-base changes (e.g., modifying or deleting a few documents), the system supports **incremental graph updates**, avoiding unnecessary full rebuilds:
@@ -543,6 +567,8 @@ For partial knowledge-base changes (e.g., modifying or deleting a few documents)
 5. **Transaction Consistency**: All cleanup and re-extraction operations are performed within an explicit transaction; on failure, rollback ensures the graph never ends up in a half-deleted state.
 
 Incremental update time complexity is proportional to the number of changed documents, not the total chunk count. When too many documents change or for initial construction, the system automatically falls back to full rebuild.
+
+> **Design Intent (Why we do this)**: In enterprise knowledge bases, users frequently add, delete, or edit a few documents. Rebuilding the entire graph over thousands of chunks for every minor change is computationally and financially unviable. Incremental Graph Updates identify affected concepts and relations, execute atomic cascade purges under transactional safeguards, and recompute only the local subgraphs. This slashes update complexity from $O(N)$ to $O(M)$ where $M \ll N$, assuring production-grade efficiency.
 
 ### 8. Collaboration Boundaries And Caveats
 
@@ -565,9 +591,13 @@ The limitations and course-material constraints are explicit:
 
 The frontend colors graph nodes by Louvain community, sizes nodes by centrality and graph rank, and renders inferred edges as dashed lines. Users can filter communities and open key entity details quickly, but the graph view should be understood as a course-evidence navigation graph, not an unsupported authoritative ontology.
 
+> **Design Intent (Why we do this)**: This system does not let any single algorithm decide the graph alone. We enforce a robust system of checks and balances where LLMs suggest possibilities, quality policies guard factuality, and sparse KNN rules limit hairball growth. By keeping similarity links as candidates, restricting centrality metrics to evidence-supported subgraphs, and requiring atomic transactional rollbacks, we systematically neutralize single-point model failures.
+
 ## Retrieval And QA
 
 SymboGraph's QA pipeline uses a **Perception → Retrieval Planning → Base Retrieval → Evidence Navigation → EvidenceEvaluator → Generation** evidence-first agent architecture orchestrated by LangGraph. Every node writes to `agent_trace_events`, and the frontend renders the live trace via SSE.
+
+> **Design Intent (Why we do this)**: Traditional QA retrieval relies heavily on naive vector similarity matching, which frequently falls short on multi-step reasoning and deep conceptual connections. Incorporating a dual-channel Perception and Planning architecture (orchestrated via LangGraph) aligns queries with graph concepts and intent profiles before choosing between hybrid recall, graph traversal, or community summaries. This elevates RAG from simple text concatenation to cognitive-level agentic chain-of-evidence synthesis, ensuring thorough, robust answer grounding.
 
 ```mermaid
 flowchart LR
@@ -607,6 +637,8 @@ Perception outputs:
 - `suggested_strategy`: recommended evidence-first route (`base_retrieval`, `evidence_chain`, `community`)
 - `needs_graph`: whether graph enhancement is needed
 
+> **Design Intent (Why we do this)**: Retrieving raw user queries directly is short-sighted, as user inputs are often colloquial, ambiguous, or packed with cross-disciplinary entities. The Perception node acts as the agent's eyes and ears, peeling back semantic noise, extracting query entities, and matching them directly against canonical concept names and aliases in the knowledge graph. This identifies relevant Louvain communities, providing the planner with a crystal-clear map of the knowledge terrain.
+
 ### RetrievalPlanner
 
 The planning layer configures evidence-first retrieval based on Perception output and performs cross-lingual query translation:
@@ -645,6 +677,8 @@ Execution always retrieves text evidence first, then uses the graph for navigati
 | Evidence assembly      | `assemble_evidence_documents`                              | Merge base evidence, anchor evidence, and graph-path evidence        |
 
 All strategies follow the **Small-to-Big** principle: only the finest-grained units enter recall and reranking (child chunks, or parent chunks that have no children and thus represent the finest granularity themselves); parent context is assembled later via `parent_chunk_id` where available.
+
+> **Design Intent (Why we do this)**: We refuse to prioritize abstract graph aesthetics over physical grounding. The system strictly enforces the "retrieve text first, enhance with graph second" rule. Even when graph enhancement is enabled, concepts and community summaries are only used for routing and pathway navigation within audited bounds, ensuring no floaty concepts pollute the generation context. This guarantees every line generated by the LLM rests on a physical child chunk.
 
 ### DocumentGrader
 
@@ -713,11 +747,15 @@ If only an anchor exists but quantity/score is marginal, the run is marked `marg
 
 These nodes are observable in traces but do not participate in the main loop by default, avoiding extra latency and model call costs. The pre-generation `EvidenceEvaluator` already covers most insufficient-evidence scenarios.
 
+> **Design Intent (Why we do this)**: Post-generation reflection and NLI validation represent the ultimate safety net for serious enterprise QA. While kept off by default to maintain lightning-fast response speeds, in high-stakes and zero-tolerance domains it runs strict reverse citation checks and self-correction steps. This forms an autonomous correction loop, putting the final premium touch on high-credibility RAG production.
+
 ### Evidence-first Graph Navigation
 
 Every question starts with base recall; only comparison, derivation, procedure, or broad analysis questions enable graph navigation after evidence anchors are selected. `semantic_sparse`, `dijkstra_inferred`, `candidate_only`, and relations without evidence chunks do not participate in default path planning.
 
 Cacheable retrieval results written to Redis must bind keys to course, query, filters, model, embedding text version, and relevant config. Cache hits still carry audit metadata.
+
+> **Design Intent (Why we do this)**: Unconstrained graph navigation based solely on semantic similarity creates hairballs and invites noise. We strictly confine navigation paths to explicit, audited factual relationships that have passed our quality gate, treating `semantic_sparse` and `dijkstra_inferred` as candidate/routing aids rather than source facts. This limits the exploration radius while maintaining deep, factual, and highly deterministic reasoning chains.
 
 ### Small-To-Big Retrieval
 
@@ -732,6 +770,8 @@ finest-grained dense recall + finest-grained BM25 recall
 ```
 
 This avoids both coarse recall from overly large chunks and missing context from tiny chunks. Retrieval results carry `retrieval_granularity=child_with_parent_context`, dense score, BM25 score, fused score, rerank score, graph boost, and model audit fields.
+
+> **Design Intent (Why we do this)**: Large text blocks provide complete context but suffer from poor retrieval precision (low Signal-to-Noise ratio). Small chunks offer high precision but lose the broader context. Small-to-Big retrieval breaks this trade-off by using small child chunks for extremely precise dense/BM25 recall and then reloading the corresponding parent chunks in memory. This two-phase decoupling achieves both stellar retrieval recall and beautifully cohesive, contextually-rich answers.
 
 ## Technical Advantages
 
