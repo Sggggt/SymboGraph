@@ -38,6 +38,7 @@ async def test_embedding_base_url_is_required_without_fallback(no_fallback_env, 
     from app.services.embeddings import EmbeddingProvider, FallbackDisabledError
 
     monkeypatch.setattr(config, "WORKSPACE_ROOT", no_fallback_env.parent)
+    monkeypatch.setenv("MODEL_BRIDGE_ENABLED", "false")
     monkeypatch.setenv("EMBEDDING_BASE_URL", "")
     get_settings.cache_clear()
 

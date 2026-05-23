@@ -1,36 +1,82 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# SymboGraph Frontend Web App
 
-## Getting Started
+A sleek, responsive, and visually premium Next.js client for exploring course Knowledge Graphs and interacting with the citation-grounded RAG query interface.
 
-First, run the development server:
+---
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## 🚀 Technology Stack
+
+This application is built with modern, production-grade frontend practices:
+
+1. **Core Framework**: **Next.js 16.2.4** utilizing the App Router and **React 19** for optimized concurrency and state orchestration.
+2. **State Management**: **TanStack Query (React Query) v5** handles server state synchronization, query caching, and mutation invalidation.
+3. **Styling & UI Components**: Tailored HSL color palettes, modern typography, glassmorphism, dynamic transitions, and polished **Shadcn UI** primitives styled with Vanilla Tailwind CSS.
+4. **Data Graph Visualization**: Interactive force-directed layouts representing course concepts, evidence relationships, topological centrality scores, and Louvain community grouping.
+
+---
+
+## 🎨 Core Views & Features
+
+### 1. Interactive Knowledge Graph Explorer
+- Fully interactive visual rendering of course concepts (nodes) and relations (edges).
+- Highlights Dijkstra traversal paths, neighborhood relations, and Louvain community partitions.
+
+### 2. Real-Time Ingestion Logs Monitor
+- Connects to the backend log streamer using Server-Sent Events (SSE) / stream subscription.
+- Visually shows document parsing, adaptive chunking distributions, embedding audits, and Auto HPO optuna trial evolution.
+
+### 3. Citation-Grounded RAG Chat
+- Sleek interactive chat dashboard with agentic reflection support.
+- Displays inline hoverable citations mapping directly to source PDF bounding boxes, jupyter notebooks, or raw snippets.
+- Reveals multi-hop reasoning steps and the retrieval layering breakdown.
+
+### 4. Concept Card Catalog
+- An inspector catalog showing concept definitions, Aliases, PageRank statistics, in/out degree counts, and all associated raw evidence snippets.
+
+---
+
+## 📂 Project Structure
+
+```
+apps/web/
+├── src/
+│   ├── app/            # Next.js App Router pages and layouts
+│   ├── components/     # High-fidelity UI modular elements (graph, chat, cards)
+│   ├── hooks/          # Custom react hooks for handling dynamic states
+│   └── lib/
+│       ├── api.ts      # Centralized, strongly-typed API client contracts
+│       └── utils.ts    # Styling helpers and class-merging functions
+├── public/             # Static graphics and icons assets
+├── tsconfig.json       # TypeScript configuration aligning with build contracts
+├── eslint.config.mjs   # Strict ESLint configurations
+└── package.json        # Dependencies locked to Next.js 16.2.4
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+---
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## 💻 Developer Scripts
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Manage the frontend web app from the repository workspace using standard npm scripts:
 
-## Learn More
+### Starting Development Server
+Starts a local development server at `http://localhost:3000`:
+```bash
+# Run from apps/web directory
+npm run dev
+```
 
-To learn more about Next.js, take a look at the following resources:
+### Static Production Build
+Compiles the Next.js app for production deployment:
+```bash
+npm run build
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### Strict Code Quality & Verification
+To ensure backend compatibility, zero regressions, and robust builds, always run typechecking and linting before proposing changes:
+```bash
+# Run strict TypeScript type checks across the web workspace
+npm run typecheck --workspace web
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+# Run ESLint validation
+npm run lint --workspace web
+```
