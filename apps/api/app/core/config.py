@@ -2,6 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 import os
 import re
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -26,6 +27,8 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_collection: str = "knowledge_chunks"
     redis_url: str = "redis://localhost:6379/0"
+    ingestion_execution_mode: Literal["inline", "celery"] = "inline"
+    ingestion_task_queue: str = "ingestion"
     enable_database_fallback: bool = False
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
     api_keys: str = ""

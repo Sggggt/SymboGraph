@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -95,12 +96,31 @@ def wait_for_batch(client: ApiClient, batch_id: str, timeout_seconds: int) -> di
     raise RuntimeError(f"Batch {batch_id} did not finish within {timeout_seconds}s; last={last}")
 
 
+def check_worker_container(container_name: str) -> dict:
+    result = subprocess.run(
+        ["docker", "inspect", "--format", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}", container_name],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Worker container {container_name} is not inspectable: {result.stderr.strip()}")
+    parts = result.stdout.strip().split()
+    status = parts[0] if parts else ""
+    health = parts[1] if len(parts) > 1 else "unknown"
+    require(status == "running", f"Worker container {container_name} is not running: status={status} health={health}")
+    require(health in {"healthy", "no-healthcheck"}, f"Worker container {container_name} is not healthy: {health}")
+    return {"container": container_name, "status": status, "health": health}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Smoke-test the Docker API chain with a disposable course.")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/api")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--timeout-seconds", type=int, default=300)
     parser.add_argument("--skip-model-calls", action="store_true", help="Only check infrastructure and read-only endpoints.")
+    parser.add_argument("--worker-container", default="course-kg-worker")
+    parser.add_argument("--skip-worker-check", action="store_true")
     args = parser.parse_args()
 
     client = ApiClient(args.base_url, args.api_key or None)
@@ -116,10 +136,13 @@ def main() -> None:
         infra = runtime.get("infrastructure") or {}
         for key in ("postgres", "qdrant", "redis"):
             require(infra.get(key) is True, f"{key} is not reachable from the API runtime")
+        worker_status = None
+        if not args.skip_worker_check:
+            worker_status = check_worker_container(args.worker_container)
 
         settings = client.request_json("GET", "/settings/model")
         if args.skip_model_calls:
-            print(json.dumps({"ok": True, "mode": "infrastructure-only", "runtime": runtime}, ensure_ascii=False, indent=2))
+            print(json.dumps({"ok": True, "mode": "infrastructure-only", "runtime": runtime, "worker": worker_status}, ensure_ascii=False, indent=2))
             return
         require(settings.get("has_api_key") is True, "Model API key is required for full no-fallback smoke")
         require(settings.get("degraded_mode") is False, f"Model settings are degraded: {settings}")
@@ -238,6 +261,7 @@ def main() -> None:
                     "ok": True,
                     "course_id": created_course_id,
                     "batch": batch_status,
+                    "worker": worker_status,
                     "search_model_audit": audit,
                     "qa_run_id": qa.get("run_id"),
                     "chinese_search_model_audit": audit_cn,

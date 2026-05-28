@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import AgentRun, AgentTraceEvent, Concept, ConceptRelation, Document, IngestionBatch, QASession
+from app.models import AgentRun, AgentTraceEvent, Concept, ConceptRelation, Document, IngestionBatch, IngestionJob, QASession
 from app.core.config import get_settings
 from app.schemas import (
     AgentRequest,
@@ -226,7 +226,16 @@ async def rebuild_graph_endpoint(
     db.add(batch)
     db.commit()
     db.refresh(batch)
-    background_tasks.add_task(run_graph_rebuild_background, batch.id, course.id, request.mode)
+    if get_settings().ingestion_execution_mode == "celery":
+        try:
+            enqueue_graph_rebuild_batch(batch.id, course.id, request.mode)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "graph_rebuild_enqueue_failed", "message": enqueue_error_message(exc)},
+            ) from exc
+    else:
+        background_tasks.add_task(run_graph_rebuild_background, batch.id, course.id, request.mode)
     return {
         "batch_id": batch.id,
         "state": "extracting_graph",
@@ -277,21 +286,119 @@ def concept_cards(course_id: str | None = None, db: Session = Depends(get_db)) -
 
 
 async def enqueue_ingestion(job_id: str, source_path: str, trigger_source: str) -> None:
+    settings = get_settings()
+    if settings.ingestion_execution_mode == "inline":
+        await run_ingestion_job(job_id, Path(source_path), trigger_source=trigger_source)
+        return
     try:
         from worker_app.tasks import ingest_path
 
-        ingest_path.delay(source_path, trigger_source=trigger_source, job_id=job_id)
-    except Exception:
-        await run_ingestion_job(job_id, Path(source_path), trigger_source=trigger_source)
+        ingest_path.apply_async(args=[source_path], kwargs={"trigger_source": trigger_source, "job_id": job_id}, queue=settings.ingestion_task_queue)
+    except Exception as exc:
+        mark_job_enqueue_failed(job_id, exc)
+        raise
 
 
 async def enqueue_batch(batch_id: str) -> None:
+    settings = get_settings()
+    if settings.ingestion_execution_mode == "inline":
+        await run_batch_ingestion(batch_id)
+        return
     try:
         from worker_app.tasks import ingest_batch
 
-        ingest_batch.delay(batch_id)
-    except Exception:
-        await run_batch_ingestion(batch_id)
+        task = ingest_batch.apply_async(args=[batch_id], queue=settings.ingestion_task_queue)
+        mark_batch_enqueued(batch_id, "ingest_batch", getattr(task, "id", None))
+    except Exception as exc:
+        mark_batch_enqueue_failed(batch_id, exc)
+        raise
+
+
+async def enqueue_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False) -> None:
+    settings = get_settings()
+    if settings.ingestion_execution_mode == "inline":
+        await run_uploaded_files_ingestion(batch_id, file_paths, force=force)
+        return
+    try:
+        from worker_app.tasks import ingest_uploaded_batch
+
+        task = ingest_uploaded_batch.apply_async(args=[batch_id, file_paths], kwargs={"force": force}, queue=settings.ingestion_task_queue)
+        mark_batch_enqueued(batch_id, "ingest_uploaded_batch", getattr(task, "id", None))
+    except Exception as exc:
+        mark_batch_enqueue_failed(batch_id, exc)
+        raise
+
+
+def enqueue_error_message(exc: Exception) -> str:
+    return f"Failed to enqueue ingestion task in celery mode: {type(exc).__name__}: {exc}"
+
+
+def mark_batch_enqueued(batch_id: str, task_name: str, task_id: str | None) -> None:
+    from app.db import SessionLocal
+
+    session = SessionLocal()
+    try:
+        batch = session.get(IngestionBatch, batch_id)
+        if batch is None:
+            return
+        stats = dict(batch.stats or {})
+        stats["ingestion_execution_mode"] = "celery"
+        stats["celery_task_name"] = task_name
+        if task_id:
+            stats["celery_task_id"] = task_id
+        batch.stats = stats
+        session.commit()
+    finally:
+        session.close()
+
+
+def mark_batch_enqueue_failed(batch_id: str, exc: Exception) -> None:
+    from app.db import SessionLocal
+    from app.services.ingestion_logs import emit_ingestion_log
+
+    message = enqueue_error_message(exc)
+    session = SessionLocal()
+    try:
+        batch = session.get(IngestionBatch, batch_id)
+        if batch is None:
+            return
+        batch.status = "failed"
+        batch.last_error = message
+        batch.completed_at = datetime.utcnow()
+        batch.stats = {**(batch.stats or {}), "ingestion_execution_mode": "celery", "enqueue_error": message}
+        session.commit()
+        emit_ingestion_log(batch_id, "batch_failed", message, error=message, ingestion_execution_mode="celery")
+    finally:
+        session.close()
+
+
+def mark_job_enqueue_failed(job_id: str, exc: Exception) -> None:
+    from app.db import SessionLocal
+
+    message = enqueue_error_message(exc)
+    session = SessionLocal()
+    try:
+        job = session.get(IngestionJob, job_id)
+        if job is None:
+            return
+        job.status = "failed"
+        job.error_message = message
+        job.stats = {**(job.stats or {}), "ingestion_execution_mode": "celery", "enqueue_error": message}
+        session.commit()
+    finally:
+        session.close()
+
+
+def enqueue_graph_rebuild_batch(batch_id: str, course_id: str, mode: str) -> None:
+    settings = get_settings()
+    try:
+        from worker_app.tasks import rebuild_course_graph_task
+
+        task = rebuild_course_graph_task.apply_async(args=[batch_id, course_id, mode], queue=settings.ingestion_task_queue)
+        mark_batch_enqueued(batch_id, "rebuild_course_graph", getattr(task, "id", None))
+    except Exception as exc:
+        mark_batch_enqueue_failed(batch_id, exc)
+        raise
 
 
 def enqueue_batch_background(batch_id: str) -> None:
@@ -299,7 +406,7 @@ def enqueue_batch_background(batch_id: str) -> None:
 
 
 def enqueue_uploaded_batch_background(batch_id: str, file_paths: list[str], force: bool = False) -> None:
-    asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths, force=force))
+    asyncio.run(enqueue_uploaded_batch(batch_id, file_paths, force=force))
 
 
 @router.post("/files/upload", response_model=UploadFileResponse)
@@ -343,7 +450,17 @@ async def parse_uploaded_files(
         seen_paths.add(path)
         file_paths.append(path)
     batch = create_uploaded_files_batch(db, course.id, file_paths, force=request.force)
-    background_tasks.add_task(enqueue_uploaded_batch_background, batch.id, [str(path) for path in file_paths], request.force)
+    serialized_paths = [str(path) for path in file_paths]
+    if get_settings().ingestion_execution_mode == "celery":
+        try:
+            await enqueue_uploaded_batch(batch.id, serialized_paths, request.force)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "ingestion_enqueue_failed", "message": enqueue_error_message(exc)},
+            ) from exc
+    else:
+        background_tasks.add_task(enqueue_uploaded_batch_background, batch.id, serialized_paths, request.force)
     return {"batch_id": batch.id, "state": "queued"}
 
 
@@ -355,7 +472,16 @@ async def parse_storage_directory(background_tasks: BackgroundTasks, course_id: 
     if not root.exists():
         raise HTTPException(status_code=404, detail=f"Storage root not found: {root}")
     batch = create_sync_batch(db, course.id, root, trigger_source="storage")
-    background_tasks.add_task(enqueue_batch_background, batch.id)
+    if get_settings().ingestion_execution_mode == "celery":
+        try:
+            await enqueue_batch(batch.id)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "ingestion_enqueue_failed", "message": enqueue_error_message(exc)},
+            ) from exc
+    else:
+        background_tasks.add_task(enqueue_batch_background, batch.id)
     return {"batch_id": batch.id, "state": "queued"}
 
 
@@ -559,8 +685,10 @@ async def qa(request: QARequest, db: Session = Depends(get_db)) -> dict:
 
 
 @router.post("/qa/stream")
-async def qa_stream(request: QARequest, db: Session = Depends(get_db)) -> StreamingResponse:
-    get_requested_course(db, request.course_id)
+async def qa_stream(request: QARequest) -> StreamingResponse:
+    from app.db import SessionLocal
+    with SessionLocal() as db:
+        get_requested_course(db, request.course_id)
     agent_request = AgentRequest(
         question=request.question,
         session_id=request.session_id,
@@ -572,11 +700,15 @@ async def qa_stream(request: QARequest, db: Session = Depends(get_db)) -> Stream
     )
 
     async def event_stream():
+        from app.db import SessionLocal
+        db = SessionLocal()
         try:
             async for event in stream_agent_events(db, agent_request):
                 yield f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
         except Exception as exc:
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc)}, ensure_ascii=False)}\n\n"
+        finally:
+            db.close()
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

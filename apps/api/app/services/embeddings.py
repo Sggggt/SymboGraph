@@ -29,6 +29,22 @@ class GraphExtractionError(RuntimeError):
     pass
 
 
+def prefers_chinese_answer(text: str) -> bool:
+    from app.services.chinese_text import contains_chinese
+
+    return contains_chinese(text)
+
+
+def answer_language_name(text: str) -> str:
+    return "Chinese" if prefers_chinese_answer(text) else "English"
+
+
+def no_context_answer(question: str) -> str:
+    if prefers_chinese_answer(question):
+        return "课程材料中没有找到足够可靠的上下文来回答这个问题并提供引用。"
+    return "I could not find enough reliable course context to answer this question with citations."
+
+
 def vector_norm(vector: list[float]) -> float:
     return math.sqrt(sum(float(value) * float(value) for value in vector))
 
@@ -198,7 +214,7 @@ class ChatProvider:
     async def answer_question_with_meta(self, question: str, contexts: list[dict], history: list[dict] | None = None, evidence_quality: str = "normal") -> ChatCallResult:
         if not contexts:
             return ChatCallResult(
-                answer="I could not find enough reliable course context to answer this question with citations.",
+                answer=no_context_answer(question),
                 provider="none",
                 model=self.settings.chat_model,
                 external_called=False,
@@ -480,6 +496,7 @@ class ChatProvider:
             return default_result
 
     async def _openai_compatible_chat(self, question: str, contexts: list[dict], history: list[dict], evidence_quality: str = "normal") -> str:
+        target_language = answer_language_name(question)
         citations = "\n\n".join(
             f"[{idx + 1}] {item['document_title']} / {item.get('chapter') or 'General'}\n{item['content']}"
             for idx, item in enumerate(contexts)
@@ -491,8 +508,11 @@ class ChatProvider:
                     "You are a course knowledge-base assistant. "
                     "Answer only from the supplied course excerpts and do not invent unsupported facts. "
                     "Keep the answer direct, concise, and say when the evidence is insufficient. "
-                    "You may answer in Chinese or English depending on the user's question language. "
-                    "请根据用户的提问语言选择中文或英文回答。"
+                    "Always follow the required answer language below. "
+                    "Do not infer the answer language from the retrieved excerpts. "
+                    f"Required answer language: {target_language}. "
+                    "The supplied excerpts may be Chinese, English, or mixed; use them as evidence, "
+                    "but do not switch the answer language to match the excerpt language. "
                     "Format the answer as clean GitHub-flavored Markdown. "
                     "When writing mathematical notation, use valid LaTeX only: inline variables and short expressions "
                     "must be wrapped in single dollar delimiters like $k_i$ and $n - 1$; important equations must be "
@@ -519,6 +539,7 @@ class ChatProvider:
                 "role": "user",
                 "content": (
                     f"Question: {question}\n\n"
+                    f"Required answer language: {target_language}\n\n"
                     "Course excerpts:\n"
                     f"{citations}\n\n"
                     + (
@@ -711,12 +732,21 @@ class ChatProvider:
 
     def _extractive_answer(self, question: str, contexts: list[dict]) -> str:
         lead = next((item for item in contexts if item.get("metadata", {}).get("content_kind") != "code"), contexts[0])
-        lines = [
-            f"The strongest course source is {lead['document_title']} in {lead.get('chapter') or 'the relevant section'}.",
-            lead["snippet"],
-        ]
+        if prefers_chinese_answer(question):
+            lines = [
+                f"最相关的课程来源是 {lead['document_title']} / {lead.get('chapter') or '相关章节'}。",
+                lead["snippet"],
+            ]
+        else:
+            lines = [
+                f"The strongest course source is {lead['document_title']} in {lead.get('chapter') or 'the relevant section'}.",
+                lead["snippet"],
+            ]
         if len(contexts) > 1:
-            lines.append("Other retrieved excerpts provide related background; use the citations to inspect the source material.")
+            if prefers_chinese_answer(question):
+                lines.append("其他检索片段提供了相关背景；请结合引用检查原始课程材料。")
+            else:
+                lines.append("Other retrieved excerpts provide related background; use the citations to inspect the source material.")
         lines.append(f"Question: {question}")
         return "\n".join(lines)
 

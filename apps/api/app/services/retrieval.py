@@ -906,6 +906,8 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
             "graph": {"nodes": [], "edges": [], "focus_chapter": None},
             "batch_status": None,
             "ingested_document_count": 0,
+            "chunk_count": 0,
+            "graph_eligible_chunk_count": 0,
             "graph_relation_count": 0,
             "coverage_by_source_type": {},
             "degraded_mode": is_degraded_mode(),
@@ -915,6 +917,13 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
     file_items = list_course_files(db, course.id)
     concepts = db.scalars(select(Concept).where(Concept.course_id == course.id)).all()
     relations = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course.id)).all()
+    chunks = db.scalars(select(Chunk).where(Chunk.course_id == course.id, Chunk.is_active.is_(True))).all()
+    chunk_count = len(chunks)
+    graph_eligible_chunk_count = sum(
+        1
+        for chunk in chunks
+        if ((chunk.metadata_json or {}).get("route_eligibility") or {}).get("graph_extraction") is True
+    )
     batches = db.scalars(select(IngestionBatch).where(IngestionBatch.course_id == course.id).order_by(IngestionBatch.created_at.desc())).all()
 
     chapter_map: dict[str, list[dict]] = defaultdict(list)
@@ -974,6 +983,8 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
             "completed_at": latest_batch.completed_at,
         },
         "ingested_document_count": len(file_items),
+        "chunk_count": chunk_count,
+        "graph_eligible_chunk_count": graph_eligible_chunk_count,
         "graph_relation_count": len(relations),
         "coverage_by_source_type": dict(source_coverage),
         "degraded_mode": is_degraded_mode(),

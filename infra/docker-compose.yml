@@ -19,6 +19,9 @@ services:
       EMBEDDING_RESOLVE_IP: ${EMBEDDING_RESOLVE_IP:-}
       ENABLE_MODEL_FALLBACK: "false"
       ENABLE_DATABASE_FALLBACK: "false"
+      INGESTION_EXECUTION_MODE: celery
+      INGESTION_TASK_QUEUE: course-kg-main-ingestion
+      PYTHONPATH: /app/apps/worker:/app/apps/api
     ports:
       - "${API_HOST_PORT:-8000}:8000"
     volumes:
@@ -28,6 +31,7 @@ services:
       - ../data/models/huggingface:/app/models/huggingface
       - ../apps/api/app:/app/apps/api/app
       - ../apps/api/tests:/app/apps/api/tests
+      - ../apps/worker/worker_app:/app/apps/worker/worker_app
       - ../scripts:/app/scripts
     depends_on:
       postgres:
@@ -43,6 +47,54 @@ services:
       retries: 30
       start_period: 60s
 
+  worker:
+    image: ${API_IMAGE:-course-kg-api:local}
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    pull_policy: never
+    container_name: course-kg-worker
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/course_kg
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
+      DATA_ROOT: /app/data
+      CHAT_BASE_URL: ${API_CHAT_BASE_URL:-${CHAT_BASE_URL:-https://api.openai.com/v1}}
+      CHAT_RESOLVE_IP: ${API_CHAT_RESOLVE_IP:-${CHAT_RESOLVE_IP:-}}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_RESOLVE_IP: ${EMBEDDING_RESOLVE_IP:-}
+      ENABLE_MODEL_FALLBACK: "false"
+      ENABLE_DATABASE_FALLBACK: "false"
+      INGESTION_EXECUTION_MODE: celery
+      INGESTION_TASK_QUEUE: course-kg-main-ingestion
+      PYTHONPATH: /app/apps/worker:/app/apps/api
+    working_dir: /app/apps/worker
+    command: ["python", "-m", "celery", "-A", "worker_app.celery_app", "worker", "--loglevel=info", "--queues=course-kg-main-ingestion"]
+    volumes:
+      - ../data:/app/data
+      - ../.env:/app/.env
+      - ../.env.example:/app/.env.example:ro
+      - ../data/models/huggingface:/app/models/huggingface
+      - ../apps/api/app:/app/apps/api/app
+      - ../apps/api/tests:/app/apps/api/tests
+      - ../apps/worker/worker_app:/app/apps/worker/worker_app
+      - ../scripts:/app/scripts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -m celery -A worker_app.celery_app inspect ping -d celery@$$HOSTNAME | grep -q pong"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
   web:
     image: ${WEB_IMAGE:-course-kg-web:local}
     build:
@@ -52,6 +104,7 @@ services:
     container_name: course-kg-web
     environment:
       NEXT_PUBLIC_API_BASE_URL: http://127.0.0.1:${API_HOST_PORT:-8000}/api
+      NODE_OPTIONS: "--max-old-space-size=2048"
     ports:
       - "${WEB_HOST_PORT:-3000}:3000"
     volumes:

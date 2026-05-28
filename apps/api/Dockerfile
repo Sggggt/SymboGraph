@@ -24,6 +24,7 @@ RUN uv pip install --system --no-cache -e ".[rerank,dev]"
 # 复制应用代码
 COPY apps/api/app ./app
 COPY apps/api/tests ./tests
+COPY apps/worker/worker_app /app/apps/worker/worker_app
 COPY .env.example /app/.env.example
 
 # 默认不在构建阶段访问 Hugging Face，避免常规 rebuild 卡在网络下载。

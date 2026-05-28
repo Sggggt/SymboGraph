@@ -731,6 +731,31 @@ def test_merge_graph_candidates_treats_non_mapping_payload_as_empty():
     assert merged["relations"] == []
 
 
+def test_graph_extraction_payload_normalizes_model_enum_aliases():
+    from app.schemas import GraphExtractionPayload
+
+    payload = GraphExtractionPayload.model_validate(
+        {
+            "concepts": [
+                {"name": "Equilibrium", "concept_type": "Definition", "entity_type": "Definition", "importance_score": 8},
+                {"name": "Price of Anarchy", "concept_type": "Metric", "entity_type": "Metric", "importance_score": "7"},
+                {"name": "Mechanism Design", "concept_type": "Application", "entity_type": "Application", "importance_score": 0.6},
+                {"name": "Auction Problem", "concept_type": "Problem Type", "entity_type": "Problem Type", "importance_score": 0.6},
+            ],
+            "relations": [
+                {"source": "Equilibrium", "target": "Price of Anarchy", "relation_type": "defines", "confidence": 8},
+                {"source": "Mechanism Design", "target": "Auction Problem", "relation_type": "relates_to", "confidence": 0.7},
+                {"source": "Mechanism Design", "target": "Equilibrium", "relation_type": "extends", "confidence": 0.7},
+            ],
+        }
+    ).model_dump()
+
+    assert [concept["concept_type"] for concept in payload["concepts"]] == ["definition", "metric", "concept", "problem_type"]
+    assert [concept["importance_score"] for concept in payload["concepts"][:2]] == [0.8, 0.7]
+    assert [relation["relation_type"] for relation in payload["relations"]] == ["defined_by", "related_to", "derives_from"]
+    assert payload["relations"][0]["confidence"] == 0.8
+
+
 def test_concept_quality_filters_structural_noise_generically():
     from app.services.concept_graph import concept_quality, is_valid_concept
 

@@ -1,4 +1,5 @@
 from collections.abc import Generator
+import contextvars
 
 from pathlib import Path
 
@@ -77,7 +78,48 @@ def build_engine():
 
 
 engine = build_engine()
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+_original_SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+_db_context_var = contextvars.ContextVar("db_session", default=None)
+_active_sessions = contextvars.ContextVar("active_sessions", default=None)
+
+class ContextSessionWrapper:
+    def __init__(self, session):
+        object.__setattr__(self, "_session", session)
+        
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+        
+    def __setattr__(self, name, value):
+        setattr(self._session, name, value)
+        
+    def close(self):
+        pass
+        
+    def __enter__(self):
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+class ContextSessionLocalProxy:
+    def __init__(self, original_sessionmaker):
+        self.original_sessionmaker = original_sessionmaker
+        
+    def __getattr__(self, name):
+        return getattr(self.original_sessionmaker, name)
+        
+    def __call__(self, *args, **kwargs):
+        ctx_db = _db_context_var.get(None)
+        if ctx_db is not None:
+            return ContextSessionWrapper(ctx_db)
+            
+        new_db = self.original_sessionmaker(*args, **kwargs)
+        sessions_list = _active_sessions.get(None)
+        if sessions_list is not None:
+            sessions_list.append(new_db)
+        return new_db
+
+SessionLocal = ContextSessionLocalProxy(_original_SessionLocal)
 
 
 SCHEMA_PATCHES: dict[str, dict[str, str]] = {

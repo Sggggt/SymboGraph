@@ -29,6 +29,7 @@ dependencies = [
   "pillow>=11.0.0",
   "markdown>=3.7",
   "beautifulsoup4>=4.12.3",
+  "celery[redis]>=5.4.0",
   "networkx>=3.4.2",
   "numpy>=2.1.0",
   "scipy>=1.14.0",

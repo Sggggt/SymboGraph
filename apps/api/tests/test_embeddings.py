@@ -219,6 +219,85 @@ async def test_answer_prompt_enforces_latex_markdown_format(no_fallback_env, mon
 
 
 @pytest.mark.asyncio
+async def test_answer_prompt_language_follows_english_question_with_chinese_context(no_fallback_env, monkeypatch):
+    from app.services import embeddings
+    from app.services.embeddings import ChatProvider
+
+    captured_payload: dict = {}
+
+    async def fake_post_json(url, payload, headers, *, timeout, resolve_ip=None):
+        captured_payload.update(payload)
+        return {"choices": [{"message": {"content": "A graph is represented by vertices and edges."}}]}
+
+    monkeypatch.setattr(embeddings, "post_openai_compatible_json", fake_post_json)
+
+    result = await ChatProvider().answer_question_with_meta(
+        "What is a graph and how is it represented?",
+        [
+            {
+                "document_title": "图论讲义",
+                "chapter": "第1章",
+                "content": "图由顶点集合和边集合组成。",
+                "snippet": "图由顶点集合和边集合组成。",
+                "citations": [],
+                "metadata": {},
+            }
+        ],
+        [],
+    )
+
+    system_prompt = captured_payload["messages"][0]["content"]
+    user_prompt = captured_payload["messages"][-1]["content"]
+    assert "Required answer language: English" in system_prompt
+    assert "Required answer language: English" in user_prompt
+    assert "do not switch the answer language to match the excerpt language" in system_prompt
+    assert result.answer.startswith("A graph")
+
+
+@pytest.mark.asyncio
+async def test_answer_prompt_language_follows_chinese_question_with_english_context(no_fallback_env, monkeypatch):
+    from app.services import embeddings
+    from app.services.embeddings import ChatProvider
+
+    captured_payload: dict = {}
+
+    async def fake_post_json(url, payload, headers, *, timeout, resolve_ip=None):
+        captured_payload.update(payload)
+        return {"choices": [{"message": {"content": "图由顶点集合和边集合组成。"}}]}
+
+    monkeypatch.setattr(embeddings, "post_openai_compatible_json", fake_post_json)
+
+    result = await ChatProvider().answer_question_with_meta(
+        "\u4ec0\u4e48\u662f\u56fe\uff0c\u56fe\u5982\u4f55\u8868\u793a\uff1f",
+        [
+            {
+                "document_title": "Graph Notes",
+                "chapter": "Chapter 1",
+                "content": "A graph consists of a vertex set and an edge set.",
+                "snippet": "A graph consists of a vertex set and an edge set.",
+                "citations": [],
+                "metadata": {},
+            }
+        ],
+        [],
+    )
+
+    system_prompt = captured_payload["messages"][0]["content"]
+    user_prompt = captured_payload["messages"][-1]["content"]
+    assert "Required answer language: Chinese" in system_prompt
+    assert "Required answer language: Chinese" in user_prompt
+    assert "do not switch the answer language to match the excerpt language" in system_prompt
+    assert result.answer.startswith("\u56fe")
+
+
+def test_no_context_answer_follows_question_language(no_fallback_env):
+    from app.services.embeddings import no_context_answer
+
+    assert no_context_answer("What is a graph?").startswith("I could not find")
+    assert no_context_answer("\u4ec0\u4e48\u662f\u56fe\uff1f").startswith("\u8bfe\u7a0b\u6750\u6599")
+
+
+@pytest.mark.asyncio
 async def test_chat_json_response_format_falls_back_to_prompt_only(no_fallback_env, monkeypatch):
     from app.services import embeddings
     from app.services.embeddings import ChatProvider

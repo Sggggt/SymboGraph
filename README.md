@@ -915,7 +915,7 @@ ENABLE_DATABASE_FALLBACK=false
 2. 启动 Docker 栈：
 
 ```powershell
-docker compose -f infra/docker-compose.yml up -d api web postgres redis qdrant
+docker compose -f infra/docker-compose.yml up -d api worker web postgres redis qdrant
 ```
 
 Windows 用户也可以直接双击 `start-app.bat` 一键启动后端、前端和基础设施容器；该脚本**不会**强制重建镜像，适合日常快速启动。
@@ -923,7 +923,7 @@ Windows 用户也可以直接双击 `start-app.bat` 一键启动后端、前端�
 如果应用代码或依赖发生变更，需要重新构建本地镜像，可运行：
 
 ```powershell
-docker compose -f infra/docker-compose.yml build api web
+docker compose -f infra/docker-compose.yml build api worker web
 ```
 
 或在 Windows 下直接运行 `rebuild-images.bat`；如需强制无缓存重建，可执行 `rebuild-images.bat -NoCache`。

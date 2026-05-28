@@ -35,8 +35,8 @@ $buildArgs = @("compose", "-f", $InfraComposeFile, "build")
 if ($NoCache) {
   $buildArgs += "--no-cache"
 }
-$buildArgs += @("api", "web")
+$buildArgs += @("api", "worker", "web")
 
-Write-Host "Rebuilding application images (api, web)..." -ForegroundColor Cyan
+Write-Host "Rebuilding application images (api, worker, web)..." -ForegroundColor Cyan
 Invoke-Compose -Arguments $buildArgs
 Write-Host "Done. Images rebuilt. Start services with start-app.bat" -ForegroundColor Green

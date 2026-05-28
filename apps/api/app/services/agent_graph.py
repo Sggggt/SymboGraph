@@ -16,7 +16,7 @@ from app.db import SessionLocal
 from app.models import AgentRun, AgentTraceEvent, QASession
 from app.schemas import AgentRequest, SearchFilters
 from app.core.config import get_settings
-from app.services.embeddings import ChatProvider, EmbeddingProvider, FallbackDisabledError, is_degraded_mode
+from app.services.embeddings import ChatProvider, EmbeddingProvider, FallbackDisabledError, is_degraded_mode, prefers_chinese_answer
 from app.services.ingestion import resolve_course
 from app.services.retrieval import (
     assemble_evidence_documents,
@@ -87,6 +87,30 @@ def _terms(text: str) -> set[str]:
 def _summarize(text: str, limit: int = 280) -> str:
     compact = re.sub(r"\s+", " ", text).strip()
     return compact[:limit]
+
+
+def _direct_answer_text(question: str) -> str:
+    if prefers_chinese_answer(question):
+        return "我可以回答已索引课程材料中的问题，提供引用，并说明检索智能体如何得到答案。"
+    return "I can answer questions about the indexed course materials, show citations, and explain how the retrieval agent reached its answer."
+
+
+def _clarify_answer_text(question: str) -> str:
+    if prefers_chinese_answer(question):
+        return "请进一步说明你要检索的课程概念、章节、习题或比较问题。"
+    return "Please clarify the course concept, chapter, exercise, or comparison you want me to retrieve."
+
+
+def _correction_no_context_answer_text(question: str) -> str:
+    if prefers_chinese_answer(question):
+        return (
+            "课程材料中没有找到足够相关内容来回答这个问题。"
+            "如果你希望我基于已经检索到的有限材料尝试回答（可能包含推测），请告诉我。"
+        )
+    return (
+        "I could not find enough relevant course material to answer this question. "
+        "If you want me to try answering from the limited retrieved material, which may involve inference, please tell me."
+    )
 
 
 def _set_run_state_sync(
@@ -743,35 +767,69 @@ class EvidenceAssembler:
 class DocumentGrader:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = SessionLocal()
         question = state.get("rewritten_question") or state["question"]
-        query_terms = _terms(question)
+
+        query_variants: list[tuple[str, str, set[str]]] = []
+        seen_queries: set[str] = set()
+
+        def add_query_variant(label: str, value: str | None) -> None:
+            normalized = (value or "").strip()
+            if not normalized or normalized in seen_queries:
+                return
+            seen_queries.add(normalized)
+            query_variants.append((label, normalized, _terms(normalized)))
+
+        add_query_variant("original_question", state.get("question"))
+        add_query_variant("rewritten_question", state.get("rewritten_question"))
+        for sub_query in state.get("retrieval_params", {}).get("sub_queries", []):
+            add_query_variant("sub_query", sub_query)
+        if not query_variants:
+            add_query_variant("question", question)
+
         graded = []
         low_confidence = []
 
-        # Compute query embedding once for similarity scoring
-        query_vector = None
+        # Compute query embeddings once for similarity scoring.  All query
+        # variants are considered so cross-language rewrites cannot mask a
+        # high-quality same-language match.
+        query_vectors: list[list[float]] = []
         settings = get_settings()
         if settings.retrieval_layer_enabled and not is_degraded_mode():
             try:
                 embedder = EmbeddingProvider()
-                query_vector = (await embedder.embed_texts([question], text_type="query"))[0]
+                query_vectors = await embedder.embed_texts([item[1] for item in query_variants], text_type="query")
             except Exception:
-                query_vector = None
+                query_vectors = []
 
         for document in state.get("documents", []):
             haystack = f"{document.get('document_title', '')} {document.get('snippet', '')} {document.get('content', '')}"
-            overlap = len(query_terms.intersection(_terms(haystack)))
-            overlap_ratio = overlap / max(len(query_terms), 1)
-            scores = document.setdefault("metadata", {}).setdefault("scores", {})
-            scores["grader_overlap"] = overlap
+            haystack_terms = _terms(haystack)
+            max_overlap = 0
+            overlap_ratio = 0.0
+            overlap_source = "none"
+            for label, _variant, terms in query_variants:
+                overlap = len(terms.intersection(haystack_terms))
+                current_ratio = overlap / max(len(terms), 1)
+                if current_ratio > overlap_ratio or (current_ratio == overlap_ratio and overlap > max_overlap):
+                    max_overlap = overlap
+                    overlap_ratio = current_ratio
+                    overlap_source = label
+
+            metadata = document.setdefault("metadata", {})
+            scores = metadata.setdefault("scores", {})
+            scores["grader_overlap"] = max_overlap
             scores["term_overlap_ratio"] = round(overlap_ratio, 4)
+            metadata["grader_overlap_source"] = overlap_source
+            metadata["grader_query_variant_count"] = len(query_variants)
 
             # Embedding similarity boost
             embedding_sim = 0.0
-            if query_vector and document.get("metadata", {}).get("embedding_vector"):
+            if query_vectors and document.get("metadata", {}).get("embedding_vector"):
                 try:
-                    embedding_sim = cosine_similarity(query_vector, document["metadata"]["embedding_vector"])
+                    embedding_sim = max(
+                        cosine_similarity(query_vector, document["metadata"]["embedding_vector"])
+                        for query_vector in query_vectors
+                    )
                 except Exception:
                     embedding_sim = 0.0
             if embedding_sim == 0.0:
@@ -830,7 +888,6 @@ class EvidenceEvaluator:
 
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = SessionLocal()
         docs = state.get("graded_documents", [])
         perception = state.get("perception_result", {})
         retry_count = state.get("retry_count", 0)
@@ -840,14 +897,26 @@ class EvidenceEvaluator:
         if not docs:
             sufficient = False
             score = 0.0
+            avg_score = max_score = avg_overlap = max_overlap = 0.0
             reason = "no_documents"
         else:
             grade_scores = [
                 float(d.get("metadata", {}).get("scores", {}).get("grade_score", 0))
                 for d in docs
             ]
+            overlap_scores = [
+                float(d.get("metadata", {}).get("scores", {}).get("term_overlap_ratio", 0))
+                for d in docs
+            ]
+            embedding_scores = [
+                float(d.get("metadata", {}).get("scores", {}).get("grader_embedding_sim", 0))
+                for d in docs
+            ]
             avg_score = sum(grade_scores) / len(grade_scores)
             max_score = max(grade_scores)
+            avg_overlap = sum(overlap_scores) / len(overlap_scores)
+            max_overlap = max(overlap_scores)
+            max_embedding = max(embedding_scores)
 
             # Intent-based thresholds
             if intent in ("definition", "procedure"):
@@ -860,27 +929,32 @@ class EvidenceEvaluator:
                 min_docs_needed = 1
                 min_avg_score = 0.20
 
-            has_anchor = max_score >= 0.35
+            has_strong_evidence = max_score >= 0.35 or max_embedding >= 0.45 or max_overlap >= 0.5
             doc_count_ok = len(docs) >= min_docs_needed
+            score_ok = avg_score >= min_avg_score or avg_overlap >= 0.35
+            reason_metrics = (
+                f"avg_score={avg_score:.2f} max_score={max_score:.2f} "
+                f"avg_overlap={avg_overlap:.2f} max_overlap={max_overlap:.2f} "
+                f"docs={len(docs)} needed={min_docs_needed}"
+            )
 
-            if has_anchor and doc_count_ok and avg_score >= min_avg_score:
+            if has_strong_evidence and doc_count_ok and score_ok:
                 sufficient = True
                 score = avg_score
-                reason = "sufficient"
-            elif has_anchor and len(docs) >= 1:
-                # Anchor present but marginal quantity / score
-                sufficient = True
-                score = avg_score
-                reason = "marginal"
+                reason = f"sufficient {reason_metrics}"
             else:
                 sufficient = False
                 score = avg_score
-                reason = f"avg_score={avg_score:.2f} max_score={max_score:.2f} docs={len(docs)} needed={min_docs_needed}"
+                reason = reason_metrics
 
         evaluation = {
             "sufficient": sufficient,
             "score": round(score, 4),
             "reason": reason,
+            "avg_score": round(avg_score, 4),
+            "max_score": round(max_score, 4),
+            "avg_overlap": round(avg_overlap, 4),
+            "max_overlap": round(max_overlap, 4),
             "retry_count": retry_count,
             "anchor_count": len(state.get("evidence_anchors", [])),
             "planned_paths": len(state.get("evidence_chain_plan", [])),
@@ -965,10 +1039,9 @@ class ContextSynthesizer:
 class AnswerGenerator:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = SessionLocal()
         route = state.get("route", "retrieve_both")
         if route == "direct_answer":
-            answer = "I can answer questions about the indexed course materials, show citations, and explain how the retrieval agent reached its answer."
+            answer = _direct_answer_text(state["question"])
             citations: list[dict] = []
             used_chunks: list[dict] = []
             state["answer_model_audit"] = {
@@ -979,7 +1052,7 @@ class AnswerGenerator:
                 "skipped_reason": "direct_answer_route",
             }
         elif route == "clarify":
-            answer = "Please clarify the course concept, chapter, exercise, or comparison you want me to retrieve."
+            answer = _clarify_answer_text(state["question"])
             citations = []
             used_chunks = []
             state["answer_model_audit"] = {
@@ -995,10 +1068,7 @@ class AnswerGenerator:
             # During reflection-correction retry, if no documents remain after correction,
             # produce a graceful response instead of the generic no_contexts fallback.
             if not used_chunks and retry_count > 0:
-                answer = (
-                    "课程材料中没有找到足够相关内容来回答这个问题。"
-                    "如果你希望我从已检索到的有限材料中尝试回答（可能包含推测），请告诉我。"
-                )
+                answer = _correction_no_context_answer_text(state["question"])
                 state["answer_model_audit"] = {
                     "provider": "none",
                     "model": get_settings().chat_model,
@@ -1419,6 +1489,9 @@ def create_agent_run_context(db: Session, request: AgentRequest) -> tuple[QASess
 
 
 async def execute_agent_run(db: Session, request: AgentRequest, session: QASession, run: AgentRun, initial: AgentState) -> dict:
+    from app.db import _db_context_var, _active_sessions
+    token = _db_context_var.set(db)
+    sessions_token = _active_sessions.set([])
     try:
         final_state = await AGENT_GRAPH.ainvoke(initial)
         trace_events = db.scalars(select(AgentTraceEvent).where(AgentTraceEvent.run_id == run.id).order_by(AgentTraceEvent.created_at.asc())).all()
@@ -1441,6 +1514,15 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
         _set_run_state_sync(db, run.id, "failed", current_node=None, error=str(exc))
         _trace_sync(db, run.id, "error", status="failed", output_summary=str(exc), error=str(exc))
         raise
+    finally:
+        _db_context_var.reset(token)
+        sessions = _active_sessions.get([])
+        for sess in sessions:
+            try:
+                sess.close()
+            except Exception:
+                pass
+        _active_sessions.reset(sessions_token)
 
 
 async def run_agent(db: Session, request: AgentRequest) -> dict:
@@ -1475,6 +1557,12 @@ async def stream_agent_events(db: Session, request: AgentRequest) -> AsyncGenera
         return
     finally:
         _unsubscribe_trace(run.id, trace_queue)
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     if request.stream_trace:
         # Defensive replay for any trace rows missed by the in-memory queue.

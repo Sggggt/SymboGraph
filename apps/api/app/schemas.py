@@ -39,6 +39,75 @@ GraphType = Literal["semantic", "structural", "evidence"]
 SemanticEntityType = Literal["concept", "method", "formula", "metric", "algorithm", "definition", "theorem", "problem_type"]
 GraphNodeCategory = Literal["semantic_entity", "course", "document", "chapter", "section", "chunk", "evidence_chunk", "document_version"]
 
+SEMANTIC_ENTITY_TYPE_VALUES = {"concept", "method", "formula", "metric", "algorithm", "definition", "theorem", "problem_type"}
+GRAPH_RELATION_TYPE_VALUES = {
+    "is_a",
+    "part_of",
+    "prerequisite_of",
+    "used_for",
+    "causes",
+    "derives_from",
+    "compares_with",
+    "example_of",
+    "defined_by",
+    "formula_of",
+    "solves",
+    "implemented_by",
+    "related_to",
+}
+SEMANTIC_ENTITY_TYPE_ALIASES = {
+    "named_algorithm": "algorithm",
+    "algo": "algorithm",
+    "measure": "metric",
+    "definition_term": "definition",
+    "problem": "problem_type",
+    "problem type": "problem_type",
+    "application": "concept",
+}
+GRAPH_RELATION_TYPE_ALIASES = {
+    "defines": "defined_by",
+    "defined by": "defined_by",
+    "relates_to": "related_to",
+    "relates to": "related_to",
+    "mentions": "related_to",
+    "compares": "compares_with",
+    "compares with": "compares_with",
+    "extends": "derives_from",
+}
+
+
+def _normalize_semantic_entity_type(value: object) -> str:
+    if not isinstance(value, str):
+        return "concept"
+    entity_type = value.strip().lower().replace("-", "_").replace(" ", "_")
+    entity_type = SEMANTIC_ENTITY_TYPE_ALIASES.get(value.strip().lower(), entity_type)
+    entity_type = SEMANTIC_ENTITY_TYPE_ALIASES.get(entity_type, entity_type)
+    return entity_type if entity_type in SEMANTIC_ENTITY_TYPE_VALUES else "concept"
+
+
+def _normalize_graph_relation_type(value: object) -> str:
+    if not isinstance(value, str):
+        return "related_to"
+    relation_type = value.strip().lower().replace("-", "_")
+    relation_type = GRAPH_RELATION_TYPE_ALIASES.get(value.strip().lower(), relation_type)
+    relation_type = GRAPH_RELATION_TYPE_ALIASES.get(relation_type, relation_type)
+    return relation_type if relation_type in GRAPH_RELATION_TYPE_VALUES else "related_to"
+
+
+def _normalize_unit_interval_score(value: object) -> object:
+    if value is None or isinstance(value, bool):
+        return value
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return value
+    if 1.0 < score <= 10.0:
+        return score / 10.0
+    if score == 1.0:
+        if isinstance(value, int) or (isinstance(value, str) and value.strip() == "1"):
+            return 0.1
+    return value
+
 
 class SearchFilters(BaseModel):
     chapter: str | None = None
@@ -108,6 +177,8 @@ class GraphExtractionConcept(BaseModel):
             payload["concept_type"] = payload["entity_type"]
         if payload.get("concept_type") and not payload.get("entity_type"):
             payload["entity_type"] = payload["concept_type"]
+        payload["concept_type"] = _normalize_semantic_entity_type(payload.get("concept_type"))
+        payload["entity_type"] = _normalize_semantic_entity_type(payload.get("entity_type") or payload["concept_type"])
         if payload.get("definition") and not payload.get("summary"):
             payload["summary"] = payload["definition"]
         return payload
@@ -122,6 +193,11 @@ class GraphExtractionConcept(BaseModel):
     def strip_aliases(cls, value: list[str]) -> list[str]:
         return [item.strip() for item in value if item.strip()]
 
+    @field_validator("importance_score", "confidence", mode="before")
+    @classmethod
+    def normalize_scores(cls, value: object) -> object:
+        return _normalize_unit_interval_score(value)
+
     @model_validator(mode="after")
     def require_name(self) -> "GraphExtractionConcept":
         if not self.name.strip():
@@ -134,6 +210,16 @@ class GraphExtractionRelation(BaseModel):
     target: str = Field(min_length=1, max_length=255)
     relation_type: GraphRelationType
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    @field_validator("relation_type", mode="before")
+    @classmethod
+    def normalize_relation_type(cls, value: object) -> str:
+        return _normalize_graph_relation_type(value)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def normalize_confidence(cls, value: object) -> object:
+        return _normalize_unit_interval_score(value)
 
     @field_validator("source", "target")
     @classmethod
@@ -597,6 +683,8 @@ class DashboardSnapshot(BaseModel):
     graph: GraphResponse
     batch_status: IngestionBatchSummary | None = None
     ingested_document_count: int = 0
+    chunk_count: int = 0
+    graph_eligible_chunk_count: int = 0
     graph_relation_count: int = 0
     coverage_by_source_type: dict[str, int] = Field(default_factory=dict)
     degraded_mode: bool = False

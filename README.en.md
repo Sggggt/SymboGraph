@@ -915,7 +915,7 @@ ENABLE_DATABASE_FALLBACK=false
 2. Start the Docker stack:
 
 ```powershell
-docker compose -f infra/docker-compose.yml up -d api web postgres redis qdrant
+docker compose -f infra/docker-compose.yml up -d api worker web postgres redis qdrant
 ```
 
 Windows users can also double-click `start-app.bat` to launch the backend, frontend, and infrastructure containers. This script **does not** force an image rebuild, making it suitable for daily quick starts.
@@ -923,7 +923,7 @@ Windows users can also double-click `start-app.bat` to launch the backend, front
 If the application code or dependencies have changed and you need to rebuild the local images, run:
 
 ```powershell
-docker compose -f infra/docker-compose.yml build api web
+docker compose -f infra/docker-compose.yml build api worker web
 ```
 
 Or on Windows simply run `rebuild-images.bat`. To force a rebuild without cache, use `rebuild-images.bat -NoCache`.

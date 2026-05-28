@@ -6,6 +6,17 @@ from app.schemas import AgentRequest
 from app.services.embeddings import ChatCallResult
 
 
+def _patch_agent_state_writes(monkeypatch):
+    import app.services.agent_graph as agent_graph
+
+    async def noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(agent_graph, "_set_run_state", noop)
+    monkeypatch.setattr(agent_graph, "_trace", noop)
+    return agent_graph
+
+
 @pytest.mark.asyncio
 async def test_agent_clarify_route_does_not_use_fallback(db_session, sample_course):
     from app.core.config import get_settings
@@ -296,10 +307,10 @@ async def test_stream_agent_events_emits_trace_before_answer_tokens(db_session, 
 
 
 @pytest.mark.asyncio
-async def test_evidence_evaluator_marks_sufficient_for_high_quality_docs(db_session, sample_course):
-    from app.services.agent_graph import EvidenceEvaluator
+async def test_evidence_evaluator_marks_sufficient_for_high_quality_docs(monkeypatch):
+    agent_graph = _patch_agent_state_writes(monkeypatch)
 
-    evaluator = EvidenceEvaluator()
+    evaluator = agent_graph.EvidenceEvaluator()
     state = {
         "run_id": "run-ev-1",
         "question": "q",
@@ -312,16 +323,37 @@ async def test_evidence_evaluator_marks_sufficient_for_high_quality_docs(db_sess
     }
     result = await evaluator(state)
     assert result["evidence_evaluation"]["sufficient"] is True
-    assert result["evidence_evaluation"]["reason"] == "sufficient"
+    assert result["evidence_evaluation"]["reason"].startswith("sufficient")
     assert "low_evidence" not in result
     assert "retry_count" not in result
 
 
 @pytest.mark.asyncio
-async def test_evidence_evaluator_triggers_retry_when_insufficient(db_session, sample_course):
-    from app.services.agent_graph import EvidenceEvaluator
+async def test_evidence_evaluator_marks_sufficient_for_high_overlap_docs(monkeypatch):
+    agent_graph = _patch_agent_state_writes(monkeypatch)
 
-    evaluator = EvidenceEvaluator()
+    evaluator = agent_graph.EvidenceEvaluator()
+    state = {
+        "run_id": "run-ev-overlap",
+        "question": "q",
+        "top_k": 3,
+        "retry_count": 0,
+        "perception_result": {"intent": "definition"},
+        "graded_documents": [
+            {"chunk_id": "c1", "metadata": {"scores": {"grade_score": 0.28, "term_overlap_ratio": 0.7}}},
+        ],
+    }
+    result = await evaluator(state)
+    assert result["evidence_evaluation"]["sufficient"] is True
+    assert result["evidence_evaluation"]["avg_overlap"] == 0.7
+    assert "retry_count" not in result
+
+
+@pytest.mark.asyncio
+async def test_evidence_evaluator_triggers_retry_when_insufficient(monkeypatch):
+    agent_graph = _patch_agent_state_writes(monkeypatch)
+
+    evaluator = agent_graph.EvidenceEvaluator()
     state = {
         "run_id": "run-ev-2",
         "question": "q",
@@ -329,7 +361,7 @@ async def test_evidence_evaluator_triggers_retry_when_insufficient(db_session, s
         "retry_count": 0,
         "perception_result": {"intent": "comparison"},
         "graded_documents": [
-            {"chunk_id": "c1", "metadata": {"scores": {"grade_score": 0.1}}},
+            {"chunk_id": "c1", "metadata": {"scores": {"grade_score": 0.1, "term_overlap_ratio": 0.1, "grader_embedding_sim": 0.1}}},
         ],
     }
     result = await evaluator(state)
@@ -340,10 +372,10 @@ async def test_evidence_evaluator_triggers_retry_when_insufficient(db_session, s
 
 
 @pytest.mark.asyncio
-async def test_evidence_evaluator_sets_low_evidence_after_max_retries(db_session, sample_course):
-    from app.services.agent_graph import EvidenceEvaluator
+async def test_evidence_evaluator_sets_low_evidence_after_max_retries(monkeypatch):
+    agent_graph = _patch_agent_state_writes(monkeypatch)
 
-    evaluator = EvidenceEvaluator()
+    evaluator = agent_graph.EvidenceEvaluator()
     state = {
         "run_id": "run-ev-3",
         "question": "q",
@@ -359,10 +391,10 @@ async def test_evidence_evaluator_sets_low_evidence_after_max_retries(db_session
 
 
 @pytest.mark.asyncio
-async def test_evidence_evaluator_marginal_with_anchor(db_session, sample_course):
-    from app.services.agent_graph import EvidenceEvaluator
+async def test_evidence_evaluator_marginal_with_anchor(monkeypatch):
+    agent_graph = _patch_agent_state_writes(monkeypatch)
 
-    evaluator = EvidenceEvaluator()
+    evaluator = agent_graph.EvidenceEvaluator()
     state = {
         "run_id": "run-ev-4",
         "question": "q",
@@ -391,3 +423,104 @@ def test_route_after_evidence_evaluator():
     # Insufficient without retry budget -> context_synthesizer (with low_evidence flag already set by evaluator)
     assert route_after_evidence_evaluator({"evidence_evaluation": {"sufficient": False}, "retry_count": 2}) == "context_synthesizer"
     assert route_after_evidence_evaluator({"evidence_evaluation": {"sufficient": False}, "retry_count": 5}) == "context_synthesizer"
+
+
+def test_agent_fixed_answers_follow_question_language():
+    from app.services.agent_graph import _clarify_answer_text, _correction_no_context_answer_text, _direct_answer_text
+
+    assert _direct_answer_text("hello").startswith("I can answer")
+    assert _clarify_answer_text("it").startswith("Please clarify")
+    assert _correction_no_context_answer_text("What is a graph?").startswith("I could not find")
+    assert _direct_answer_text("\u4f60\u597d").startswith("\u6211\u53ef\u4ee5")
+    assert _clarify_answer_text("\u8fd9\u4e2a").startswith("\u8bf7\u8fdb\u4e00\u6b65")
+    assert _correction_no_context_answer_text("\u4ec0\u4e48\u662f\u56fe\uff1f").startswith("\u8bfe\u7a0b\u6750\u6599")
+
+
+@pytest.mark.asyncio
+async def test_document_grader_keeps_english_evidence_when_rewritten_query_is_chinese(monkeypatch):
+    from app.core.config import get_settings
+    import app.services.agent_graph as agent_graph
+
+    monkeypatch.setenv("RETRIEVAL_LAYER_ENABLED", "false")
+    get_settings.cache_clear()
+
+    async def noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(agent_graph, "_set_run_state", noop)
+    monkeypatch.setattr(agent_graph, "_trace", noop)
+
+    question = "What is the difference between a walk, a trail, and a path?"
+    rewritten_question = "\u4ec0\u4e48\u662f\u901a\u8def\u3001\u8ff9\u548c\u8def\u5f84\u4e4b\u95f4\u7684\u533a\u522b\uff1f"
+    document = {
+        "chunk_id": "walk-trail-path",
+        "document_title": "Chapter 1",
+        "snippet": "A walk may repeat vertices and edges. A trail has no repeated edges. A path has no repeated vertices.",
+        "content": "The difference between a walk, a trail, and a path is based on repeated edges and vertices.",
+        "score": 0.42,
+        "citations": [],
+        "metadata": {"scores": {"dense": 0.42}},
+    }
+
+    result = await agent_graph.DocumentGrader()(
+        {
+            "run_id": "run-grader-cross-lang",
+            "question": question,
+            "rewritten_question": rewritten_question,
+            "retrieval_params": {"sub_queries": [question, rewritten_question]},
+            "documents": [document],
+            "top_k": 3,
+        }
+    )
+
+    graded = result["graded_documents"]
+    assert [item["chunk_id"] for item in graded] == ["walk-trail-path"]
+    scores = graded[0]["metadata"]["scores"]
+    assert scores["term_overlap_ratio"] > 0
+    assert scores["grade_score"] >= 0.35
+    assert graded[0]["metadata"]["grader_overlap_source"] == "original_question"
+
+
+@pytest.mark.asyncio
+async def test_document_grader_keeps_english_evidence_for_chinese_question_with_english_rewrite(monkeypatch):
+    from app.core.config import get_settings
+    import app.services.agent_graph as agent_graph
+
+    monkeypatch.setenv("RETRIEVAL_LAYER_ENABLED", "false")
+    get_settings.cache_clear()
+
+    async def noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(agent_graph, "_set_run_state", noop)
+    monkeypatch.setattr(agent_graph, "_trace", noop)
+
+    question = "\u4ec0\u4e48\u662f\u901a\u8def\u3001\u8ff9\u548c\u8def\u5f84\u7684\u533a\u522b\uff1f"
+    rewritten_question = "What is the difference between a walk, a trail, and a path?"
+    document = {
+        "chunk_id": "walk-trail-path",
+        "document_title": "Chapter 1",
+        "snippet": "A walk may repeat vertices and edges. A trail has no repeated edges. A path has no repeated vertices.",
+        "content": "The difference between a walk, a trail, and a path is based on repeated edges and vertices.",
+        "score": 0.42,
+        "citations": [],
+        "metadata": {"scores": {"dense": 0.42}},
+    }
+
+    result = await agent_graph.DocumentGrader()(
+        {
+            "run_id": "run-grader-cross-lang-zh",
+            "question": question,
+            "rewritten_question": rewritten_question,
+            "retrieval_params": {"sub_queries": [question, rewritten_question]},
+            "documents": [document],
+            "top_k": 3,
+        }
+    )
+
+    graded = result["graded_documents"]
+    assert [item["chunk_id"] for item in graded] == ["walk-trail-path"]
+    scores = graded[0]["metadata"]["scores"]
+    assert scores["term_overlap_ratio"] > 0
+    assert scores["grade_score"] >= 0.35
+    assert graded[0]["metadata"]["grader_overlap_source"] == "rewritten_question"

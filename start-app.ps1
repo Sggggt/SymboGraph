@@ -187,6 +187,21 @@ if ($modelBridgeEnabled) {
 Write-Host "API: http://127.0.0.1:$BackendPort/api"
 Write-Host "Web: http://127.0.0.1:$FrontendPort"
 
+# Stop heavy leftover ablation/experiment containers to free up system memory and prevent OOM
+try {
+  $runningAblations = & docker ps --filter "status=running" --format "{{.Names}}" 2>$null
+  if ($LASTEXITCODE -eq 0 -and $runningAblations) {
+    foreach ($containerName in $runningAblations) {
+      if ($containerName -match "ablation" -or $containerName -match "experiment") {
+        Write-Host "Stopping heavy background service to free up memory: $containerName" -ForegroundColor Yellow
+        & docker stop $containerName > $null
+      }
+    }
+  }
+} catch {
+  # Ignore failures to avoid blocking startup if docker is not running or other issues
+}
+
 Invoke-Compose -Arguments @(
   "compose",
   "-f", $InfraComposeFile,
@@ -197,13 +212,13 @@ Invoke-Compose -Arguments @(
   "compose",
   "-f", $InfraComposeFile,
   "up", "-d",
-  "postgres", "redis", "qdrant", "api", "web"
+  "postgres", "redis", "qdrant", "api", "worker", "web"
 )
 $stopCommand = "docker compose -f infra/docker-compose.yml down"
 
 
 Wait-Url -Url $BackendUrl -Name "Backend"
-Wait-Url -Url $FrontendUrl -Name "Frontend"
+Wait-Url -Url "http://127.0.0.1:$FrontendPort" -Name "Frontend"
 
 if (-not $NoBrowser) {
   Write-Host "Opening $FrontendUrl"
