@@ -167,21 +167,21 @@ def get_settings() -> Settings:
 
     # Embedding-specific overrides (no fallback to chat model settings)
     embedding_base_url = os.getenv("EMBEDDING_BASE_URL")
-    if embedding_base_url:
-        settings.embedding_base_url = embedding_base_url
-    elif model_bridge_enabled:
+    if model_bridge_enabled:
         settings.embedding_base_url = f"http://host.docker.internal:{settings.model_bridge_port}"
         settings.embedding_resolve_ip = "__none__"
+    elif embedding_base_url:
+        settings.embedding_base_url = embedding_base_url
     elif env_entries.get("EMBEDDING_BASE_URL"):
         settings.embedding_base_url = env_entries["EMBEDDING_BASE_URL"]
     elif "EMBEDDING_BASE_URL" in os.environ:
         settings.embedding_base_url = ""
 
     embedding_resolve_ip = os.getenv("EMBEDDING_RESOLVE_IP")
-    if embedding_resolve_ip:
-        settings.embedding_resolve_ip = embedding_resolve_ip
-    elif model_bridge_enabled:
+    if model_bridge_enabled:
         settings.embedding_resolve_ip = "__none__"
+    elif embedding_resolve_ip:
+        settings.embedding_resolve_ip = embedding_resolve_ip
     elif env_entries.get("EMBEDDING_RESOLVE_IP") is not None:
         settings.embedding_resolve_ip = env_entries.get("EMBEDDING_RESOLVE_IP")
     elif "EMBEDDING_RESOLVE_IP" in os.environ:
