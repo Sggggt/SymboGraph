@@ -42,7 +42,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ocr = ["paddleocr>=2.9.1"]
+ocr = ["pytesseract>=0.3.13"]
 fallback = ["unstructured>=0.16.8"]
 rerank = ["sentence-transformers>=3.3.1"]
 dev = [

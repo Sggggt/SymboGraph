@@ -59,6 +59,7 @@ from app.services.ingestion import (
     create_sync_batch,
     get_batch_status,
     list_course_summaries,
+    request_batch_cancel,
     register_uploaded_file,
     resolve_course,
     run_batch_ingestion,
@@ -314,15 +315,15 @@ async def enqueue_batch(batch_id: str) -> None:
         raise
 
 
-async def enqueue_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False) -> None:
+async def enqueue_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False, rebuild_graph_mode: str = "none") -> None:
     settings = get_settings()
     if settings.ingestion_execution_mode == "inline":
-        await run_uploaded_files_ingestion(batch_id, file_paths, force=force)
+        await run_uploaded_files_ingestion(batch_id, file_paths, force=force, rebuild_graph_mode=rebuild_graph_mode)
         return
     try:
         from worker_app.tasks import ingest_uploaded_batch
 
-        task = ingest_uploaded_batch.apply_async(args=[batch_id, file_paths], kwargs={"force": force}, queue=settings.ingestion_task_queue)
+        task = ingest_uploaded_batch.apply_async(args=[batch_id, file_paths], kwargs={"force": force, "rebuild_graph_mode": rebuild_graph_mode}, queue=settings.ingestion_task_queue)
         mark_batch_enqueued(batch_id, "ingest_uploaded_batch", getattr(task, "id", None))
     except Exception as exc:
         mark_batch_enqueue_failed(batch_id, exc)
@@ -405,8 +406,8 @@ def enqueue_batch_background(batch_id: str) -> None:
     asyncio.run(enqueue_batch(batch_id))
 
 
-def enqueue_uploaded_batch_background(batch_id: str, file_paths: list[str], force: bool = False) -> None:
-    asyncio.run(enqueue_uploaded_batch(batch_id, file_paths, force=force))
+def enqueue_uploaded_batch_background(batch_id: str, file_paths: list[str], force: bool = False, rebuild_graph_mode: str = "none") -> None:
+    asyncio.run(enqueue_uploaded_batch(batch_id, file_paths, force=force, rebuild_graph_mode=rebuild_graph_mode))
 
 
 @router.post("/files/upload", response_model=UploadFileResponse)
@@ -433,6 +434,8 @@ async def parse_uploaded_files(
     db: Session = Depends(get_db),
 ) -> dict:
     course = get_requested_course(db, course_id)
+    if request.rebuild_graph_mode == "full" and not request.confirm_destructive_graph_rebuild:
+        raise HTTPException(status_code=400, detail="confirm_destructive_graph_rebuild is required for full graph rebuild after parsing")
     storage_root = Path(get_settings().course_paths_for_name(course.name)["storage_root"]).resolve()
     requested_paths = request.file_paths or [str(path) for path in collect_source_documents(storage_root)]
     if not requested_paths:
@@ -449,18 +452,18 @@ async def parse_uploaded_files(
             continue
         seen_paths.add(path)
         file_paths.append(path)
-    batch = create_uploaded_files_batch(db, course.id, file_paths, force=request.force)
+    batch = create_uploaded_files_batch(db, course.id, file_paths, force=request.force, rebuild_graph_mode=request.rebuild_graph_mode)
     serialized_paths = [str(path) for path in file_paths]
     if get_settings().ingestion_execution_mode == "celery":
         try:
-            await enqueue_uploaded_batch(batch.id, serialized_paths, request.force)
+            await enqueue_uploaded_batch(batch.id, serialized_paths, request.force, request.rebuild_graph_mode)
         except Exception as exc:
             raise HTTPException(
                 status_code=503,
                 detail={"code": "ingestion_enqueue_failed", "message": enqueue_error_message(exc)},
             ) from exc
     else:
-        background_tasks.add_task(enqueue_uploaded_batch_background, batch.id, serialized_paths, request.force)
+        background_tasks.add_task(enqueue_uploaded_batch_background, batch.id, serialized_paths, request.force, request.rebuild_graph_mode)
     return {"batch_id": batch.id, "state": "queued"}
 
 
@@ -488,6 +491,18 @@ async def parse_storage_directory(background_tasks: BackgroundTasks, course_id: 
 @router.get("/ingestion/batches/{batch_id}", response_model=IngestionBatchSummary)
 def batch_status(batch_id: str, db: Session = Depends(get_db)) -> dict:
     batch = get_batch_status(db, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    return batch
+
+
+@router.post("/ingestion/batches/{batch_id}/cancel", response_model=IngestionBatchSummary)
+def cancel_batch(batch_id: str, course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+    course = get_requested_course(db, course_id)
+    try:
+        batch = request_batch_cancel(db, batch_id, course.id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     if batch is None:
         raise HTTPException(status_code=404, detail="Batch not found")
     return batch

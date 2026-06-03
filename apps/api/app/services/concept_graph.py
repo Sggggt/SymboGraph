@@ -23,6 +23,7 @@ from app.models import (
     ConceptAlias,
     ConceptRelation,
     Course,
+    CourseGraphState,
     Document,
     DocumentVersion,
     EntityMention,
@@ -34,6 +35,7 @@ from app.models import (
     IngestionBatch,
 )
 from app.schemas import Citation, GraphExtractionPayload
+from app.services.cancellation import CANCELLED, IngestionCancelled, ensure_not_cancelled
 from app.services.embeddings import ChatProvider
 from app.services.graph_algorithms import enrich_course_graph
 from app.services.ingestion_logs import emit_ingestion_log
@@ -2003,6 +2005,7 @@ async def _execute_graph_extraction_run_inner(
     run.status = "running" if pending_task_refs else "completed"
     run.started_at = run.started_at or datetime.utcnow()
     db.commit()
+    ensure_not_cancelled(db, batch_id)
 
     if pending_task_refs:
         probe_refs = pending_task_refs[: min(3, len(pending_task_refs))]
@@ -2017,7 +2020,9 @@ async def _execute_graph_extraction_run_inner(
                 probe_chunk_ids=[chunk.id for chunk in probe_chunks],
             )
         db.commit()
+        ensure_not_cancelled(db, batch_id)
         probe_payloads, probe_errors = await run_llm_graph_extraction(probe_chunks, batch_id=batch_id)
+        ensure_not_cancelled(db, batch_id)
         probe_task_ids = [task_id for task_id, _chunk_id in probe_refs]
         probe_tasks = db.scalars(
             select(GraphExtractionChunkTask).where(GraphExtractionChunkTask.id.in_(probe_task_ids))
@@ -2056,6 +2061,7 @@ async def _execute_graph_extraction_run_inner(
     ).all()
     batch_size = int(settings.graph_extraction_resume_batch_size)
     for start in range(0, len(remaining_tasks), batch_size):
+        ensure_not_cancelled(db, batch_id)
         batch_refs = [(task.id, task.chunk_id) for task in remaining_tasks[start : start + batch_size]]
         batch_chunks = [chunk_by_id[chunk_id] for _task_id, chunk_id in batch_refs if chunk_id in chunk_by_id]
         if batch_id:
@@ -2068,6 +2074,7 @@ async def _execute_graph_extraction_run_inner(
             )
         db.commit()
         payloads, errors = await run_llm_graph_extraction(batch_chunks, batch_id=batch_id)
+        ensure_not_cancelled(db, batch_id)
         batch_task_ids = [task_id for task_id, _chunk_id in batch_refs]
         batch_tasks = db.scalars(
             select(GraphExtractionChunkTask).where(GraphExtractionChunkTask.id.in_(batch_task_ids))
@@ -2106,6 +2113,7 @@ async def _execute_graph_extraction_run_inner(
                 graph_extraction_coverage=run.coverage_json,
             )
 
+    ensure_not_cancelled(db, batch_id)
     tasks = db.scalars(select(GraphExtractionChunkTask).where(GraphExtractionChunkTask.run_id == run.id)).all()
     payloads = {task.chunk_id: task.payload_json for task in tasks if task.status == "completed" and task.payload_json}
     errors = {task.chunk_id: task.error_message or "graph extraction failed" for task in tasks if task.status == "failed"}
@@ -2464,6 +2472,7 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         sample_error = next(iter(llm_errors.values()), "模型没有返回图谱抽取结果")
         raise RuntimeError(f"所有已选片段的图谱抽取均失败：{sample_error}")
     llm_document_ids = {chunk.document_id for chunk in chunks if chunk.id in llm_chunk_ids}
+    ensure_not_cancelled(db, batch_id)
 
     try:
         _backup_course_graph_tables(db, course_id)
@@ -2472,6 +2481,7 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         logger = logging.getLogger(__name__)
         logger.exception("图谱备份失败，course_id=%s", course_id)
         raise RuntimeError(f"图谱备份失败，中止重建: {exc}") from exc
+    ensure_not_cancelled(db, batch_id)
     db.query(ConceptRelation).filter(ConceptRelation.course_id == course_id).delete(synchronize_session=False)
     db.query(GraphRelationCandidate).filter(GraphRelationCandidate.course_id == course_id).delete(synchronize_session=False)
     db.query(EntityMention).filter(EntityMention.course_id == course_id).delete(synchronize_session=False)
@@ -2535,6 +2545,7 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         stage="graph_community",
         **community_summary_stats,
     )
+    record_course_graph_state(db, course_id, build_mode="full")
     db.commit()
     graph = get_graph_payload(db, course_id, graph_type="semantic")
     return {
@@ -2667,6 +2678,7 @@ async def incremental_update_course_graph(
     batch_id: str | None = None,
 ) -> dict:
     course = db.get(Course, course_id)
+    ensure_not_cancelled(db, batch_id)
     if not changed_document_ids:
         return {"graph_rebuilt": False, "reason": "no_changed_documents"}
 
@@ -2690,11 +2702,16 @@ async def incremental_update_course_graph(
         from app.services.maintenance import delete_document_graph_incremental
 
         graph_gc_stats: dict[str, int] = {}
+        ensure_not_cancelled(db, batch_id)
         for document_id in changed_document_ids:
             stats = delete_document_graph_incremental(db, course_id, document_id)
             graph_gc_stats = {key: graph_gc_stats.get(key, 0) + value for key, value in stats.items()}
+        ensure_not_cancelled(db, batch_id)
         from app.services.graph_algorithms import enrich_course_graph
         graph_algorithm_stats = await enrich_course_graph(db, course_id, run_relation_completion=False, run_dijkstra=False)
+        ensure_not_cancelled(db, batch_id)
+        record_course_graph_state(db, course_id, build_mode="incremental")
+        ensure_not_cancelled(db, batch_id)
         db.commit()
         return {
             "graph_rebuilt": True,
@@ -2722,6 +2739,7 @@ async def incremental_update_course_graph(
         profile_version=quality_profile.version,
     )
     db.commit()
+    ensure_not_cancelled(db, batch_id)
     llm_chunk_ids = set(plan.selected_chunk_ids)
     selected_llm_chunks = [chunk for chunk in chunks if chunk.id in llm_chunk_ids]
 
@@ -2745,6 +2763,7 @@ async def incremental_update_course_graph(
         chunks=chunks,
         batch_id=batch_id,
     )
+    ensure_not_cancelled(db, batch_id)
 
     from app.services.maintenance import delete_document_graph_incremental
 
@@ -2752,6 +2771,7 @@ async def incremental_update_course_graph(
     for document_id in changed_document_ids:
         stats = delete_document_graph_incremental(db, course_id, document_id)
         graph_gc_stats = {key: graph_gc_stats.get(key, 0) + value for key, value in stats.items()}
+    ensure_not_cancelled(db, batch_id)
 
     _safe_emit_log(
         batch_id,
@@ -2762,6 +2782,7 @@ async def incremental_update_course_graph(
         graph_llm_success_chunks=len(llm_payloads),
     )
     upsert_stats = await upsert_graph_candidates_from_chunks(db, course_id, chunks, llm_payloads=llm_payloads, run_llm_merge=False)
+    ensure_not_cancelled(db, batch_id)
     _safe_emit_log(
         batch_id,
         "graph_upsert_completed",
@@ -2783,11 +2804,13 @@ async def incremental_update_course_graph(
         payloads=llm_payloads,
         baseline_context_chunks=chunks,
     )
+    ensure_not_cancelled(db, batch_id)
 
     # 3. Enrich: run full algorithms but skip expensive LLM completion and Dijkstra for speed
     from app.services.graph_algorithms import enrich_course_graph
     _safe_emit_log(batch_id, "graph_enrichment_started", "正在刷新最小更新后的图谱拓扑指标", stage="graph_enrichment")
     graph_algorithm_stats = await enrich_course_graph(db, course_id, run_relation_completion=False, run_dijkstra=False)
+    ensure_not_cancelled(db, batch_id)
     _safe_emit_log(
         batch_id,
         "graph_enrichment_completed",
@@ -2797,6 +2820,7 @@ async def incremental_update_course_graph(
     )
     _safe_emit_log(batch_id, "graph_community_started", "正在生成图谱社区摘要", stage="graph_community")
     community_summary_stats = await rebuild_graph_community_summaries(db, course_id, batch_id=batch_id)
+    ensure_not_cancelled(db, batch_id)
     _safe_emit_log(
         batch_id,
         "graph_community_completed",
@@ -2804,6 +2828,8 @@ async def incremental_update_course_graph(
         stage="graph_community",
         **community_summary_stats,
     )
+    record_course_graph_state(db, course_id, build_mode="incremental")
+    ensure_not_cancelled(db, batch_id)
     db.commit()
     graph = get_graph_payload(db, course_id, graph_type="semantic")
     return {
@@ -3099,6 +3125,7 @@ def _graph_response(graph_type: str, nodes: list[dict], edges: list[dict], chapt
         "node_counts": _count_by(nodes, "category"),
         "edge_counts": _count_by(edges, "category"),
         "focus_chapter": chapter,
+        "freshness": {"is_stale": False, "reason": None},
     }
 
 
@@ -3117,10 +3144,197 @@ def get_graph_payload(db: Session, course_id: str, chapter: str | None = None, g
     if graph_type not in GRAPH_TYPES:
         raise ValueError(f"invalid graph_type {graph_type!r}")
     if graph_type == "structural":
-        return get_structural_graph_payload(db, course_id)
-    if graph_type == "evidence":
-        return get_evidence_graph_payload(db, course_id, chapter=chapter)
-    return get_semantic_graph_payload(db, course_id, chapter=chapter)
+        payload = get_structural_graph_payload(db, course_id)
+    elif graph_type == "evidence":
+        payload = get_evidence_graph_payload(db, course_id, chapter=chapter)
+    else:
+        payload = get_semantic_graph_payload(db, course_id, chapter=chapter)
+    payload["freshness"] = graph_freshness(db, course_id)
+    return payload
+
+
+def _hash_ids(ids: list[str]) -> str:
+    return hashlib.sha256(json.dumps(sorted(ids), separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _graph_scope_snapshot(db: Session, course_id: str) -> dict[str, Any]:
+    from app.services.chunking import CURRENT_EMBEDDING_TEXT_VERSION
+
+    course = db.get(Course, course_id)
+    active_documents = db.scalars(
+        select(Document).where(Document.course_id == course_id, Document.is_active.is_(True)).order_by(Document.id.asc())
+    ).all()
+    graph_documents = filter_graph_documents(course, active_documents)
+    graph_document_ids = sorted(document.id for document in graph_documents)
+    graph_document_id_set = set(graph_document_ids)
+    active_versions = db.scalars(
+        select(DocumentVersion)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .where(
+            Document.course_id == course_id,
+            Document.id.in_(graph_document_ids) if graph_document_ids else False,
+            DocumentVersion.is_active.is_(True),
+        )
+        .order_by(DocumentVersion.id.asc())
+    ).all() if graph_document_ids else []
+    active_chunks = db.scalars(
+        select(Chunk)
+        .where(
+            Chunk.course_id == course_id,
+            Chunk.is_active.is_(True),
+            Chunk.document_id.in_(graph_document_ids) if graph_document_ids else False,
+        )
+        .order_by(Chunk.id.asc())
+    ).all() if graph_document_ids else []
+    active_chunk_ids = sorted(chunk.id for chunk in active_chunks)
+    active_document_version_ids = sorted(version.id for version in active_versions if version.document_id in graph_document_id_set)
+    return {
+        "embedding_text_version": CURRENT_EMBEDDING_TEXT_VERSION,
+        "graph_document_ids": graph_document_ids,
+        "active_document_version_ids": active_document_version_ids,
+        "active_chunk_ids": active_chunk_ids,
+        "active_chunk_ids_hash": _hash_ids(active_chunk_ids),
+        "active_chunk_count": len(active_chunk_ids),
+    }
+
+
+def record_course_graph_state(db: Session, course_id: str, *, build_mode: str) -> CourseGraphState:
+    snapshot = _graph_scope_snapshot(db, course_id)
+    state = db.get(CourseGraphState, course_id)
+    if state is None:
+        state = CourseGraphState(
+            course_id=course_id,
+            embedding_text_version=snapshot["embedding_text_version"],
+            active_chunk_ids_hash=snapshot["active_chunk_ids_hash"],
+        )
+        db.add(state)
+    state.graph_build_id = hashlib.sha256(
+        json.dumps(
+            {
+                "course_id": course_id,
+                "built_at": datetime.utcnow().isoformat(),
+                "chunk_hash": snapshot["active_chunk_ids_hash"],
+                "mode": build_mode,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:36]
+    state.build_mode = build_mode
+    state.embedding_text_version = snapshot["embedding_text_version"]
+    state.active_document_version_ids = snapshot["active_document_version_ids"]
+    state.active_chunk_ids_hash = snapshot["active_chunk_ids_hash"]
+    state.graph_document_ids = snapshot["graph_document_ids"]
+    state.active_chunk_count = snapshot["active_chunk_count"]
+    state.built_at = datetime.utcnow()
+    return state
+
+
+def graph_freshness(db: Session, course_id: str) -> dict:
+    from app.services.chunking import CURRENT_EMBEDDING_TEXT_VERSION
+
+    relations = db.scalars(
+        select(ConceptRelation).where(
+            ConceptRelation.course_id == course_id,
+            ConceptRelation.evidence_chunk_id.is_not(None),
+        )
+    ).all()
+    evidence_chunk_ids = sorted({relation.evidence_chunk_id for relation in relations if relation.evidence_chunk_id})
+    active_chunks = db.scalars(select(Chunk).where(Chunk.course_id == course_id, Chunk.is_active.is_(True))).all()
+    latest_chunk_versions = sorted({chunk.embedding_text_version for chunk in active_chunks if chunk.embedding_text_version})
+    state = db.get(CourseGraphState, course_id)
+    scope = _graph_scope_snapshot(db, course_id)
+    if state is None and evidence_chunk_ids:
+        return {
+            "is_stale": True,
+            "reason": "missing_graph_build_watermark",
+            "latest_chunk_version": CURRENT_EMBEDDING_TEXT_VERSION,
+            "active_chunk_versions": latest_chunk_versions,
+            "graph_chunk_version": None,
+            "graph_chunk_versions": [],
+            "stale_evidence_chunks": 0,
+            "missing_evidence_chunks": 0,
+            "current_document_versions": scope["active_document_version_ids"],
+            "graph_build_document_versions": [],
+            "uncovered_document_versions": scope["active_document_version_ids"],
+            "graph_active_chunk_count": None,
+            "current_active_chunk_count": scope["active_chunk_count"],
+        }
+    if state is not None:
+        graph_versions = sorted(state.active_document_version_ids or [])
+        current_versions = scope["active_document_version_ids"]
+        uncovered_versions = sorted(set(current_versions) - set(graph_versions))
+        removed_versions = sorted(set(graph_versions) - set(current_versions))
+        chunk_scope_changed = state.active_chunk_ids_hash != scope["active_chunk_ids_hash"]
+        if (
+            graph_versions != current_versions
+            or chunk_scope_changed
+            or state.embedding_text_version != CURRENT_EMBEDDING_TEXT_VERSION
+        ):
+            if state.embedding_text_version != CURRENT_EMBEDDING_TEXT_VERSION:
+                reason = "embedding_text_version_changed"
+            else:
+                reason = "active_documents_changed"
+            return {
+                "is_stale": True,
+                "reason": reason,
+                "latest_chunk_version": CURRENT_EMBEDDING_TEXT_VERSION,
+                "active_chunk_versions": latest_chunk_versions,
+                "graph_chunk_version": state.embedding_text_version,
+                "graph_chunk_versions": [state.embedding_text_version] if state.embedding_text_version else [],
+                "stale_evidence_chunks": 0,
+                "missing_evidence_chunks": 0,
+                "current_document_versions": current_versions,
+                "graph_build_document_versions": graph_versions,
+                "uncovered_document_versions": uncovered_versions,
+                "removed_document_versions": removed_versions,
+                "graph_active_chunk_count": state.active_chunk_count,
+                "current_active_chunk_count": scope["active_chunk_count"],
+                "graph_build_id": state.graph_build_id,
+                "graph_built_at": state.built_at.isoformat() if state.built_at else None,
+                "chunk_scope_changed": chunk_scope_changed,
+            }
+    if not evidence_chunk_ids:
+        return {
+            "is_stale": False,
+            "reason": "no_graph_evidence",
+            "latest_chunk_version": CURRENT_EMBEDDING_TEXT_VERSION,
+            "active_chunk_versions": latest_chunk_versions,
+            "graph_chunk_version": None,
+            "stale_evidence_chunks": 0,
+            "missing_evidence_chunks": 0,
+            "current_document_versions": scope["active_document_version_ids"],
+            "graph_build_document_versions": sorted(state.active_document_version_ids or []) if state else [],
+        }
+
+    evidence_chunks = db.scalars(select(Chunk).where(Chunk.id.in_(evidence_chunk_ids))).all()
+    chunk_by_id = {chunk.id: chunk for chunk in evidence_chunks}
+    missing_count = len([chunk_id for chunk_id in evidence_chunk_ids if chunk_id not in chunk_by_id])
+    stale_chunks = [chunk for chunk in evidence_chunks if not chunk.is_active]
+    graph_versions = sorted({chunk.embedding_text_version for chunk in evidence_chunks if chunk.embedding_text_version})
+    version_stale = bool(graph_versions and CURRENT_EMBEDDING_TEXT_VERSION not in graph_versions)
+    is_stale = bool(missing_count or stale_chunks or version_stale)
+    if missing_count:
+        reason = "missing_evidence_chunks"
+    elif stale_chunks:
+        reason = "inactive_evidence_chunks"
+    elif version_stale:
+        reason = "embedding_text_version_changed"
+    else:
+        reason = None
+    return {
+        "is_stale": is_stale,
+        "reason": reason,
+        "latest_chunk_version": CURRENT_EMBEDDING_TEXT_VERSION,
+        "active_chunk_versions": latest_chunk_versions,
+        "graph_chunk_version": graph_versions[-1] if graph_versions else None,
+        "graph_chunk_versions": graph_versions,
+        "stale_evidence_chunks": len(stale_chunks),
+        "missing_evidence_chunks": missing_count,
+        "current_document_versions": scope["active_document_version_ids"],
+        "graph_build_document_versions": sorted(state.active_document_version_ids or []) if state else [],
+        "graph_build_id": state.graph_build_id if state else None,
+        "graph_built_at": state.built_at.isoformat() if state and state.built_at else None,
+    }
 
 
 def get_structural_graph_payload(db: Session, course_id: str) -> dict:

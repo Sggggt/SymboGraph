@@ -14,6 +14,37 @@ describe("api client", () => {
     vi.stubEnv("NEXT_PUBLIC_API_KEY", "test-key");
   });
 
+  it("starts parse batches with graph rebuild mode and cancels batches", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ batch_id: "batch-1", state: "queued" }))
+      .mockResolvedValueOnce(jsonResponse({ batch_id: "batch-1", state: "cancel_requested", trigger_source: "upload", source_root: "root", total_files: 1, processed_files: 0, success_count: 0, failure_count: 0, skipped_count: 0, coverage_by_source_type: {}, errors: [], graph_stats: {} }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { parseUploadedFiles, cancelBatch } = await import("./api");
+
+    await parseUploadedFiles(["/data/course/a.pdf"], "course-1", true, "full");
+    await cancelBatch("batch-1", "course-1");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://api.test/api/ingestion/parse-uploaded-files?course_id=course-1",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          file_paths: ["/data/course/a.pdf"],
+          force: true,
+          rebuild_graph_mode: "full",
+          confirm_destructive_graph_rebuild: true,
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://api.test/api/ingestion/batches/batch-1/cancel?course_id=course-1",
+      expect.objectContaining({ method: "POST", headers: { "X-API-Key": "test-key" } }),
+    );
+  });
+
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
@@ -114,8 +145,8 @@ describe("api client", () => {
   it("requires graph_type on graph requests and confirms destructive rebuilds", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse({ graph_type: "semantic", schema_version: "typed_graph_v1", nodes: [], edges: [], node_counts: {}, edge_counts: {} }))
-      .mockResolvedValueOnce(jsonResponse({ graph_type: "evidence", schema_version: "typed_graph_v1", nodes: [], edges: [], node_counts: {}, edge_counts: {} }))
+      .mockResolvedValueOnce(jsonResponse({ graph_type: "semantic", schema_version: "typed_graph_v1", nodes: [], edges: [], node_counts: {}, edge_counts: {}, freshness: { is_stale: false } }))
+      .mockResolvedValueOnce(jsonResponse({ graph_type: "evidence", schema_version: "typed_graph_v1", nodes: [], edges: [], node_counts: {}, edge_counts: {}, freshness: { is_stale: false } }))
       .mockResolvedValueOnce(jsonResponse({ batch_id: "batch-1", state: "extracting_graph", mode: "full" }))
       .mockResolvedValueOnce(jsonResponse({ batch_id: null, state: "dry_run", mode: "full", dry_run: true, affected_documents: 3 }));
     vi.stubGlobal("fetch", fetchMock);

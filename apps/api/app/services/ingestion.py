@@ -15,6 +15,7 @@ from app.core.config import get_settings
 from app.core.utils import source_type_from_path
 from app.models import Chunk, Concept, Course, Document, DocumentVersion, IngestionBatch, IngestionCompensationLog, IngestionJob
 from app.services.chunking import CURRENT_EMBEDDING_TEXT_VERSION, chunk_sections_hierarchical_async, contextual_embedding_text, normalize_for_dedup
+from app.services.cancellation import CANCEL_REQUESTED, CANCELLED, IngestionCancelled, ensure_not_cancelled, is_cancel_requested
 from app.services.concept_graph import get_concept_cards, get_graph_payload, graph_extraction_provider, rebuild_course_graph, incremental_update_course_graph
 from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded_mode, vector_norm
 from app.services.ingestion_logs import emit_ingestion_log
@@ -26,13 +27,15 @@ from app.services.vector_store import VectorStore
 ALLOWED_SUFFIXES = {".pdf", ".ipynb", ".md", ".markdown", ".txt", ".docx", ".pptx", ".ppt", ".png", ".jpg", ".jpeg", ".bmp", ".html", ".htm"}
 EXCLUDED_PARTS = {"output", "scripts", ".ipynb_checkpoints", "__pycache__"}
 IGNORED_NAMES = {".ds_store"}
-TERMINAL_STATES = {"completed", "failed", "partial_failed", "skipped"}
+TERMINAL_STATES = {"completed", "failed", "partial_failed", "skipped", CANCELLED}
 STATE_LABELS = {
     "queued": "排队中",
     "parsing": "解析中",
     "chunking": "切块中",
     "embedding": "向量化中",
     "extracting_graph": "生成图谱中",
+    CANCEL_REQUESTED: "正在取消",
+    CANCELLED: "已取消",
     "completed": "已完成",
     "failed": "失败",
     "partial_failed": "部分失败",
@@ -316,6 +319,9 @@ async def run_graph_rebuild(batch_id: str, course_id: str, mode: str = "full") -
         batch = session.get(IngestionBatch, batch_id)
         if batch is None:
             raise RuntimeError(f"Batch {batch_id} not found")
+        if is_cancel_requested(session, batch_id):
+            await compensate_cancelled_batch(session, batch_id)
+            return summarize_batch(session.get(IngestionBatch, batch_id))
         batch.status = "extracting_graph"
         batch.started_at = datetime.utcnow()
         session.commit()
@@ -349,6 +355,16 @@ async def run_graph_rebuild(batch_id: str, course_id: str, mode: str = "full") -
                 changed_document_ids = [doc.id for doc in changed_documents]
                 try:
                     graph_stats = await incremental_update_course_graph(session, course_id, changed_document_ids, batch_id)
+                    ensure_not_cancelled(session, batch_id)
+                except IngestionCancelled:
+                    session.rollback()
+                    try:
+                        _restore_course_graph_from_backup(session, course_id)
+                        session.commit()
+                    except Exception:
+                        session.rollback()
+                    await compensate_cancelled_batch(session, batch_id)
+                    return summarize_batch(session.get(IngestionBatch, batch_id))
                 except Exception as exc:
                     session.rollback()
                     emit_ingestion_log(batch_id, "graph_incremental_failed", f"增量图谱更新失败，尝试全量重建：{exception_message(exc)}")
@@ -364,7 +380,18 @@ async def run_graph_rebuild(batch_id: str, course_id: str, mode: str = "full") -
 
         if mode == "full":
             try:
+                ensure_not_cancelled(session, batch_id)
                 graph_stats = await rebuild_course_graph_for_batch(session, course_id, batch_id)
+                ensure_not_cancelled(session, batch_id)
+            except IngestionCancelled:
+                session.rollback()
+                try:
+                    _restore_course_graph_from_backup(session, course_id)
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                await compensate_cancelled_batch(session, batch_id)
+                return summarize_batch(session.get(IngestionBatch, batch_id))
             except Exception as exc:
                 session.rollback()
                 try:
@@ -398,6 +425,12 @@ async def run_graph_rebuild(batch_id: str, course_id: str, mode: str = "full") -
         batch = session.get(IngestionBatch, batch_id)
         if batch is None:
             raise RuntimeError(f"Batch {batch_id} disappeared")
+        try:
+            ensure_not_cancelled(session, batch_id)
+        except IngestionCancelled:
+            session.rollback()
+            await compensate_cancelled_batch(session, batch_id)
+            return summarize_batch(session.get(IngestionBatch, batch_id))
         batch.status = "completed"
         batch.completed_at = datetime.utcnow()
         batch.stats = {**(batch.stats or {}), **graph_stats}
@@ -616,14 +649,14 @@ def create_sync_batch(db: Session, course_id: str, root: Path, trigger_source: s
     return batch
 
 
-def create_uploaded_files_batch(db: Session, course_id: str, files: list[Path], force: bool = False) -> IngestionBatch:
+def create_uploaded_files_batch(db: Session, course_id: str, files: list[Path], force: bool = False, rebuild_graph_mode: str = "none") -> IngestionBatch:
     active = active_batch_for_course(db, course_id)
     if active is not None:
         return active
     storage_batch_root = str(files[0].parent) if files else "storage files"
     batch = IngestionBatch(course_id=course_id, source_root=storage_batch_root, trigger_source="upload", status="queued")
     batch.total_files = len(files)
-    batch.stats = {"uploaded_files": [str(path) for path in files], "coverage_by_source_type": {}, "errors": [], "force": force}
+    batch.stats = {"uploaded_files": [str(path) for path in files], "coverage_by_source_type": {}, "errors": [], "force": force, "rebuild_graph_mode": rebuild_graph_mode}
     db.add(batch)
     db.flush()
     if force:
@@ -741,6 +774,192 @@ def get_batch_status(db: Session, batch_id: str) -> dict | None:
     if batch is None:
         return None
     return summarize_batch(batch)
+
+
+def remember_pre_batch_version(db: Session, job: IngestionJob, course_id: str, source_path: Path) -> None:
+    document = db.scalar(select(Document).where(Document.course_id == course_id, Document.source_path == str(source_path)))
+    active_version = None
+    if document is not None:
+        active_version = db.scalar(
+            select(DocumentVersion)
+            .where(DocumentVersion.document_id == document.id, DocumentVersion.is_active.is_(True))
+            .order_by(DocumentVersion.version.desc())
+        )
+        job.document_id = document.id
+    stats = dict(job.stats or {})
+    stats.setdefault("pre_batch_document_id", document.id if document else None)
+    stats.setdefault("pre_batch_active_version_id", active_version.id if active_version else None)
+    stats.setdefault("pre_batch_active_version", active_version.version if active_version else None)
+    job.stats = stats
+    db.commit()
+
+
+def request_batch_cancel(db: Session, batch_id: str, course_id: str) -> dict | None:
+    batch = db.get(IngestionBatch, batch_id)
+    if batch is None:
+        return None
+    if not course_id or batch.course_id != course_id:
+        raise PermissionError("Batch does not belong to the requested course")
+    if batch.status in TERMINAL_STATES:
+        return summarize_batch(batch)
+    batch.status = CANCEL_REQUESTED
+    batch.last_error = "用户请求取消该批次"
+    batch.stats = {**(batch.stats or {}), "cancel_requested": True, "cancel_requested_at": datetime.utcnow().isoformat()}
+    jobs = db.scalars(
+        select(IngestionJob).where(IngestionJob.batch_id == batch.id, IngestionJob.status.notin_(TERMINAL_STATES))
+    ).all()
+    for job in jobs:
+        job.status = CANCEL_REQUESTED
+        job.error_message = batch.last_error
+    db.commit()
+    emit_ingestion_log(batch.id, "batch_cancel_requested", "已收到取消请求，正在停止后续步骤并清理本批次写入", state=CANCEL_REQUESTED)
+    return summarize_batch(batch)
+
+
+async def compensate_cancelled_batch(db: Session, batch_id: str, *, reason: str = "用户取消，已回滚本批次写入") -> dict:
+    batch = db.get(IngestionBatch, batch_id)
+    if batch is None:
+        return {"cancelled": False, "reason": "batch_missing"}
+    course = db.get(Course, batch.course_id)
+    if course is None:
+        batch.status = CANCELLED
+        batch.completed_at = datetime.utcnow()
+        batch.last_error = "用户取消；课程已不存在"
+        db.commit()
+        return {"cancelled": True, "reason": "course_missing"}
+
+    stats = dict(batch.stats or {})
+    restored_versions = 0
+    deactivated_versions = 0
+    deactivated_chunks = 0
+    deleted_vectors = 0
+    restored_vectors = 0
+    graph_relations_removed = 0
+    started_at = batch.started_at or batch.created_at
+    vector_store = VectorStore(course_name=course.name)
+    jobs = db.scalars(select(IngestionJob).where(IngestionJob.batch_id == batch_id)).all()
+
+    from app.models import ConceptRelation, EntityMention, GraphExtractionChunkTask, GraphExtractionRun, GraphRelationCandidate
+
+    for job in jobs:
+        job_stats = dict(job.stats or {})
+        document = db.get(Document, job.document_id) if job.document_id else None
+        if document is None and job.source_path:
+            document = db.scalar(select(Document).where(Document.course_id == batch.course_id, Document.source_path == job.source_path))
+        if document is None:
+            job.status = CANCELLED
+            job.error_message = reason
+            continue
+
+        previous_version_id = job_stats.get("pre_batch_active_version_id")
+        new_versions = db.scalars(
+            select(DocumentVersion).where(
+                DocumentVersion.document_id == document.id,
+                DocumentVersion.id != previous_version_id,
+                DocumentVersion.created_at >= started_at,
+            )
+        ).all()
+        new_version_ids = [version.id for version in new_versions]
+        # Collect new chunks by version OR by creation time (covers version-reuse scenario)
+        new_chunk_ids = list(
+            {
+                chunk_id
+                for (chunk_id,) in db.query(Chunk.id)
+                .filter(
+                    Chunk.document_id == document.id,
+                    Chunk.document_version_id.in_(new_version_ids),
+                )
+                .all()
+            }
+            | {
+                chunk_id
+                for (chunk_id,) in db.query(Chunk.id)
+                .filter(
+                    Chunk.document_id == document.id,
+                    Chunk.created_at >= started_at,
+                )
+                .all()
+            }
+        )
+
+        if new_chunk_ids:
+            graph_relations_removed += db.query(ConceptRelation).filter(ConceptRelation.evidence_chunk_id.in_(new_chunk_ids)).delete(synchronize_session=False)
+            db.query(EntityMention).filter(EntityMention.chunk_id.in_(new_chunk_ids)).delete(synchronize_session=False)
+            db.query(GraphRelationCandidate).filter(GraphRelationCandidate.evidence_chunk_id.in_(new_chunk_ids)).delete(synchronize_session=False)
+            db.query(GraphExtractionChunkTask).filter(GraphExtractionChunkTask.chunk_id.in_(new_chunk_ids)).update({"status": CANCELLED}, synchronize_session=False)
+            try:
+                await vector_store.async_delete(new_chunk_ids)
+                deleted_vectors += len(new_chunk_ids)
+            except Exception as exc:
+                emit_ingestion_log(batch_id, "batch_cancel_compensation_warning", f"取消清理新向量失败：{exc}", error=str(exc))
+            deactivated_chunks += db.query(Chunk).filter(Chunk.id.in_(new_chunk_ids)).update({"is_active": False}, synchronize_session=False)
+
+        if new_version_ids:
+            deactivated_versions += db.query(DocumentVersion).filter(DocumentVersion.id.in_(new_version_ids)).update({"is_active": False}, synchronize_session=False)
+
+        if previous_version_id:
+            previous_version = db.get(DocumentVersion, previous_version_id)
+            if previous_version is not None:
+                previous_version.is_active = True
+                restored_versions += 1
+                previous_chunk_ids = [
+                    chunk_id
+                    for (chunk_id,) in db.query(Chunk.id)
+                    .filter(
+                        Chunk.document_version_id == previous_version_id,
+                        Chunk.created_at < started_at,
+                    )
+                    .all()
+                ]
+                if previous_chunk_ids:
+                    db.query(Chunk).filter(Chunk.id.in_(previous_chunk_ids)).update({"is_active": True}, synchronize_session=False)
+                    for log in db.scalars(
+                        select(IngestionCompensationLog).where(
+                            IngestionCompensationLog.job_id == job.id,
+                            IngestionCompensationLog.operation == "delete",
+                            IngestionCompensationLog.status == "completed",
+                        )
+                    ).all():
+                        points = (log.payload_json or {}).get("points") or []
+                        if points:
+                            try:
+                                await vector_store.async_upsert(points)
+                                restored_vectors += len(points)
+                            except Exception as exc:
+                                emit_ingestion_log(batch_id, "batch_cancel_compensation_warning", f"取消恢复旧向量失败：{exc}", error=str(exc))
+                document.checksum = previous_version.checksum
+                document.is_active = True
+        else:
+            has_active_versions = db.scalar(
+                select(func.count(DocumentVersion.id)).where(DocumentVersion.document_id == document.id, DocumentVersion.is_active.is_(True))
+            ) or 0
+            if not has_active_versions:
+                document.is_active = False
+
+        job.status = CANCELLED
+        job.error_message = reason
+        job.stats = {**job_stats, "cancelled": True, "cancelled_at": datetime.utcnow().isoformat()}
+
+    db.query(GraphExtractionRun).filter(GraphExtractionRun.batch_id == batch_id, GraphExtractionRun.status.notin_(TERMINAL_STATES)).update(
+        {"status": CANCELLED, "error_message": reason, "completed_at": datetime.utcnow()},
+        synchronize_session=False,
+    )
+    batch.status = CANCELLED
+    batch.completed_at = datetime.utcnow()
+    batch.last_error = reason
+    compensation_stats = {
+        "cancelled": True,
+        "deactivated_document_versions": deactivated_versions,
+        "restored_document_versions": restored_versions,
+        "deactivated_chunks": deactivated_chunks,
+        "deleted_vectors": deleted_vectors,
+        "restored_vectors": restored_vectors,
+        "removed_graph_relations": graph_relations_removed,
+    }
+    batch.stats = {**stats, "cancel_requested": True, **compensation_stats}
+    db.commit()
+    emit_ingestion_log(batch_id, "batch_cancelled", "批次已取消，本批次写入已补偿清理", state=CANCELLED, **compensation_stats)
+    return compensation_stats
 
 
 def finalize_interrupted_batches() -> int:
@@ -862,9 +1081,27 @@ def create_or_update_document(
     checksum: str,
     tags: list[str] | None = None,
     difficulty: str | None = None,
+    force: bool = False,
+    target_version: int | None = None,
 ) -> tuple[Document, int, list[str]]:
+    """Create or update a document.
+
+    Version numbering rule:
+    - New file: version = course_max_version + 1
+    - Existing file + force=True + target_version provided: version = target_version
+    - Existing file + force=True (no target): version = course_max_version + 1
+    - Existing file + force=False: version = max(course_max_version, file_current_version + 1)
+    """
     document = db.scalar(select(Document).where(Document.course_id == course.id, Document.source_path == str(source_path)))
     stale_chunk_ids: list[str] = []
+
+    # Query course-wide max active version
+    course_max_version = db.scalar(
+        select(func.max(DocumentVersion.version))
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .where(Document.course_id == course.id, DocumentVersion.is_active.is_(True))
+    ) or 0
+
     if document is None:
         document = Document(
             course_id=course.id,
@@ -878,20 +1115,37 @@ def create_or_update_document(
         )
         db.add(document)
         db.flush()
-        version_number = 1
+        # New file: bump course version by 1
+        version_number = target_version if target_version is not None else course_max_version + 1
+        return document, version_number, stale_chunk_ids
+
+    # Document exists
+    stale_chunk_ids = [
+        chunk_id
+        for (chunk_id,) in db.query(Chunk.id)
+        .filter(Chunk.document_id == document.id, Chunk.is_active.is_(True))
+        .all()
+    ]
+    document.is_active = True
+    document.title = title
+    document.source_type = source_type
+    document.tags = tags or document.tags
+    document.difficulty = difficulty or document.difficulty
+
+    active_version = db.scalar(
+        select(DocumentVersion)
+        .where(DocumentVersion.document_id == document.id, DocumentVersion.is_active.is_(True))
+        .order_by(DocumentVersion.version.desc())
+    )
+    file_current_version = active_version.version if active_version else 0
+
+    if target_version is not None:
+        version_number = target_version
+    elif force:
+        version_number = course_max_version + 1
     else:
-        stale_chunk_ids = [
-            chunk_id
-            for (chunk_id,) in db.query(Chunk.id)
-            .filter(Chunk.document_id == document.id, Chunk.is_active.is_(True))
-            .all()
-        ]
-        document.is_active = True
-        document.title = title
-        document.source_type = source_type
-        document.tags = tags or document.tags
-        document.difficulty = difficulty or document.difficulty
-        version_number = (db.scalar(select(func.max(DocumentVersion.version)).where(DocumentVersion.document_id == document.id)) or 0) + 1
+        # Existing file: align to course max, or bump from current if leading
+        version_number = max(course_max_version, file_current_version + 1)
     db.flush()
     return document, version_number, stale_chunk_ids
 
@@ -978,6 +1232,7 @@ async def ingest_file(
     course_id: str | None = None,
     rebuild_graph: bool = True,
     force: bool = False,
+    target_version: int | None = None,
 ) -> dict:
     async with source_path_lock(source_path):
         return await _ingest_file_locked(
@@ -989,6 +1244,7 @@ async def ingest_file(
             course_id=course_id,
             rebuild_graph=rebuild_graph,
             force=force,
+            target_version=target_version,
         )
 
 
@@ -1001,6 +1257,7 @@ async def _ingest_file_locked(
     course_id: str | None = None,
     rebuild_graph: bool = True,
     force: bool = False,
+    target_version: int | None = None,
 ) -> dict:
     job = db.get(IngestionJob, existing_job_id) if existing_job_id else None
     course = resolve_course(db, job.course_id if job is not None else course_id)
@@ -1092,6 +1349,8 @@ async def _ingest_file_locked(
         source_type=source_type,
         checksum=checksum,
         tags=[chapter],
+        force=force,
+        target_version=target_version,
     )
     stale_chunk_ids.extend(
         deactivate_duplicate_documents(
@@ -1477,7 +1736,7 @@ async def _ingest_file_locked(
     }
 
 
-async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
+async def run_batch_ingestion(batch_id: str, force: bool = False, rebuild_graph_mode: str = "incremental") -> dict:
     from app.db import SessionLocal
 
     session = SessionLocal()
@@ -1485,6 +1744,9 @@ async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
         batch = session.get(IngestionBatch, batch_id)
         if batch is None:
             raise RuntimeError(f"Batch {batch_id} not found")
+        if is_cancel_requested(session, batch_id):
+            await compensate_cancelled_batch(session, batch_id)
+            return summarize_batch(session.get(IngestionBatch, batch_id))
         root = Path(batch.source_root)
         if not root.exists():
             batch.status = "failed"
@@ -1510,8 +1772,22 @@ async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
         session.commit()
 
         course = resolve_course(session, batch.course_id)
+        # Compute unified target version for this batch when forcing reparse
+        target_version = None
+        if force:
+            course_max = session.scalar(
+                select(func.max(DocumentVersion.version))
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(Document.course_id == course.id, DocumentVersion.is_active.is_(True))
+            ) or 0
+            target_version = course_max + 1
+            batch.stats = {**(batch.stats or {}), "target_version": target_version}
+            session.commit()
         emit_ingestion_log(batch_id, "batch_files", f"发现 {len(files)} 个待解析文件", total_files=len(files))
         for index, path in enumerate(files, start=1):
+            if is_cancel_requested(session, batch_id):
+                await compensate_cancelled_batch(session, batch_id)
+                return summarize_batch(session.get(IngestionBatch, batch_id))
             emit_ingestion_log(batch_id, "file_started", f"[{index}/{len(files)}] 正在解析 {path.name}", source_path=str(path), processed_files=batch.processed_files, total_files=batch.total_files)
             job = create_job(
                 session,
@@ -1521,7 +1797,9 @@ async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
                 batch_id=batch.id,
                 source_path=str(path),
             )
+            remember_pre_batch_version(session, job, course.id, path)
             try:
+                ensure_not_cancelled(session, batch_id)
                 result = await ingest_file(
                     session,
                     path,
@@ -1530,6 +1808,7 @@ async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
                     batch_id=batch.id,
                     rebuild_graph=False,
                     force=force,
+                    target_version=target_version,
                 )
                 coverage[result.get("source_type", "unknown")] += 1
                 if result["status"] == "skipped":
@@ -1538,6 +1817,10 @@ async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
                 else:
                     batch.success_count += 1
                     emit_ingestion_log(batch_id, "file_completed", f"{path.name} 解析完成", source_path=str(path), stats=result.get("stats", {}))
+            except IngestionCancelled:
+                session.rollback()
+                await compensate_cancelled_batch(session, batch_id)
+                return summarize_batch(session.get(IngestionBatch, batch_id))
             except Exception as exc:
                 session.rollback()
                 error_message = exception_message(exc)
@@ -1556,8 +1839,11 @@ async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
                 batch = session.get(IngestionBatch, batch_id)
                 if batch is None:
                     break
+                if is_cancel_requested(session, batch_id):
+                    await compensate_cancelled_batch(session, batch_id)
+                    return summarize_batch(session.get(IngestionBatch, batch_id))
                 batch.processed_files += 1
-                batch.stats = {"coverage_by_source_type": dict(coverage), "errors": errors}
+                batch.stats = {**(batch.stats or {}), "coverage_by_source_type": dict(coverage), "errors": errors, "rebuild_graph_mode": rebuild_graph_mode}
                 emit_ingestion_log(
                     batch_id,
                     "batch_progress",
@@ -1573,7 +1859,10 @@ async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
         batch = session.get(IngestionBatch, batch_id)
         if batch is None:
             raise RuntimeError(f"Batch {batch_id} disappeared")
-        if batch.success_count > 0:
+        if is_cancel_requested(session, batch_id):
+            await compensate_cancelled_batch(session, batch_id)
+            return summarize_batch(session.get(IngestionBatch, batch_id))
+        if batch.success_count > 0 and rebuild_graph_mode != "none":
             settings = get_settings()
             batch_course_id = batch.course_id
             graph_start_payload = {
@@ -1597,8 +1886,14 @@ async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
             )
             try:
                 session.rollback()
-                graph_stats = await rebuild_course_graph_for_batch(session, batch_course_id, batch_id)
+                ensure_not_cancelled(session, batch_id)
+                graph_stats = await rebuild_course_graph_for_batch(session, batch_course_id, batch_id) if rebuild_graph_mode == "full" else await incremental_update_course_graph(session, batch_course_id, [job.document_id for job in session.scalars(select(IngestionJob).where(IngestionJob.batch_id == batch_id)).all() if job.document_id], batch_id)
+                ensure_not_cancelled(session, batch_id)
             except Exception as exc:
+                if isinstance(exc, IngestionCancelled):
+                    session.rollback()
+                    await compensate_cancelled_batch(session, batch_id)
+                    return summarize_batch(session.get(IngestionBatch, batch_id))
                 session.rollback()
                 recovery_stats = await recover_existing_graph_algorithm_metrics(session, batch_course_id)
                 return finalize_graph_generation_failure(
@@ -1624,6 +1919,7 @@ async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
         batch.stats = {
             "coverage_by_source_type": dict(coverage),
             "errors": errors,
+            "rebuild_graph_mode": rebuild_graph_mode,
             "degraded_mode": is_degraded_mode(),
             **graph_stats,
         }
@@ -1652,7 +1948,7 @@ async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
         session.close()
 
 
-async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], force: bool = False) -> dict:
+async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], force: bool = False, rebuild_graph_mode: str = "none") -> dict:
     from app.db import SessionLocal
 
     session = SessionLocal()
@@ -1660,6 +1956,9 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
         batch = session.get(IngestionBatch, batch_id)
         if batch is None:
             raise RuntimeError(f"Batch {batch_id} not found")
+        if is_cancel_requested(session, batch_id):
+            await compensate_cancelled_batch(session, batch_id)
+            return summarize_batch(session.get(IngestionBatch, batch_id))
         files = [Path(path) for path in file_paths]
         batch.total_files = len(files)
         batch.processed_files = 0
@@ -1674,9 +1973,23 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
         session.commit()
 
         course = resolve_course(session, batch.course_id)
+        # Compute unified target version for this batch when forcing reparse
+        target_version = None
+        if force:
+            course_max = session.scalar(
+                select(func.max(DocumentVersion.version))
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(Document.course_id == course.id, DocumentVersion.is_active.is_(True))
+            ) or 0
+            target_version = course_max + 1
+            batch.stats = {**(batch.stats or {}), "target_version": target_version, "rebuild_graph_mode": rebuild_graph_mode}
+            session.commit()
         emit_model_audit_log(batch_id)
-        emit_ingestion_log(batch_id, "batch_started", f"正在解析 {len(files)} 个文件" + ("，并强制重建已有内容" if force else ""), total_files=len(files), force=force)
+        emit_ingestion_log(batch_id, "batch_started", f"正在解析 {len(files)} 个文件" + ("，并强制重建已有内容" if force else ""), total_files=len(files), force=force, rebuild_graph_mode=rebuild_graph_mode)
         for index, path in enumerate(files, start=1):
+            if is_cancel_requested(session, batch_id):
+                await compensate_cancelled_batch(session, batch_id)
+                return summarize_batch(session.get(IngestionBatch, batch_id))
             emit_ingestion_log(batch_id, "file_started", f"[{index}/{len(files)}] 正在解析 {path.name}", source_path=str(path), processed_files=batch.processed_files, total_files=batch.total_files)
             job = session.scalar(
                 select(IngestionJob)
@@ -1699,7 +2012,9 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
                 job.status = "queued"
                 job.error_message = None
                 session.commit()
+            remember_pre_batch_version(session, job, course.id, path)
             try:
+                ensure_not_cancelled(session, batch_id)
                 if not path.exists():
                     raise RuntimeError(f"文件不存在：{path.name}")
                 result = await ingest_file(
@@ -1711,6 +2026,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
                     course_id=course.id,
                     rebuild_graph=False,
                     force=force,
+                    target_version=target_version,
                 )
                 coverage[result.get("source_type", "unknown")] += 1
                 if result["status"] == "skipped":
@@ -1719,6 +2035,10 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
                 else:
                     batch.success_count += 1
                     emit_ingestion_log(batch_id, "file_completed", f"{path.name} 解析完成", source_path=str(path), stats=result.get("stats", {}))
+            except IngestionCancelled:
+                session.rollback()
+                await compensate_cancelled_batch(session, batch_id)
+                return summarize_batch(session.get(IngestionBatch, batch_id))
             except Exception as exc:
                 session.rollback()
                 error_message = exception_message(exc)
@@ -1737,8 +2057,11 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
                 batch = session.get(IngestionBatch, batch_id)
                 if batch is None:
                     break
+                if is_cancel_requested(session, batch_id):
+                    await compensate_cancelled_batch(session, batch_id)
+                    return summarize_batch(session.get(IngestionBatch, batch_id))
                 batch.processed_files += 1
-                batch.stats = {"uploaded_files": file_paths, "coverage_by_source_type": dict(coverage), "errors": errors, "force": force}
+                batch.stats = {**(batch.stats or {}), "uploaded_files": file_paths, "coverage_by_source_type": dict(coverage), "errors": errors, "force": force, "rebuild_graph_mode": rebuild_graph_mode}
                 emit_ingestion_log(
                     batch_id,
                     "batch_progress",
@@ -1754,7 +2077,10 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
         batch = session.get(IngestionBatch, batch_id)
         if batch is None:
             raise RuntimeError(f"Batch {batch_id} disappeared")
-        if batch.success_count > 0:
+        if is_cancel_requested(session, batch_id):
+            await compensate_cancelled_batch(session, batch_id)
+            return summarize_batch(session.get(IngestionBatch, batch_id))
+        if batch.success_count > 0 and rebuild_graph_mode != "none":
             settings = get_settings()
             batch_course_id = batch.course_id
             graph_start_payload = {
@@ -1778,8 +2104,15 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
             )
             try:
                 session.rollback()
-                graph_stats = await rebuild_course_graph_for_batch(session, batch_course_id, batch_id)
+                ensure_not_cancelled(session, batch_id)
+                changed_document_ids = [job.document_id for job in session.scalars(select(IngestionJob).where(IngestionJob.batch_id == batch_id)).all() if job.document_id]
+                graph_stats = await rebuild_course_graph_for_batch(session, batch_course_id, batch_id) if rebuild_graph_mode == "full" else await incremental_update_course_graph(session, batch_course_id, changed_document_ids, batch_id)
+                ensure_not_cancelled(session, batch_id)
             except Exception as exc:
+                if isinstance(exc, IngestionCancelled):
+                    session.rollback()
+                    await compensate_cancelled_batch(session, batch_id)
+                    return summarize_batch(session.get(IngestionBatch, batch_id))
                 session.rollback()
                 recovery_stats = await recover_existing_graph_algorithm_metrics(session, batch_course_id)
                 return finalize_graph_generation_failure(
@@ -1809,6 +2142,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
             "coverage_by_source_type": dict(coverage),
             "errors": errors,
             "force": force,
+            "rebuild_graph_mode": rebuild_graph_mode,
             "degraded_mode": is_degraded_mode(),
             **graph_stats,
         }

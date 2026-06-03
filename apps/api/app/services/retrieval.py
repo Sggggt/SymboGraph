@@ -41,7 +41,7 @@ STORAGE_ALLOWED_SUFFIXES = {
 }
 STORAGE_EXCLUDED_PARTS = {"output", "scripts", ".ipynb_checkpoints", "__pycache__"}
 STORAGE_IGNORED_NAMES = {".ds_store"}
-TERMINAL_BATCH_STATES = {"completed", "failed", "partial_failed", "skipped"}
+TERMINAL_BATCH_STATES = {"completed", "failed", "partial_failed", "skipped", "cancelled"}
 QUERY_TYPE_CONFIG = {
     "definition": {"alpha": 0.85, "recall_k": 60},
     "formula": {"alpha": 0.30, "recall_k": 80},
@@ -999,6 +999,10 @@ def file_status_from_job(job: IngestionJob | None, has_parsed_chunks: bool) -> s
         return "parsed" if has_parsed_chunks else "pending"
     if job.status in ACTIVE_FILE_STATES:
         return "parsing"
+    if job.status == "cancel_requested":
+        return "parsing"
+    if job.status == "cancelled":
+        return "pending"
     if job.status == "queued":
         if (job.stats or {}).get("force_reparse"):
             return "pending"

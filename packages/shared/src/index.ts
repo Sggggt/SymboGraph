@@ -18,6 +18,8 @@ export type JobState =
   | "chunking"
   | "embedding"
   | "extracting_graph"
+  | "cancel_requested"
+  | "cancelled"
   | "processing"
   | "completed"
   | "partial_failed"
@@ -556,6 +558,25 @@ export interface GraphResponse {
   node_counts: Record<string, number>;
   edge_counts: Record<string, number>;
   focus_chapter?: string | null;
+  freshness: {
+    is_stale: boolean;
+    reason?: string | null;
+    latest_chunk_version?: string | null;
+    active_chunk_versions?: string[];
+    graph_chunk_version?: string | null;
+    graph_chunk_versions?: string[];
+    stale_evidence_chunks?: number;
+    missing_evidence_chunks?: number;
+    current_document_versions?: string[];
+    graph_build_document_versions?: string[];
+    uncovered_document_versions?: string[];
+    removed_document_versions?: string[];
+    graph_active_chunk_count?: number | null;
+    current_active_chunk_count?: number;
+    graph_build_id?: string | null;
+    graph_built_at?: string | null;
+    chunk_scope_changed?: boolean;
+  };
 }
 
 export interface CourseTreeNode {
@@ -611,6 +632,8 @@ export interface BatchStartResponse {
 export interface ParseUploadedFilesRequest {
   file_paths: string[];
   force?: boolean;
+  rebuild_graph_mode?: "none" | "incremental" | "full";
+  confirm_destructive_graph_rebuild?: boolean;
 }
 
 export interface DashboardSnapshot {

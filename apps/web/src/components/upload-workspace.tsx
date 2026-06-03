@@ -6,7 +6,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import type { CourseFileStatus, CourseFileSummary, IngestionLogEvent } from "@course-kg/shared";
 import { AlertCircle, CheckCircle2, Clock3, Database, FileCheck2, Files, LoaderCircle, Network, PanelRightOpen, RefreshCcw, Trash2, UploadCloud, X } from "lucide-react";
 
-import { cleanupStaleData, cleanupStaleGraph, createBatchLogToken, fetchBatchStatus, fetchCourseFiles, fetchDashboard, getBatchLogUrl, parseUploadedFiles, rebuildGraph, removeCourseFile, uploadFile } from "@/lib/api";
+import { cancelBatch, cleanupStaleData, cleanupStaleGraph, createBatchLogToken, fetchBatchStatus, fetchCourseFiles, fetchDashboard, getBatchLogUrl, parseUploadedFiles, rebuildGraph, removeCourseFile, uploadFile } from "@/lib/api";
 import { useCourseContext } from "@/components/course-context";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -19,9 +19,9 @@ type UploadedFile = {
   path: string;
 };
 
-const terminalLogEvents = new Set(["batch_completed", "batch_failed", "batch_partial_failed", "batch_skipped", "batch_missing"]);
+const terminalLogEvents = new Set(["batch_completed", "batch_failed", "batch_partial_failed", "batch_skipped", "batch_cancelled", "batch_missing"]);
 const failureLogEvents = new Set(["batch_failed", "batch_partial_failed", "graph_failed"]);
-const terminalBatchStates = new Set(["completed", "partial_failed", "failed", "skipped"]);
+const terminalBatchStates = new Set(["completed", "partial_failed", "failed", "skipped", "cancelled"]);
 const failureBatchStates = new Set(["partial_failed", "failed"]);
 const logStreamMaxRetries = 3;
 const logStreamRetryDelayMs = 1200;
@@ -42,6 +42,8 @@ const logEventLabels: Record<string, string> = {
   batch_completed: "批次完成",
   batch_partial_failed: "部分失败",
   batch_failed: "批次失败",
+  batch_cancel_requested: "请求取消",
+  batch_cancelled: "已取消",
   batch_skipped: "批次跳过",
   batch_missing: "批次丢失",
   log_stream_retry: "日志重连",
@@ -61,6 +63,8 @@ const batchStateLabels: Record<string, string> = {
   chunking: "切块中",
   embedding: "向量化中",
   extracting_graph: "生成图谱中",
+  cancel_requested: "正在取消",
+  cancelled: "已取消",
   completed: "已完成",
   partial_failed: "部分失败",
   failed: "失败",
@@ -170,14 +174,17 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   const [logStreamRetryCount, setLogStreamRetryCount] = useState(0);
   const [rebuildMode, setRebuildMode] = useState<"incremental" | "full">("incremental");
   const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
+  const [autoFullGraphRebuild, setAutoFullGraphRebuild] = useState(false);
   const [confirmDialog, setConfirmDialog] = useState<{
     title: string;
     message: string;
-    onConfirm: () => void;
+    onConfirm: (autoFullGraphRebuild?: boolean) => void;
     confirmText?: string;
     variant?: "default" | "danger";
+    includeGraphRebuildOption?: boolean;
   } | null>(null);
   const [removeFileTarget, setRemoveFileTarget] = useState<FileBrowserItem | null>(null);
+  const uploadAbortControllerRef = useRef<AbortController | null>(null);
 
   const dashboardQuery = useQuery({
     queryKey: ["dashboard", selectedCourseId],
@@ -221,9 +228,11 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   const uploadMutation = useMutation({
     mutationFn: async (files: File[]) => {
       setUploadProgress({ completed: 0, total: files.length });
+      const controller = new AbortController();
+      uploadAbortControllerRef.current = controller;
       const responses = await Promise.all(
         files.map(async (file) => {
-          const response = await uploadFile(file, selectedCourseId);
+          const response = await uploadFile(file, selectedCourseId, controller.signal);
           setUploadProgress((progress) => ({ ...progress, completed: progress.completed + 1 }));
           return response;
         }),
@@ -243,11 +252,21 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     },
     onSettled: () => {
       setUploadProgress({ completed: 0, total: 0 });
+      uploadAbortControllerRef.current = null;
+    },
+    onError: (error) => {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return;
+      }
+      setFailureDialog({
+        title: "上传失败",
+        message: error instanceof Error ? error.message : "上传失败，后端未返回错误详情。",
+      });
     },
   });
 
   const parseUploadsMutation = useMutation({
-    mutationFn: ({ paths, force }: { paths: string[]; force: boolean }) => parseUploadedFiles(paths, selectedCourseId, force),
+    mutationFn: ({ paths, force, rebuildGraphMode }: { paths: string[]; force: boolean; rebuildGraphMode: "none" | "full" }) => parseUploadedFiles(paths, selectedCourseId, force, rebuildGraphMode),
     onSuccess: (data) => {
       setBatchId(data.batch_id);
       setDismissedBatchId(null);
@@ -263,6 +282,23 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       setFailureDialog({
         title: "解析启动失败",
         message: error instanceof Error ? error.message : "解析任务启动失败，后端未返回错误详情。",
+      });
+    },
+  });
+
+  const cancelBatchMutation = useMutation({
+    mutationFn: (targetBatchId: string) => cancelBatch(targetBatchId, selectedCourseId),
+    onSuccess: (data) => {
+      setBatchId(data.batch_id);
+      void queryClient.invalidateQueries({ queryKey: ["batch", selectedCourseId, data.batch_id] });
+      void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["graph", selectedCourseId] });
+    },
+    onError: (error) => {
+      setFailureDialog({
+        title: "取消失败",
+        message: error instanceof Error ? error.message : "后端未返回取消失败详情。",
       });
     },
   });
@@ -632,11 +668,13 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                 type="button"
                 onClick={() => {
                   if (effectiveParseTargetPaths.length === 0) return;
+                  setAutoFullGraphRebuild(false);
                   setConfirmDialog({
                     title: "确认解析文件",
-                    message: `即将解析 ${effectiveParseTargetPaths.length} 个文件，包括切块、向量化和图谱更新。`,
-                    onConfirm: () => parseUploadsMutation.mutate({ paths: effectiveParseTargetPaths, force: false }),
+                    message: `即将强制解析 ${effectiveParseTargetPaths.length} 个文件，包括切块与向量化。可选择解析完成后自动全量重建图谱。`,
+                    onConfirm: (auto) => parseUploadsMutation.mutate({ paths: effectiveParseTargetPaths, force: true, rebuildGraphMode: auto ? "full" : "none" }),
                     confirmText: "确认解析",
+                    includeGraphRebuildOption: true,
                   });
                 }}
                 disabled={parseUploadsMutation.isPending || effectiveParseTargetPaths.length === 0}
@@ -649,12 +687,14 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                 type="button"
                 onClick={() => {
                   if (parseTargetPaths.length === 0) return;
+                  setAutoFullGraphRebuild(false);
                   setConfirmDialog({
                     title: "确认全量重新解析",
-                    message: "强制重建当前资料库所有文件的片段、向量、Qdrant 向量记录和图谱。此操作会覆盖现有数据。",
-                    onConfirm: () => parseUploadsMutation.mutate({ paths: parseTargetPaths, force: true }),
+                    message: "强制重建当前资料库所有文件的片段、向量和 Qdrant 向量记录。可选择解析完成后自动全量重建图谱；该选项会清空当前图谱数据。",
+                    onConfirm: (auto) => parseUploadsMutation.mutate({ paths: parseTargetPaths, force: true, rebuildGraphMode: auto ? "full" : "none" }),
                     confirmText: "确认重建",
                     variant: "danger",
+                    includeGraphRebuildOption: true,
                   });
                 }}
                 disabled={parseUploadsMutation.isPending || parseTargetPaths.length === 0}
@@ -663,6 +703,33 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               >
                 {parseUploadsMutation.isPending ? <LoaderCircle className="mr-2 inline size-3.5 animate-spin" /> : <RefreshCcw className="mr-2 inline size-3.5" />}
                 全量重新解析
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmDialog({
+                    title: uploadMutation.isPending ? "确认取消上传" : "确认取消当前批次",
+                    message: uploadMutation.isPending
+                      ? "确认后会中断当前浏览器上传请求，已上传到服务器的文件不会自动删除。"
+                      : "确认后会请求后端停止当前批次，并补偿清理本批次已写入的数据库、向量和图谱数据。",
+                    onConfirm: () => {
+                      if (uploadMutation.isPending) {
+                        uploadAbortControllerRef.current?.abort();
+                        return;
+                      }
+                      if (activeBatchId) {
+                        cancelBatchMutation.mutate(activeBatchId);
+                      }
+                    },
+                    confirmText: uploadMutation.isPending ? "确认取消上传" : "确认取消批次",
+                    variant: "danger",
+                  });
+                }}
+                disabled={(!uploadMutation.isPending && !activeBatchId) || cancelBatchMutation.isPending}
+                className="rounded-full border border-rose-300/30 bg-rose-300/8 px-4 py-3 text-xs uppercase tracking-[0.2em] text-rose-50/80 transition hover:text-white disabled:opacity-45"
+              >
+                {cancelBatchMutation.isPending ? <LoaderCircle className="mr-2 inline size-3.5 animate-spin" /> : <X className="mr-2 inline size-3.5" />}
+                {cancelBatchMutation.isPending ? "取消中..." : "取消"}
               </button>
               <button
                 type="button"
@@ -1017,6 +1084,20 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
             <DialogDescription>{confirmDialog?.message ?? "请确认是否继续执行此操作。"}</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 px-6 py-5">
+            {confirmDialog?.includeGraphRebuildOption ? (
+              <label className="flex cursor-pointer items-start gap-3 rounded-2xl border border-rose-200/16 bg-rose-300/[0.045] px-4 py-3 text-sm leading-6 text-rose-50/80">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={autoFullGraphRebuild}
+                  onChange={(event) => setAutoFullGraphRebuild(event.target.checked)}
+                />
+                <span>
+                  自动全量重建图谱
+                  <span className="mt-1 block text-xs leading-5 text-rose-50/62">该操作会清空当前图谱数据，并在解析完成后重新生成 Semantic KG。</span>
+                </span>
+              </label>
+            ) : null}
             <div className="flex justify-end gap-2">
               <button
                 type="button"
@@ -1028,7 +1109,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               <button
                 type="button"
                 onClick={() => {
-                  confirmDialog?.onConfirm();
+                  confirmDialog?.onConfirm(autoFullGraphRebuild);
                   setConfirmDialog(null);
                 }}
                 className={`rounded-full border px-4 py-2 text-sm transition hover:text-white ${

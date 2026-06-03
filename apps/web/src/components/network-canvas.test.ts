@@ -10,6 +10,7 @@ describe("NetworkCanvas option mapping", () => {
       schema_version: "typed_graph_v1",
       node_counts: {},
       edge_counts: {},
+      freshness: { is_stale: false },
       nodes: [
         { id: "semantic:1", name: "PageRank", category: "semantic_entity", entity_type: "algorithm", value: 4 },
         { id: "evidence_chunk:c1", name: "Evidence", category: "evidence_chunk", snippet: "PageRank is defined..." },

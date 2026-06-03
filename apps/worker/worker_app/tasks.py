@@ -22,8 +22,8 @@ def ingest_batch(batch_id: str) -> dict:
 
 
 @celery_app.task(name="ingest_uploaded_batch")
-def ingest_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False) -> dict:
-    return asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths, force=force))
+def ingest_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False, rebuild_graph_mode: str = "none") -> dict:
+    return asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths, force=force, rebuild_graph_mode=rebuild_graph_mode))
 
 
 @celery_app.task(name="rebuild_course_graph")

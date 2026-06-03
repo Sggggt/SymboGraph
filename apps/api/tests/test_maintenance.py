@@ -374,6 +374,7 @@ async def test_rebuild_graph_endpoint_accepts_mode_parameter(db_session, sample_
     from app.schemas import RebuildGraphRequest
 
     monkeypatch.setenv("ENABLE_MODEL_FALLBACK", "false")
+    monkeypatch.setenv("INGESTION_EXECUTION_MODE", "inline")
     get_settings.cache_clear()
     background_tasks = BackgroundTasks()
 

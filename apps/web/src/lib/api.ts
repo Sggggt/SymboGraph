@@ -263,25 +263,44 @@ export async function callAgent(payload: QARequest): Promise<AgentResponse> {
   return parseResponse<AgentResponse>(response);
 }
 
-export async function uploadFile(file: File, courseId?: string | null): Promise<UploadFileResponse> {
+export async function uploadFile(file: File, courseId?: string | null, signal?: AbortSignal): Promise<UploadFileResponse> {
   const formData = new FormData();
   formData.append("upload", file);
   const response = await fetch(buildApiUrl("/files/upload", { course_id: courseId }), {
     method: "POST",
     headers: authHeaders(),
     body: formData,
+    signal,
   });
   return parseResponse<UploadFileResponse>(response);
 }
 
-export async function parseUploadedFiles(filePaths: string[], courseId?: string | null, force = false): Promise<BatchStartResponse> {
-  const payload: ParseUploadedFilesRequest = { file_paths: filePaths, force };
+export async function parseUploadedFiles(
+  filePaths: string[],
+  courseId?: string | null,
+  force = false,
+  rebuildGraphMode: ParseUploadedFilesRequest["rebuild_graph_mode"] = "none",
+): Promise<BatchStartResponse> {
+  const payload: ParseUploadedFilesRequest = {
+    file_paths: filePaths,
+    force,
+    rebuild_graph_mode: rebuildGraphMode,
+    confirm_destructive_graph_rebuild: rebuildGraphMode === "full",
+  };
   const response = await fetch(buildApiUrl("/ingestion/parse-uploaded-files", { course_id: courseId }), {
     method: "POST",
     headers: jsonHeaders(),
     body: JSON.stringify(payload),
   });
   return parseResponse<BatchStartResponse>(response);
+}
+
+export async function cancelBatch(batchId: string, courseId?: string | null): Promise<IngestionBatchSummary> {
+  const response = await fetch(buildApiUrl(`/ingestion/batches/${batchId}/cancel`, { course_id: courseId }), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  return parseResponse<IngestionBatchSummary>(response);
 }
 
 export async function createBatchLogToken(batchId: string): Promise<BatchLogTokenResponse> {

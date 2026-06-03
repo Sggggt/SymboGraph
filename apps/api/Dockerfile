@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TRANSFORMERS_OFFLINE=0
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # 安装 uv 用于快速依赖解析和安装
@@ -19,7 +19,7 @@ COPY apps/api/pyproject.toml ./
 
 # 使用 uv pip install --system 直接安装到系统 Python，不创建虚拟环境
 # 安装 [rerank] 和 dev extra 到系统 Python：支持 Cross-Encoder 与容器内 pytest 验收
-RUN uv pip install --system --no-cache -e ".[rerank,dev]"
+RUN uv pip install --system --no-cache -e ".[rerank,dev,ocr]"
 
 # 复制应用代码
 COPY apps/api/app ./app

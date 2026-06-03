@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import io
 import re
 import unicodedata
 from dataclasses import asdict, dataclass, field
@@ -275,8 +276,39 @@ def _detect_formula(text: str) -> bool:
     return ratio > 0.03
 
 
+def ocr_image_to_text(image: Any, *, source_name: str) -> tuple[str, dict[str, Any]]:
+    """Run OCR on an image path or PIL image and return text plus audit metadata."""
+    if isinstance(image, Path):
+        try:
+            from paddleocr import PaddleOCR
+
+            ocr = PaddleOCR(use_angle_cls=True, lang="ch")
+            results = ocr.ocr(str(image), cls=True)
+            text = "\n".join(line[1][0] for page in results for line in page)
+            if text.strip():
+                return text.strip(), {"ocr_engine": "paddleocr"}
+        except Exception:
+            pass
+
+    try:
+        import pytesseract
+        from PIL import Image
+
+        pil_image = Image.open(image) if isinstance(image, Path) else image
+        text = pytesseract.image_to_string(pil_image, lang="chi_sim+eng")
+        if text.strip():
+            return text.strip(), {"ocr_engine": "pytesseract"}
+    except Exception as exc:
+        raise RuntimeError(
+            f"OCR dependencies unavailable for {source_name}: install/enable the api OCR extra "
+            "or provide a working PaddleOCR/Tesseract runtime"
+        ) from exc
+    raise RuntimeError(f"No OCR text extracted from {source_name}")
+
+
 def parse_pdf(path: Path) -> list[ParsedSection]:
     import fitz
+    from PIL import Image
 
     sections: list[ParsedSection] = []
     with fitz.open(path) as document:
@@ -286,8 +318,34 @@ def parse_pdf(path: Path) -> list[ParsedSection]:
             except Exception:
                 text = page.get_text("text").strip()
 
-            if not text:
+            image_list = page.get_images(full=True)
+            ocr_texts: list[str] = []
+            ocr_metadata: dict[str, Any] = {}
+            image_errors: list[str] = []
+
+            for img_idx, img in enumerate(image_list, start=1):
+                xref = img[0]
+                try:
+                    base_image = document.extract_image(xref)
+                    image = Image.open(io.BytesIO(base_image["image"]))
+                    img_ocr_text, img_ocr_meta = ocr_image_to_text(
+                        image,
+                        source_name=f"{path.name} p.{idx} img.{img_idx}",
+                    )
+                    if img_ocr_text:
+                        ocr_texts.append(img_ocr_text)
+                    if not ocr_metadata:
+                        ocr_metadata = img_ocr_meta
+                except Exception as exc:
+                    image_errors.append(str(exc))
+                    continue
+
+            combined_ocr_text = "\n\n".join(ocr_texts).strip()
+
+            if not text and not combined_ocr_text:
                 continue
+            if combined_ocr_text:
+                text = f"{text}\n\n[OCR]\n{combined_ocr_text}".strip() if text else combined_ocr_text
 
             # Preserve table/formula hints for downstream chunk metadata.
             lines = text.splitlines()
@@ -295,11 +353,22 @@ def parse_pdf(path: Path) -> list[ParsedSection]:
             has_formula = _detect_formula(text)
 
             page_title = lines[0][:120] if lines else ""
-            metadata: dict[str, Any] = {"content_kind": "pdf_page"}
+            metadata: dict[str, Any] = {"content_kind": "pdf_page", "pdf_image_count": len(image_list)}
             if has_table:
                 metadata["has_table"] = True
             if has_formula:
                 metadata["has_formula"] = True
+            if combined_ocr_text:
+                metadata.update(
+                    {
+                        **ocr_metadata,
+                        "ocr_applied": True,
+                        "ocr_page_count": 1,
+                        "ocr_reason": "page_contains_images",
+                    }
+                )
+            if image_errors:
+                metadata["ocr_image_errors"] = image_errors
 
             sections.append(
                 ParsedSection(
@@ -443,28 +512,15 @@ def parse_notebook(path: Path) -> list[ParsedSection]:
 
 
 def parse_image(path: Path) -> list[ParsedSection]:
-    try:
-        from paddleocr import PaddleOCR
-
-        ocr = PaddleOCR(use_angle_cls=True, lang="ch")
-        results = ocr.ocr(str(path), cls=True)
-        text = "\n".join(line[1][0] for page in results for line in page)
-        if text.strip():
-            return [ParsedSection(title=path.stem, text=text.strip(), section=path.stem, metadata={"content_kind": "ocr"})]
-    except Exception:
-        pass
-
-    try:
-        import pytesseract
-        from PIL import Image
-
-        image = Image.open(path)
-        text = pytesseract.image_to_string(image, lang="chi_sim+eng")
-        if text.strip():
-            return [ParsedSection(title=path.stem, text=text.strip(), section=path.stem, metadata={"content_kind": "ocr"})]
-    except Exception as exc:
-        raise RuntimeError(f"OCR dependencies unavailable for {path.name}: {exc}") from exc
-    raise RuntimeError(f"No OCR text extracted from {path.name}")
+    text, metadata = ocr_image_to_text(path, source_name=path.name)
+    return [
+        ParsedSection(
+            title=path.stem,
+            text=text,
+            section=path.stem,
+            metadata={"content_kind": "ocr", "ocr_applied": True, "ocr_page_count": 1, "ocr_reason": "image_file", **metadata},
+        )
+    ]
 
 
 def parse_with_unstructured(path: Path) -> list[ParsedSection]:

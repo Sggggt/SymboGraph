@@ -17,6 +17,8 @@ const batchStateLabels: Record<string, string> = {
   chunking: "切块中",
   embedding: "向量化中",
   extracting_graph: "生成图谱中",
+  cancel_requested: "正在取消",
+  cancelled: "已取消",
   completed: "已完成",
   partial_failed: "部分失败",
   failed: "失败",
@@ -41,6 +43,17 @@ function batchStateLabel(state?: string | null): string {
 
 function sourceTypeLabel(type: string): string {
   return sourceTypeLabels[type] ?? type;
+}
+
+function GraphStaleBadge({ isStale }: { isStale?: boolean }) {
+  if (!isStale) {
+    return null;
+  }
+  return (
+    <span title="该图谱已过期，建议重建图谱" className="rounded-full border border-rose-200/35 bg-rose-400/15 px-3 py-1 text-xs font-medium text-rose-50">
+      已过期
+    </span>
+  );
 }
 
 export function OverviewDashboard() {
@@ -108,7 +121,10 @@ export function OverviewDashboard() {
           <div className="mb-2 flex items-center justify-between">
             <div>
               <p className="section-kicker">实时图谱</p>
-              <h3 className="mt-1.5 text-xl font-semibold text-white">概念关系热区</h3>
+              <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                <h3 className="text-xl font-semibold text-white">概念关系热区</h3>
+                <GraphStaleBadge isStale={data.graph.freshness?.is_stale} />
+              </div>
             </div>
             <Orbit className="size-5 text-cyan-200" />
           </div>

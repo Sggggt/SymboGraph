@@ -21,6 +21,18 @@ const graphTabs: Array<{ type: GraphType; label: string }> = [
   { type: "evidence", label: "证据图" },
 ];
 const entityTypes: SemanticEntityType[] = ["concept", "method", "formula", "metric", "algorithm", "definition", "theorem", "problem_type"];
+
+function GraphStaleBadge({ isStale }: { isStale?: boolean }) {
+  if (!isStale) {
+    return null;
+  }
+  return (
+    <span title="该图谱已过期，建议重建图谱" className="inline-flex rounded-full border border-rose-200/35 bg-rose-400/15 px-3 py-1 text-xs font-medium text-rose-50">
+      已过期
+    </span>
+  );
+}
+
 function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | null }) {
   const storageScope = selectedCourseId ?? "unassigned";
   const dashboardQuery = useQuery({
@@ -195,7 +207,10 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
         <div className="mb-4 flex flex-wrap items-center justify-between gap-4 px-2">
           <div className="min-w-0">
             <p className="section-kicker">图谱画布</p>
-            <h2 className="mt-2 break-words text-3xl font-semibold text-white">{selectedChapter && graphType !== "structural" ? selectedChapter : "全库图谱"}</h2>
+            <div className="mt-2 flex flex-wrap items-center gap-3">
+              <h2 className="break-words text-3xl font-semibold text-white">{selectedChapter && graphType !== "structural" ? selectedChapter : "全库图谱"}</h2>
+              <GraphStaleBadge isStale={graphQuery.data.freshness?.is_stale} />
+            </div>
             <p className="mt-2 max-w-3xl break-words text-sm leading-7 text-white/50">
               {graphType === "semantic" ? "单击节点只做高亮，双击语义实体打开知识详解。支持拖拽平移与滚轮缩放。" : graphType === "evidence" ? "语义实体、证据片段与文档版本分层展示，单击节点查看基础信息。" : "本地资料结构单独展示，不混入语义实体。"}
             </p>

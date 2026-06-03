@@ -95,6 +95,79 @@ def test_parse_docx_pptx_pdf(tmp_path, no_fallback_env):
     assert "PDF parsing text" in parse_document(pdf_path)[1][0].text
 
 
+def test_parse_pdf_with_image_appends_ocr_text(tmp_path, no_fallback_env, monkeypatch):
+    fitz = pytest.importorskip("fitz")
+    Image = pytest.importorskip("PIL.Image")
+
+    image_path = tmp_path / "scan.png"
+    image = Image.new("RGB", (120, 60), color="white")
+    image.save(image_path)
+
+    pdf_path = tmp_path / "scan.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=180, height=100)
+    page.insert_image(fitz.Rect(10, 10, 130, 70), filename=str(image_path))
+    pdf.save(pdf_path)
+    pdf.close()
+
+    monkeypatch.setattr(parsers, "ocr_image_to_text", lambda image, source_name: ("OCR centrality text", {"ocr_engine": "unit-ocr"}))
+
+    _source_type, sections = parse_document(pdf_path)
+
+    assert "OCR centrality text" in sections[0].text
+    assert sections[0].metadata["ocr_applied"] is True
+    assert sections[0].metadata["ocr_engine"] == "unit-ocr"
+    assert sections[0].metadata["ocr_reason"] == "page_contains_images"
+
+
+def test_parse_pdf_with_image_continues_when_ocr_fails(tmp_path, no_fallback_env, monkeypatch):
+    fitz = pytest.importorskip("fitz")
+    Image = pytest.importorskip("PIL.Image")
+
+    image_path = tmp_path / "scan.png"
+    Image.new("RGB", (80, 40), color="white").save(image_path)
+    pdf_path = tmp_path / "scan.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=120, height=80)
+    page.insert_image(fitz.Rect(10, 10, 90, 50), filename=str(image_path))
+    pdf.save(pdf_path)
+    pdf.close()
+
+    def fail_ocr(image, source_name):
+        raise RuntimeError("OCR dependencies unavailable for scan.pdf p.1 img.1: install/enable the api OCR extra")
+
+    monkeypatch.setattr(parsers, "ocr_image_to_text", fail_ocr)
+
+    _source_type, sections = parse_document(pdf_path)
+    assert sections == []
+
+
+def test_parse_pdf_with_image_continues_when_ocr_fails_but_text_exists(tmp_path, no_fallback_env, monkeypatch):
+    fitz = pytest.importorskip("fitz")
+    Image = pytest.importorskip("PIL.Image")
+
+    image_path = tmp_path / "scan.png"
+    Image.new("RGB", (80, 40), color="white").save(image_path)
+    pdf_path = tmp_path / "scan.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=120, height=80)
+    page.insert_text((10, 70), "Native PDF text")
+    page.insert_image(fitz.Rect(10, 10, 90, 50), filename=str(image_path))
+    pdf.save(pdf_path)
+    pdf.close()
+
+    def fail_ocr(image, source_name):
+        raise RuntimeError("OCR dependencies unavailable for scan.pdf p.1 img.1: install/enable the api OCR extra")
+
+    monkeypatch.setattr(parsers, "ocr_image_to_text", fail_ocr)
+
+    _source_type, sections = parse_document(pdf_path)
+    assert len(sections) == 1
+    assert "Native PDF text" in sections[0].text
+    assert sections[0].metadata.get("ocr_image_errors")
+    assert "OCR dependencies unavailable" in sections[0].metadata["ocr_image_errors"][0]
+
+
 def test_parser_does_not_call_unstructured_when_fallback_disabled(tmp_path, no_fallback_env, monkeypatch):
     broken = tmp_path / "broken.md"
     broken.write_text("# Broken", encoding="utf-8")

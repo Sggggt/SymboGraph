@@ -10,6 +10,8 @@ JobState = Literal[
     "chunking",
     "embedding",
     "extracting_graph",
+    "cancel_requested",
+    "cancelled",
     "processing",
     "completed",
     "partial_failed",
@@ -126,6 +128,8 @@ class UploadFileResponse(BaseModel):
 class ParseUploadedFilesRequest(BaseModel):
     file_paths: list[str] = Field(default_factory=list)
     force: bool = False
+    rebuild_graph_mode: Literal["none", "incremental", "full"] = "none"
+    confirm_destructive_graph_rebuild: bool = False
 
 
 class JobStatusResponse(BaseModel):
@@ -619,6 +623,7 @@ class GraphResponse(BaseModel):
     node_counts: dict[str, int] = Field(default_factory=dict)
     edge_counts: dict[str, int] = Field(default_factory=dict)
     focus_chapter: str | None = None
+    freshness: dict = Field(default_factory=dict)
 
 
 class CourseTreeNode(BaseModel):

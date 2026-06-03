@@ -32,6 +32,20 @@ class Course(TimestampMixin, Base):
     model_hyperparameters: Mapped[list["CourseModelHyperparameter"]] = relationship(back_populates="course")
 
 
+class CourseGraphState(TimestampMixin, Base):
+    __tablename__ = "course_graph_states"
+
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), primary_key=True)
+    graph_build_id: Mapped[str] = mapped_column(String(36), default=generate_uuid, index=True)
+    build_mode: Mapped[str] = mapped_column(String(32), default="full")
+    embedding_text_version: Mapped[str] = mapped_column(String(32), index=True)
+    active_document_version_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    active_chunk_ids_hash: Mapped[str] = mapped_column(String(64), index=True)
+    graph_document_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    active_chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    built_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class CourseModelHyperparameter(TimestampMixin, Base):
     __tablename__ = "course_model_hyperparameters"
 
