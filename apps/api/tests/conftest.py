@@ -35,6 +35,9 @@ def db_session(no_fallback_env: Path):
     db.settings = get_settings()
     db.engine.dispose()
     db.engine = db.build_engine()
+    engine_url = db.engine.url
+    if engine_url.drivername != "sqlite":
+        raise RuntimeError(f"Refusing to run unit-test schema reset against non-sqlite database: {engine_url}")
     db.SessionLocal.configure(bind=db.engine)
     db.Base.metadata.drop_all(bind=db.engine)
     db.Base.metadata.create_all(bind=db.engine)

@@ -25,6 +25,7 @@ class Course(TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_root: Mapped[str] = mapped_column(Text)
+    current_chunk_version: Mapped[int] = mapped_column(Integer, default=0)
 
     documents: Mapped[list["Document"]] = relationship(back_populates="course")
     concepts: Mapped[list["Concept"]] = relationship(back_populates="course")
@@ -163,6 +164,7 @@ class Chunk(Base):
     course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
     document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
     document_version_id: Mapped[str] = mapped_column(ForeignKey("document_versions.id"), index=True)
+    chunk_version: Mapped[int] = mapped_column(Integer, default=1, index=True)
     content: Mapped[str] = mapped_column(Text)
     snippet: Mapped[str] = mapped_column(Text)
     chapter: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
@@ -383,6 +385,8 @@ class IngestionBatch(TimestampMixin, Base):
     skipped_count: Mapped[int] = mapped_column(Integer, default=0)
     stats: Mapped[dict] = mapped_column(JSON, default=dict)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 

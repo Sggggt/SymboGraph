@@ -24,6 +24,7 @@ This application is built with modern, production-grade frontend practices:
 ### 2. Real-Time Ingestion Logs Monitor
 - Connects to the backend log streamer using Server-Sent Events (SSE) / stream subscription.
 - Visually shows document parsing, adaptive chunking distributions, embedding audits, and Auto HPO optuna trial evolution.
+- Distinguishes parsing, graph extraction, cancelling, and compensating phases so users can see whether cancellation rolled back parse writes or only restored graph state.
 
 ### 3. Citation-Grounded RAG Chat
 - Sleek interactive chat dashboard with agentic reflection support.
@@ -32,6 +33,10 @@ This application is built with modern, production-grade frontend practices:
 
 ### 4. Concept Card Catalog
 - An inspector catalog showing concept definitions, Aliases, PageRank statistics, in/out degree counts, and all associated raw evidence snippets.
+
+### 5. Runtime Settings & Full Reparse Controls
+- Runtime settings writes model endpoints, graph budgets, retrieval toggles, and bounded concurrency controls through the backend `.env` update API.
+- Upload controls expose selected-file parsing separately from full reparse. Full reparse is disabled until the course has active chunks, matching backend chunk-version rules.
 
 ---
 

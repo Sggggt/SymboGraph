@@ -18,6 +18,7 @@ venv/
 .vscode/
 .playwright-cli/
 output/
+local_light_tests/
 retrieval_architecture.md
 models/
 *.pyc

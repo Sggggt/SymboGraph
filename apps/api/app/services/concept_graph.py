@@ -35,7 +35,7 @@ from app.models import (
     IngestionBatch,
 )
 from app.schemas import Citation, GraphExtractionPayload
-from app.services.cancellation import CANCELLED, IngestionCancelled, ensure_not_cancelled
+from app.services.cancellation import CANCELLED, IngestionCancelled, ensure_not_cancelled, is_cancel_requested
 from app.services.embeddings import ChatProvider
 from app.services.graph_algorithms import enrich_course_graph
 from app.services.ingestion_logs import emit_ingestion_log
@@ -684,7 +684,7 @@ def adaptive_specificity_threshold(scores: list[float]) -> dict:
         return {
             **base,
             "enabled": False,
-            "threshold": MIN_CONCEPT_SPECIFICITY,
+            "threshold": ADAPTIVE_SPECIFICITY_FLOOR,
             "fallback_reason": "insufficient_samples",
         }
     p25 = _percentile(usable, 25)
@@ -748,6 +748,24 @@ def concept_gate_decision(
             **decision_audit,
             "accepted": True,
             "gate_reason": "strong_singleton_evidence",
+            "specificity_threshold": round(effective_specificity_threshold, 4),
+            "adaptive_threshold": threshold_audit,
+        }
+    single_chunk_domain_term = (
+        existing is None
+        and len(group.chunk_ids) == 1
+        and group.confidence >= 0.5
+        and score >= max(ADAPTIVE_SPECIFICITY_FLOOR, effective_specificity_threshold - 0.05)
+        and set(decision.reasons) == {"insufficient_evidence"}
+        and not set(decision.reasons).intersection(HARD_REJECT_CONCEPT_REASONS)
+    )
+    if not accepted and single_chunk_domain_term:
+        decision_audit = decision.model_dump()
+        return True, {
+            **audit,
+            **decision_audit,
+            "accepted": True,
+            "gate_reason": "single_chunk_domain_term",
             "specificity_threshold": round(effective_specificity_threshold, 4),
             "adaptive_threshold": threshold_audit,
         }
@@ -1089,6 +1107,7 @@ async def upsert_graph_candidates_from_chunks(
     concept_map: dict[str, Concept] = {}
     created_count = 0
     rejected_concepts = 0
+    rejected_groups: list[tuple[str, StagedConcept, dict]] = []
     for key, group in staged_concepts.items():
         existing = _find_existing_concept_for_group(db, course_id, group)
         accepted, audit = concept_gate_decision(
@@ -1101,6 +1120,7 @@ async def upsert_graph_candidates_from_chunks(
         )
         if not accepted:
             rejected_concepts += 1
+            rejected_groups.append((key, group, audit))
             continue
         try:
             concept, created = get_or_create_concept(
@@ -1132,6 +1152,51 @@ async def upsert_graph_candidates_from_chunks(
         concept_map[key] = concept
         if created:
             created_count += 1
+
+    promoted_rejected_concepts = 0
+    if created_count == 0 and rejected_groups:
+        for key, group, audit in sorted(rejected_groups, key=lambda item: (float(item[2].get("specificity_score") or 0.0), item[1].confidence), reverse=True)[:8]:
+            reasons = set(audit.get("reasons") or [])
+            if reasons.intersection(HARD_REJECT_CONCEPT_REASONS) or "generic_low_specificity" in reasons:
+                continue
+            if float(audit.get("specificity_score") or 0.0) < ADAPTIVE_SPECIFICITY_FLOOR:
+                continue
+            try:
+                concept, created = get_or_create_concept(
+                    db=db,
+                    course_id=course_id,
+                    name=group.name,
+                    chapter=sorted(group.chapter_refs)[0] if group.chapter_refs else None,
+                    summary=max(group.summaries, key=len) if group.summaries else "",
+                    aliases=sorted(group.aliases),
+                    concept_type=group.concept_type,
+                    importance_score=group.importance_score,
+                    document_id=sorted(group.document_ids)[0] if group.document_ids else None,
+                    context_terms=set(),
+                )
+            except ValueError:
+                continue
+            concept.source_document_ids = sorted({*(concept.source_document_ids or []), *group.document_ids})
+            concept.chapter_refs = sorted({*(concept.chapter_refs or []), *group.chapter_refs})
+            concept.evidence_count = max(int(concept.evidence_count or 0), len(group.chunk_ids))
+            _merge_quality_audit(
+                concept,
+                {
+                    **audit,
+                    "accepted": True,
+                    "gate_reason": "all_rejected_fallback",
+                    "fallback_original_reasons": sorted(reasons),
+                },
+            )
+            for alias in group.aliases:
+                alias_key = canonical_entity_key(alias, group.concept_type)
+                if alias_key:
+                    concept_map[alias_key] = concept
+            concept_map[key] = concept
+            if created:
+                created_count += 1
+            promoted_rejected_concepts += 1
+            rejected_concepts = max(0, rejected_concepts - 1)
 
     relation_count = 0
     for relation_data in staged_relations.values():
@@ -1206,6 +1271,7 @@ async def upsert_graph_candidates_from_chunks(
         "created_concepts": created_count,
         "relations": relation_count,
         "rejected_concepts": rejected_concepts,
+        "promoted_rejected_concepts": promoted_rejected_concepts,
         "llm_success_chunks": llm_success_chunks,
         "llm_verified_merges": llm_verified_merges,
         "graph_concept_specificity_threshold": specificity_threshold,
@@ -1788,6 +1854,19 @@ def choose_graph_probe_chunks(chunks: list[Chunk], limit: int = 3) -> list[Chunk
     return [ranked_by_length[index] for index in sorted(indexes)][:limit]
 
 
+async def run_llm_graph_extraction_with_timeout(
+    chunks: list[Chunk],
+    *,
+    timeout_seconds: float,
+    batch_id: str | None = None,
+) -> tuple[dict[str, dict], dict[str, str]]:
+    del timeout_seconds
+    # Each model call is already protected by model_request_timeout_seconds inside
+    # extract_llm_graph_payloads. A second timeout around the whole batch makes
+    # valid slow batches fail when concurrency is bounded and batch_size > concurrency.
+    return await run_llm_graph_extraction(chunks, batch_id=batch_id)
+
+
 async def run_llm_graph_extraction(chunks: list[Chunk], batch_id: str | None = None) -> tuple[dict[str, dict], dict[str, str]]:
     try:
         extraction_result = await extract_llm_graph_payloads(chunks, batch_id=batch_id)
@@ -2021,7 +2100,11 @@ async def _execute_graph_extraction_run_inner(
             )
         db.commit()
         ensure_not_cancelled(db, batch_id)
-        probe_payloads, probe_errors = await run_llm_graph_extraction(probe_chunks, batch_id=batch_id)
+        probe_payloads, probe_errors = await run_llm_graph_extraction_with_timeout(
+            probe_chunks,
+            timeout_seconds=float(settings.model_request_timeout_seconds) + 5.0,
+            batch_id=batch_id,
+        )
         ensure_not_cancelled(db, batch_id)
         probe_task_ids = [task_id for task_id, _chunk_id in probe_refs]
         probe_tasks = db.scalars(
@@ -2073,7 +2156,11 @@ async def _execute_graph_extraction_run_inner(
                 batch_chunk_count=len(batch_chunks),
             )
         db.commit()
-        payloads, errors = await run_llm_graph_extraction(batch_chunks, batch_id=batch_id)
+        payloads, errors = await run_llm_graph_extraction_with_timeout(
+            batch_chunks,
+            timeout_seconds=float(settings.model_request_timeout_seconds) + 5.0,
+            batch_id=batch_id,
+        )
         ensure_not_cancelled(db, batch_id)
         batch_task_ids = [task_id for task_id, _chunk_id in batch_refs]
         batch_tasks = db.scalars(
@@ -2159,8 +2246,20 @@ async def extract_llm_graph_payloads(
         nonlocal completed
         async with semaphore:
             try:
-                payload, _warnings = validate_graph_payload(await provider.extract_graph_payload(chunk.content, chunk.chapter, chunk.source_type))
+                if is_cancel_requested(None, batch_id):
+                    raise IngestionCancelled("ingestion batch cancellation requested")
+                raw_payload = await asyncio.wait_for(
+                    provider.extract_graph_payload(chunk.content, chunk.chapter, chunk.source_type),
+                    timeout=float(settings.model_request_timeout_seconds),
+                )
+                payload, _warnings = validate_graph_payload(raw_payload)
+                if is_cancel_requested(None, batch_id):
+                    raise IngestionCancelled("ingestion batch cancellation requested")
                 payloads[chunk.id] = payload
+            except IngestionCancelled:
+                raise
+            except asyncio.TimeoutError:
+                errors[chunk.id] = f"TimeoutError: graph extraction model request exceeded {settings.model_request_timeout_seconds}s"
             except Exception as exc:
                 errors[chunk.id] = f"{type(exc).__name__}: {exc}"
             finally:
@@ -2178,7 +2277,15 @@ async def extract_llm_graph_payloads(
 
     if not chunks:
         return {}, {}
-    await asyncio.gather(*(extract(chunk) for chunk in chunks))
+    tasks = [asyncio.create_task(extract(chunk)) for chunk in chunks]
+    try:
+        await asyncio.gather(*tasks)
+    except IngestionCancelled:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     return payloads, errors
 
 
@@ -2253,7 +2360,7 @@ def _representative_chunks_for_community(
     return ordered_chunk_ids, source_document_ids, relation_samples
 
 
-async def rebuild_graph_community_summaries(db: Session, course_id: str, *, batch_id: str | None = None) -> dict:
+async def rebuild_graph_community_summaries(db: Session, course_id: str, *, batch_id: str | None = None, community_ids: set[int] | None = None) -> dict:
     """Generate active Louvain community summaries for routing/planning."""
 
     concepts = db.scalars(
@@ -2265,27 +2372,34 @@ async def rebuild_graph_community_summaries(db: Session, course_id: str, *, batc
     communities: dict[int, list[Concept]] = defaultdict(list)
     for concept in concepts:
         if concept.community_louvain is not None:
+            if community_ids is not None and int(concept.community_louvain) not in community_ids:
+                continue
             communities[int(concept.community_louvain)].append(concept)
     if not communities:
-        db.query(GraphCommunitySummary).filter(GraphCommunitySummary.course_id == course_id).update(
-            {"is_active": False},
-            synchronize_session=False,
-        )
+        if community_ids is None:
+            db.query(GraphCommunitySummary).filter(GraphCommunitySummary.course_id == course_id).update(
+                {"is_active": False},
+                synchronize_session=False,
+            )
         return {"community_summary_count": 0, "community_summary_prompt_version": COMMUNITY_SUMMARY_PROMPT_VERSION}
 
     chat = ChatProvider()
     version = _community_summary_version(course_id)
-    db.query(GraphCommunitySummary).filter(GraphCommunitySummary.course_id == course_id).update(
-        {"is_active": False},
-        synchronize_session=False,
-    )
-    db.query(GraphCommunitySummary).filter(
+    deactivate_query = db.query(GraphCommunitySummary).filter(GraphCommunitySummary.course_id == course_id)
+    delete_query = db.query(GraphCommunitySummary).filter(
         GraphCommunitySummary.course_id == course_id,
         GraphCommunitySummary.algorithm == "louvain",
         GraphCommunitySummary.version == version,
-    ).delete(synchronize_session=False)
+    )
+    if community_ids is not None:
+        deactivate_query = deactivate_query.filter(GraphCommunitySummary.community_id.in_(list(community_ids)))
+        delete_query = delete_query.filter(GraphCommunitySummary.community_id.in_(list(community_ids)))
+    deactivate_query.update({"is_active": False}, synchronize_session=False)
+    delete_query.delete(synchronize_session=False)
     created = 0
+    settings = get_settings()
     for community_id, community_concepts in sorted(communities.items(), key=lambda item: item[0]):
+        ensure_not_cancelled(db, batch_id)
         ranked = sorted(community_concepts, key=_concept_rank_value, reverse=True)
         top_concepts = [
                 {
@@ -2330,15 +2444,19 @@ async def rebuild_graph_community_summaries(db: Session, course_id: str, *, batc
             },
             ensure_ascii=False,
         )
-        response = await chat.classify_json(
-            (
-                "You summarize graph communities for evidence-first RAG routing. "
-                "Return JSON with keys summary, key_concepts, routing_hints, quality_notes. "
-                "Do not invent facts outside the supplied concepts, relations, and chunk snippets."
+        response = await asyncio.wait_for(
+            chat.classify_json(
+                (
+                    "You summarize graph communities for evidence-first RAG routing. "
+                    "Return JSON with keys summary, key_concepts, routing_hints, quality_notes. "
+                    "Do not invent facts outside the supplied concepts, relations, and chunk snippets."
+                ),
+                user_prompt,
+                fallback={"summary": "", "key_concepts": [], "routing_hints": [], "quality_notes": []},
             ),
-            user_prompt,
-            fallback={"summary": "", "key_concepts": [], "routing_hints": [], "quality_notes": []},
+            timeout=settings.model_request_timeout_seconds,
         )
+        ensure_not_cancelled(db, batch_id)
         summary_text = _text_value(response.get("summary")) or "; ".join(item["name"] for item in top_concepts[:5])
         db.add(
             GraphCommunitySummary(
@@ -2386,9 +2504,11 @@ async def _run_auto_hpo_after_graph_upsert(
     probe_chunks: list[Chunk],
     payloads: dict[str, dict],
     baseline_context_chunks: list[Chunk],
+    run_hpo: bool | None = None,
 ) -> dict[str, Any]:
     settings = get_settings()
-    if not settings.enable_auto_hpo or not batch_id:
+    enabled = settings.enable_auto_hpo if run_hpo is None else run_hpo
+    if not enabled or not batch_id:
         return {"hpo_auto_enabled": False}
     from app.services.hpo_engine import HyperparameterTuningService
 
@@ -2417,7 +2537,16 @@ async def _run_auto_hpo_after_graph_upsert(
         return {"hpo_auto_enabled": True, "hpo_status": "failed", "hpo_error": str(exc)}
 
 
-async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None = None) -> dict:
+async def rebuild_course_graph(
+    db: Session,
+    course_id: str,
+    batch_id: str | None = None,
+    *,
+    run_llm_merge: bool | None = None,
+    run_hpo: bool | None = None,
+    run_community_summaries: bool | None = None,
+) -> dict:
+    settings = get_settings()
     course = db.get(Course, course_id)
     sync_graph_chapter_labels(db, course_id)
     active_documents = db.scalars(select(Document).where(Document.course_id == course_id, Document.is_active.is_(True))).all()
@@ -2504,7 +2633,7 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         course_id,
         chunks,
         llm_payloads=llm_payloads,
-        run_llm_merge=batch_id is not None,
+        run_llm_merge=(batch_id is not None if run_llm_merge is None else run_llm_merge),
     )
     _safe_emit_log(
         batch_id,
@@ -2515,10 +2644,12 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         relations=upsert_stats["relations"],
         graph_llm_success_chunks=upsert_stats["llm_success_chunks"],
         graph_rejected_concepts=upsert_stats["rejected_concepts"],
+        graph_promoted_rejected_concepts=upsert_stats.get("promoted_rejected_concepts", 0),
     )
     concept_count = upsert_stats["created_concepts"]
     relation_count = upsert_stats["relations"]
     llm_success_chunks = upsert_stats["llm_success_chunks"]
+    ensure_not_cancelled(db, batch_id)
     hpo_stats = await _run_auto_hpo_after_graph_upsert(
         db,
         course_id=course_id,
@@ -2526,9 +2657,12 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         probe_chunks=selected_llm_chunks,
         payloads=llm_payloads,
         baseline_context_chunks=chunks,
+        run_hpo=run_hpo,
     )
     _safe_emit_log(batch_id, "graph_enrichment_started", "正在刷新图谱拓扑指标", stage="graph_enrichment")
+    ensure_not_cancelled(db, batch_id)
     graph_algorithm_stats = await enrich_course_graph(db, course_id)
+    ensure_not_cancelled(db, batch_id)
     _safe_emit_log(
         batch_id,
         "graph_enrichment_completed",
@@ -2537,7 +2671,12 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         **graph_algorithm_stats,
     )
     _safe_emit_log(batch_id, "graph_community_started", "正在生成图谱社区摘要", stage="graph_community")
-    community_summary_stats = await rebuild_graph_community_summaries(db, course_id, batch_id=batch_id)
+    should_run_community_summaries = settings.enable_graph_community_summaries if run_community_summaries is None else run_community_summaries
+    if should_run_community_summaries:
+        community_summary_stats = await rebuild_graph_community_summaries(db, course_id, batch_id=batch_id)
+        ensure_not_cancelled(db, batch_id)
+    else:
+        community_summary_stats = {"community_summary_count": 0, "community_summary_skipped": True}
     _safe_emit_log(
         batch_id,
         "graph_community_completed",
@@ -2545,6 +2684,7 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         stage="graph_community",
         **community_summary_stats,
     )
+    ensure_not_cancelled(db, batch_id)
     record_course_graph_state(db, course_id, build_mode="full")
     db.commit()
     graph = get_graph_payload(db, course_id, graph_type="semantic")
@@ -2571,6 +2711,7 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         "graph_llm_errors": llm_errors,
         "graph_llm_validation_warnings": llm_validation_warnings,
         "graph_rejected_concepts": upsert_stats["rejected_concepts"],
+        "graph_promoted_rejected_concepts": upsert_stats.get("promoted_rejected_concepts", 0),
         "graph_concept_specificity_threshold": upsert_stats.get("graph_concept_specificity_threshold"),
         "graph_concept_specificity_threshold_audit": upsert_stats.get("graph_concept_specificity_threshold_audit"),
         "graph_llm_verified_merges": upsert_stats["llm_verified_merges"],
@@ -2591,37 +2732,38 @@ def _ensure_graph_backup_tables(db: Session) -> None:
 
     # If the source table gained new columns since the backup table was created,
     # drop the stale backup table so it gets recreated with the correct schema.
-    db.execute(text("""
-        DO $$
-        BEGIN
-            IF to_regclass('public.concepts_backup') IS NOT NULL THEN
-                IF (SELECT COUNT(*) FROM pg_attribute
-                    WHERE attrelid = 'public.concepts'::regclass AND attnum > 0 AND NOT attisdropped)
-                   != (SELECT COUNT(*) FROM pg_attribute
-                       WHERE attrelid = 'public.concepts_backup'::regclass AND attnum > 0 AND NOT attisdropped) THEN
-                    DROP TABLE concepts_backup;
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.execute(text("""
+            DO $$
+            BEGIN
+                IF to_regclass('public.concepts_backup') IS NOT NULL THEN
+                    IF (SELECT COUNT(*) FROM pg_attribute
+                        WHERE attrelid = 'public.concepts'::regclass AND attnum > 0 AND NOT attisdropped)
+                       != (SELECT COUNT(*) FROM pg_attribute
+                           WHERE attrelid = 'public.concepts_backup'::regclass AND attnum > 0 AND NOT attisdropped) THEN
+                        DROP TABLE concepts_backup;
+                    END IF;
                 END IF;
-            END IF;
 
-            IF to_regclass('public.concept_relations_backup') IS NOT NULL THEN
-                IF (SELECT COUNT(*) FROM pg_attribute
-                    WHERE attrelid = 'public.concept_relations'::regclass AND attnum > 0 AND NOT attisdropped)
-                   != (SELECT COUNT(*) FROM pg_attribute
-                       WHERE attrelid = 'public.concept_relations_backup'::regclass AND attnum > 0 AND NOT attisdropped) THEN
-                    DROP TABLE concept_relations_backup;
+                IF to_regclass('public.concept_relations_backup') IS NOT NULL THEN
+                    IF (SELECT COUNT(*) FROM pg_attribute
+                        WHERE attrelid = 'public.concept_relations'::regclass AND attnum > 0 AND NOT attisdropped)
+                       != (SELECT COUNT(*) FROM pg_attribute
+                           WHERE attrelid = 'public.concept_relations_backup'::regclass AND attnum > 0 AND NOT attisdropped) THEN
+                        DROP TABLE concept_relations_backup;
+                    END IF;
                 END IF;
-            END IF;
 
-            IF to_regclass('public.concept_aliases_backup') IS NOT NULL THEN
-                IF (SELECT COUNT(*) FROM pg_attribute
-                    WHERE attrelid = 'public.concept_aliases'::regclass AND attnum > 0 AND NOT attisdropped)
-                   != (SELECT COUNT(*) FROM pg_attribute
-                       WHERE attrelid = 'public.concept_aliases_backup'::regclass AND attnum > 0 AND NOT attisdropped) THEN
-                    DROP TABLE concept_aliases_backup;
+                IF to_regclass('public.concept_aliases_backup') IS NOT NULL THEN
+                    IF (SELECT COUNT(*) FROM pg_attribute
+                        WHERE attrelid = 'public.concept_aliases'::regclass AND attnum > 0 AND NOT attisdropped)
+                       != (SELECT COUNT(*) FROM pg_attribute
+                           WHERE attrelid = 'public.concept_aliases_backup'::regclass AND attnum > 0 AND NOT attisdropped) THEN
+                        DROP TABLE concept_aliases_backup;
+                    END IF;
                 END IF;
-            END IF;
-        END $$;
-    """))
+            END $$;
+        """))
 
     db.execute(text(
         "CREATE TABLE IF NOT EXISTS concepts_backup AS SELECT * FROM concepts WHERE 1=0"
@@ -2631,6 +2773,18 @@ def _ensure_graph_backup_tables(db: Session) -> None:
     ))
     db.execute(text(
         "CREATE TABLE IF NOT EXISTS concept_aliases_backup AS SELECT * FROM concept_aliases WHERE 1=0"
+    ))
+    db.execute(text(
+        "CREATE TABLE IF NOT EXISTS graph_relation_candidates_backup AS SELECT * FROM graph_relation_candidates WHERE 1=0"
+    ))
+    db.execute(text(
+        "CREATE TABLE IF NOT EXISTS entity_mentions_backup AS SELECT * FROM entity_mentions WHERE 1=0"
+    ))
+    db.execute(text(
+        "CREATE TABLE IF NOT EXISTS entity_merge_candidates_backup AS SELECT * FROM entity_merge_candidates WHERE 1=0"
+    ))
+    db.execute(text(
+        "CREATE TABLE IF NOT EXISTS graph_community_summaries_backup AS SELECT * FROM graph_community_summaries WHERE 1=0"
     ))
 
 
@@ -2642,14 +2796,75 @@ def _backup_course_graph_tables(db: Session, course_id: str) -> None:
     db.execute(text("DELETE FROM concepts_backup WHERE course_id = :course_id"), {"course_id": course_id})
     db.execute(text("DELETE FROM concept_relations_backup WHERE course_id = :course_id"), {"course_id": course_id})
     db.execute(text("DELETE FROM concept_aliases_backup WHERE concept_id IN (SELECT id FROM concepts WHERE course_id = :course_id)"), {"course_id": course_id})
+    db.execute(text("DELETE FROM graph_relation_candidates_backup WHERE course_id = :course_id"), {"course_id": course_id})
+    db.execute(text("DELETE FROM entity_mentions_backup WHERE course_id = :course_id"), {"course_id": course_id})
+    db.execute(text("DELETE FROM entity_merge_candidates_backup WHERE course_id = :course_id"), {"course_id": course_id})
+    db.execute(text("DELETE FROM graph_community_summaries_backup WHERE course_id = :course_id"), {"course_id": course_id})
+    def cols(names: tuple[str, ...], prefix: str | None = None) -> str:
+        return ", ".join(f"{prefix}.{name}" if prefix else name for name in names)
+
+    concepts_cols = (
+        "id", "course_id", "canonical_name", "normalized_name", "concept_type", "summary",
+        "chapter_refs", "importance_score", "evidence_count", "community_louvain",
+        "community_spectral", "component_id", "centrality_json", "graph_rank_score",
+        "source_document_ids", "quality_json", "created_at", "updated_at",
+    )
+    relations_cols = (
+        "id", "course_id", "source_concept_id", "target_concept_id", "target_name",
+        "relation_type", "evidence_chunk_id", "confidence", "extraction_method",
+        "is_validated", "weight", "semantic_similarity", "support_count", "relation_source",
+        "is_inferred", "metadata_json", "source_document_ids", "created_at",
+    )
+    aliases_cols = ("id", "concept_id", "alias", "normalized_alias")
+    candidates_cols = (
+        "id", "course_id", "source_concept_id", "target_concept_id", "target_name",
+        "relation_type", "relation_source", "evidence_chunk_id", "confidence", "weight",
+        "semantic_similarity", "support_count", "is_inferred", "decision_json",
+        "metadata_json", "source_document_ids", "created_at",
+    )
+    mentions_cols = (
+        "id", "course_id", "chunk_id", "document_id", "concept_id", "surface",
+        "canonical_name", "normalized_key", "entity_type", "confidence", "evidence_spans",
+        "status", "decision_json", "created_at",
+    )
+    merge_candidates_cols = (
+        "id", "course_id", "left_key", "right_key", "entity_type", "source", "score",
+        "status", "verifier_json", "created_at",
+    )
+    community_summary_cols = (
+        "id", "course_id", "algorithm", "community_id", "version", "summary",
+        "key_concepts_json", "representative_chunk_ids", "source_document_ids",
+        "prompt_version", "model", "quality_json", "is_active", "created_at", "updated_at",
+    )
+
     db.execute(text(
-        "INSERT INTO concepts_backup SELECT * FROM concepts WHERE course_id = :course_id"
+        f"INSERT INTO concepts_backup ({cols(concepts_cols)}) "
+        f"SELECT {cols(concepts_cols)} FROM concepts WHERE course_id = :course_id"
     ), {"course_id": course_id})
     db.execute(text(
-        "INSERT INTO concept_relations_backup SELECT * FROM concept_relations WHERE course_id = :course_id"
+        f"INSERT INTO concept_relations_backup ({cols(relations_cols)}) "
+        f"SELECT {cols(relations_cols)} FROM concept_relations WHERE course_id = :course_id"
     ), {"course_id": course_id})
     db.execute(text(
-        "INSERT INTO concept_aliases_backup SELECT ca.* FROM concept_aliases ca JOIN concepts c ON ca.concept_id = c.id WHERE c.course_id = :course_id"
+        f"INSERT INTO concept_aliases_backup ({cols(aliases_cols)}) "
+        f"SELECT {cols(aliases_cols, 'ca')} FROM concept_aliases ca "
+        "JOIN concepts c ON ca.concept_id = c.id WHERE c.course_id = :course_id"
+    ), {"course_id": course_id})
+    db.execute(text(
+        f"INSERT INTO graph_relation_candidates_backup ({cols(candidates_cols)}) "
+        f"SELECT {cols(candidates_cols)} FROM graph_relation_candidates WHERE course_id = :course_id"
+    ), {"course_id": course_id})
+    db.execute(text(
+        f"INSERT INTO entity_mentions_backup ({cols(mentions_cols)}) "
+        f"SELECT {cols(mentions_cols)} FROM entity_mentions WHERE course_id = :course_id"
+    ), {"course_id": course_id})
+    db.execute(text(
+        f"INSERT INTO entity_merge_candidates_backup ({cols(merge_candidates_cols)}) "
+        f"SELECT {cols(merge_candidates_cols)} FROM entity_merge_candidates WHERE course_id = :course_id"
+    ), {"course_id": course_id})
+    db.execute(text(
+        f"INSERT INTO graph_community_summaries_backup ({cols(community_summary_cols)}) "
+        f"SELECT {cols(community_summary_cols)} FROM graph_community_summaries WHERE course_id = :course_id"
     ), {"course_id": course_id})
 
 
@@ -2659,15 +2874,76 @@ def _restore_course_graph_from_backup(db: Session, course_id: str) -> None:
 
     db.execute(text("DELETE FROM concept_relations WHERE course_id = :course_id"), {"course_id": course_id})
     db.execute(text("DELETE FROM concept_aliases WHERE concept_id IN (SELECT id FROM concepts WHERE course_id = :course_id)"), {"course_id": course_id})
+    db.execute(text("DELETE FROM graph_relation_candidates WHERE course_id = :course_id"), {"course_id": course_id})
+    db.execute(text("DELETE FROM entity_mentions WHERE course_id = :course_id"), {"course_id": course_id})
+    db.execute(text("DELETE FROM entity_merge_candidates WHERE course_id = :course_id"), {"course_id": course_id})
+    db.execute(text("DELETE FROM graph_community_summaries WHERE course_id = :course_id"), {"course_id": course_id})
     db.execute(text("DELETE FROM concepts WHERE course_id = :course_id"), {"course_id": course_id})
+    def cols(names: tuple[str, ...], prefix: str | None = None) -> str:
+        return ", ".join(f"{prefix}.{name}" if prefix else name for name in names)
+
+    concepts_cols = (
+        "id", "course_id", "canonical_name", "normalized_name", "concept_type", "summary",
+        "chapter_refs", "importance_score", "evidence_count", "community_louvain",
+        "community_spectral", "component_id", "centrality_json", "graph_rank_score",
+        "source_document_ids", "quality_json", "created_at", "updated_at",
+    )
+    relations_cols = (
+        "id", "course_id", "source_concept_id", "target_concept_id", "target_name",
+        "relation_type", "evidence_chunk_id", "confidence", "extraction_method",
+        "is_validated", "weight", "semantic_similarity", "support_count", "relation_source",
+        "is_inferred", "metadata_json", "source_document_ids", "created_at",
+    )
+    aliases_cols = ("id", "concept_id", "alias", "normalized_alias")
+    candidates_cols = (
+        "id", "course_id", "source_concept_id", "target_concept_id", "target_name",
+        "relation_type", "relation_source", "evidence_chunk_id", "confidence", "weight",
+        "semantic_similarity", "support_count", "is_inferred", "decision_json",
+        "metadata_json", "source_document_ids", "created_at",
+    )
+    mentions_cols = (
+        "id", "course_id", "chunk_id", "document_id", "concept_id", "surface",
+        "canonical_name", "normalized_key", "entity_type", "confidence", "evidence_spans",
+        "status", "decision_json", "created_at",
+    )
+    merge_candidates_cols = (
+        "id", "course_id", "left_key", "right_key", "entity_type", "source", "score",
+        "status", "verifier_json", "created_at",
+    )
+    community_summary_cols = (
+        "id", "course_id", "algorithm", "community_id", "version", "summary",
+        "key_concepts_json", "representative_chunk_ids", "source_document_ids",
+        "prompt_version", "model", "quality_json", "is_active", "created_at", "updated_at",
+    )
+
     db.execute(text(
-        "INSERT INTO concepts SELECT * FROM concepts_backup WHERE course_id = :course_id"
+        f"INSERT INTO concepts ({cols(concepts_cols)}) "
+        f"SELECT {cols(concepts_cols)} FROM concepts_backup WHERE course_id = :course_id"
     ), {"course_id": course_id})
     db.execute(text(
-        "INSERT INTO concept_relations SELECT * FROM concept_relations_backup WHERE course_id = :course_id"
+        f"INSERT INTO concept_relations ({cols(relations_cols)}) "
+        f"SELECT {cols(relations_cols)} FROM concept_relations_backup WHERE course_id = :course_id"
     ), {"course_id": course_id})
     db.execute(text(
-        "INSERT INTO concept_aliases SELECT ca.* FROM concept_aliases_backup ca JOIN concepts_backup c ON ca.concept_id = c.id WHERE c.course_id = :course_id"
+        f"INSERT INTO concept_aliases ({cols(aliases_cols)}) "
+        f"SELECT {cols(aliases_cols, 'ca')} FROM concept_aliases_backup ca "
+        "JOIN concepts_backup c ON ca.concept_id = c.id WHERE c.course_id = :course_id"
+    ), {"course_id": course_id})
+    db.execute(text(
+        f"INSERT INTO graph_relation_candidates ({cols(candidates_cols)}) "
+        f"SELECT {cols(candidates_cols)} FROM graph_relation_candidates_backup WHERE course_id = :course_id"
+    ), {"course_id": course_id})
+    db.execute(text(
+        f"INSERT INTO entity_mentions ({cols(mentions_cols)}) "
+        f"SELECT {cols(mentions_cols)} FROM entity_mentions_backup WHERE course_id = :course_id"
+    ), {"course_id": course_id})
+    db.execute(text(
+        f"INSERT INTO entity_merge_candidates ({cols(merge_candidates_cols)}) "
+        f"SELECT {cols(merge_candidates_cols)} FROM entity_merge_candidates_backup WHERE course_id = :course_id"
+    ), {"course_id": course_id})
+    db.execute(text(
+        f"INSERT INTO graph_community_summaries ({cols(community_summary_cols)}) "
+        f"SELECT {cols(community_summary_cols)} FROM graph_community_summaries_backup WHERE course_id = :course_id"
     ), {"course_id": course_id})
 
 
@@ -2676,7 +2952,11 @@ async def incremental_update_course_graph(
     course_id: str,
     changed_document_ids: list[str],
     batch_id: str | None = None,
+    *,
+    run_hpo: bool | None = None,
+    run_community_summaries: bool | None = None,
 ) -> dict:
+    settings = get_settings()
     course = db.get(Course, course_id)
     ensure_not_cancelled(db, batch_id)
     if not changed_document_ids:
@@ -2792,6 +3072,7 @@ async def incremental_update_course_graph(
         relations=upsert_stats["relations"],
         graph_llm_success_chunks=upsert_stats["llm_success_chunks"],
         graph_rejected_concepts=upsert_stats["rejected_concepts"],
+        graph_promoted_rejected_concepts=upsert_stats.get("promoted_rejected_concepts", 0),
     )
     concept_count = upsert_stats["created_concepts"]
     relation_count = upsert_stats["relations"]
@@ -2803,6 +3084,7 @@ async def incremental_update_course_graph(
         probe_chunks=selected_llm_chunks,
         payloads=llm_payloads,
         baseline_context_chunks=chunks,
+        run_hpo=run_hpo,
     )
     ensure_not_cancelled(db, batch_id)
 
@@ -2819,8 +3101,40 @@ async def incremental_update_course_graph(
         **graph_algorithm_stats,
     )
     _safe_emit_log(batch_id, "graph_community_started", "正在生成图谱社区摘要", stage="graph_community")
-    community_summary_stats = await rebuild_graph_community_summaries(db, course_id, batch_id=batch_id)
-    ensure_not_cancelled(db, batch_id)
+    changed_chunk_ids = {chunk.id for chunk in chunks}
+    changed_relation_concept_ids: set[str] = set()
+    if changed_chunk_ids:
+        changed_relations = db.scalars(
+            select(ConceptRelation).where(
+                ConceptRelation.course_id == course_id,
+                ConceptRelation.evidence_chunk_id.in_(list(changed_chunk_ids)),
+            )
+        ).all()
+        for relation in changed_relations:
+            changed_relation_concept_ids.add(relation.source_concept_id)
+            if relation.target_concept_id:
+                changed_relation_concept_ids.add(relation.target_concept_id)
+    changed_community_ids = {
+        int(community_id)
+        for (community_id,) in db.query(Concept.community_louvain)
+        .filter(
+            Concept.course_id == course_id,
+            Concept.id.in_(list(changed_relation_concept_ids)) if changed_relation_concept_ids else False,
+            Concept.community_louvain.is_not(None),
+        )
+        .all()
+    }
+    should_run_community_summaries = settings.enable_graph_community_summaries if run_community_summaries is None else run_community_summaries
+    if should_run_community_summaries:
+        community_summary_stats = await rebuild_graph_community_summaries(
+            db,
+            course_id,
+            batch_id=batch_id,
+            community_ids=changed_community_ids,
+        )
+        ensure_not_cancelled(db, batch_id)
+    else:
+        community_summary_stats = {"community_summary_count": 0, "community_summary_skipped": True}
     _safe_emit_log(
         batch_id,
         "graph_community_completed",
@@ -2852,6 +3166,7 @@ async def incremental_update_course_graph(
         "graph_llm_success_chunks": llm_success_chunks,
         "graph_llm_failed_chunks": len(llm_errors),
         "graph_rejected_concepts": upsert_stats["rejected_concepts"],
+        "graph_promoted_rejected_concepts": upsert_stats.get("promoted_rejected_concepts", 0),
         **graph_gc_stats,
         **hpo_stats,
         "graph_concept_specificity_threshold": upsert_stats.get("graph_concept_specificity_threshold"),
@@ -3240,14 +3555,15 @@ def graph_freshness(db: Session, course_id: str) -> dict:
     ).all()
     evidence_chunk_ids = sorted({relation.evidence_chunk_id for relation in relations if relation.evidence_chunk_id})
     active_chunks = db.scalars(select(Chunk).where(Chunk.course_id == course_id, Chunk.is_active.is_(True))).all()
-    latest_chunk_versions = sorted({chunk.embedding_text_version for chunk in active_chunks if chunk.embedding_text_version})
+    latest_chunk_versions = [str(version) for version in sorted({chunk.chunk_version for chunk in active_chunks if chunk.chunk_version})]
+    latest_chunk_version = latest_chunk_versions[-1] if latest_chunk_versions else None
     state = db.get(CourseGraphState, course_id)
     scope = _graph_scope_snapshot(db, course_id)
     if state is None and evidence_chunk_ids:
         return {
             "is_stale": True,
             "reason": "missing_graph_build_watermark",
-            "latest_chunk_version": CURRENT_EMBEDDING_TEXT_VERSION,
+            "latest_chunk_version": latest_chunk_version,
             "active_chunk_versions": latest_chunk_versions,
             "graph_chunk_version": None,
             "graph_chunk_versions": [],
@@ -3277,10 +3593,10 @@ def graph_freshness(db: Session, course_id: str) -> dict:
             return {
                 "is_stale": True,
                 "reason": reason,
-                "latest_chunk_version": CURRENT_EMBEDDING_TEXT_VERSION,
+                "latest_chunk_version": latest_chunk_version,
                 "active_chunk_versions": latest_chunk_versions,
-                "graph_chunk_version": state.embedding_text_version,
-                "graph_chunk_versions": [state.embedding_text_version] if state.embedding_text_version else [],
+                "graph_chunk_version": None,
+                "graph_chunk_versions": [],
                 "stale_evidence_chunks": 0,
                 "missing_evidence_chunks": 0,
                 "current_document_versions": current_versions,
@@ -3297,7 +3613,7 @@ def graph_freshness(db: Session, course_id: str) -> dict:
         return {
             "is_stale": False,
             "reason": "no_graph_evidence",
-            "latest_chunk_version": CURRENT_EMBEDDING_TEXT_VERSION,
+            "latest_chunk_version": latest_chunk_version,
             "active_chunk_versions": latest_chunk_versions,
             "graph_chunk_version": None,
             "stale_evidence_chunks": 0,
@@ -3310,21 +3626,22 @@ def graph_freshness(db: Session, course_id: str) -> dict:
     chunk_by_id = {chunk.id: chunk for chunk in evidence_chunks}
     missing_count = len([chunk_id for chunk_id in evidence_chunk_ids if chunk_id not in chunk_by_id])
     stale_chunks = [chunk for chunk in evidence_chunks if not chunk.is_active]
-    graph_versions = sorted({chunk.embedding_text_version for chunk in evidence_chunks if chunk.embedding_text_version})
-    version_stale = bool(graph_versions and CURRENT_EMBEDDING_TEXT_VERSION not in graph_versions)
+    graph_versions = [str(version) for version in sorted({chunk.chunk_version for chunk in evidence_chunks if chunk.chunk_version})]
+    current_chunk_versions = {str(chunk.chunk_version) for chunk in active_chunks if chunk.chunk_version}
+    version_stale = bool(graph_versions and not set(graph_versions).issubset(current_chunk_versions))
     is_stale = bool(missing_count or stale_chunks or version_stale)
     if missing_count:
         reason = "missing_evidence_chunks"
     elif stale_chunks:
         reason = "inactive_evidence_chunks"
     elif version_stale:
-        reason = "embedding_text_version_changed"
+        reason = "chunk_version_changed"
     else:
         reason = None
     return {
         "is_stale": is_stale,
         "reason": reason,
-        "latest_chunk_version": CURRENT_EMBEDDING_TEXT_VERSION,
+        "latest_chunk_version": latest_chunk_version,
         "active_chunk_versions": latest_chunk_versions,
         "graph_chunk_version": graph_versions[-1] if graph_versions else None,
         "graph_chunk_versions": graph_versions,

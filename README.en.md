@@ -141,6 +141,10 @@ sequenceDiagram
 
 Ingestion uses explicit batch / job state and file-level locks. A knowledge base keeps at most one non-terminal ingestion batch at a time. PostgreSQL is the source of truth for lifecycle state; Qdrant and Redis are derived or runtime stores. Failures record compensation or actionable error context instead of silently degrading.
 
+Chunk versions are tracked only on `chunks.chunk_version`; `courses.current_chunk_version` records the highest committed chunk version for the knowledge base. The first successful parse of an empty knowledge base creates version 1. Normal selected-file parsing syncs successful files to the current highest version without creating a new version. Full reparse is available only after active chunks exist and targets `current_chunk_version + 1`; if the whole batch has no successful files, the course version is not advanced.
+
+Cancellation has phase-specific compensation. Cancelling during parsing rolls back writes from that parse phase to the previously active chunks. Cancelling after the batch has entered graph construction restores the graph snapshot taken before graph work started, while preserving already committed parse results.
+
 ## Ingestion, Chunking, And Vectors
 
 ### Hierarchical Chunking
@@ -420,7 +424,7 @@ Where $\text{new}(c)$ denotes newly covered dimensions when chunk $c$ is added. 
 Selection uses a **greedy best-first** strategy: at each step, pick the unselected chunk with maximum $\Delta_{\text{cov}}$. Stopping criteria:
 - Cumulative coverage exceeds threshold (default $0.85$)
 - Marginal gain $\Delta_{\text{cov}} < 0.03$
-- Soft-start budget reached (`GRAPH_EXTRACTION_SOFT_START_BUDGET`, default 120)
+- Soft-start budget reached (`GRAPH_EXTRACTION_SOFT_START_BUDGET`) or the model-call cap is reached (`GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN`)
 - All chunks selected
 
 Selected chunks enter LLM graph extraction; remaining chunks stay in the vector store and retrieval system but do not consume model call budget.
@@ -863,21 +867,22 @@ Common variables:
 | `EMBEDDING_RESOLVE_IP`                                                                                       | Target IP when embedding model-domain resolution must be pinned                                   |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` / `EMBEDDING_BATCH_SIZE`                                          | Embedding model, dimensions, and batch size                                                       |
 | `CHAT_MODEL`                                                                                                 | Chat and graph extraction model                                                                   |
-| `GRAPH_EXTRACTION_SOFT_START_BUDGET` / `GRAPH_EXTRACTION_CONCURRENCY` / `GRAPH_EXTRACTION_RESUME_BATCH_SIZE` | Adaptive graph extraction initial budget, concurrent model calls, and model-call chunk batch size |
+| `GRAPH_EXTRACTION_SOFT_START_BUDGET` / `GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN` / `GRAPH_EXTRACTION_CONCURRENCY` / `GRAPH_EXTRACTION_RESUME_BATCH_SIZE` | Adaptive graph extraction budget, hard model-call cap, concurrent model calls, and model-call chunk batch size |
+| `WORKER_CONCURRENCY` / `INGESTION_FILE_CONCURRENCY` / `MODEL_REQUEST_CONCURRENCY` / `MODEL_REQUEST_TIMEOUT_SECONDS` / `HPO_CONCURRENCY` | Bounded concurrency and timeout controls for worker processes, file parsing, model requests, and HPO |
 | `ENABLE_MODEL_FALLBACK`                                                                                      | Model fallback switch, default `false`                                                            |
 | `RERANKER_ENABLED` / `RERANKER_MODEL` / `RERANKER_MAX_LENGTH`                                                | Cross-Encoder reranker settings                                                                   |
 | `SEMANTIC_CHUNKING_ENABLED` / `SEMANTIC_CHUNKING_MIN_LENGTH`                                                 | Semantic chunking switch and minimum text length                                                  |
 | `RETRIEVAL_LAYER_ENABLED`                                                                                    | Retrieval layer switch, default `true`                                                            |
-| `RETRIEVAL_CACHE_TTL_SECONDS`                                                                                | Redis retrieval cache TTL, default `300`                                                          |
+| `RETRIEVAL_CACHE_TTL_SECONDS`                                                                                | Redis retrieval cache TTL, template default `120`                                                 |
 | `ENABLE_AGENTIC_REFLECTION`                                                                                  | Agentic reflection and correction master switch, default `true`                                   |
 | `ENABLE_POST_GENERATION_REFLECTION`                                                                          | Post-generation reflection switch (CitationVerifier/Reflection/AnswerCorrector), default `false`  |
 | `CITATION_VERIFICATION_SAMPLE_MAX`                                                                           | Citation verification sample size per answer, default `3`                                         |
 | `REFLECTION_MAX_RETRIES`                                                                                     | Max reflection-triggered correction retries, default `2`                                          |
-| `MODEL_BRIDGE_ENABLED` / `MODEL_BRIDGE_PORT`                                                                 | Host model-bridge switch and port                                                                 |
-| `ENABLE_AUTO_HPO`                                                                                            | Auto-run TPE hyperparameter optimization before graph rebuild, default `false`                    |
+| `MODEL_BRIDGE_ENABLED` / `MODEL_BRIDGE_PORT`                                                                 | Host model-bridge switch and port; root template enables it by default                            |
+| `ENABLE_AUTO_HPO`                                                                                            | Auto-run TPE hyperparameter optimization before graph rebuild; root template enables it by default |
+| `ENABLE_GRAPH_COMMUNITY_SUMMARIES`                                                                           | Generate graph community summaries during graph rebuild/update when enabled                       |
 | `HPO_JUDGE_MAX_CANDIDATES` / `HPO_JUDGE_MAX_PAIRS` / `HPO_JUDGE_MIN_LABELS`                                  | HPO judge candidate count, pairwise comparison count, minimum valid labels                        |
 | `HPO_JUDGE_MAX_TOKENS_PER_PAIR` / `HPO_JUDGE_CONCURRENCY`                                                    | Max tokens per judge pair and concurrency                                                         |
-| `GRAPH_EXTRACTION_SOFT_START_BUDGET` / `GRAPH_EXTRACTION_RESUME_BATCH_SIZE`                                  | Adaptive graph extraction initial budget and per-batch model-call chunk count                     |
 
 Docker Compose overrides infrastructure URLs inside the API container:
 

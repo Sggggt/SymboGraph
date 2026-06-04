@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -17,11 +18,32 @@ def make_chunk(chunk_id: str, document_id: str, content: str, content_kind: str 
     )
 
 
-def test_adaptive_graph_extraction_plan_has_no_fixed_chunk_cap(no_fallback_env, monkeypatch):
+def write_test_env(monkeypatch, tmp_path, **entries: str):
+    from app.core import config
+
+    workspace = tmp_path / "workspace"
+    app_dir = workspace / "apps" / "api" / "app"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", workspace)
+    monkeypatch.setattr(config, "APP_DIR", app_dir)
+    env_entries = {
+        "DATABASE_URL": f"sqlite:///{(tmp_path / 'test.db').as_posix()}",
+        "DATA_ROOT": (tmp_path / "data").as_posix(),
+        "GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN": "1000",
+        "GRAPH_EXTRACTION_MAX_INPUT_TOKENS_PER_RUN": "999999",
+        "GRAPH_EXTRACTION_MIN_MARGINAL_GAIN": "0",
+        "GRAPH_EXTRACTION_STALL_ROUNDS": "20",
+        **entries,
+    }
+    (workspace / ".env").write_text("\n".join(f"{key}={value}" for key, value in env_entries.items()) + "\n", encoding="utf-8")
+    config.get_settings.cache_clear()
+
+
+def test_adaptive_graph_extraction_plan_has_no_fixed_chunk_cap(no_fallback_env, monkeypatch, tmp_path):
     from app.core.config import get_settings
     from app.services.concept_graph import plan_adaptive_graph_extraction_chunks
 
-    monkeypatch.setenv("GRAPH_EXTRACTION_SOFT_START_BUDGET", "3")
+    write_test_env(monkeypatch, tmp_path, GRAPH_EXTRACTION_SOFT_START_BUDGET="3")
     monkeypatch.delenv("GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN", raising=False)
     monkeypatch.delenv("GRAPH_EXTRACTION_MAX_INPUT_TOKENS_PER_RUN", raising=False)
     get_settings.cache_clear()
@@ -46,11 +68,55 @@ def test_adaptive_graph_extraction_plan_has_no_fixed_chunk_cap(no_fallback_env, 
     assert plan.coverage["chapters"]["covered"] >= 2
 
 
-def test_adaptive_graph_extraction_plan_respects_optional_model_call_budget(no_fallback_env, monkeypatch):
+@pytest.mark.asyncio
+async def test_llm_graph_extraction_respects_model_request_timeout(monkeypatch):
+    from app.services import concept_graph
+
+    class SlowProvider:
+        async def extract_graph_payload(self, *_args, **_kwargs):
+            await asyncio.sleep(1)
+            return {"concepts": [], "relations": []}
+
+    monkeypatch.setattr(concept_graph, "ChatProvider", SlowProvider)
+    monkeypatch.setattr(
+        concept_graph,
+        "get_settings",
+        lambda: SimpleNamespace(graph_extraction_concurrency=1, model_request_timeout_seconds=0.01),
+    )
+
+    payloads, errors = await concept_graph.extract_llm_graph_payloads(
+        [make_chunk("chunk-timeout", "doc-1", "centrality and modularity")]
+    )
+
+    assert payloads == {}
+    assert "chunk-timeout" in errors
+    assert "model request exceeded" in errors["chunk-timeout"]
+
+
+@pytest.mark.asyncio
+async def test_llm_graph_extraction_batch_timeout_is_not_applied_above_chunk_timeouts(monkeypatch):
+    from app.services import concept_graph
+
+    async def slow_batch(*_args, **_kwargs):
+        await asyncio.sleep(1)
+        return {}, {}
+
+    monkeypatch.setattr(concept_graph, "run_llm_graph_extraction", slow_batch)
+
+    payloads, errors = await concept_graph.run_llm_graph_extraction_with_timeout(
+        [make_chunk("chunk-batch-timeout", "doc-1", "centrality and modularity")],
+        timeout_seconds=0.01,
+    )
+
+    assert payloads == {}
+    assert errors == {}
+
+
+def test_adaptive_graph_extraction_plan_respects_optional_model_call_budget(no_fallback_env, monkeypatch, tmp_path):
     from app.core.config import get_settings
     from app.services.concept_graph import plan_adaptive_graph_extraction_chunks
 
-    monkeypatch.setenv("GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN", "2")
+    write_test_env(monkeypatch, tmp_path, GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN="2")
     get_settings.cache_clear()
     chunks = [
         make_chunk(f"doc-{index}", f"doc-{index}", "Maximum Flow is defined by feasible flow and residual network. " * 10)
@@ -68,7 +134,7 @@ def test_adaptive_specificity_threshold_uses_distribution_with_fallback():
 
     fallback = adaptive_specificity_threshold([0.41, 0.52, 0.66])
     assert fallback["enabled"] is False
-    assert fallback["threshold"] == 0.55
+    assert fallback["threshold"] == 0.35
     assert fallback["fallback_reason"] == "insufficient_samples"
 
     profile = adaptive_specificity_threshold([0.42] * 5 + [0.48] * 10 + [0.72] * 10)
@@ -104,7 +170,7 @@ def test_record_entity_mention_merges_duplicate_pending_mentions(db_session, sam
 
 
 @pytest.mark.asyncio
-async def test_extract_llm_graph_payloads_uses_configured_concurrency(no_fallback_env, monkeypatch):
+async def test_extract_llm_graph_payloads_uses_configured_concurrency(no_fallback_env, monkeypatch, tmp_path):
     from app.core.config import get_settings
     from app.services import concept_graph
 
@@ -120,7 +186,7 @@ async def test_extract_llm_graph_payloads_uses_configured_concurrency(no_fallbac
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-    monkeypatch.setenv("GRAPH_EXTRACTION_CONCURRENCY", "4")
+    write_test_env(monkeypatch, tmp_path, GRAPH_EXTRACTION_CONCURRENCY="4")
     get_settings.cache_clear()
     monkeypatch.setattr(concept_graph.asyncio, "Semaphore", RecordingSemaphore)
 
@@ -232,12 +298,12 @@ def test_resumable_graph_extraction_ignores_terminal_batch_runs(db_session, samp
 
 
 @pytest.mark.asyncio
-async def test_rebuild_course_graph_reports_real_llm_selection_stats(db_session, sample_course, monkeypatch):
+async def test_rebuild_course_graph_reports_real_llm_selection_stats(db_session, sample_course, monkeypatch, tmp_path):
     from app.core.config import get_settings
     from app.models import Chunk, Document, DocumentVersion
     from app.services import concept_graph
 
-    monkeypatch.setenv("GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN", "5")
+    write_test_env(monkeypatch, tmp_path, GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN="5")
     get_settings.cache_clear()
 
     for document_index in range(3):
@@ -345,7 +411,7 @@ async def test_auto_hpo_runs_after_graph_upsert_before_enrich(db_session, sample
             "llm_verified_merges": 0,
         }
 
-    async def fake_hpo(db, *, course_id, batch_id, probe_chunks, payloads, baseline_context_chunks):
+    async def fake_hpo(db, *, course_id, batch_id, probe_chunks, payloads, baseline_context_chunks, run_hpo=None):
         order.append("hpo")
         assert payloads
         assert probe_chunks
@@ -845,6 +911,21 @@ def test_concept_gate_requires_batch_evidence_and_specificity():
 
     assert singleton_accepted is True
     assert singleton_audit["gate_reason"] == "strong_singleton_evidence"
+
+    single_chunk_group = StagedConcept(
+        key="pagerank",
+        name="PageRank",
+        concept_type="metric",
+        importance_score=0.7,
+        confidence=0.7,
+        chunk_ids={"c1"},
+        heading_hits=0,
+        definition_hits=0,
+    )
+    single_chunk_accepted, single_chunk_audit = concept_gate_decision(single_chunk_group, chunks, specificity_threshold=0.35)
+
+    assert single_chunk_accepted is True
+    assert single_chunk_audit["gate_reason"] == "single_chunk_domain_term"
 
     heading_singleton_group = StagedConcept(
         key="lecture 1::concept",

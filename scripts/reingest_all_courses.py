@@ -23,7 +23,7 @@ sys.path.insert(0, str(repo_root / "apps" / "api"))
 from app.db import SessionLocal
 from app.models import Course
 from app.core.config import get_settings
-from app.services.ingestion import create_sync_batch, run_batch_ingestion
+from app.services.ingestion import active_chunk_count, create_sync_batch, run_batch_ingestion
 from app.services.maintenance import cleanup_stale_data
 
 EXCLUDE_DIRS = {"ingestion", "postgres", "qdrant", "redis", "storage", "models"}
@@ -69,7 +69,7 @@ async def reingest_course(course_name: str, cleanup_stale: bool) -> dict:
         batch = create_sync_batch(db, course.id, storage_root, trigger_source="reingest")
         print(f"  [batch {batch.id}] created for course '{course_name}'")
 
-        result = await run_batch_ingestion(batch.id, force=True)
+        result = await run_batch_ingestion(batch.id, force=True, full_reparse=active_chunk_count(db, course.id) > 0)
         cleanup_stats = None
         if cleanup_stale and result.get("state") in {"completed", "partial_failed"}:
             cleanup_stats = cleanup_stale_data(db, course.id, course.name)

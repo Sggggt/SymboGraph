@@ -566,7 +566,7 @@ class ChatProvider:
             f"{self.settings.chat_base_url.rstrip('/')}/chat/completions",
             payload,
             headers,
-            timeout=180.0,
+            timeout=float(self.settings.model_request_timeout_seconds),
             resolve_ip=self.settings.chat_resolve_ip,
         )
         return self._normalize_chat_content(data)

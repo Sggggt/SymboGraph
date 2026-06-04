@@ -20,6 +20,8 @@ The backend enforces strict ACID constraints and coordinates three persistent st
 - **Multiformat Parsers**: Custom parsers for `.pdf`, `.ipynb`, `.md`, `.docx`, `.pptx`, `.html`.
 - **Adaptive Semantic Chunking**: Preserves structural hierarchy, LaTeX formulas, and table coordinates. Dynamically balances chunk boundaries based on semantic coherence (F1 score).
 - **Contextualized Embeddings**: Enhances dense vectors by prefixing parent-chapter context to prevent loss of local semantics in downstream RAG.
+- **Chunk Version Control**: Tracks committed knowledge-base versions with `courses.current_chunk_version` and `chunks.chunk_version`; selected-file parses reuse the current version, while full reparse advances only after at least one file succeeds.
+- **Phase-aware Cancellation**: Parse-phase cancellation rolls back parse writes, while graph-phase cancellation restores the pre-graph snapshot without discarding committed parse results.
 
 ### 2. Evidence-First Retrieval
 - **Hybrid Search**: Combines Qdrant dense vector cosine similarity with lexical full-text matching, resolved using Reciprocal Rank Fusion (RRF).
@@ -28,6 +30,7 @@ The backend enforces strict ACID constraints and coordinates three persistent st
 
 ### 3. Adaptive Graph Extraction & Auto HPO
 - **Adaptive Extraction Plan**: Automatically budgets API token consumption by selecting critical chunks (`adaptive_best_first` strategy) for LLM relationship extraction.
+- **Bounded Model Calls**: Applies `GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN`, `MODEL_REQUEST_CONCURRENCY`, and `MODEL_REQUEST_TIMEOUT_SECONDS` to avoid unbounded graph extraction fan-out.
 - **Graph Enrichment**: Calculates PageRank, betweenness centrality, and Louvain community partitions to summarize corpus topology.
 - **TPE Auto HPO**: Runs an Optuna-powered Tree-structured Parzen Estimator (TPE) over a surrogate LLM-pairwise-judge learned objective to optimize Dijkstra distance cutoffs and relation confidence weights.
 

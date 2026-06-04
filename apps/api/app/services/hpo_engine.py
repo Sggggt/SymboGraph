@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any
@@ -249,25 +250,33 @@ class HyperparameterTuningService:
             effective_labels=0,
             min_labels=settings.hpo_judge_min_labels,
         )
-        for pair_number, (left, right) in enumerate(pair_indices, start=1):
+        semaphore = asyncio.Semaphore(max(1, settings.hpo_concurrency or settings.hpo_judge_concurrency or 1))
+
+        async def judge_pair(left: int, right: int) -> dict[str, Any]:
             evaluation_a = ordered[left]
             evaluation_b = ordered[right]
-            try:
-                judge_result = await cls._judge_pair(evaluation_a, evaluation_b, chunks, settings.hpo_judge_max_tokens_per_pair)
-            except Exception as exc:
-                judge_result = {
-                    "winner": "tie",
-                    "confidence": 0.0,
-                    "reasons": [str(exc)],
-                    "safety_flags": ["judge_error"],
-                    "prompt_version": HPO_JUDGE_PROMPT_VERSION,
-                    "raw_response": {"error": str(exc)},
-                }
-            label = {
+            async with semaphore:
+                try:
+                    judge_result = await cls._judge_pair(evaluation_a, evaluation_b, chunks, settings.hpo_judge_max_tokens_per_pair)
+                except Exception as exc:
+                    judge_result = {
+                        "winner": "tie",
+                        "confidence": 0.0,
+                        "reasons": [str(exc)],
+                        "safety_flags": ["judge_error"],
+                        "prompt_version": HPO_JUDGE_PROMPT_VERSION,
+                        "raw_response": {"error": str(exc)},
+                    }
+            return {
                 "candidate_a_id": evaluation_a.candidate_id,
                 "candidate_b_id": evaluation_b.candidate_id,
                 **judge_result,
             }
+
+        judged_pairs = await asyncio.gather(*(judge_pair(left, right) for left, right in pair_indices))
+        for pair_number, ((left, right), label) in enumerate(zip(pair_indices, judged_pairs, strict=False), start=1):
+            evaluation_a = ordered[left]
+            evaluation_b = ordered[right]
             labels.append(label)
             effective_labels = len([item for item in labels if item.get("winner") in {"A", "B"} and float(item.get("confidence", 0.0) or 0.0) > 0])
             _emit_hpo_log(
@@ -291,17 +300,17 @@ class HyperparameterTuningService:
                         embedding_text_version=embedding_text_version,
                         model_key=model_key,
                         payload_fingerprint=fingerprint,
-                        prompt_version=str(judge_result.get("prompt_version") or HPO_JUDGE_PROMPT_VERSION),
+                        prompt_version=str(label.get("prompt_version") or HPO_JUDGE_PROMPT_VERSION),
                         judge_model=get_settings().chat_model,
                         candidate_a_params=evaluation_a.params.audit(),
                         candidate_b_params=evaluation_b.params.audit(),
                         candidate_a_features=evaluation_a.features,
                         candidate_b_features=evaluation_b.features,
-                        winner=str(judge_result.get("winner") or "tie"),
-                        confidence=float(judge_result.get("confidence", 0.0) or 0.0),
-                        reasons=list(judge_result.get("reasons") or []),
-                        safety_flags=list(judge_result.get("safety_flags") or []),
-                        raw_response=dict(judge_result.get("raw_response") or {}),
+                        winner=str(label.get("winner") or "tie"),
+                        confidence=float(label.get("confidence", 0.0) or 0.0),
+                        reasons=list(label.get("reasons") or []),
+                        safety_flags=list(label.get("safety_flags") or []),
+                        raw_response=dict(label.get("raw_response") or {}),
                     )
                 )
                 db.flush()

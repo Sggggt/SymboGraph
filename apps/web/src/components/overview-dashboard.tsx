@@ -18,6 +18,8 @@ const batchStateLabels: Record<string, string> = {
   embedding: "向量化中",
   extracting_graph: "生成图谱中",
   cancel_requested: "正在取消",
+  cancelling: "正在取消",
+  compensating: "正在回滚",
   cancelled: "已取消",
   completed: "已完成",
   partial_failed: "部分失败",

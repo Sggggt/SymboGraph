@@ -1,10 +1,203 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
 
+def test_selected_parse_aligns_to_current_chunk_version_without_bump(db_session, sample_course, tmp_path):
+    from app.models import Chunk, Document, DocumentVersion
+    from app.services.ingestion import create_or_update_document
+
+    sample_course.current_chunk_version = 3
+    document = Document(
+        course_id=sample_course.id,
+        title="Existing",
+        source_path=str(tmp_path / "existing.md"),
+        source_type="markdown",
+        checksum="old",
+        tags=[],
+        is_active=True,
+    )
+    db_session.add(document)
+    db_session.flush()
+    version = DocumentVersion(document_id=document.id, version=1, checksum="old", storage_path=document.source_path, is_active=True)
+    db_session.add(version)
+    db_session.flush()
+    db_session.add(
+        Chunk(
+            course_id=sample_course.id,
+            document_id=document.id,
+            document_version_id=version.id,
+            chunk_version=1,
+            content="old",
+            snippet="old",
+            source_type="markdown",
+            metadata_json={},
+            is_active=True,
+        )
+    )
+    db_session.commit()
+
+    path = tmp_path / "existing.md"
+    path.write_text("new", encoding="utf-8")
+    _document, version_number, stale_chunk_ids = create_or_update_document(
+        db_session,
+        sample_course,
+        path,
+        "Existing",
+        "markdown",
+        "new",
+        force=True,
+    )
+
+    assert version_number == 3
+    assert sample_course.current_chunk_version == 3
+    assert stale_chunk_ids
+
+
+@pytest.mark.asyncio
+async def test_chunk_knowledge_generation_timeout_is_nonblocking(monkeypatch):
+    from app.services import ingestion
+
+    class SlowChat:
+        async def classify_json(self, **_kwargs):
+            await asyncio.sleep(1)
+            return {"results": [{"summary": "should not be used", "keywords": ["x"]}]}
+
+    chunk = SimpleNamespace(content="centrality and modularity", summary=None, keywords=[])
+    monkeypatch.setattr(
+        ingestion,
+        "get_settings",
+        lambda: SimpleNamespace(model_request_timeout_seconds=0.01),
+    )
+
+    await ingestion._generate_chunk_knowledge([chunk], SlowChat(), batch_id=None)
+
+    assert chunk.summary is None
+    assert chunk.keywords == []
+
+
+def test_empty_library_first_parse_uses_v1_and_full_reparse_uses_explicit_target(db_session, sample_course, tmp_path):
+    from app.services.ingestion import create_or_update_document
+
+    first_path = tmp_path / "first.md"
+    first_path.write_text("first", encoding="utf-8")
+    _document, version_number, stale_chunk_ids = create_or_update_document(
+        db_session,
+        sample_course,
+        first_path,
+        "First",
+        "markdown",
+        "first",
+        force=True,
+    )
+    assert version_number == 1
+    assert stale_chunk_ids == []
+
+    _document, version_number, _stale_chunk_ids = create_or_update_document(
+        db_session,
+        sample_course,
+        first_path,
+        "First",
+        "markdown",
+        "first-new",
+        force=True,
+        target_version=2,
+    )
+    assert version_number == 2
+
+
+def test_chunk_dedup_ignores_active_chunks_below_target_version(db_session, sample_course):
+    from app.models import Chunk, Document, DocumentVersion
+    from app.services.ingestion import (
+        active_chunk_hashes_for_course,
+        chunk_content_hash,
+        deactivate_superseded_duplicate_documents_by_chunks,
+    )
+
+    old_document = Document(
+        course_id=sample_course.id,
+        title="Current",
+        source_path="storage_temp/legacy.md",
+        source_type="markdown",
+        checksum="old",
+        tags=[],
+        is_active=True,
+    )
+    current_document = Document(
+        course_id=sample_course.id,
+        title="Current",
+        source_path="storage/current.md",
+        source_type="markdown",
+        checksum="current",
+        tags=[],
+        is_active=True,
+    )
+    db_session.add_all([old_document, current_document])
+    db_session.flush()
+    old_version = DocumentVersion(document_id=old_document.id, version=1, checksum="old", storage_path="legacy", is_active=True)
+    current_version = DocumentVersion(document_id=current_document.id, version=2, checksum="current", storage_path="current", is_active=True)
+    db_session.add_all([old_version, current_version])
+    db_session.flush()
+    duplicated_content = "Bayesian posterior is proportional to likelihood times prior."
+    db_session.add_all(
+        [
+            Chunk(
+                course_id=sample_course.id,
+                document_id=old_document.id,
+                document_version_id=old_version.id,
+                chunk_version=1,
+                content=duplicated_content,
+                snippet=duplicated_content,
+                source_type="markdown",
+                metadata_json={"is_parent": False},
+                is_active=True,
+            ),
+            Chunk(
+                course_id=sample_course.id,
+                document_id=current_document.id,
+                document_version_id=current_version.id,
+                chunk_version=2,
+                content="A conjugate prior keeps the posterior in the same family.",
+                snippet="A conjugate prior keeps the posterior in the same family.",
+                source_type="markdown",
+                metadata_json={"is_parent": False},
+                is_active=True,
+            ),
+        ]
+    )
+    db_session.commit()
+
+    target_hashes = active_chunk_hashes_for_course(db_session, sample_course.id, minimum_chunk_version=2)
+    all_hashes = active_chunk_hashes_for_course(db_session, sample_course.id)
+
+    assert chunk_content_hash(duplicated_content) in all_hashes
+    assert chunk_content_hash(duplicated_content) not in target_hashes
+    assert chunk_content_hash("A conjugate prior keeps the posterior in the same family.") in target_hashes
+
+    stale_chunk_ids = deactivate_superseded_duplicate_documents_by_chunks(
+        db_session,
+        course_id=sample_course.id,
+        canonical_document_id=current_document.id,
+        title=current_document.title,
+        replacement_chunk_hashes={chunk_content_hash(duplicated_content)},
+        target_version=2,
+    )
+    db_session.commit()
+    db_session.refresh(old_document)
+    db_session.refresh(old_version)
+    db_session.refresh(current_document)
+
+    assert stale_chunk_ids
+    assert old_document.is_active is False
+    assert old_version.is_active is False
+    assert current_document.is_active is True
+
+
 def test_request_batch_cancel_requires_matching_course_scope(db_session, sample_course):
-    from app.models import Course, IngestionBatch
+    from app.models import Course, GraphExtractionRun, IngestionBatch
     from app.services.ingestion import request_batch_cancel
 
     other_course = Course(name="Other Course", description="tests", source_root="other")
@@ -25,6 +218,15 @@ def test_request_batch_cancel_requires_matching_course_scope(db_session, sample_
         total_files=1,
     )
     db_session.add_all([active_batch, terminal_batch])
+    db_session.flush()
+    active_run = GraphExtractionRun(
+        course_id=sample_course.id,
+        batch_id=active_batch.id,
+        strategy="adaptive_best_first",
+        status="running",
+        stats_json={"pending_chunks": 10},
+    )
+    db_session.add(active_run)
     db_session.commit()
 
     with pytest.raises(PermissionError):
@@ -37,6 +239,101 @@ def test_request_batch_cancel_requires_matching_course_scope(db_session, sample_
     result = request_batch_cancel(db_session, active_batch.id, sample_course.id)
     assert result is not None
     assert result["state"] == "cancel_requested"
+    db_session.refresh(active_run)
+    assert active_run.status == "cancelled"
+    assert active_run.completed_at is not None
+    assert active_run.stats_json["cancelled"] is True
+
+
+@pytest.mark.asyncio
+async def test_control_plane_cancel_finishes_unclaimed_graph_batch(db_session, sample_course, monkeypatch):
+    from app.models import IngestionBatch
+    from app.services import concept_graph
+    from app.services.ingestion import active_batch_for_course, request_batch_cancel_control
+
+    batch = IngestionBatch(
+        course_id=sample_course.id,
+        source_root="graph_rebuild",
+        trigger_source="rebuild_graph",
+        status="extracting_graph",
+        total_files=0,
+        stats={"phase": "graph", "parse_committed": True},
+    )
+    db_session.add(batch)
+    db_session.commit()
+
+    monkeypatch.setattr(concept_graph, "_restore_course_graph_from_backup", lambda session, course_id: None)
+
+    result = await request_batch_cancel_control(db_session, batch.id, sample_course.id)
+
+    db_session.refresh(batch)
+    assert result is not None
+    assert result["state"] == "cancelled"
+    assert batch.status == "cancelled"
+    assert batch.completed_at is not None
+    assert batch.stats["graph_restored_from_backup"] is True
+    assert active_batch_for_course(db_session, sample_course.id) is None
+
+
+@pytest.mark.asyncio
+async def test_control_plane_cancel_leaves_live_worker_batch_requested(db_session, sample_course):
+    from datetime import datetime
+
+    from app.models import IngestionBatch
+    from app.services.ingestion import active_batch_for_course, request_batch_cancel_control
+
+    batch = IngestionBatch(
+        course_id=sample_course.id,
+        source_root="graph_rebuild",
+        trigger_source="rebuild_graph",
+        status="extracting_graph",
+        started_at=datetime.utcnow(),
+        worker_id="worker-1",
+        heartbeat_at=datetime.utcnow(),
+        stats={"phase": "graph", "parse_committed": True},
+    )
+    db_session.add(batch)
+    db_session.commit()
+
+    result = await request_batch_cancel_control(db_session, batch.id, sample_course.id)
+
+    db_session.refresh(batch)
+    assert result is not None
+    assert result["state"] == "cancel_requested"
+    assert batch.status == "cancel_requested"
+    assert active_batch_for_course(db_session, sample_course.id).id == batch.id
+
+
+def test_set_job_state_does_not_overwrite_cancel_request(db_session, sample_course):
+    from app.models import IngestionBatch, IngestionJob
+    from app.services.cancellation import IngestionCancelled
+    from app.services.ingestion import set_job_state
+
+    batch = IngestionBatch(
+        course_id=sample_course.id,
+        source_root="unit",
+        trigger_source="upload",
+        status="cancel_requested",
+        stats={"cancel_requested": True, "cancellation_status": "requested"},
+    )
+    job = IngestionJob(
+        course_id=sample_course.id,
+        batch_id=batch.id,
+        source_path="cancel.md",
+        trigger_source="upload",
+        status="queued",
+    )
+    db_session.add_all([batch, job])
+    db_session.commit()
+
+    with pytest.raises(IngestionCancelled):
+        set_job_state(db_session, job, "parsing", batch_id=batch.id)
+
+    db_session.refresh(batch)
+    db_session.refresh(job)
+    assert batch.status == "cancel_requested"
+    assert batch.stats["cancel_requested"] is True
+    assert job.status == "queued"
 
 
 @pytest.mark.asyncio
@@ -72,6 +369,7 @@ async def test_cancelled_batch_restores_previous_version_and_deletes_new_vectors
         is_active=True,
     )
     db_session.add(document)
+    sample_course.current_chunk_version = 2
     db_session.flush()
     old_version = DocumentVersion(document_id=document.id, version=1, checksum="old", storage_path="cancel.md", is_active=True)
     db_session.add(old_version)
@@ -80,6 +378,7 @@ async def test_cancelled_batch_restores_previous_version_and_deletes_new_vectors
         course_id=sample_course.id,
         document_id=document.id,
         document_version_id=old_version.id,
+        chunk_version=1,
         content="old",
         snippet="old",
         source_type="markdown",
@@ -117,6 +416,7 @@ async def test_cancelled_batch_restores_previous_version_and_deletes_new_vectors
         course_id=sample_course.id,
         document_id=document.id,
         document_version_id=new_version.id,
+        chunk_version=2,
         content="new",
         snippet="new",
         source_type="markdown",
@@ -142,6 +442,8 @@ async def test_cancelled_batch_restores_previous_version_and_deletes_new_vectors
     assert new_chunk.is_active is False
     assert new_chunk.id in FakeVectorStore.deleted
     assert stats["restored_document_versions"] == 1
+    db_session.refresh(sample_course)
+    assert sample_course.current_chunk_version == 1
 
 
 @pytest.mark.asyncio
@@ -190,7 +492,7 @@ async def test_run_graph_rebuild_incremental_cancel_does_not_fallback_to_full(db
     db_session.add_all([last_batch, current_batch, document])
     db_session.commit()
 
-    async def fake_incremental_update(session, course_id, changed_document_ids, batch_id):
+    async def fake_incremental_update(session, course_id, changed_document_ids, batch_id, **_kwargs):
         assert changed_document_ids == [document.id]
         raise IngestionCancelled("unit cancel")
 
@@ -210,6 +512,84 @@ async def test_run_graph_rebuild_incremental_cancel_does_not_fallback_to_full(db
     refreshed = db_session.get(IngestionBatch, current_batch.id)
     assert result["state"] == "cancelled"
     assert refreshed.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_run_graph_rebuild_lock_failure_marks_batch_failed(db_session, sample_course, monkeypatch):
+    from app.models import IngestionBatch
+    from app.services import ingestion
+    from app.services.ingestion import run_graph_rebuild
+
+    batch = IngestionBatch(
+        course_id=sample_course.id,
+        source_root="graph",
+        trigger_source="rebuild_graph",
+        status="extracting_graph",
+        total_files=0,
+    )
+    db_session.add(batch)
+    db_session.commit()
+
+    monkeypatch.setattr(ingestion, "acquire_course_graph_lock", lambda session, course_id: False)
+    monkeypatch.setattr(ingestion, "GRAPH_LOCK_WAIT_SECONDS", 0)
+
+    def forbidden_release(*args, **kwargs):
+        raise AssertionError("must not release a graph lock this worker did not acquire")
+
+    monkeypatch.setattr(ingestion, "release_course_graph_lock", forbidden_release)
+
+    with pytest.raises(RuntimeError, match="课程图谱正在重建中"):
+        await run_graph_rebuild(batch.id, sample_course.id, mode="full")
+
+    db_session.expire_all()
+    refreshed = db_session.get(IngestionBatch, batch.id)
+    assert refreshed.status == "failed"
+    assert refreshed.completed_at is not None
+    assert refreshed.last_error == "课程图谱正在重建中，请等待当前任务完成"
+
+
+@pytest.mark.asyncio
+async def test_graph_phase_cancel_preserves_committed_parse_jobs(db_session, sample_course, monkeypatch):
+    from datetime import datetime
+
+    from app.models import IngestionBatch, IngestionJob
+    from app.services import concept_graph
+    from app.services.ingestion import compensate_cancelled_batch, request_batch_cancel
+
+    batch = IngestionBatch(
+        course_id=sample_course.id,
+        source_root="unit",
+        trigger_source="upload",
+        status="extracting_graph",
+        started_at=datetime.utcnow(),
+        total_files=1,
+        processed_files=1,
+        success_count=1,
+        stats={"phase": "graph", "parse_committed": True},
+    )
+    db_session.add(batch)
+    db_session.flush()
+    job = IngestionJob(
+        course_id=sample_course.id,
+        batch_id=batch.id,
+        source_path="parsed.md",
+        trigger_source="upload",
+        status="completed",
+        stats={"chunks": 2},
+    )
+    db_session.add(job)
+    db_session.commit()
+
+    monkeypatch.setattr(concept_graph, "_restore_course_graph_from_backup", lambda session, course_id: None)
+
+    request_batch_cancel(db_session, batch.id, sample_course.id)
+    stats = await compensate_cancelled_batch(db_session, batch.id)
+
+    db_session.refresh(batch)
+    db_session.refresh(job)
+    assert batch.status == "cancelled"
+    assert job.status == "completed"
+    assert stats["parse_rollback_skipped"] is True
 
 
 @pytest.mark.asyncio

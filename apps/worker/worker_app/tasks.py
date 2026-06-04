@@ -22,10 +22,26 @@ def ingest_batch(batch_id: str) -> dict:
 
 
 @celery_app.task(name="ingest_uploaded_batch")
-def ingest_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False, rebuild_graph_mode: str = "none") -> dict:
-    return asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths, force=force, rebuild_graph_mode=rebuild_graph_mode))
+def ingest_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False, rebuild_graph_mode: str = "none", full_reparse: bool = False) -> dict:
+    return asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths, force=force, rebuild_graph_mode=rebuild_graph_mode, full_reparse=full_reparse))
 
 
 @celery_app.task(name="rebuild_course_graph")
-def rebuild_course_graph_task(batch_id: str, course_id: str, mode: str = "full") -> dict:
-    return asyncio.run(run_graph_rebuild(batch_id, course_id, mode))
+def rebuild_course_graph_task(
+    batch_id: str,
+    course_id: str,
+    mode: str = "full",
+    run_llm_merge: bool | None = None,
+    run_hpo: bool | None = None,
+    run_community_summaries: bool | None = None,
+) -> dict:
+    return asyncio.run(
+        run_graph_rebuild(
+            batch_id,
+            course_id,
+            mode,
+            run_llm_merge=run_llm_merge,
+            run_hpo=run_hpo,
+            run_community_summaries=run_community_summaries,
+        )
+    )

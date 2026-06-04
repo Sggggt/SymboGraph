@@ -64,6 +64,8 @@ const batchStateLabels: Record<string, string> = {
   embedding: "向量化中",
   extracting_graph: "生成图谱中",
   cancel_requested: "正在取消",
+  cancelling: "正在取消",
+  compensating: "正在回滚",
   cancelled: "已取消",
   completed: "已完成",
   partial_failed: "部分失败",
@@ -171,6 +173,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   const [cleanupMessage, setCleanupMessage] = useState<string | null>(null);
   const [cleanupDialog, setCleanupDialog] = useState<"data" | "graph" | null>(null);
   const [failureDialog, setFailureDialog] = useState<{ title: string; message: string; details?: string | null } | null>(null);
+  const [noticeDialog, setNoticeDialog] = useState<{ title: string; message: string } | null>(null);
   const [logStreamRetryCount, setLogStreamRetryCount] = useState(0);
   const [rebuildMode, setRebuildMode] = useState<"incremental" | "full">("incremental");
   const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
@@ -225,6 +228,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     [parseTargetPaths, selectedFilePaths],
   );
   const effectiveParseTargetPaths = selectedParseTargetPaths.length > 0 ? selectedParseTargetPaths : parseTargetPaths;
+  const canFullReparse = Boolean(dashboardQuery.data?.course.can_full_reparse);
   const uploadMutation = useMutation({
     mutationFn: async (files: File[]) => {
       setUploadProgress({ completed: 0, total: files.length });
@@ -266,7 +270,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   });
 
   const parseUploadsMutation = useMutation({
-    mutationFn: ({ paths, force, rebuildGraphMode }: { paths: string[]; force: boolean; rebuildGraphMode: "none" | "full" }) => parseUploadedFiles(paths, selectedCourseId, force, rebuildGraphMode),
+    mutationFn: ({ paths, force, rebuildGraphMode, fullReparse }: { paths: string[]; force: boolean; rebuildGraphMode: "none" | "full"; fullReparse?: boolean }) =>
+      parseUploadedFiles(paths, selectedCourseId, force, rebuildGraphMode, fullReparse ?? false),
     onSuccess: (data) => {
       setBatchId(data.batch_id);
       setDismissedBatchId(null);
@@ -294,6 +299,15 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
       void queryClient.invalidateQueries({ queryKey: ["graph", selectedCourseId] });
+      if (data.state === "cancelled") {
+        const graphPhase = data.phase === "graph" && data.parse_committed;
+        setNoticeDialog({
+          title: "取消已完成",
+          message: graphPhase
+            ? "后端已成功取消该图谱批次，并恢复到取消前的图谱状态；已提交的解析结果已保留。"
+            : "后端已成功取消该解析批次，并回滚/清理本批次已写入的数据。",
+        });
+      }
     },
     onError: (error) => {
       setFailureDialog({
@@ -672,7 +686,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                   setConfirmDialog({
                     title: "确认解析文件",
                     message: `即将强制解析 ${effectiveParseTargetPaths.length} 个文件，包括切块与向量化。可选择解析完成后自动全量重建图谱。`,
-                    onConfirm: (auto) => parseUploadsMutation.mutate({ paths: effectiveParseTargetPaths, force: true, rebuildGraphMode: auto ? "full" : "none" }),
+                    onConfirm: (auto) => parseUploadsMutation.mutate({ paths: effectiveParseTargetPaths, force: true, rebuildGraphMode: auto ? "full" : "none", fullReparse: false }),
                     confirmText: "确认解析",
                     includeGraphRebuildOption: true,
                   });
@@ -686,23 +700,23 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               <button
                 type="button"
                 onClick={() => {
-                  if (parseTargetPaths.length === 0) return;
+                  if (parseTargetPaths.length === 0 || !canFullReparse) return;
                   setAutoFullGraphRebuild(false);
                   setConfirmDialog({
                     title: "确认全量重新解析",
                     message: "强制重建当前资料库所有文件的片段、向量和 Qdrant 向量记录。可选择解析完成后自动全量重建图谱；该选项会清空当前图谱数据。",
-                    onConfirm: (auto) => parseUploadsMutation.mutate({ paths: parseTargetPaths, force: true, rebuildGraphMode: auto ? "full" : "none" }),
+                    onConfirm: (auto) => parseUploadsMutation.mutate({ paths: parseTargetPaths, force: true, rebuildGraphMode: auto ? "full" : "none", fullReparse: true }),
                     confirmText: "确认重建",
                     variant: "danger",
                     includeGraphRebuildOption: true,
                   });
                 }}
-                disabled={parseUploadsMutation.isPending || parseTargetPaths.length === 0}
+                disabled={parseUploadsMutation.isPending || parseTargetPaths.length === 0 || !canFullReparse}
                 className="rounded-full border border-rose-300/30 bg-rose-300/8 px-4 py-3 text-xs uppercase tracking-[0.2em] text-rose-50/80 transition hover:text-white disabled:opacity-45"
                   title="强制重建当前资料库所有文件的片段、向量、Qdrant 向量记录和图谱"
               >
                 {parseUploadsMutation.isPending ? <LoaderCircle className="mr-2 inline size-3.5 animate-spin" /> : <RefreshCcw className="mr-2 inline size-3.5" />}
-                全量重新解析
+                {canFullReparse ? "全量重新解析" : "全量重新解析（需先解析）"}
               </button>
               <button
                 type="button"
@@ -1274,6 +1288,20 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                 </button>
               ) : null}
             </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={noticeDialog !== null} onOpenChange={(open) => !open && setNoticeDialog(null)}>
+        <DialogContent className="max-w-md border border-emerald-200/18 bg-[rgba(8,20,16,0.94)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl">
+          <DialogHeader className="border-b border-emerald-200/12 px-6 py-5">
+            <DialogTitle>{noticeDialog?.title ?? "操作已完成"}</DialogTitle>
+            <DialogDescription>{noticeDialog?.message ?? "操作已完成。"}</DialogDescription>
+          </DialogHeader>
+          <div className="flex justify-end px-6 py-5">
+            <button type="button" onClick={() => setNoticeDialog(null)} className="rounded-full border border-emerald-200/20 px-4 py-2 text-sm text-emerald-50/78 transition hover:text-white">
+              知道了
+            </button>
           </div>
         </DialogContent>
       </Dialog>

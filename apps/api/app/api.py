@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import AgentRun, AgentTraceEvent, Concept, ConceptRelation, Document, IngestionBatch, IngestionJob, QASession
+from app.models import AgentRun, AgentTraceEvent, Chunk, Concept, ConceptRelation, Document, IngestionBatch, IngestionJob, QASession
 from app.core.config import get_settings
 from app.schemas import (
     AgentRequest,
@@ -59,7 +59,7 @@ from app.services.ingestion import (
     create_sync_batch,
     get_batch_status,
     list_course_summaries,
-    request_batch_cancel,
+    request_batch_cancel_control,
     register_uploaded_file,
     resolve_course,
     run_batch_ingestion,
@@ -223,20 +223,33 @@ async def rebuild_graph_endpoint(
         source_root="graph_rebuild",
         trigger_source="rebuild_graph",
         status="extracting_graph",
+        stats={
+            "mode": request.mode,
+            "run_llm_merge": request.run_llm_merge,
+            "run_hpo": request.run_hpo,
+            "run_community_summaries": request.run_community_summaries,
+        },
     )
     db.add(batch)
     db.commit()
     db.refresh(batch)
     if get_settings().ingestion_execution_mode == "celery":
         try:
-            enqueue_graph_rebuild_batch(batch.id, course.id, request.mode)
+            enqueue_graph_rebuild_batch(
+                batch.id,
+                course.id,
+                request.mode,
+                run_llm_merge=request.run_llm_merge,
+                run_hpo=request.run_hpo,
+                run_community_summaries=request.run_community_summaries,
+            )
         except Exception as exc:
             raise HTTPException(
                 status_code=503,
                 detail={"code": "graph_rebuild_enqueue_failed", "message": enqueue_error_message(exc)},
             ) from exc
     else:
-        background_tasks.add_task(run_graph_rebuild_background, batch.id, course.id, request.mode)
+        background_tasks.add_task(run_graph_rebuild_background, batch.id, course.id, request.mode, request.run_llm_merge, request.run_hpo, request.run_community_summaries)
     return {
         "batch_id": batch.id,
         "state": "extracting_graph",
@@ -315,15 +328,15 @@ async def enqueue_batch(batch_id: str) -> None:
         raise
 
 
-async def enqueue_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False, rebuild_graph_mode: str = "none") -> None:
+async def enqueue_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False, rebuild_graph_mode: str = "none", full_reparse: bool = False) -> None:
     settings = get_settings()
     if settings.ingestion_execution_mode == "inline":
-        await run_uploaded_files_ingestion(batch_id, file_paths, force=force, rebuild_graph_mode=rebuild_graph_mode)
+        await run_uploaded_files_ingestion(batch_id, file_paths, force=force, rebuild_graph_mode=rebuild_graph_mode, full_reparse=full_reparse)
         return
     try:
         from worker_app.tasks import ingest_uploaded_batch
 
-        task = ingest_uploaded_batch.apply_async(args=[batch_id, file_paths], kwargs={"force": force, "rebuild_graph_mode": rebuild_graph_mode}, queue=settings.ingestion_task_queue)
+        task = ingest_uploaded_batch.apply_async(args=[batch_id, file_paths], kwargs={"force": force, "rebuild_graph_mode": rebuild_graph_mode, "full_reparse": full_reparse}, queue=settings.ingestion_task_queue)
         mark_batch_enqueued(batch_id, "ingest_uploaded_batch", getattr(task, "id", None))
     except Exception as exc:
         mark_batch_enqueue_failed(batch_id, exc)
@@ -390,12 +403,24 @@ def mark_job_enqueue_failed(job_id: str, exc: Exception) -> None:
         session.close()
 
 
-def enqueue_graph_rebuild_batch(batch_id: str, course_id: str, mode: str) -> None:
+def enqueue_graph_rebuild_batch(
+    batch_id: str,
+    course_id: str,
+    mode: str,
+    *,
+    run_llm_merge: bool | None = None,
+    run_hpo: bool | None = None,
+    run_community_summaries: bool | None = None,
+) -> None:
     settings = get_settings()
     try:
         from worker_app.tasks import rebuild_course_graph_task
 
-        task = rebuild_course_graph_task.apply_async(args=[batch_id, course_id, mode], queue=settings.ingestion_task_queue)
+        task = rebuild_course_graph_task.apply_async(
+            args=[batch_id, course_id, mode],
+            kwargs={"run_llm_merge": run_llm_merge, "run_hpo": run_hpo, "run_community_summaries": run_community_summaries},
+            queue=settings.ingestion_task_queue,
+        )
         mark_batch_enqueued(batch_id, "rebuild_course_graph", getattr(task, "id", None))
     except Exception as exc:
         mark_batch_enqueue_failed(batch_id, exc)
@@ -406,8 +431,8 @@ def enqueue_batch_background(batch_id: str) -> None:
     asyncio.run(enqueue_batch(batch_id))
 
 
-def enqueue_uploaded_batch_background(batch_id: str, file_paths: list[str], force: bool = False, rebuild_graph_mode: str = "none") -> None:
-    asyncio.run(enqueue_uploaded_batch(batch_id, file_paths, force=force, rebuild_graph_mode=rebuild_graph_mode))
+def enqueue_uploaded_batch_background(batch_id: str, file_paths: list[str], force: bool = False, rebuild_graph_mode: str = "none", full_reparse: bool = False) -> None:
+    asyncio.run(enqueue_uploaded_batch(batch_id, file_paths, force=force, rebuild_graph_mode=rebuild_graph_mode, full_reparse=full_reparse))
 
 
 @router.post("/files/upload", response_model=UploadFileResponse)
@@ -452,18 +477,22 @@ async def parse_uploaded_files(
             continue
         seen_paths.add(path)
         file_paths.append(path)
-    batch = create_uploaded_files_batch(db, course.id, file_paths, force=request.force, rebuild_graph_mode=request.rebuild_graph_mode)
+    if request.full_reparse:
+        active_chunks = db.scalar(select(func.count(Chunk.id)).where(Chunk.course_id == course.id, Chunk.is_active.is_(True))) or 0
+        if active_chunks <= 0:
+            raise HTTPException(status_code=409, detail="Full reparse is unavailable before the first successful parse")
+    batch = create_uploaded_files_batch(db, course.id, file_paths, force=request.force, rebuild_graph_mode=request.rebuild_graph_mode, full_reparse=request.full_reparse)
     serialized_paths = [str(path) for path in file_paths]
     if get_settings().ingestion_execution_mode == "celery":
         try:
-            await enqueue_uploaded_batch(batch.id, serialized_paths, request.force, request.rebuild_graph_mode)
+            await enqueue_uploaded_batch(batch.id, serialized_paths, request.force, request.rebuild_graph_mode, request.full_reparse)
         except Exception as exc:
             raise HTTPException(
                 status_code=503,
                 detail={"code": "ingestion_enqueue_failed", "message": enqueue_error_message(exc)},
             ) from exc
     else:
-        background_tasks.add_task(enqueue_uploaded_batch_background, batch.id, serialized_paths, request.force, request.rebuild_graph_mode)
+        background_tasks.add_task(enqueue_uploaded_batch_background, batch.id, serialized_paths, request.force, request.rebuild_graph_mode, request.full_reparse)
     return {"batch_id": batch.id, "state": "queued"}
 
 
@@ -497,10 +526,10 @@ def batch_status(batch_id: str, db: Session = Depends(get_db)) -> dict:
 
 
 @router.post("/ingestion/batches/{batch_id}/cancel", response_model=IngestionBatchSummary)
-def cancel_batch(batch_id: str, course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+async def cancel_batch(batch_id: str, course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
     course = get_requested_course(db, course_id)
     try:
-        batch = request_batch_cancel(db, batch_id, course.id)
+        batch = await request_batch_cancel_control(db, batch_id, course.id)
     except PermissionError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if batch is None:

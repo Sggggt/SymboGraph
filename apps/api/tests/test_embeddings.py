@@ -3,14 +3,33 @@ from __future__ import annotations
 import pytest
 
 
+def write_test_env(monkeypatch, tmp_path, **entries: str):
+    import app.core.config as config
+
+    workspace = tmp_path / "workspace"
+    app_dir = workspace / "apps" / "api" / "app"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", workspace)
+    monkeypatch.setattr(config, "APP_DIR", app_dir)
+    env_entries = {
+        "DATABASE_URL": f"sqlite:///{(tmp_path / 'test.db').as_posix()}",
+        "DATA_ROOT": (tmp_path / "data").as_posix(),
+        "OPENAI_API_KEY": "unit-key",
+        "EMBEDDING_BASE_URL": "https://embedding.test/v1",
+        "EMBEDDING_API_KEY": "unit-embedding-key",
+        **entries,
+    }
+    (workspace / ".env").write_text("\n".join(f"{key}={value}" for key, value in env_entries.items()) + "\n", encoding="utf-8")
+    config.get_settings.cache_clear()
+
+
 @pytest.mark.asyncio
-async def test_openai_compatible_embeddings_are_batched(no_fallback_env, monkeypatch):
+async def test_openai_compatible_embeddings_are_batched(no_fallback_env, monkeypatch, tmp_path):
     from app.core.config import get_settings
     from app.services import embeddings
     from app.services.embeddings import EmbeddingProvider
 
-    monkeypatch.setenv("EMBEDDING_BATCH_SIZE", "10")
-    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "2")
+    write_test_env(monkeypatch, tmp_path, EMBEDDING_BATCH_SIZE="10", EMBEDDING_DIMENSIONS="2")
     get_settings.cache_clear()
     calls: list[list[str]] = []
 
@@ -47,12 +66,12 @@ async def test_embedding_base_url_is_required_without_fallback(no_fallback_env, 
 
 
 @pytest.mark.asyncio
-async def test_openai_compatible_embeddings_reject_zero_vectors(no_fallback_env, monkeypatch):
+async def test_openai_compatible_embeddings_reject_zero_vectors(no_fallback_env, monkeypatch, tmp_path):
     from app.core.config import get_settings
     from app.services import embeddings
     from app.services.embeddings import EmbeddingProvider
 
-    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "2")
+    write_test_env(monkeypatch, tmp_path, EMBEDDING_DIMENSIONS="2")
     get_settings.cache_clear()
 
     async def fake_post_json(url, payload, headers, *, timeout, resolve_ip=None):
@@ -65,12 +84,12 @@ async def test_openai_compatible_embeddings_reject_zero_vectors(no_fallback_env,
 
 
 @pytest.mark.asyncio
-async def test_openai_compatible_embeddings_retry_without_dimensions(no_fallback_env, monkeypatch):
+async def test_openai_compatible_embeddings_retry_without_dimensions(no_fallback_env, monkeypatch, tmp_path):
     from app.core.config import get_settings
     from app.services import embeddings
     from app.services.embeddings import EmbeddingProvider
 
-    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "2")
+    write_test_env(monkeypatch, tmp_path, EMBEDDING_DIMENSIONS="2")
     get_settings.cache_clear()
     payloads: list[dict] = []
 

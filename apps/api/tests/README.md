@@ -24,6 +24,7 @@ docker exec course-kg-api python -m pytest
 | `test_maintenance.py` | inactive 数据、孤儿向量、图谱引用和课程删除清理 |
 | `test_runtime_settings.py` | `.env`/`.env.example` 参数名一致性、运行时检查、热更新 |
 | `test_embeddings.py` | OpenAI-compatible embedding/chat 请求、零向量拒绝、错误重试策略 |
+| `test_ingestion_batches.py` | chunk 版本推进、全量重新解析、取消补偿、batch phase/heartbeat 和上传解析契约 |
 | `test_parsers.py` | Markdown、HTML、Notebook、PDF、DOCX、PPTX 解析和 fallback 禁用行为 |
 | `test_agent_graph.py` | Agent 路由、检索问答、trace 流式事件 |
 | `test_concept_graph.py` | 概念抽取、图谱合并、章节归一化和模型输出容错 |
@@ -39,7 +40,7 @@ docker exec course-kg-api python -m pytest tests/test_retrieval.py tests/test_p0
 运行配置、维护和模型请求单测：
 
 ```powershell
-docker exec course-kg-api python -m pytest tests/test_runtime_settings.py tests/test_maintenance.py tests/test_embeddings.py
+docker exec course-kg-api python -m pytest tests/test_runtime_settings.py tests/test_maintenance.py tests/test_embeddings.py tests/test_ingestion_batches.py
 ```
 
 显式运行 fallback 兼容测试：

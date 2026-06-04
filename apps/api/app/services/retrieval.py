@@ -900,6 +900,9 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
                 "storage_root": "",
                 "document_count": 0,
                 "concept_count": 0,
+                "current_chunk_version": 0,
+                "has_parsed_chunks": False,
+                "can_full_reparse": False,
                 "degraded_mode": is_degraded_mode(),
             },
             "tree": [],
@@ -919,6 +922,10 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
     relations = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course.id)).all()
     chunks = db.scalars(select(Chunk).where(Chunk.course_id == course.id, Chunk.is_active.is_(True))).all()
     chunk_count = len(chunks)
+    current_chunk_version = max([chunk.chunk_version or 0 for chunk in chunks] + [course.current_chunk_version or 0])
+    if (course.current_chunk_version or 0) < current_chunk_version:
+        course.current_chunk_version = current_chunk_version
+        db.flush()
     graph_eligible_chunk_count = sum(
         1
         for chunk in chunks
@@ -956,6 +963,9 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
             "storage_root": str(get_settings().course_paths_for_name(course.name)["storage_root"]),
             "document_count": len(file_items),
             "concept_count": len(concepts),
+            "current_chunk_version": current_chunk_version,
+            "has_parsed_chunks": chunk_count > 0,
+            "can_full_reparse": chunk_count > 0,
             "degraded_mode": is_degraded_mode(),
         },
         "tree": tree,
@@ -1055,6 +1065,11 @@ def list_course_files(db: Session, course_id: str) -> list[dict]:
             job = latest_jobs.get(path_string)
             document = documents_by_storage_path.get(path_string)
             chunk_count = db.query(Chunk).filter(Chunk.document_id == document.id, Chunk.is_active.is_(True)).count() if document else 0
+            chunk_version = (
+                db.scalar(select(Chunk.chunk_version).where(Chunk.document_id == document.id, Chunk.is_active.is_(True)).order_by(Chunk.chunk_version.desc()))
+                if document
+                else None
+            )
             items[path_string] = {
                 "id": document.id if document else path_string,
                 "document_id": document.id if document else None,
@@ -1069,6 +1084,7 @@ def list_course_files(db: Session, course_id: str) -> list[dict]:
                 "batch_id": job.batch_id if job else None,
                 "error": job.error_message if job and job.status == "failed" else None,
                 "chunk_count": chunk_count,
+                "chunk_version": chunk_version,
                 "updated_at": document.updated_at if document else job.updated_at if job else None,
             }
 
@@ -1091,6 +1107,7 @@ def list_course_files(db: Session, course_id: str) -> list[dict]:
             "batch_id": job.batch_id,
             "error": job.error_message,
             "chunk_count": 0,
+            "chunk_version": None,
             "updated_at": job.updated_at,
         }
 
@@ -1115,6 +1132,7 @@ def list_course_files(db: Session, course_id: str) -> list[dict]:
             "batch_id": latest_batch.id,
             "error": None,
             "chunk_count": 0,
+            "chunk_version": None,
             "updated_at": latest_batch.created_at,
         }
 

@@ -5,6 +5,7 @@ The local stack is Docker-first and split into reusable infrastructure plus smal
 ## Services
 
 - `api`: project FastAPI image, `course-kg-api:local`
+- `worker`: project Celery worker image, `course-kg-api:local`
 - `web`: project Next.js image, `course-kg-web:local`
 - `postgres`: reusable `postgres:16`
 - `redis`: reusable `redis:7`
@@ -45,5 +46,7 @@ The API image includes the reranker Python extra in system Python. Enable it wit
 Direct Compose examples:
 
 ```powershell
-docker compose -f infra/docker-compose.yml up -d postgres redis qdrant api web
+docker compose -f infra/docker-compose.yml up -d postgres redis qdrant api worker web
 ```
+
+The worker consumes `course-kg-main-ingestion` and uses `WORKER_CONCURRENCY` for Celery process concurrency. Keep this value aligned with API-side bounded concurrency settings such as `INGESTION_FILE_CONCURRENCY`, `MODEL_REQUEST_CONCURRENCY`, and `HPO_CONCURRENCY`.

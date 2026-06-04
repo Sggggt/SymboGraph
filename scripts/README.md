@@ -21,7 +21,7 @@ docker exec course-kg-api python /app/scripts/quality_gate.py --course-name "课
 | `cleanup_aliases.py` | 清理并删除重复、冲突或失效的实体别名，维护别名表一致性 | 是 |
 | `reembed_all_chunks.py` | 只修复零向量 chunks，使用当前 contextual embedding input | 是 |
 | `reembed_with_enhancement.py` | 按当前 embedding input 重嵌入 active chunks，并更新 embedding version | 是 |
-| `reingest_all_courses.py` | 通过正式 ingestion pipeline 重解析课程 storage 文件 | 是 |
+| `reingest_all_courses.py` | 通过正式 ingestion pipeline 重解析课程 storage 文件；已有 active chunks 时按 full reparse 规则推进 chunk 版本 | 是 |
 | `repair_parent_child_links.py` | 修复历史 child chunks 缺失的 `parent_chunk_id`，可选择重嵌入 | 是 |
 | `tune_graph_hyperparameters.py` | 对单门课程的 LLM/embedding 组合运行本地 TPE 图谱超参标定，报告写入 `output/` | dry-run 否，否则是 |
 | `docker_smoke.py` | 通过 HTTP API 创建临时课程，验证上传、解析、检索、问答链路 | 是，结束时清理 |
@@ -55,6 +55,8 @@ docker exec course-kg-api python /app/scripts/reembed_with_enhancement.py --cour
 ```powershell
 docker exec course-kg-api python /app/scripts/reingest_all_courses.py --course-name "课程名称" --cleanup-stale
 ```
+
+该脚本不会绕过正式导入语义：空知识库首次解析创建 v1，已有 active chunks 时才启用 full reparse 并以当前最高 chunk 版本 + 1 为目标版本。
 
 运行端到端 smoke 测试：
 ```powershell

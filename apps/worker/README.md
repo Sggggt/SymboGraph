@@ -12,6 +12,7 @@ To prevent blocking the core API event loop and maintain low latency for interac
 - **High-volume Embedding Generation**: Performing batch vector embeddings across thousands of semantic text chunks.
 - **LLM Graph Extraction**: Managing long-running LLM extract-and-merge pipelines.
 - **Auto HPO Trials**: Running sequential Optuna TPE simulations over candidate parameters.
+- **Phase-aware cancellation**: Preserving committed parse results when cancellation happens during graph work, while rolling back parse-phase writes when cancellation happens before parse commit.
 
 ### 2. Filesystem Synchronization (Course Watcher)
 A lightweight monitoring service using `watchdog` to track file events within your course directories (`DATA_ROOT`):
@@ -37,7 +38,7 @@ apps/worker/
 ## 🚀 Running the Worker
 
 > [!NOTE]
-> The worker and filesystem watcher are currently optional services and are **not** run by default in the standard `infra/docker-compose.yml` profile. They are intended for high-concurrency deployments or persistent background automatic sync setups.
+> The Celery worker is part of the standard `infra/docker-compose.yml` stack and consumes the `course-kg-main-ingestion` queue. The filesystem watcher remains optional and is not started by the default compose command.
 
 Ensure that PostgreSQL, Qdrant, and Redis are running and reachable before launching the worker services.
 
@@ -48,7 +49,7 @@ To run the background task handler:
 uv sync
 
 # Launch Celery worker
-uv run celery -A worker_app.celery_app worker --loglevel=info
+uv run celery -A worker_app.celery_app worker --loglevel=info --queues=course-kg-main-ingestion --concurrency=${WORKER_CONCURRENCY:-2}
 ```
 
 ### Starting the Filesystem Directory Watcher

@@ -33,6 +33,7 @@ describe("api client", () => {
         body: JSON.stringify({
           file_paths: ["/data/course/a.pdf"],
           force: true,
+          full_reparse: false,
           rebuild_graph_mode: "full",
           confirm_destructive_graph_rebuild: true,
         }),
@@ -62,6 +63,75 @@ describe("api client", () => {
       expect.objectContaining({
         method: "PUT",
         headers: { "Content-Type": "application/json", "X-API-Key": "test-key" },
+      }),
+    );
+  });
+
+  it("passes production runtime setting fields", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ provider: "openai_compatible" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { updateModelSettings } = await import("./api");
+
+    await updateModelSettings({
+      graph_extraction_max_model_calls_per_run: 24,
+      graph_extraction_min_marginal_gain: 0.03,
+      graph_extraction_stall_rounds: 2,
+      worker_concurrency: 3,
+      ingestion_file_concurrency: 3,
+      model_request_concurrency: 3,
+      model_request_timeout_seconds: 240,
+      hpo_concurrency: 1,
+      retrieval_layer_enabled: true,
+      retrieval_cache_ttl_seconds: 120,
+      enable_agentic_reflection: true,
+      enable_post_generation_reflection: false,
+      citation_verification_sample_max: 3,
+      reflection_max_retries: 2,
+      enable_graph_community_summaries: true,
+      semantic_chunking_enabled: false,
+      reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    });
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+      graph_extraction_max_model_calls_per_run: 24,
+      graph_extraction_min_marginal_gain: 0.03,
+      graph_extraction_stall_rounds: 2,
+      worker_concurrency: 3,
+      ingestion_file_concurrency: 3,
+      model_request_concurrency: 3,
+      model_request_timeout_seconds: 240,
+      hpo_concurrency: 1,
+      retrieval_layer_enabled: true,
+      retrieval_cache_ttl_seconds: 120,
+      enable_agentic_reflection: true,
+      enable_post_generation_reflection: false,
+      citation_verification_sample_max: 3,
+      reflection_max_retries: 2,
+      enable_graph_community_summaries: true,
+      semantic_chunking_enabled: false,
+      reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    });
+  });
+
+  it("passes graph rebuild stage toggles", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ batch_id: "batch-graph", state: "extracting_graph", mode: "full", affected_documents: 1 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { rebuildGraph } = await import("./api");
+
+    await rebuildGraph("course-1", "full", false, { run_llm_merge: false, run_hpo: false, run_community_summaries: false });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://api.test/api/maintenance/rebuild-graph?course_id=course-1",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          mode: "full",
+          confirm_destructive: true,
+          dry_run: false,
+          run_llm_merge: false,
+          run_hpo: false,
+          run_community_summaries: false,
+        }),
       }),
     );
   });

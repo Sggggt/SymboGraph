@@ -19,6 +19,8 @@ export type JobState =
   | "embedding"
   | "extracting_graph"
   | "cancel_requested"
+  | "cancelling"
+  | "compensating"
   | "cancelled"
   | "processing"
   | "completed"
@@ -257,6 +259,9 @@ export interface RebuildGraphRequest {
   mode: "incremental" | "full";
   confirm_destructive?: boolean;
   dry_run?: boolean;
+  run_llm_merge?: boolean | null;
+  run_hpo?: boolean | null;
+  run_community_summaries?: boolean | null;
 }
 
 export interface RebuildGraphResponse {
@@ -326,6 +331,11 @@ export interface ModelSettingsResponse {
   graph_extraction_min_marginal_gain: number;
   graph_extraction_stall_rounds: number;
   graph_extraction_concurrency: number;
+  worker_concurrency: number;
+  ingestion_file_concurrency: number;
+  model_request_concurrency: number;
+  model_request_timeout_seconds: number;
+  hpo_concurrency: number;
   graph_extraction_resume_batch_size: number;
   reranker_enabled: boolean;
   reranker_model: string;
@@ -334,8 +344,17 @@ export interface ModelSettingsResponse {
   reranker_url: string;
   semantic_chunking_enabled: boolean;
   semantic_chunking_min_length: number;
+  retrieval_layer_enabled: boolean;
+  retrieval_cache_ttl_seconds: number;
+  enable_agentic_reflection: boolean;
+  enable_post_generation_reflection: boolean;
+  citation_verification_sample_max: number;
+  reflection_max_retries: number;
   model_bridge_enabled: boolean;
   enable_auto_hpo: boolean;
+  enable_graph_community_summaries: boolean;
+  enable_model_fallback: boolean;
+  enable_database_fallback: boolean;
   has_api_key: boolean;
   has_embedding_api_key: boolean;
   degraded_mode: boolean;
@@ -358,6 +377,11 @@ export interface ModelSettingsUpdate {
   graph_extraction_min_marginal_gain?: number | null;
   graph_extraction_stall_rounds?: number | null;
   graph_extraction_concurrency?: number | null;
+  worker_concurrency?: number | null;
+  ingestion_file_concurrency?: number | null;
+  model_request_concurrency?: number | null;
+  model_request_timeout_seconds?: number | null;
+  hpo_concurrency?: number | null;
   graph_extraction_resume_batch_size?: number | null;
   reranker_enabled?: boolean | null;
   reranker_model?: string | null;
@@ -365,8 +389,15 @@ export interface ModelSettingsUpdate {
   reranker_device?: "cpu" | "cuda" | null;
   semantic_chunking_enabled?: boolean | null;
   semantic_chunking_min_length?: number | null;
+  retrieval_layer_enabled?: boolean | null;
+  retrieval_cache_ttl_seconds?: number | null;
+  enable_agentic_reflection?: boolean | null;
+  enable_post_generation_reflection?: boolean | null;
+  citation_verification_sample_max?: number | null;
+  reflection_max_retries?: number | null;
   model_bridge_enabled?: boolean | null;
   enable_auto_hpo?: boolean | null;
+  enable_graph_community_summaries?: boolean | null;
   embedding_api_key?: string | null;
   clear_embedding_api_key?: boolean;
 }
@@ -594,6 +625,9 @@ export interface CourseSummary {
   storage_root: string;
   document_count: number;
   concept_count: number;
+  current_chunk_version: number;
+  has_parsed_chunks: boolean;
+  can_full_reparse: boolean;
   degraded_mode: boolean;
 }
 
@@ -620,6 +654,11 @@ export interface BatchError {
     coverage_by_source_type: Record<string, number>;
     errors: BatchError[];
     graph_stats: Record<string, unknown>;
+    phase?: string | null;
+    parse_committed: boolean;
+    cancellation_status?: string | null;
+    worker_id?: string | null;
+    heartbeat_at?: string | null;
     started_at?: string | null;
     completed_at?: string | null;
   }
@@ -632,6 +671,7 @@ export interface BatchStartResponse {
 export interface ParseUploadedFilesRequest {
   file_paths: string[];
   force?: boolean;
+  full_reparse?: boolean;
   rebuild_graph_mode?: "none" | "incremental" | "full";
   confirm_destructive_graph_rebuild?: boolean;
 }
@@ -659,6 +699,7 @@ export interface CourseFileSummary {
   batch_id?: string | null;
   error?: string | null;
   chunk_count: number;
+  chunk_version?: number | null;
   updated_at?: string | null;
 }
 

@@ -198,11 +198,16 @@ export async function cleanupStaleGraph(courseId?: string | null): Promise<Clean
   return parseResponse<CleanupStaleGraphResponse>(response);
 }
 
-export async function rebuildGraph(courseId?: string | null, mode: "incremental" | "full" = "incremental", dryRun = false): Promise<RebuildGraphResponse> {
+export async function rebuildGraph(
+  courseId?: string | null,
+  mode: "incremental" | "full" = "incremental",
+  dryRun = false,
+  options: Pick<RebuildGraphRequest, "run_llm_merge" | "run_hpo" | "run_community_summaries"> = {},
+): Promise<RebuildGraphResponse> {
   const response = await fetch(buildApiUrl("/maintenance/rebuild-graph", { course_id: courseId }), {
     method: "POST",
     headers: jsonHeaders(),
-    body: JSON.stringify({ mode, confirm_destructive: mode === "full" && !dryRun, dry_run: dryRun } satisfies RebuildGraphRequest),
+    body: JSON.stringify({ mode, confirm_destructive: mode === "full" && !dryRun, dry_run: dryRun, ...options } satisfies RebuildGraphRequest),
   });
   return parseResponse<RebuildGraphResponse>(response);
 }
@@ -280,10 +285,12 @@ export async function parseUploadedFiles(
   courseId?: string | null,
   force = false,
   rebuildGraphMode: ParseUploadedFilesRequest["rebuild_graph_mode"] = "none",
+  fullReparse = false,
 ): Promise<BatchStartResponse> {
   const payload: ParseUploadedFilesRequest = {
     file_paths: filePaths,
     force,
+    full_reparse: fullReparse,
     rebuild_graph_mode: rebuildGraphMode,
     confirm_destructive_graph_rebuild: rebuildGraphMode === "full",
   };

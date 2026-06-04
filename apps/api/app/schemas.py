@@ -11,6 +11,8 @@ JobState = Literal[
     "embedding",
     "extracting_graph",
     "cancel_requested",
+    "cancelling",
+    "compensating",
     "cancelled",
     "processing",
     "completed",
@@ -128,6 +130,7 @@ class UploadFileResponse(BaseModel):
 class ParseUploadedFilesRequest(BaseModel):
     file_paths: list[str] = Field(default_factory=list)
     force: bool = False
+    full_reparse: bool = False
     rebuild_graph_mode: Literal["none", "incremental", "full"] = "none"
     confirm_destructive_graph_rebuild: bool = False
 
@@ -402,6 +405,9 @@ class RebuildGraphRequest(BaseModel):
     mode: str = "incremental"
     confirm_destructive: bool = False
     dry_run: bool = False
+    run_llm_merge: bool | None = None
+    run_hpo: bool | None = None
+    run_community_summaries: bool | None = None
 
 
 class RebuildGraphResponse(BaseModel):
@@ -472,6 +478,11 @@ class ModelSettingsResponse(BaseModel):
     graph_extraction_min_marginal_gain: float = 0.03
     graph_extraction_stall_rounds: int = 2
     graph_extraction_concurrency: int = 2
+    worker_concurrency: int = 2
+    ingestion_file_concurrency: int = 2
+    model_request_concurrency: int = 2
+    model_request_timeout_seconds: int = 180
+    hpo_concurrency: int = 1
     graph_extraction_resume_batch_size: int = 24
     reranker_enabled: bool = False
     reranker_model: str = ""
@@ -480,7 +491,16 @@ class ModelSettingsResponse(BaseModel):
     reranker_url: str = ""
     semantic_chunking_enabled: bool = True
     semantic_chunking_min_length: int = 2000
+    retrieval_layer_enabled: bool = True
+    retrieval_cache_ttl_seconds: int = 300
+    enable_agentic_reflection: bool = True
+    enable_post_generation_reflection: bool = False
+    citation_verification_sample_max: int = 3
+    reflection_max_retries: int = 2
     enable_auto_hpo: bool = False
+    enable_graph_community_summaries: bool = True
+    enable_model_fallback: bool = False
+    enable_database_fallback: bool = False
     has_api_key: bool
     has_embedding_api_key: bool
     degraded_mode: bool
@@ -504,6 +524,11 @@ class ModelSettingsUpdate(BaseModel):
     graph_extraction_min_marginal_gain: float | None = Field(default=None, ge=0.0, le=1.0)
     graph_extraction_stall_rounds: int | None = Field(default=None, ge=1, le=20)
     graph_extraction_concurrency: int | None = Field(default=None, ge=1, le=8)
+    worker_concurrency: int | None = Field(default=None, ge=1, le=32)
+    ingestion_file_concurrency: int | None = Field(default=None, ge=1, le=8)
+    model_request_concurrency: int | None = Field(default=None, ge=1, le=16)
+    model_request_timeout_seconds: int | None = Field(default=None, ge=5, le=600)
+    hpo_concurrency: int | None = Field(default=None, ge=1, le=8)
     graph_extraction_resume_batch_size: int | None = Field(default=None, ge=1, le=100)
     reranker_enabled: bool | None = None
     reranker_model: str | None = None
@@ -511,7 +536,14 @@ class ModelSettingsUpdate(BaseModel):
     reranker_device: str | None = None
     semantic_chunking_enabled: bool | None = None
     semantic_chunking_min_length: int | None = Field(default=None, ge=500, le=5000)
+    retrieval_layer_enabled: bool | None = None
+    retrieval_cache_ttl_seconds: int | None = Field(default=None, ge=0, le=86400)
+    enable_agentic_reflection: bool | None = None
+    enable_post_generation_reflection: bool | None = None
+    citation_verification_sample_max: int | None = Field(default=None, ge=0, le=20)
+    reflection_max_retries: int | None = Field(default=None, ge=0, le=5)
     enable_auto_hpo: bool | None = None
+    enable_graph_community_summaries: bool | None = None
     embedding_api_key: str | None = None
     clear_embedding_api_key: bool = False
 
@@ -641,6 +673,9 @@ class CourseSummary(BaseModel):
     storage_root: str
     document_count: int
     concept_count: int
+    current_chunk_version: int = 0
+    has_parsed_chunks: bool = False
+    can_full_reparse: bool = False
     degraded_mode: bool = False
 
 
@@ -673,6 +708,11 @@ class IngestionBatchSummary(BaseModel):
     coverage_by_source_type: dict[str, int] = Field(default_factory=dict)
     errors: list[BatchError] = Field(default_factory=list)
     graph_stats: dict = Field(default_factory=dict)
+    phase: str | None = None
+    parse_committed: bool = False
+    cancellation_status: str | None = None
+    worker_id: str | None = None
+    heartbeat_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
 
@@ -730,6 +770,7 @@ class CourseFileSummary(BaseModel):
     batch_id: str | None = None
     error: str | None = None
     chunk_count: int = 0
+    chunk_version: int | None = None
     updated_at: datetime | None = None
 
 

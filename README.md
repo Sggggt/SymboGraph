@@ -141,6 +141,10 @@ sequenceDiagram
 
 导入过程使用显式 batch / job 状态和文件级锁。同一知识库同一时间只保留一个非终态导入批次。PostgreSQL 是生命周期事实源；Qdrant 和 Redis 是派生或运行态存储，失败会记录补偿或错误上下文，不做静默降级。
 
+chunk 版本只记录在 `chunks.chunk_version` 上；`courses.current_chunk_version` 保存知识库已提交的最高 chunk 版本。空知识库首次成功解析创建 v1；一般选中文件解析会把成功文件同步到当前最高版本，不创建新版本。全量重新解析只在已有 active chunks 后可用，目标版本为 `current_chunk_version + 1`；如果整批没有任何成功文件，不推进课程版本。
+
+取消补偿按阶段隔离：解析阶段取消只回滚本次解析写入并恢复解析前 active chunks；进入图谱阶段后取消只恢复图谱阶段开始前的图状态，已经提交的解析结果保留。
+
 ## 导入、切块与向量
 
 ### 分层切块
@@ -420,7 +424,7 @@ $$
 选择采用**贪心最佳优先**策略，每次从未选 chunks 中挑选 $\Delta_{\text{cov}}$ 最大者，直到满足以下任一停止条件：
 - 累积覆盖率超过阈值（默认 $0.85$）
 - 边际增益 $\Delta_{\text{cov}} < 0.03$
-- 达到软启动预算（`GRAPH_EXTRACTION_SOFT_START_BUDGET`，默认 120）
+- 达到软启动预算（`GRAPH_EXTRACTION_SOFT_START_BUDGET`）或模型调用上限（`GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN`）
 - 所有 chunks 已选
 
 被选中的 chunks 进入 LLM 图谱抽取，其余 chunks 仍保留在向量库和检索系统中，但不消耗模型调用预算。
@@ -863,21 +867,22 @@ Copy-Item .env.example .env
 | `EMBEDDING_RESOLVE_IP`                                                                                       | 需要固定解析 embedding 模型域名时使用的目标 IP                              |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` / `EMBEDDING_BATCH_SIZE`                                          | 向量模型、维度和批大小                                                      |
 | `CHAT_MODEL`                                                                                                 | 对话与图谱抽取模型                                                          |
-| `GRAPH_EXTRACTION_SOFT_START_BUDGET` / `GRAPH_EXTRACTION_CONCURRENCY` / `GRAPH_EXTRACTION_RESUME_BATCH_SIZE` | 自适应图谱抽取初始预算、并发模型调用数和每批模型抽取 chunk 数               |
+| `GRAPH_EXTRACTION_SOFT_START_BUDGET` / `GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN` / `GRAPH_EXTRACTION_CONCURRENCY` / `GRAPH_EXTRACTION_RESUME_BATCH_SIZE` | 自适应图谱抽取预算、模型调用硬上限、并发模型调用数和每批模型抽取 chunk 数 |
+| `WORKER_CONCURRENCY` / `INGESTION_FILE_CONCURRENCY` / `MODEL_REQUEST_CONCURRENCY` / `MODEL_REQUEST_TIMEOUT_SECONDS` / `HPO_CONCURRENCY` | worker、文件解析、模型请求和 HPO 的有界并发与超时控制                      |
 | `ENABLE_MODEL_FALLBACK`                                                                                      | 模型降级开关，默认 `false`                                                  |
 | `RERANKER_ENABLED` / `RERANKER_MODEL` / `RERANKER_MAX_LENGTH`                                                | Cross-Encoder 精排配置                                                      |
 | `SEMANTIC_CHUNKING_ENABLED` / `SEMANTIC_CHUNKING_MIN_LENGTH`                                                 | 语义切分开关和最小文本长度                                                  |
 | `RETRIEVAL_LAYER_ENABLED`                                                                                    | 检索分层开关，默认 `true`                                                   |
-| `RETRIEVAL_CACHE_TTL_SECONDS`                                                                                | Redis 检索缓存 TTL，默认 `300`                                              |
+| `RETRIEVAL_CACHE_TTL_SECONDS`                                                                                | Redis 检索缓存 TTL，模板默认 `120`                                          |
 | `ENABLE_AGENTIC_REFLECTION`                                                                                  | Agentic 反思与修正总开关，默认 `true`                                       |
 | `ENABLE_POST_GENERATION_REFLECTION`                                                                          | 后生成反思开关（CitationVerifier/Reflection/AnswerCorrector），默认 `false` |
 | `CITATION_VERIFICATION_SAMPLE_MAX`                                                                           | 每答案引用验证抽样数，默认 `3`                                              |
 | `REFLECTION_MAX_RETRIES`                                                                                     | 反思触发修正的最大重试次数，默认 `2`                                        |
-| `MODEL_BRIDGE_ENABLED` / `MODEL_BRIDGE_PORT`                                                                 | 宿主机模型桥接开关和端口                                                    |
-| `ENABLE_AUTO_HPO`                                                                                            | 图谱重建前自动运行 TPE 超参优化，默认 `false`                               |
+| `MODEL_BRIDGE_ENABLED` / `MODEL_BRIDGE_PORT`                                                                 | 宿主机模型桥接开关和端口；根配置模板默认开启                                |
+| `ENABLE_AUTO_HPO`                                                                                            | 图谱重建前自动运行 TPE 超参优化；根配置模板默认开启                         |
+| `ENABLE_GRAPH_COMMUNITY_SUMMARIES`                                                                           | 开启后在图谱重建/更新时生成社区摘要                                          |
 | `HPO_JUDGE_MAX_CANDIDATES` / `HPO_JUDGE_MAX_PAIRS` / `HPO_JUDGE_MIN_LABELS`                                  | HPO 裁判候选数、成对比较数、最小有效标签数                                   |
 | `HPO_JUDGE_MAX_TOKENS_PER_PAIR` / `HPO_JUDGE_CONCURRENCY`                                                    | 每对裁判最大 token 数和并发数                                               |
-| `GRAPH_EXTRACTION_SOFT_START_BUDGET` / `GRAPH_EXTRACTION_RESUME_BATCH_SIZE`                                  | 自适应图谱抽取初始预算和每批模型调用 chunk 数                               |
 
 Docker Compose 会在 API 容器内使用服务名覆盖基础设施地址：
 

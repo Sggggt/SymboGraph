@@ -21,6 +21,7 @@ services:
       ENABLE_DATABASE_FALLBACK: "false"
       INGESTION_EXECUTION_MODE: celery
       INGESTION_TASK_QUEUE: course-kg-main-ingestion
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
       PYTHONPATH: /app/apps/worker:/app/apps/api
     ports:
       - "${API_HOST_PORT:-8000}:8000"
@@ -69,9 +70,10 @@ services:
       ENABLE_DATABASE_FALLBACK: "false"
       INGESTION_EXECUTION_MODE: celery
       INGESTION_TASK_QUEUE: course-kg-main-ingestion
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
       PYTHONPATH: /app/apps/worker:/app/apps/api
     working_dir: /app/apps/worker
-    command: ["python", "-m", "celery", "-A", "worker_app.celery_app", "worker", "--loglevel=info", "--queues=course-kg-main-ingestion"]
+    command: ["python", "-m", "celery", "-A", "worker_app.celery_app", "worker", "--loglevel=info", "--queues=course-kg-main-ingestion", "--concurrency=${WORKER_CONCURRENCY:-2}"]
     volumes:
       - ../data:/app/data
       - ../.env:/app/.env

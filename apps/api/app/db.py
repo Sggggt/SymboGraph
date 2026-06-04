@@ -123,7 +123,11 @@ SessionLocal = ContextSessionLocalProxy(_original_SessionLocal)
 
 
 SCHEMA_PATCHES: dict[str, dict[str, str]] = {
+    "courses": {
+        "current_chunk_version": "INTEGER DEFAULT 0",
+    },
     "chunks": {
+        "chunk_version": "INTEGER DEFAULT 1",
         "parent_chunk_id": "VARCHAR(36)",
         "summary": "TEXT",
         "keywords": "JSON DEFAULT '[]'",
@@ -157,6 +161,10 @@ SCHEMA_PATCHES: dict[str, dict[str, str]] = {
     "ingestion_jobs": {
         "batch_id": "VARCHAR(36)",
         "source_path": "TEXT",
+    },
+    "ingestion_batches": {
+        "worker_id": "VARCHAR(128)",
+        "heartbeat_at": "TIMESTAMP",
     },
     "qa_sessions": {
         "title": "VARCHAR(255)",
@@ -386,6 +394,37 @@ def ensure_schema() -> None:
                 connection.execute(text(" ".join(["ALTER TABLE", table_sql, "ADD COLUMN", column_name_sql, column_sql])))
         if "course_model_hyperparameters" in inspector.get_table_names():
             _migrate_course_model_hyperparameters(connection)
+        if {"courses", "documents", "document_versions", "chunks"}.issubset(set(inspector.get_table_names())):
+            connection.execute(
+                text(
+                    """
+                    UPDATE chunks AS c
+                    SET chunk_version = COALESCE(c.chunk_version, dv.version, 1)
+                    FROM document_versions AS dv
+                    WHERE c.document_version_id = dv.id
+                      AND (c.chunk_version IS NULL OR c.chunk_version <= 0)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    UPDATE courses AS course
+                    SET current_chunk_version = COALESCE(active.max_version, 0)
+                    FROM (
+                        SELECT c.course_id, MAX(c.chunk_version) AS max_version
+                        FROM chunks AS c
+                        WHERE c.is_active = true
+                        GROUP BY c.course_id
+                    ) AS active
+                    WHERE course.id = active.course_id
+                      AND COALESCE(course.current_chunk_version, 0) < COALESCE(active.max_version, 0)
+                    """
+                )
+            )
+            connection.execute(
+                text("UPDATE courses SET current_chunk_version = 0 WHERE current_chunk_version IS NULL")
+            )
 
 
 def get_db() -> Generator[Session, None, None]:

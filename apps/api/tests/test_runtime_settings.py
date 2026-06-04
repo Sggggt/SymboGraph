@@ -2,6 +2,19 @@
 from __future__ import annotations
 
 
+def _redirect_settings_env(monkeypatch, workspace):
+    from app.core import config
+    from app.services import runtime_settings
+
+    app_dir = workspace / "apps" / "api" / "app"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", workspace)
+    monkeypatch.setattr(config, "APP_DIR", app_dir)
+    monkeypatch.setattr(runtime_settings, "ENV_PATH", workspace / ".env")
+    monkeypatch.setattr(runtime_settings, "ENV_EXAMPLE_PATH", workspace / ".env.example")
+    config.get_settings.cache_clear()
+
+
 def test_env_sync_detects_bom_key(tmp_path, monkeypatch):
     from app.services import runtime_settings
 
@@ -139,12 +152,21 @@ def test_runtime_check_reports_model_bridge_when_configured(monkeypatch):
 def test_settings_routes_compose_model_calls_through_bridge(monkeypatch, tmp_path):
     from app.core.config import get_settings
 
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
-    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
-    monkeypatch.setenv("MODEL_BRIDGE_ENABLED", "true")
-    monkeypatch.setenv("MODEL_BRIDGE_PORT", "8766")
-    monkeypatch.setenv("CHAT_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    monkeypatch.setenv("CHAT_RESOLVE_IP", "1.2.3.4")
+    _redirect_settings_env(monkeypatch, tmp_path)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                f"DATABASE_URL=sqlite:///{(tmp_path / 'test.db').as_posix()}",
+                f"DATA_ROOT={(tmp_path / 'data').as_posix()}",
+                "MODEL_BRIDGE_ENABLED=true",
+                "MODEL_BRIDGE_PORT=8766",
+                "CHAT_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "CHAT_RESOLVE_IP=1.2.3.4",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     monkeypatch.delenv("API_CHAT_BASE_URL", raising=False)
     monkeypatch.delenv("API_CHAT_RESOLVE_IP", raising=False)
     get_settings.cache_clear()
@@ -162,6 +184,7 @@ def test_model_settings_payload_uses_split_model_urls(monkeypatch, tmp_path):
     from app.core.config import get_settings
     from app.services import runtime_settings
 
+    _redirect_settings_env(monkeypatch, tmp_path)
     env_path = tmp_path / ".env"
     env_path.write_text(
         "\n".join(
@@ -177,7 +200,6 @@ def test_model_settings_payload_uses_split_model_urls(monkeypatch, tmp_path):
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
     monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("OPENAI_API_KEY", "unit-chat-key")
@@ -206,9 +228,9 @@ def test_update_model_settings_updates_current_process_env(tmp_path, monkeypatch
     from app.core.config import get_settings
     from app.services import runtime_settings
 
+    _redirect_settings_env(monkeypatch, tmp_path)
     env_path = tmp_path / ".env"
     env_path.write_text("EMBEDDING_MODEL=text-embedding-v4\n", encoding="utf-8")
-    monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
     monkeypatch.setenv("EMBEDDING_MODEL", "text-embedding-v4")
     get_settings.cache_clear()
 
@@ -223,9 +245,9 @@ def test_update_model_settings_updates_graph_extraction_concurrency(tmp_path, mo
     from app.core.config import get_settings
     from app.services import runtime_settings
 
+    _redirect_settings_env(monkeypatch, tmp_path)
     env_path = tmp_path / ".env"
     env_path.write_text("GRAPH_EXTRACTION_CONCURRENCY=2\n", encoding="utf-8")
-    monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
     monkeypatch.setenv("GRAPH_EXTRACTION_CONCURRENCY", "2")
     get_settings.cache_clear()
 
@@ -234,6 +256,80 @@ def test_update_model_settings_updates_graph_extraction_concurrency(tmp_path, mo
     assert payload["graph_extraction_concurrency"] == 4
     assert env_path.read_text(encoding="utf-8").strip() == "GRAPH_EXTRACTION_CONCURRENCY=4"
     assert get_settings().graph_extraction_concurrency == 4
+
+
+def test_update_model_settings_updates_model_request_timeout(tmp_path, monkeypatch):
+    from app.core.config import get_settings
+    from app.services import runtime_settings
+
+    _redirect_settings_env(monkeypatch, tmp_path)
+    env_path = tmp_path / ".env"
+    env_path.write_text("MODEL_REQUEST_TIMEOUT_SECONDS=180\n", encoding="utf-8")
+    monkeypatch.setenv("MODEL_REQUEST_TIMEOUT_SECONDS", "180")
+    get_settings.cache_clear()
+
+    payload = runtime_settings.update_model_settings({"model_request_timeout_seconds": 45})
+
+    assert payload["model_request_timeout_seconds"] == 45
+    assert env_path.read_text(encoding="utf-8").strip() == "MODEL_REQUEST_TIMEOUT_SECONDS=45"
+    assert get_settings().model_request_timeout_seconds == 45
+
+
+def test_update_model_settings_updates_graph_community_summary_toggle(tmp_path, monkeypatch):
+    from app.core.config import get_settings
+    from app.services import runtime_settings
+
+    _redirect_settings_env(monkeypatch, tmp_path)
+    env_path = tmp_path / ".env"
+    env_path.write_text("ENABLE_GRAPH_COMMUNITY_SUMMARIES=true\n", encoding="utf-8")
+    monkeypatch.setenv("ENABLE_GRAPH_COMMUNITY_SUMMARIES", "true")
+    get_settings.cache_clear()
+
+    payload = runtime_settings.update_model_settings({"enable_graph_community_summaries": False})
+
+    assert payload["enable_graph_community_summaries"] is False
+    assert env_path.read_text(encoding="utf-8").strip() == "ENABLE_GRAPH_COMMUNITY_SUMMARIES=false"
+    assert get_settings().enable_graph_community_summaries is False
+
+
+def test_settings_hot_reload_prefers_workspace_env_over_process_env(tmp_path, monkeypatch):
+    from app.core import config
+
+    workspace = tmp_path / "workspace"
+    _redirect_settings_env(monkeypatch, workspace)
+    env_path = workspace / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                f"DATABASE_URL=sqlite:///{(tmp_path / 'test.db').as_posix()}",
+                f"DATA_ROOT={(tmp_path / 'data').as_posix()}",
+                "CHAT_MODEL=qwen3.7-plus",
+                "GRAPH_EXTRACTION_CONCURRENCY=3",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CHAT_MODEL", "deepseek-v4-pro")
+    config.get_settings.cache_clear()
+
+    assert config.get_settings().chat_model == "qwen3.7-plus"
+    env_path.write_text(
+        "\n".join(
+            [
+                f"DATABASE_URL=sqlite:///{(tmp_path / 'test.db').as_posix()}",
+                f"DATA_ROOT={(tmp_path / 'data').as_posix()}",
+                "CHAT_MODEL=qwen3.7-plus-hot",
+                "GRAPH_EXTRACTION_CONCURRENCY=4",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    reloaded = config.get_settings()
+    assert reloaded.chat_model == "qwen3.7-plus-hot"
+    assert reloaded.graph_extraction_concurrency == 4
 
 
 def test_update_model_settings_does_not_remove_keys_when_cleared(tmp_path, monkeypatch):

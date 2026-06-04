@@ -170,13 +170,18 @@ class VectorStore:
             return
         collections = {item.name for item in self.client.get_collections().collections}
         if self.collection not in collections:
-            self.client.create_collection(
-                collection_name=self.collection,
-                vectors_config=rest.VectorParams(
-                    size=self.settings.embedding_dimensions,
-                    distance=rest.Distance.COSINE,
-                ),
-            )
+            try:
+                self.client.create_collection(
+                    collection_name=self.collection,
+                    vectors_config=rest.VectorParams(
+                        size=self.settings.embedding_dimensions,
+                        distance=rest.Distance.COSINE,
+                    ),
+                )
+            except Exception:
+                collections = {item.name for item in self.client.get_collections().collections}
+                if self.collection not in collections:
+                    raise
 
     def upsert(self, points: list[dict]) -> None:
         if not points:
