@@ -684,7 +684,7 @@ def adaptive_specificity_threshold(scores: list[float]) -> dict:
         return {
             **base,
             "enabled": False,
-            "threshold": ADAPTIVE_SPECIFICITY_FLOOR,
+            "threshold": MIN_CONCEPT_SPECIFICITY,
             "fallback_reason": "insufficient_samples",
         }
     p25 = _percentile(usable, 25)
@@ -748,24 +748,6 @@ def concept_gate_decision(
             **decision_audit,
             "accepted": True,
             "gate_reason": "strong_singleton_evidence",
-            "specificity_threshold": round(effective_specificity_threshold, 4),
-            "adaptive_threshold": threshold_audit,
-        }
-    single_chunk_domain_term = (
-        existing is None
-        and len(group.chunk_ids) == 1
-        and group.confidence >= 0.5
-        and score >= max(ADAPTIVE_SPECIFICITY_FLOOR, effective_specificity_threshold - 0.05)
-        and set(decision.reasons) == {"insufficient_evidence"}
-        and not set(decision.reasons).intersection(HARD_REJECT_CONCEPT_REASONS)
-    )
-    if not accepted and single_chunk_domain_term:
-        decision_audit = decision.model_dump()
-        return True, {
-            **audit,
-            **decision_audit,
-            "accepted": True,
-            "gate_reason": "single_chunk_domain_term",
             "specificity_threshold": round(effective_specificity_threshold, 4),
             "adaptive_threshold": threshold_audit,
         }
@@ -1107,7 +1089,6 @@ async def upsert_graph_candidates_from_chunks(
     concept_map: dict[str, Concept] = {}
     created_count = 0
     rejected_concepts = 0
-    rejected_groups: list[tuple[str, StagedConcept, dict]] = []
     for key, group in staged_concepts.items():
         existing = _find_existing_concept_for_group(db, course_id, group)
         accepted, audit = concept_gate_decision(
@@ -1120,7 +1101,6 @@ async def upsert_graph_candidates_from_chunks(
         )
         if not accepted:
             rejected_concepts += 1
-            rejected_groups.append((key, group, audit))
             continue
         try:
             concept, created = get_or_create_concept(
@@ -1152,51 +1132,6 @@ async def upsert_graph_candidates_from_chunks(
         concept_map[key] = concept
         if created:
             created_count += 1
-
-    promoted_rejected_concepts = 0
-    if created_count == 0 and rejected_groups:
-        for key, group, audit in sorted(rejected_groups, key=lambda item: (float(item[2].get("specificity_score") or 0.0), item[1].confidence), reverse=True)[:8]:
-            reasons = set(audit.get("reasons") or [])
-            if reasons.intersection(HARD_REJECT_CONCEPT_REASONS) or "generic_low_specificity" in reasons:
-                continue
-            if float(audit.get("specificity_score") or 0.0) < ADAPTIVE_SPECIFICITY_FLOOR:
-                continue
-            try:
-                concept, created = get_or_create_concept(
-                    db=db,
-                    course_id=course_id,
-                    name=group.name,
-                    chapter=sorted(group.chapter_refs)[0] if group.chapter_refs else None,
-                    summary=max(group.summaries, key=len) if group.summaries else "",
-                    aliases=sorted(group.aliases),
-                    concept_type=group.concept_type,
-                    importance_score=group.importance_score,
-                    document_id=sorted(group.document_ids)[0] if group.document_ids else None,
-                    context_terms=set(),
-                )
-            except ValueError:
-                continue
-            concept.source_document_ids = sorted({*(concept.source_document_ids or []), *group.document_ids})
-            concept.chapter_refs = sorted({*(concept.chapter_refs or []), *group.chapter_refs})
-            concept.evidence_count = max(int(concept.evidence_count or 0), len(group.chunk_ids))
-            _merge_quality_audit(
-                concept,
-                {
-                    **audit,
-                    "accepted": True,
-                    "gate_reason": "all_rejected_fallback",
-                    "fallback_original_reasons": sorted(reasons),
-                },
-            )
-            for alias in group.aliases:
-                alias_key = canonical_entity_key(alias, group.concept_type)
-                if alias_key:
-                    concept_map[alias_key] = concept
-            concept_map[key] = concept
-            if created:
-                created_count += 1
-            promoted_rejected_concepts += 1
-            rejected_concepts = max(0, rejected_concepts - 1)
 
     relation_count = 0
     for relation_data in staged_relations.values():
@@ -1271,7 +1206,7 @@ async def upsert_graph_candidates_from_chunks(
         "created_concepts": created_count,
         "relations": relation_count,
         "rejected_concepts": rejected_concepts,
-        "promoted_rejected_concepts": promoted_rejected_concepts,
+        "promoted_rejected_concepts": 0,
         "llm_success_chunks": llm_success_chunks,
         "llm_verified_merges": llm_verified_merges,
         "graph_concept_specificity_threshold": specificity_threshold,
@@ -2242,38 +2177,74 @@ async def extract_llm_graph_payloads(
     payloads: dict[str, dict] = {}
     errors: dict[str, str] = {}
 
+    retry_succeeded = 0
+    retry_failed = 0
+
     async def extract(chunk: Chunk) -> None:
-        nonlocal completed
-        async with semaphore:
-            try:
-                if is_cancel_requested(None, batch_id):
-                    raise IngestionCancelled("ingestion batch cancellation requested")
-                raw_payload = await asyncio.wait_for(
-                    provider.extract_graph_payload(chunk.content, chunk.chapter, chunk.source_type),
-                    timeout=float(settings.model_request_timeout_seconds),
-                )
-                payload, _warnings = validate_graph_payload(raw_payload)
-                if is_cancel_requested(None, batch_id):
-                    raise IngestionCancelled("ingestion batch cancellation requested")
-                payloads[chunk.id] = payload
-            except IngestionCancelled:
-                raise
-            except asyncio.TimeoutError:
-                errors[chunk.id] = f"TimeoutError: graph extraction model request exceeded {settings.model_request_timeout_seconds}s"
-            except Exception as exc:
-                errors[chunk.id] = f"{type(exc).__name__}: {exc}"
-            finally:
-                completed += 1
-                if batch_id and (completed == total or completed % 5 == 0 or chunk.id in errors):
-                    emit_ingestion_log(
-                        batch_id,
-                        "batch_graph_progress",
-                        f"图谱抽取进度 {completed}/{total} 个片段",
-                        completed_graph_chunks=completed,
-                        total_graph_chunks=total,
-                        successful_extractions=len(payloads),
-                        failed_extractions=len(errors),
+        nonlocal completed, retry_succeeded, retry_failed
+        max_retries = 3
+        last_error = ""
+        succeeded_after_retry = False
+        for attempt in range(1, max_retries + 1):
+            async with semaphore:
+                try:
+                    if is_cancel_requested(None, batch_id):
+                        raise IngestionCancelled("ingestion batch cancellation requested")
+                    raw_payload = await asyncio.wait_for(
+                        provider.extract_graph_payload(chunk.content, chunk.chapter, chunk.source_type),
+                        timeout=float(settings.model_request_timeout_seconds),
                     )
+                    payload, _warnings = validate_graph_payload(raw_payload)
+                    if is_cancel_requested(None, batch_id):
+                        raise IngestionCancelled("ingestion batch cancellation requested")
+                    payloads[chunk.id] = payload
+                    if attempt > 1:
+                        succeeded_after_retry = True
+                    break
+                except IngestionCancelled:
+                    raise
+                except asyncio.TimeoutError:
+                    last_error = f"TimeoutError: graph extraction model request exceeded {settings.model_request_timeout_seconds}s"
+                    if attempt < max_retries:
+                        continue
+                except Exception as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    if attempt < max_retries:
+                        continue
+        if chunk.id not in payloads:
+            errors[chunk.id] = last_error
+            if attempt > 1 and batch_id:
+                retry_failed += 1
+                emit_ingestion_log(
+                    batch_id,
+                    "batch_graph_chunk_failed_after_retry",
+                    f"片段 {chunk.id[:8]}... 在 {attempt} 次尝试后最终失败: {last_error[:120]}",
+                    chunk_id=chunk.id,
+                    retry_attempts=attempt,
+                    last_error=last_error[:400],
+                )
+        elif succeeded_after_retry and batch_id:
+            retry_succeeded += 1
+            emit_ingestion_log(
+                batch_id,
+                "batch_graph_chunk_retry_succeeded",
+                f"片段 {chunk.id[:8]}... 第 {attempt} 次尝试成功（前 {attempt - 1} 次失败）",
+                chunk_id=chunk.id,
+                retry_attempts=attempt,
+            )
+        completed += 1
+        if batch_id and (completed == total or completed % 5 == 0 or chunk.id in errors):
+            emit_ingestion_log(
+                batch_id,
+                "batch_graph_progress",
+                f"图谱抽取进度 {completed}/{total} 个片段",
+                completed_graph_chunks=completed,
+                total_graph_chunks=total,
+                successful_extractions=len(payloads),
+                failed_extractions=len(errors),
+                retry_succeeded=retry_succeeded,
+                retry_failed=retry_failed,
+            )
 
     if not chunks:
         return {}, {}

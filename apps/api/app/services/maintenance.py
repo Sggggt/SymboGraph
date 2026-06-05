@@ -267,9 +267,13 @@ def delete_document_graph_incremental(db: Session, course_id: str, document_id: 
     ).delete(synchronize_session=False)
 
     removed_relations = 0
-    for relation in db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course_id)).all():
+    for relation in db.scalars(
+        select(ConceptRelation).where(ConceptRelation.course_id == course_id)
+    ).all():
         sources = set(relation.source_document_ids or [])
         evidence_from_document = bool(relation.evidence_chunk_id and relation.evidence_chunk_id in chunk_ids)
+        if not evidence_from_document and not sources.intersection(document_ids):
+            continue
         affected_concept_ids.add(relation.source_concept_id)
         if relation.target_concept_id:
             affected_concept_ids.add(relation.target_concept_id)

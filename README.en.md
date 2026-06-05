@@ -917,6 +917,8 @@ ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 ```
 
+> **Model selection recommendation**: The QA pipeline's Perception, Retrieval Planning, and Reflection nodes all rely on the LLM to produce high-quality structured outputs. We recommend using a **strong reasoning model** (e.g., kimi-k2.6, o3, DeepSeek-R1) as `CHAT_MODEL`. These models significantly outperform general chat models in intent understanding, entity extraction, self-checking, and structured output, substantially improving answer quality and reducing overall latency.
+
 2. Start the Docker stack:
 
 ```powershell

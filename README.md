@@ -917,6 +917,8 @@ ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 ```
 
+> **模型选择建议**：问答链路中的 Perception、Retrieval Planning、Reflection 等节点均依赖 LLM 输出高质量的结构化结果。建议使用 **强推理模型**（如 kimi-k2.6、o3、DeepSeek-R1 等）作为 `CHAT_MODEL`，其在意图理解、实体提取、自我检查和结构化输出上显著优于通用聊天模型，能大幅提升回答质量并降低整体延迟。
+
 2. 启动 Docker 栈：
 
 ```powershell
