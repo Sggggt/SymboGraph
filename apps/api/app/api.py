@@ -45,6 +45,17 @@ from app.schemas import (
     SearchResponse,
     SessionMessagesResponse,
     SessionSummary,
+    StrategyProfileBindRequest,
+    StrategyProfileAssistantRequest,
+    StrategyProfileAssistantStateResponse,
+    StrategyProfileCopyRequest,
+    StrategyProfileCreateRequest,
+    StrategyProfileDetail,
+    StrategyProfileDraftRequest,
+    StrategyProfileDraftResponse,
+    StrategyProfileMutationResponse,
+    StrategyProfileSummary,
+    StrategyProfileUpdateRequest,
     TaskStatusResponse,
     UploadFileResponse,
 )
@@ -87,6 +98,18 @@ from app.services.retrieval import (
 )
 from app.services.runtime_settings import model_settings_payload, normalize_env_file, runtime_check_payload, update_model_settings
 from app.services.storage import save_upload
+from app.services.strategy_profiles import (
+    bind_profile_to_course,
+    copy_profile,
+    create_profile,
+    delete_profile,
+    generate_profile_draft,
+    get_profile_or_raise,
+    list_profiles,
+    profile_to_payload,
+    update_profile,
+)
+from app.services.profile_assistant import get_profile_assistant_state, stream_profile_assistant_events
 
 router = APIRouter()
 
@@ -117,6 +140,127 @@ def save_model_settings(request: ModelSettingsUpdate) -> dict:
 @router.get("/settings/runtime-check", response_model=RuntimeCheckResponse)
 def get_runtime_check() -> dict:
     return runtime_check_payload()
+
+
+@router.get("/settings/profiles", response_model=list[StrategyProfileSummary])
+def get_strategy_profiles(db: Session = Depends(get_db)) -> list[dict]:
+    return list_profiles(db)
+
+
+@router.get("/settings/profiles/{profile_id}", response_model=StrategyProfileDetail)
+def get_strategy_profile(profile_id: str, db: Session = Depends(get_db)) -> dict:
+    try:
+        return profile_to_payload(get_profile_or_raise(db, profile_id))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/settings/profiles", response_model=StrategyProfileMutationResponse)
+def create_strategy_profile(request: StrategyProfileCreateRequest, db: Session = Depends(get_db)) -> dict:
+    try:
+        profile, warnings = create_profile(
+            db,
+            name=request.name,
+            library_type=request.library_type,
+            profile_json=request.profile_json,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"profile": profile_to_payload(profile), "warnings": warnings}
+
+
+@router.put("/settings/profiles/{profile_id}", response_model=StrategyProfileMutationResponse)
+def update_strategy_profile(profile_id: str, request: StrategyProfileUpdateRequest, db: Session = Depends(get_db)) -> dict:
+    try:
+        profile, warnings = update_profile(
+            db,
+            profile_id,
+            name=request.name,
+            library_type=request.library_type,
+            profile_json=request.profile_json,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"profile": profile_to_payload(profile), "warnings": warnings}
+
+
+@router.post("/settings/profiles/{profile_id}/copy", response_model=StrategyProfileDetail)
+def copy_strategy_profile(profile_id: str, request: StrategyProfileCopyRequest, db: Session = Depends(get_db)) -> dict:
+    try:
+        return profile_to_payload(copy_profile(db, profile_id, name=request.name))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/settings/profiles/{profile_id}", response_model=DeleteResponse)
+def delete_strategy_profile(profile_id: str, db: Session = Depends(get_db)) -> dict:
+    try:
+        delete_profile(db, profile_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"deleted": True}
+
+
+@router.post("/settings/profiles/bind", response_model=CourseSummary)
+def bind_strategy_profile(request: StrategyProfileBindRequest, db: Session = Depends(get_db)) -> dict:
+    try:
+        course = bind_profile_to_course(db, course_id=request.course_id, profile_id=request.profile_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return summarize_course(db, course)
+
+
+@router.post("/settings/profile-drafts", response_model=StrategyProfileDraftResponse)
+async def draft_strategy_profile(request: StrategyProfileDraftRequest, db: Session = Depends(get_db)) -> dict:
+    base = request.base_profile_json
+    if base is None and request.base_profile_id:
+        try:
+            base = get_profile_or_raise(db, request.base_profile_id).profile_json
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    try:
+        return await generate_profile_draft(request.prompt, base_profile=base)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/settings/profile-assistant/{session_id}", response_model=StrategyProfileAssistantStateResponse)
+def get_strategy_profile_assistant_state(session_id: str) -> dict:
+    return get_profile_assistant_state(session_id)
+
+
+@router.post("/settings/profile-assistant/stream")
+async def stream_strategy_profile_assistant(request: StrategyProfileAssistantRequest, db: Session = Depends(get_db)):
+    base = request.base_profile_json
+    if base is None and request.base_profile_id:
+        try:
+            base = get_profile_or_raise(db, request.base_profile_id).profile_json
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def event_stream():
+        try:
+            async for event in stream_profile_assistant_events(
+                prompt=request.prompt,
+                session_id=request.session_id,
+                base_profile_id=request.base_profile_id,
+                base_profile=base,
+            ):
+                yield f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'error': str(exc)}, ensure_ascii=False)}\n\n"
+        finally:
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.get("/courses", response_model=list[CourseSummary])

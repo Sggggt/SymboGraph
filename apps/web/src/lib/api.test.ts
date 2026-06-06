@@ -292,6 +292,60 @@ describe("api client", () => {
     expect(meta).toContainEqual({ degraded_mode: false, run_id: "run-1", session_id: "session-1", route: "retrieve_notes" });
   });
 
+  it("parses profile assistant SSE chunks", async () => {
+    const profileJson = {
+      schema_version: "strategy_profile_v1",
+      library_type: "legal",
+      ui_labels: {},
+      prompt_pack: {},
+      schema_pack: { entity_types: ["clause"], relation_types: ["cites"] },
+      parsing_strategy: {},
+      graph_strategy: {},
+      retrieval_strategy: {},
+      quality_policy: {},
+    };
+    const body = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        controller.enqueue(encoder.encode('data: {"type":"meta","session_id":"profile-session"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"token","token":"已生成"}\n\n'));
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "profile_json", profile_json: profileJson, warnings: ["check"], profile_hash: "hash-1" })}\n\n`));
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "final", state: { session_id: "profile-session", messages: [], latest_profile_json: profileJson, latest_profile_hash: "hash-1", warnings: ["check"] } })}\n\n`));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(body, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { streamProfileAssistant } = await import("./api");
+    const tokens: string[] = [];
+    const profileEvents: unknown[] = [];
+    const finalStates: unknown[] = [];
+    const meta: unknown[] = [];
+
+    await streamProfileAssistant(
+      { prompt: "legal", session_id: "profile-session", base_profile_id: "base" },
+      {
+        onToken: (value) => tokens.push(value),
+        onProfileJson: (value) => profileEvents.push(value),
+        onFinal: (value) => finalStates.push(value),
+        onMeta: (value) => meta.push(value),
+      },
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://api.test/api/settings/profile-assistant/stream",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ prompt: "legal", session_id: "profile-session", base_profile_id: "base" }),
+      }),
+    );
+    expect(meta).toEqual([{ session_id: "profile-session", cached: undefined }]);
+    expect(tokens).toEqual(["已生成"]);
+    expect(profileEvents).toEqual([{ profile_json: profileJson, warnings: ["check"], profile_hash: "hash-1" }]);
+    expect(finalStates).toEqual([{ session_id: "profile-session", messages: [], latest_profile_json: profileJson, latest_profile_hash: "hash-1", warnings: ["check"] }]);
+  });
+
   it("passes structured stream errors to handlers before rejecting", async () => {
     const body = {
       detail: {

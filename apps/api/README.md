@@ -8,7 +8,7 @@ A high-performance, asynchronous FastAPI backend service orchestrating the Symbo
 
 The backend enforces strict ACID constraints and coordinates three persistent stores:
 
-1. **PostgreSQL (v16)**: The single source of truth for structural course metadata, ingestion batches, active document chunks, concept nodes, and relationship matrices. Enforces transaction atomicity and relational integrity.
+1. **PostgreSQL (v16)**: The single source of truth for structural course metadata, strategy profiles, ingestion batches, active document chunks, concept nodes, and relationship matrices. Enforces transaction atomicity and relational integrity.
 2. **Qdrant (v1.17)**: High-speed vector store storing dense contextualized embeddings (1024-dimension `text-embedding-v4`) for semantic hybrid search.
 3. **Redis (v7)**: Shared runtime cache, distributed locks (`_RedisDistributedLock`), and message broker facilitating high-throughput operations.
 
@@ -34,6 +34,14 @@ The backend enforces strict ACID constraints and coordinates three persistent st
 - **Graph Enrichment**: Calculates PageRank, betweenness centrality, and Louvain community partitions to summarize corpus topology.
 - **TPE Auto HPO**: Runs an Optuna-powered Tree-structured Parzen Estimator (TPE) over a surrogate LLM-pairwise-judge learned objective to optimize Dijkstra distance cutoffs and relation confidence weights.
 
+### 4. Knowledge-Base Strategy Profiles
+- **Default Compatibility Layer**: New and legacy courses bind to the built-in course Profile by default, preserving existing RAG, graph extraction, retrieval, and agent behavior.
+- **Persistent Profiles**: Profiles are stored in PostgreSQL table `strategy_profiles` and linked from `courses.active_profile_id`; Profile state is not stored in `.env`.
+- **Profile-Aware Boundaries**: Prompt builders, entity/relation normalization, chunk labels, embedding metadata, query classification, agent routes, graph judge hints, and quality policy hints read the active Profile at pipeline boundaries.
+- **Non-Destructive Switching**: Profile changes only affect new tasks. Existing chunks, graph objects, vectors, and sessions remain untouched; graph extraction runs record `strategy_profile_id` and `strategy_profile_hash`.
+- **Deletion Semantics**: The built-in default Profile cannot be deleted. Deleting any custom Profile soft-deletes it and automatically rebinds any affected courses to the default Profile in one transaction.
+- **Profile Assistant**: `/settings/profile-assistant/stream` streams natural-language guidance plus a validated Profile JSON draft and caches assistant session state in Redis.
+
 ---
 
 ## 📂 Codebase Directory Layout
@@ -44,7 +52,7 @@ apps/api/
 │   ├── core/           # App settings, DB connections, Redis distributed lock
 │   ├── models/         # SQLAlchemy ORM declarative database models
 │   ├── schemas/        # Strong contract validation using Pydantic v2
-│   ├── services/       # Core business logic: concept_graph, ingestion, HPO engine
+│   ├── services/       # Core business logic: concept_graph, ingestion, strategy profiles, HPO engine
 │   ├── main.py         # FastAPI app registration and API router entry
 │   └── api.py          # Endpoints for ingestion, RAG chat, concept card catalog
 ├── tests/              # Extensive pytest suite covering logic, DB integrations
@@ -69,6 +77,9 @@ Integrations with PostgreSQL, Redis, and Qdrant must be validated inside the con
 ```bash
 # Run the complete test suite inside the container
 docker exec course-kg-api python -m pytest tests
+
+# Run Profile-specific regression tests
+docker exec course-kg-api python -m pytest tests/test_strategy_profiles.py
 ```
 
 ### Running Locally for Active Debugging

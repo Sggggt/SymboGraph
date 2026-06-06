@@ -85,6 +85,25 @@ select {
   font: inherit;
 }
 
+select {
+  color-scheme: dark;
+}
+
+select option {
+  background-color: #151a2b;
+  color: #edf6ff;
+}
+
+select option:checked,
+select option:hover {
+  background-color: #1f6fd6;
+  color: #ffffff;
+}
+
+.kg-dark-select {
+  color-scheme: dark;
+}
+
 .vertical-text {
   writing-mode: vertical-rl;
   text-orientation: mixed;

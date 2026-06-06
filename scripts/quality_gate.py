@@ -19,6 +19,7 @@ from sqlalchemy import select
 from app.core.config import get_settings
 from app.db import SessionLocal, ensure_schema
 from app.models import Chunk, ConceptRelation, Course, GraphCommunitySummary, GraphExtractionChunkTask, GraphExtractionRun, GraphRelationCandidate, QualityProfile
+from app.services.strategy_profiles import get_active_profile_record
 from app.services.vector_store import VectorStore
 
 LEGACY_ENTRYPOINT_SYMBOLS = (
@@ -135,6 +136,7 @@ def main() -> None:
                 .where(QualityProfile.course_id == course.id, QualityProfile.is_active.is_(True))
                 .order_by(QualityProfile.created_at.desc())
             )
+            strategy_profile = get_active_profile_record(db, course.id)
             candidate_count = db.query(GraphRelationCandidate).filter(GraphRelationCandidate.course_id == course.id).count()
             accepted_relation_count = db.query(ConceptRelation).filter(ConceptRelation.course_id == course.id).count()
             forbidden_relation_count = (
@@ -222,6 +224,10 @@ def main() -> None:
             print(f"  qdrant_vectors={len(vector_ids)} checked_vectors={checked}")
             print(f"  missing_vectors={len(missing)} orphan_vectors={len(orphan)} zero_vectors={len(zero_ids)}")
             print(f"  child_without_parent={len(child_without_parent)}")
+            print(
+                "  strategy_profile="
+                f"{strategy_profile.name} id={strategy_profile.id} hash={strategy_profile.profile_hash}"
+            )
             print(f"  quality_profile={active_profile.version if active_profile else 'missing'}")
             print(f"  quality_policy_counts={quality_policy_counts}")
             print(f"  chunk_action_counts={chunk_action_counts}")
@@ -239,6 +245,7 @@ def main() -> None:
                 f"{latest_extraction_run.id if latest_extraction_run else 'missing'} "
                 f"status={latest_extraction_run.status if latest_extraction_run else 'missing'} "
                 f"strategy={latest_extraction_run.strategy if latest_extraction_run else 'missing'} "
+                f"profile_hash={latest_extraction_run.strategy_profile_hash if latest_extraction_run else 'missing'} "
                 f"tasks={extraction_task_counts}"
             )
             if orphan_zero_ids:

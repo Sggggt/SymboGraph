@@ -65,6 +65,29 @@ As a general GraphRAG platform, SymboGraph's knowledge-base concept is not limit
 | Auto HPO                     | When `ENABLE_AUTO_HPO=true`, automatically runs TPE optimization before graph rebuild to find optimal thresholds and weight combinations     |
 | Incremental graph update     | Recomputes only subgraphs tied to changed documents, avoiding unnecessary full rebuilds                                                          |
 
+## Knowledge-Base Profiles
+
+SymboGraph now supports a knowledge-base Profile system. Profiles move document-type-specific prompts, schemas, parsing hints, graph rules, retrieval routing hints, and quality thresholds out of hard-coded course assumptions.
+
+- Every knowledge base is bound to one active Profile. New knowledge bases use the built-in course Profile by default, so existing RAG, graph, retrieval, and agent behavior remains compatible.
+- Profile records live in PostgreSQL table `strategy_profiles`; they are not stored in `.env`. Knowledge bases reference the active Profile through `courses.active_profile_id`.
+- The built-in default Profile cannot be edited or deleted. Copy it first when customization is needed. Any non-default Profile can be deleted; if it is still bound to knowledge bases, the backend automatically rebinds those knowledge bases to the default Profile.
+- Switching or editing a Profile only affects new parsing, graph extraction, retrieval, and QA tasks started afterwards. Existing chunks, vectors, graph objects, and chat sessions are not rewritten automatically. Graph extraction runs store the Profile hash so the UI can warn when existing graph data may need reparse or rebuild.
+- The settings page has two tabs: "Model & Runtime Settings" and "Profile Settings". Profile Settings covers selection, copy, create, save, bind, delete, AI-assisted draft generation, diagnostics, and advanced JSON editing.
+- The Profile Assistant uses the configured `chat_model` to produce natural-language guidance plus a Profile JSON draft. The draft remains client-side until the user clicks "Autofill" and then saves it. Assistant session state is cached in Redis.
+
+Profile JSON contains these top-level strategy packs:
+
+| Field | Purpose |
+| --- | --- |
+| `ui_labels` | Display labels for knowledge bases, partitions, entities, relations, and routes |
+| `prompt_pack` | Prompts for QA, graph extraction, intent recognition, citation checking, reflection, and community summaries |
+| `schema_pack` | Entity types, relation types, aliases, disabled labels, and default types |
+| `parsing_strategy` | Chapter/clause/partition recognition, content-type preferences, OCR/table/code hints |
+| `graph_strategy` | Extraction budget, relation admission, merge rules, HPO and community-summary preferences |
+| `retrieval_strategy` | Query types, route words, and dense/BM25/rerank weighting hints |
+| `quality_policy` | Structural noise terms, generic terms, and entity/relation admission thresholds |
+
 ## System Architecture
 
 ```mermaid
@@ -808,6 +831,7 @@ erDiagram
     Concept ||--o{ ConceptRelation : target
     Course ||--o{ IngestionBatch : batches
     IngestionBatch ||--o{ IngestionJob : jobs
+    StrategyProfile ||--o{ Course : active_profile
     Course ||--o{ QualityProfile : profiles
     Course ||--o{ QASession : sessions
     QASession ||--o{ AgentRun : runs
@@ -825,12 +849,13 @@ erDiagram
 
 | Table                                               | Purpose                                                                                                          |
 | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `courses`                                           | Knowledge-base workspace                                                                                         |
+| `courses`                                           | Knowledge-base workspace, current chunk version, and active Profile binding                                      |
 | `documents` / `document_versions`                   | File metadata, versions, and parser artifact paths                                                               |
 | `chunks`                                            | Parent/child text chunks, summaries, keywords, embedding text version, and evidence text                         |
 | `concepts`                                          | Concepts, chapter references, evidence counts, communities, centrality, and graph rank                           |
 | `concept_aliases`                                   | Concept aliases and normalized aliases                                                                           |
 | `concept_relations`                                 | Sparse edges, relation types, evidence chunks, weights, semantic similarity, support count, and inference source |
+| `strategy_profiles`                                 | Knowledge-base Profile JSON, schema/prompt/strategy packs, hash, built-in flag, and active state                 |
 | `quality_profiles`                                  | Domain quality profiles (versioned, stratified sampling, positive/negative examples, term baselines)             |
 | `ingestion_batches` / `ingestion_jobs`              | Batch ingestion and single-file jobs                                                                             |
 | `ingestion_logs` / `ingestion_compensation_logs`    | Event streams and cross-store compensation records                                                               |

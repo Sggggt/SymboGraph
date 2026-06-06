@@ -56,6 +56,22 @@ class CacheManager:
     def set_quality_judgment(self, cache_key: str, result: dict, ttl: int = 86400) -> None:
         self._set(self._key("quality_judge", cache_key), result, ttl)
 
+    def get_runtime_state(self, namespace: str, state_id: str) -> dict | None:
+        value = self._get(self._key("state", namespace, state_id))
+        return value if isinstance(value, dict) else None
+
+    def set_runtime_state(self, namespace: str, state_id: str, state: dict, ttl: int = 86400) -> None:
+        self._set(self._key("state", namespace, state_id), state, ttl)
+
+    def delete_runtime_state(self, namespace: str, state_id: str) -> None:
+        key = self._key("state", namespace, state_id)
+        if self._redis:
+            try:
+                self._redis.delete(key)
+            except Exception:
+                pass
+        self._memory.pop(key, None)
+
     def invalidate_course(self, course_id: str) -> None:
         if self._redis:
             try:

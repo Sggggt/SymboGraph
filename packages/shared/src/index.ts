@@ -500,7 +500,7 @@ export interface StructuredApiErrorBody {
   fix_commands: string[];
 }
 
-export type GraphRelationType =
+export type CourseGraphRelationType =
   | "is_a"
   | "part_of"
   | "prerequisite_of"
@@ -514,6 +514,8 @@ export type GraphRelationType =
   | "solves"
   | "implemented_by"
   | "related_to";
+
+export type GraphRelationType = CourseGraphRelationType | (string & {});
 
 export interface RelatedConcept {
   concept_id: string;
@@ -537,8 +539,9 @@ export interface ConceptCard {
 }
 
 export type GraphType = "semantic" | "structural" | "evidence";
-export type SemanticEntityType = "concept" | "method" | "formula" | "metric" | "algorithm" | "definition" | "theorem" | "problem_type";
-export type GraphNodeCategory = "semantic_entity" | "course" | "document" | "chapter" | "section" | "chunk" | "evidence_chunk" | "document_version";
+export type CourseSemanticEntityType = "concept" | "method" | "formula" | "metric" | "algorithm" | "definition" | "theorem" | "problem_type";
+export type SemanticEntityType = CourseSemanticEntityType | (string & {});
+export type GraphNodeCategory = "semantic_entity" | "course" | "document" | "chapter" | "section" | "chunk" | "evidence_chunk" | "document_version" | (string & {});
 
 export interface GraphNode {
   id: string;
@@ -607,7 +610,84 @@ export interface GraphResponse {
     graph_build_id?: string | null;
     graph_built_at?: string | null;
     chunk_scope_changed?: boolean;
+    strategy_profile_changed?: boolean;
+    current_strategy_profile_hash?: string | null;
+    graph_strategy_profile_hash?: string | null;
   };
+}
+
+export interface StrategyProfileSummary {
+  id: string;
+  name: string;
+  library_type: string;
+  is_builtin: boolean;
+  profile_hash: string;
+  is_active: boolean;
+  course_ids: string[];
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface StrategyProfileDetail extends StrategyProfileSummary {
+  profile_json: Record<string, unknown>;
+  warnings: string[];
+}
+
+export interface StrategyProfileMutationResponse {
+  profile: StrategyProfileDetail;
+  warnings: string[];
+}
+
+export interface StrategyProfileCreateRequest {
+  name: string;
+  library_type?: string;
+  profile_json: Record<string, unknown>;
+}
+
+export interface StrategyProfileUpdateRequest {
+  name?: string | null;
+  library_type?: string | null;
+  profile_json?: Record<string, unknown> | null;
+}
+
+export interface StrategyProfileCopyRequest {
+  name: string;
+}
+
+export interface StrategyProfileBindRequest {
+  course_id: string;
+  profile_id: string;
+}
+
+export interface StrategyProfileDraftRequest {
+  prompt: string;
+  base_profile_id?: string | null;
+  base_profile_json?: Record<string, unknown> | null;
+}
+
+export interface StrategyProfileDraftResponse {
+  profile_json: Record<string, unknown>;
+  warnings: string[];
+  profile_hash?: string;
+}
+
+export interface StrategyProfileAssistantRequest {
+  prompt: string;
+  session_id?: string | null;
+  base_profile_id?: string | null;
+  base_profile_json?: Record<string, unknown> | null;
+}
+
+export interface StrategyProfileAssistantStateResponse {
+  session_id: string;
+  base_profile_id?: string | null;
+  messages: Array<Record<string, unknown>>;
+  latest_profile_json?: Record<string, unknown> | null;
+  latest_profile_hash?: string | null;
+  warnings: string[];
+  draft_message?: string;
+  created_at?: string | null;
+  updated_at?: string | null;
 }
 
 export interface CourseTreeNode {
@@ -629,6 +709,9 @@ export interface CourseSummary {
   has_parsed_chunks: boolean;
   can_full_reparse: boolean;
   degraded_mode: boolean;
+  active_profile_id?: string | null;
+  active_profile_name?: string | null;
+  active_profile_hash?: string | null;
 }
 
 export interface CourseCreateRequest {

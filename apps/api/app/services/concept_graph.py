@@ -48,6 +48,7 @@ def _safe_emit_log(batch_id: str | None, event: str, message: str, **payload: An
     return _il.emit_ingestion_log(batch_id, event, message, **payload)
 from app.services.quality.policies import ConceptQualityPolicy
 from app.services.quality.signals import build_quality_signals
+from app.services.strategy_profiles import active_profile_json, get_active_profile_record, profile_prompt, profile_schema, use_strategy_profile
 
 try:
     from rapidfuzz import fuzz
@@ -81,7 +82,7 @@ LEGACY_RELATION_TYPE_MAP = {
     "extends": "derives_from",
 }
 MIN_CONCEPT_EVIDENCE_CHUNKS = 2
-MIN_CONCEPT_SPECIFICITY = 0.55
+MIN_CONCEPT_SPECIFICITY = 0.35
 ADAPTIVE_SPECIFICITY_MIN_SAMPLE = 20
 ADAPTIVE_SPECIFICITY_FLOOR = 0.35
 ADAPTIVE_SPECIFICITY_CEILING = 0.60
@@ -145,9 +146,15 @@ def _graph_payload(value: object) -> dict:
 
 
 def normalize_relation_type(value: object) -> str:
+    schema_pack = profile_schema(active_profile_json())
+    allowed_relations = set(schema_pack.get("relation_types") or ALLOWED_RELATIONS)
+    aliases = dict(schema_pack.get("relation_aliases") or LEGACY_RELATION_TYPE_MAP)
+    default_relation_type = str(schema_pack.get("default_relation_type") or "related_to")
+    if default_relation_type not in allowed_relations:
+        default_relation_type = next(iter(allowed_relations), "related_to")
     relation_type = _text_value(value).lower()
-    relation_type = LEGACY_RELATION_TYPE_MAP.get(relation_type, relation_type)
-    return relation_type if relation_type in ALLOWED_RELATIONS else ""
+    relation_type = aliases.get(relation_type, relation_type)
+    return relation_type if relation_type in allowed_relations else default_relation_type
 
 
 def _has_graph_concepts(value: object) -> bool:
@@ -245,6 +252,10 @@ def normalize_concept_name(name: object) -> str:
 
 
 def normalize_entity_type(value: object) -> str:
+    schema_pack = profile_schema(active_profile_json())
+    allowed_types = set(schema_pack.get("entity_types") or SEMANTIC_ENTITY_TYPES)
+    default_type = str(schema_pack.get("default_entity_type") or "concept")
+    profile_aliases = dict(schema_pack.get("entity_aliases") or {})
     entity_type = _text_value(value).lower().replace("-", "_").replace(" ", "_")
     aliases = {
         "named_algorithm": "algorithm",
@@ -253,8 +264,9 @@ def normalize_entity_type(value: object) -> str:
         "definition_term": "definition",
         "problem": "problem_type",
     }
+    aliases.update(profile_aliases)
     entity_type = aliases.get(entity_type, entity_type)
-    return entity_type if entity_type in SEMANTIC_ENTITY_TYPES else "concept"
+    return entity_type if entity_type in allowed_types else default_type
 
 
 def canonical_entity_key(name: object, entity_type: object = "concept") -> str:
@@ -450,7 +462,8 @@ def merge_graph_candidates(primary: dict, fallback: dict, context_terms: set[str
             if relation_type_value is not None and not isinstance(relation_type_value, str):
                 continue
             relation_type = normalize_relation_type(relation_type_value) or "related_to"
-            if relation_type not in ALLOWED_RELATIONS:
+            allowed_relations = set(profile_schema(active_profile_json()).get("relation_types") or ALLOWED_RELATIONS)
+            if relation_type not in allowed_relations:
                 continue
             source_name = _text_value(relation.get("source", ""))
             target_name = _text_value(relation.get("target", ""))
@@ -564,9 +577,12 @@ def _record_entity_mention(
 
 
 def semantic_relation_allowed(source: Concept, target: Concept, relation_type: str) -> bool:
+    schema_pack = profile_schema(active_profile_json())
+    allowed_entity_types = set(schema_pack.get("entity_types") or SEMANTIC_ENTITY_TYPES)
+    allowed_relation_types = set(schema_pack.get("relation_types") or ALLOWED_RELATIONS)
     source_type = normalize_entity_type(getattr(source, "concept_type", "concept"))
     target_type = normalize_entity_type(getattr(target, "concept_type", "concept"))
-    if source_type not in SEMANTIC_ENTITY_TYPES or target_type not in SEMANTIC_ENTITY_TYPES:
+    if source_type not in allowed_entity_types or target_type not in allowed_entity_types:
         return False
     if relation_type == "formula_of":
         return source_type == "formula" or target_type == "formula"
@@ -574,7 +590,7 @@ def semantic_relation_allowed(source: Concept, target: Concept, relation_type: s
         return target_type in {"definition", "concept", "theorem"}
     if relation_type in {"implemented_by", "solves"}:
         return "method" in {source_type, target_type} or "algorithm" in {source_type, target_type}
-    return relation_type in ALLOWED_RELATIONS
+    return relation_type in allowed_relation_types
 
 
 def chunk_text_for_specificity(chunk: Chunk) -> str:
@@ -748,6 +764,23 @@ def concept_gate_decision(
             **decision_audit,
             "accepted": True,
             "gate_reason": "strong_singleton_evidence",
+            "specificity_threshold": round(effective_specificity_threshold, 4),
+            "adaptive_threshold": threshold_audit,
+        }
+    if (
+        not accepted
+        and decision.reasons == ["insufficient_evidence"]
+        and len(group.chunk_ids) == 1
+        and normalize_entity_type(group.concept_type) in SINGLETON_ENTITY_TYPES
+        and score >= effective_specificity_threshold
+        and group.confidence >= 0.70
+    ):
+        decision_audit = decision.model_dump()
+        return True, {
+            **audit,
+            **decision_audit,
+            "accepted": True,
+            "gate_reason": "single_chunk_domain_term",
             "specificity_threshold": round(effective_specificity_threshold, 4),
             "adaptive_threshold": threshold_audit,
         }
@@ -1850,6 +1883,7 @@ def _latest_reusable_task_payloads(
     course_id: str,
     *,
     profile_version: str | None,
+    strategy_profile_hash: str | None = None,
     prompt_version: str,
     model: str | None,
 ) -> dict[str, GraphExtractionChunkTask]:
@@ -1859,6 +1893,7 @@ def _latest_reusable_task_payloads(
             GraphExtractionRun.course_id == course_id,
             GraphExtractionRun.strategy == "adaptive_best_first",
             GraphExtractionRun.profile_version == profile_version,
+            GraphExtractionRun.strategy_profile_hash == strategy_profile_hash,
             GraphExtractionRun.prompt_version == prompt_version,
             GraphExtractionRun.model == model,
         )
@@ -1889,6 +1924,8 @@ def create_graph_extraction_run_from_plan(
     chunks: list[Chunk],
     plan: GraphExtractionPlan,
     profile_version: str | None,
+    strategy_profile_id: str | None = None,
+    strategy_profile_hash: str | None = None,
 ) -> GraphExtractionRun:
     settings = get_settings()
     prompt_version = "graph_extraction_v1"
@@ -1897,6 +1934,7 @@ def create_graph_extraction_run_from_plan(
         db,
         course_id,
         profile_version=profile_version,
+        strategy_profile_hash=strategy_profile_hash,
         prompt_version=prompt_version,
         model=model,
     )
@@ -1906,6 +1944,8 @@ def create_graph_extraction_run_from_plan(
         batch_id=batch_id,
         strategy="adaptive_best_first",
         profile_version=profile_version,
+        strategy_profile_id=strategy_profile_id,
+        strategy_profile_hash=strategy_profile_hash,
         prompt_version=prompt_version,
         model=model,
         status="planned",
@@ -2417,10 +2457,14 @@ async def rebuild_graph_community_summaries(db: Session, course_id: str, *, batc
         )
         response = await asyncio.wait_for(
             chat.classify_json(
-                (
-                    "You summarize graph communities for evidence-first RAG routing. "
-                    "Return JSON with keys summary, key_concepts, routing_hints, quality_notes. "
-                    "Do not invent facts outside the supplied concepts, relations, and chunk snippets."
+                profile_prompt(
+                    active_profile_json(),
+                    "community_summary_system",
+                    (
+                        "You summarize graph communities for evidence-first RAG routing. "
+                        "Return JSON with keys summary, key_concepts, routing_hints, quality_notes. "
+                        "Do not invent facts outside the supplied concepts, relations, and chunk snippets."
+                    ),
                 ),
                 user_prompt,
                 fallback={"summary": "", "key_concepts": [], "routing_hints": [], "quality_notes": []},
@@ -2519,6 +2563,7 @@ async def rebuild_course_graph(
 ) -> dict:
     settings = get_settings()
     course = db.get(Course, course_id)
+    strategy_profile = get_active_profile_record(db, course_id)
     sync_graph_chapter_labels(db, course_id)
     active_documents = db.scalars(select(Document).where(Document.course_id == course_id, Document.is_active.is_(True))).all()
     graph_documents = filter_graph_documents(course, active_documents)
@@ -2539,6 +2584,8 @@ async def rebuild_course_graph(
         chunks=chunks,
         plan=plan,
         profile_version=quality_profile.version,
+        strategy_profile_id=strategy_profile.id,
+        strategy_profile_hash=strategy_profile.profile_hash,
     )
     db.commit()
     llm_chunk_ids = set(plan.selected_chunk_ids)
@@ -2557,12 +2604,13 @@ async def rebuild_course_graph(
             graph_extraction_coverage=plan.coverage,
             graph_extraction_stop_reason=plan.stop_reason,
         )
-    llm_payloads, llm_errors, extraction_stats = await execute_graph_extraction_run(
-        db,
-        run=extraction_run,
-        chunks=chunks,
-        batch_id=batch_id,
-    )
+    with use_strategy_profile(strategy_profile.profile_json):
+        llm_payloads, llm_errors, extraction_stats = await execute_graph_extraction_run(
+            db,
+            run=extraction_run,
+            chunks=chunks,
+            batch_id=batch_id,
+        )
     llm_validation_warnings = {
         chunk_id: payload.get("_validation_warnings", [])
         for chunk_id, payload in llm_payloads.items()
@@ -2599,13 +2647,14 @@ async def rebuild_course_graph(
         graph_extraction_completed_chunks=extraction_stats.get("completed_chunks", len(llm_payloads)),
         graph_llm_success_chunks=len(llm_payloads),
     )
-    upsert_stats = await upsert_graph_candidates_from_chunks(
-        db,
-        course_id,
-        chunks,
-        llm_payloads=llm_payloads,
-        run_llm_merge=(batch_id is not None if run_llm_merge is None else run_llm_merge),
-    )
+    with use_strategy_profile(strategy_profile.profile_json):
+        upsert_stats = await upsert_graph_candidates_from_chunks(
+            db,
+            course_id,
+            chunks,
+            llm_payloads=llm_payloads,
+            run_llm_merge=(batch_id is not None if run_llm_merge is None else run_llm_merge),
+        )
     _safe_emit_log(
         batch_id,
         "graph_upsert_completed",
@@ -2929,6 +2978,7 @@ async def incremental_update_course_graph(
 ) -> dict:
     settings = get_settings()
     course = db.get(Course, course_id)
+    strategy_profile = get_active_profile_record(db, course_id)
     ensure_not_cancelled(db, batch_id)
     if not changed_document_ids:
         return {"graph_rebuilt": False, "reason": "no_changed_documents"}
@@ -2988,6 +3038,8 @@ async def incremental_update_course_graph(
         chunks=chunks,
         plan=plan,
         profile_version=quality_profile.version,
+        strategy_profile_id=strategy_profile.id,
+        strategy_profile_hash=strategy_profile.profile_hash,
     )
     db.commit()
     ensure_not_cancelled(db, batch_id)
@@ -3008,12 +3060,13 @@ async def incremental_update_course_graph(
             graph_extraction_stop_reason=plan.stop_reason,
         )
 
-    llm_payloads, llm_errors, extraction_stats = await execute_graph_extraction_run(
-        db,
-        run=extraction_run,
-        chunks=chunks,
-        batch_id=batch_id,
-    )
+    with use_strategy_profile(strategy_profile.profile_json):
+        llm_payloads, llm_errors, extraction_stats = await execute_graph_extraction_run(
+            db,
+            run=extraction_run,
+            chunks=chunks,
+            batch_id=batch_id,
+        )
     ensure_not_cancelled(db, batch_id)
 
     from app.services.maintenance import delete_document_graph_incremental
@@ -3032,7 +3085,8 @@ async def incremental_update_course_graph(
         changed_documents=len(changed_document_ids),
         graph_llm_success_chunks=len(llm_payloads),
     )
-    upsert_stats = await upsert_graph_candidates_from_chunks(db, course_id, chunks, llm_payloads=llm_payloads, run_llm_merge=False)
+    with use_strategy_profile(strategy_profile.profile_json):
+        upsert_stats = await upsert_graph_candidates_from_chunks(db, course_id, chunks, llm_payloads=llm_payloads, run_llm_merge=False)
     ensure_not_cancelled(db, batch_id)
     _safe_emit_log(
         batch_id,
@@ -3486,6 +3540,7 @@ def _graph_scope_snapshot(db: Session, course_id: str) -> dict[str, Any]:
 
 def record_course_graph_state(db: Session, course_id: str, *, build_mode: str) -> CourseGraphState:
     snapshot = _graph_scope_snapshot(db, course_id)
+    strategy_profile = get_active_profile_record(db, course_id)
     state = db.get(CourseGraphState, course_id)
     if state is None:
         state = CourseGraphState(
@@ -3501,6 +3556,7 @@ def record_course_graph_state(db: Session, course_id: str, *, build_mode: str) -
                 "built_at": datetime.utcnow().isoformat(),
                 "chunk_hash": snapshot["active_chunk_ids_hash"],
                 "mode": build_mode,
+                "strategy_profile_hash": strategy_profile.profile_hash,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -3510,6 +3566,8 @@ def record_course_graph_state(db: Session, course_id: str, *, build_mode: str) -
     state.active_document_version_ids = snapshot["active_document_version_ids"]
     state.active_chunk_ids_hash = snapshot["active_chunk_ids_hash"]
     state.graph_document_ids = snapshot["graph_document_ids"]
+    state.strategy_profile_id = strategy_profile.id
+    state.strategy_profile_hash = strategy_profile.profile_hash
     state.active_chunk_count = snapshot["active_chunk_count"]
     state.built_at = datetime.utcnow()
     return state
@@ -3530,6 +3588,7 @@ def graph_freshness(db: Session, course_id: str) -> dict:
     latest_chunk_version = latest_chunk_versions[-1] if latest_chunk_versions else None
     state = db.get(CourseGraphState, course_id)
     scope = _graph_scope_snapshot(db, course_id)
+    current_strategy_profile = get_active_profile_record(db, course_id)
     if state is None and evidence_chunk_ids:
         return {
             "is_stale": True,
@@ -3552,13 +3611,17 @@ def graph_freshness(db: Session, course_id: str) -> dict:
         uncovered_versions = sorted(set(current_versions) - set(graph_versions))
         removed_versions = sorted(set(graph_versions) - set(current_versions))
         chunk_scope_changed = state.active_chunk_ids_hash != scope["active_chunk_ids_hash"]
+        strategy_profile_changed = bool(state.strategy_profile_hash and state.strategy_profile_hash != current_strategy_profile.profile_hash)
         if (
             graph_versions != current_versions
             or chunk_scope_changed
             or state.embedding_text_version != CURRENT_EMBEDDING_TEXT_VERSION
+            or strategy_profile_changed
         ):
             if state.embedding_text_version != CURRENT_EMBEDDING_TEXT_VERSION:
                 reason = "embedding_text_version_changed"
+            elif strategy_profile_changed:
+                reason = "strategy_profile_changed"
             else:
                 reason = "active_documents_changed"
             return {
@@ -3579,6 +3642,9 @@ def graph_freshness(db: Session, course_id: str) -> dict:
                 "graph_build_id": state.graph_build_id,
                 "graph_built_at": state.built_at.isoformat() if state.built_at else None,
                 "chunk_scope_changed": chunk_scope_changed,
+                "strategy_profile_changed": strategy_profile_changed,
+                "current_strategy_profile_hash": current_strategy_profile.profile_hash,
+                "graph_strategy_profile_hash": state.strategy_profile_hash,
             }
     if not evidence_chunk_ids:
         return {
@@ -3622,6 +3688,8 @@ def graph_freshness(db: Session, course_id: str) -> dict:
         "graph_build_document_versions": sorted(state.active_document_version_ids or []) if state else [],
         "graph_build_id": state.graph_build_id if state else None,
         "graph_built_at": state.built_at.isoformat() if state and state.built_at else None,
+        "current_strategy_profile_hash": current_strategy_profile.profile_hash,
+        "graph_strategy_profile_hash": state.strategy_profile_hash if state else None,
     }
 
 

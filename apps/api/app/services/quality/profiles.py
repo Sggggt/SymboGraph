@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Chunk, Course, QualityProfile
 from app.services.quality.signals import build_quality_signals, tokenize
+from app.services.strategy_profiles import get_active_profile_record, profile_schema
 
 
 QUALITY_PROFILE_SCHEMA_VERSION = "quality_profile_v1"
@@ -44,7 +45,15 @@ def stratified_quality_sample(chunks: list[Chunk], limit: int = 32) -> list[Chun
     return selected
 
 
-def build_domain_quality_profile_payload(course: Course, chunks: list[Chunk], *, sample_limit: int = 32) -> dict[str, Any]:
+def build_domain_quality_profile_payload(
+    course: Course,
+    chunks: list[Chunk],
+    *,
+    sample_limit: int = 32,
+    strategy_profile: Any | None = None,
+) -> dict[str, Any]:
+    strategy_profile_json = getattr(strategy_profile, "profile_json", None) or {}
+    strategy_schema = profile_schema(strategy_profile_json)
     samples = stratified_quality_sample(chunks, limit=sample_limit)
     token_counter: Counter[str] = Counter()
     role_counter: Counter[str] = Counter()
@@ -85,13 +94,16 @@ def build_domain_quality_profile_payload(course: Course, chunks: list[Chunk], *,
         "schema_version": QUALITY_PROFILE_SCHEMA_VERSION,
         "course_id": course.id,
         "course_name": course.name,
+        "strategy_profile_id": getattr(strategy_profile, "id", None),
+        "strategy_profile_name": getattr(strategy_profile, "name", None),
+        "strategy_profile_hash": getattr(strategy_profile, "profile_hash", None),
         "sample_chunk_ids": [chunk.id for chunk in samples],
         "common_terms": [term for term, _count in token_counter.most_common(40)],
         "structural_noise_types": [role for role, _count in role_counter.most_common(20)],
         "positive_examples": positive_examples[:8],
         "negative_examples": negative_examples[:8],
-        "entity_type_hints": ["concept", "algorithm", "theorem", "definition", "formula", "problem_type", "method"],
-        "relation_schema_hints": ["is_a", "part_of", "prerequisite_of", "used_for", "causes", "derives_from", "compares_with", "example_of", "defined_by", "formula_of", "solves", "implemented_by"],
+        "entity_type_hints": strategy_schema["entity_types"],
+        "relation_schema_hints": strategy_schema["relation_types"],
     }
     profile["profile_hash"] = hashlib.sha256(repr(profile).encode("utf-8", errors="ignore")).hexdigest()[:16]
     return profile
@@ -110,7 +122,8 @@ def rebuild_domain_quality_profile(db: Session, course_id: str, *, sample_limit:
     if course is None:
         raise LookupError(f"Course not found: {course_id}")
     chunks = db.scalars(select(Chunk).where(Chunk.course_id == course_id, Chunk.is_active.is_(True)).order_by(Chunk.created_at.asc())).all()
-    payload = build_domain_quality_profile_payload(course, chunks, sample_limit=sample_limit)
+    strategy_profile = get_active_profile_record(db, course_id)
+    payload = build_domain_quality_profile_payload(course, chunks, sample_limit=sample_limit, strategy_profile=strategy_profile)
     for profile in db.scalars(select(QualityProfile).where(QualityProfile.course_id == course_id, QualityProfile.is_active.is_(True))).all():
         profile.is_active = False
     version = f"{QUALITY_PROFILE_SCHEMA_VERSION}:{payload['profile_hash']}"

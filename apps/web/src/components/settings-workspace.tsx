@@ -1,21 +1,28 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import type { ModelSettingsUpdate, RuntimeCheckResponse, RuntimeIssue, StructuredApiErrorBody } from "@course-kg/shared";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ModelSettingsUpdate, RuntimeCheckResponse, RuntimeIssue, StrategyProfileDetail, StructuredApiErrorBody } from "@course-kg/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
+  Copy,
+  Bot,
   EyeOff,
+  FilePlus2,
   KeyRound,
   Loader2,
   PencilLine,
   RotateCcw,
   Save,
+  Send,
   ShieldAlert,
   SlidersHorizontal,
+  Sparkles,
+  Trash2,
   XCircle,
 } from "lucide-react";
 
+import { useCourseContext } from "@/components/course-context";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
 import {
@@ -27,7 +34,20 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { fetchModelSettings, fetchRuntimeCheck, updateModelSettings } from "@/lib/api";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  bindStrategyProfile,
+  copyStrategyProfile,
+  createStrategyProfile,
+  deleteStrategyProfile,
+  fetchModelSettings,
+  fetchRuntimeCheck,
+  fetchStrategyProfile,
+  fetchStrategyProfiles,
+  streamProfileAssistant,
+  updateModelSettings,
+  updateStrategyProfile,
+} from "@/lib/api";
 
 type SettingsForm = {
   chat_base_url: string;
@@ -255,6 +275,666 @@ function StatusPill({ ok, children }: { ok: boolean; children: React.ReactNode }
   );
 }
 
+function formatProfileJson(profile: StrategyProfileDetail | null | undefined): string {
+  return JSON.stringify(profile?.profile_json ?? {}, null, 2);
+}
+
+type JsonDiagnostic = {
+  line: number;
+  column: number;
+  message: string;
+  reason: string;
+  severity: "error" | "warning";
+};
+
+type AssistantMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  profileJson?: Record<string, unknown>;
+  warnings?: string[];
+  profileHash?: string;
+};
+
+function makeLocalId(): string {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function getLineColumnFromPosition(text: string, position: number): { line: number; column: number } {
+  const before = text.slice(0, Math.max(0, position));
+  const lines = before.split("\n");
+  return { line: lines.length, column: lines[lines.length - 1].length + 1 };
+}
+
+function getLineForKey(text: string, key: string): number {
+  const lines = text.split("\n");
+  const pattern = new RegExp(`"${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"\\s*:`);
+  const index = lines.findIndex((line) => pattern.test(line));
+  return index >= 0 ? index + 1 : 1;
+}
+
+function getProfileJsonDiagnostics(text: string): JsonDiagnostic[] {
+  const diagnostics: JsonDiagnostic[] = [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "JSON 解析失败";
+    const positionMatch = message.match(/position\s+(\d+)/i);
+    const location = positionMatch ? getLineColumnFromPosition(text, Number(positionMatch[1])) : { line: 1, column: 1 };
+    diagnostics.push({
+      ...location,
+      severity: "error",
+      message,
+      reason: "JSON 语法不完整或存在多余字符，保存前必须修正。",
+    });
+    return diagnostics;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    diagnostics.push({
+      line: 1,
+      column: 1,
+      severity: "error",
+      message: "Profile JSON 必须是对象",
+      reason: "根节点需要是 strategy_profile_v1 对象，不能是数组、字符串或空值。",
+    });
+    return diagnostics;
+  }
+  const profile = parsed as Record<string, unknown>;
+  for (const key of ["schema_version", "ui_labels", "prompt_pack", "schema_pack", "parsing_strategy", "graph_strategy", "retrieval_strategy", "quality_policy"]) {
+    if (!(key in profile)) {
+      diagnostics.push({
+        line: 1,
+        column: 1,
+        severity: "warning",
+        message: `缺少 ${key}`,
+        reason: "后端会尝试补默认值，但建议显式保留完整结构，避免 Profile 语义不清。",
+      });
+    }
+  }
+  const schemaPack = profile.schema_pack;
+  if (!schemaPack || typeof schemaPack !== "object" || Array.isArray(schemaPack)) {
+    diagnostics.push({
+      line: getLineForKey(text, "schema_pack"),
+      column: 1,
+      severity: "error",
+      message: "schema_pack 必须是对象",
+      reason: "实体类型、关系类型、别名和禁用标签都需要放在 schema_pack 中。",
+    });
+    return diagnostics;
+  }
+  const schema = schemaPack as Record<string, unknown>;
+  const entityTypes = schema.entity_types;
+  const relationTypes = schema.relation_types;
+  if (!Array.isArray(entityTypes) || entityTypes.some((item) => typeof item !== "string" || !item.trim())) {
+    diagnostics.push({
+      line: getLineForKey(text, "entity_types"),
+      column: 1,
+      severity: "error",
+      message: "schema_pack.entity_types 必须是非空字符串数组",
+      reason: "图谱抽取和实体归一需要至少一个合法实体类型。",
+    });
+  }
+  if (!Array.isArray(relationTypes) || relationTypes.some((item) => typeof item !== "string" || !item.trim())) {
+    diagnostics.push({
+      line: getLineForKey(text, "relation_types"),
+      column: 1,
+      severity: "error",
+      message: "schema_pack.relation_types 必须是非空字符串数组",
+      reason: "关系候选准入和归一需要至少一个合法关系类型。",
+    });
+  }
+  const promptPack = profile.prompt_pack;
+  if (!promptPack || typeof promptPack !== "object" || Array.isArray(promptPack)) {
+    diagnostics.push({
+      line: getLineForKey(text, "prompt_pack"),
+      column: 1,
+      severity: "error",
+      message: "prompt_pack 必须是对象",
+      reason: "问答、图谱抽取、反思和社区摘要 prompt 都需要从 prompt_pack 读取。",
+    });
+  } else if (typeof (promptPack as Record<string, unknown>).graph_extraction_system !== "string") {
+    diagnostics.push({
+      line: getLineForKey(text, "graph_extraction_system"),
+      column: 1,
+      severity: "warning",
+      message: "缺少 prompt_pack.graph_extraction_system",
+      reason: "缺少图谱抽取 prompt 会降低自定义资料库类型的约束力。",
+    });
+  }
+  return diagnostics;
+}
+
+function parseProfileJson(text: string): { value?: Record<string, unknown>; error?: string } {
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { error: "Profile JSON 必须是对象。" };
+    }
+    return { value: parsed as Record<string, unknown> };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : "JSON 解析失败。" };
+  }
+}
+
+function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }) {
+  const queryClient = useQueryClient();
+  const { selectedCourseId, selectedCourse } = useCourseContext();
+  const profilesQuery = useQuery({ queryKey: ["strategy-profiles"], queryFn: fetchStrategyProfiles });
+  const [selectedProfileId, setSelectedProfileId] = useState("");
+  const [name, setName] = useState("");
+  const [libraryType, setLibraryType] = useState("custom");
+  const [jsonText, setJsonText] = useState("{}");
+  const [message, setMessage] = useState<string | null>(null);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [assistantPrompt, setAssistantPrompt] = useState("");
+  const [assistantSessionId, setAssistantSessionId] = useState<string | null>(null);
+  const [assistantMessages, setAssistantMessages] = useState<AssistantMessage[]>([]);
+  const [assistantDraft, setAssistantDraft] = useState("");
+  const [assistantResult, setAssistantResult] = useState<{ profileJson: Record<string, unknown>; warnings: string[]; profileHash?: string } | null>(null);
+  const [assistantStreaming, setAssistantStreaming] = useState(false);
+  const [assistantError, setAssistantError] = useState<string | null>(null);
+  const assistantScrollRef = useRef<HTMLDivElement | null>(null);
+
+  const currentProfile = profilesQuery.data?.find((profile) => profile.id === selectedProfileId) ?? null;
+  const activeProfile = profilesQuery.data?.find((profile) => profile.id === selectedCourse?.active_profile_id) ?? null;
+  const detailQuery = useQuery({
+    queryKey: ["strategy-profile", selectedProfileId],
+    queryFn: () => fetchStrategyProfile(selectedProfileId),
+    enabled: Boolean(selectedProfileId),
+  });
+
+  const parsed = useMemo(() => parseProfileJson(jsonText), [jsonText]);
+  const jsonDiagnostics = useMemo(() => getProfileJsonDiagnostics(jsonText), [jsonText]);
+  const hasJsonErrors = jsonDiagnostics.some((item) => item.severity === "error");
+  const firstJsonError = jsonDiagnostics.find((item) => item.severity === "error");
+  const jsonErrorLineStyle = firstJsonError
+    ? {
+        backgroundImage: "linear-gradient(rgba(244,63,94,0.22), rgba(244,63,94,0.22))",
+        backgroundPosition: `0 ${16 + Math.max(0, firstJsonError.line - 1) * 20}px`,
+        backgroundRepeat: "no-repeat",
+        backgroundSize: "100% 20px",
+        lineHeight: "20px",
+      }
+    : { lineHeight: "20px" };
+  const validationWarnings = detailQuery.data?.warnings ?? [];
+
+  useEffect(() => {
+    assistantScrollRef.current?.scrollTo({ top: assistantScrollRef.current.scrollHeight });
+  }, [assistantMessages, assistantDraft, assistantResult, assistantOpen]);
+
+  useEffect(() => {
+    if (!profilesQuery.data?.length) {
+      return;
+    }
+    const nextId = selectedCourse?.active_profile_id || profilesQuery.data[0]?.id || "";
+    if (!selectedProfileId || !profilesQuery.data.some((profile) => profile.id === selectedProfileId)) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setSelectedProfileId(nextId);
+    }
+  }, [profilesQuery.data, selectedCourse?.active_profile_id, selectedProfileId]);
+
+  useEffect(() => {
+    if (!detailQuery.data) {
+      return;
+    }
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setName(detailQuery.data.name);
+    setLibraryType(detailQuery.data.library_type);
+    setJsonText(formatProfileJson(detailQuery.data));
+  }, [detailQuery.data]);
+
+  const invalidateProfiles = async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["strategy-profiles"] }),
+      queryClient.invalidateQueries({ queryKey: ["strategy-profile", selectedProfileId] }),
+      queryClient.invalidateQueries({ queryKey: ["courses"] }),
+      queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] }),
+      queryClient.invalidateQueries({ queryKey: ["graph", selectedCourseId] }),
+    ]);
+  };
+
+  const saveMutation = useMutation({
+    mutationFn: async () => {
+      if (!selectedProfileId || !parsed.value) {
+        throw new Error(parsed.error || "Profile JSON 无效。");
+      }
+      return updateStrategyProfile(selectedProfileId, {
+        name: name.trim(),
+        library_type: libraryType.trim() || "custom",
+        profile_json: parsed.value,
+      });
+    },
+    onSuccess: async (data) => {
+      setMessage("Profile 已保存。");
+      setJsonText(JSON.stringify(data.profile.profile_json, null, 2));
+      await invalidateProfiles();
+    },
+    onError,
+  });
+
+  const copyMutation = useMutation({
+    mutationFn: () => copyStrategyProfile(selectedProfileId, { name: `${name || currentProfile?.name || "Profile"} Copy` }),
+    onSuccess: async (data) => {
+      setSelectedProfileId(data.profile.id);
+      setMessage("已复制为自定义 Profile。");
+      await invalidateProfiles();
+    },
+    onError,
+  });
+
+  const createMutation = useMutation({
+    mutationFn: () => createStrategyProfile({ name: "新 Profile", library_type: "custom", profile_json: parsed.value || {} }),
+    onSuccess: async (data) => {
+      setSelectedProfileId(data.profile.id);
+      setMessage("已创建新 Profile。");
+      await invalidateProfiles();
+    },
+    onError,
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: () => deleteStrategyProfile(selectedProfileId),
+    onSuccess: async () => {
+      setDeleteConfirmOpen(false);
+      setSelectedProfileId("");
+      setMessage("Profile 已删除；如有资料库曾绑定它，后端已自动切回默认 Profile。");
+      await invalidateProfiles();
+    },
+    onError,
+  });
+
+  const bindMutation = useMutation({
+    mutationFn: () => {
+      if (!selectedCourseId) {
+        throw new Error("请先选择资料库。");
+      }
+      return bindStrategyProfile({ course_id: selectedCourseId, profile_id: selectedProfileId });
+    },
+    onSuccess: async () => {
+      setMessage("已设为当前资料库 Profile。");
+      await invalidateProfiles();
+    },
+    onError,
+  });
+
+  async function runAssistant() {
+    const prompt = assistantPrompt.trim();
+    if (!prompt || assistantStreaming) {
+      return;
+    }
+    setAssistantPrompt("");
+    setAssistantDraft("");
+    setAssistantResult(null);
+    setAssistantError(null);
+    setAssistantStreaming(true);
+    setAssistantMessages((items) => [...items, { id: makeLocalId(), role: "user", content: prompt }]);
+
+    let streamedText = "";
+    let streamedResult: { profileJson: Record<string, unknown>; warnings: string[]; profileHash?: string } | null = null;
+    let streamedError: string | null = null;
+    try {
+      await streamProfileAssistant(
+        {
+          prompt,
+          session_id: assistantSessionId,
+          base_profile_id: selectedProfileId || null,
+        },
+        {
+          onMeta: (meta) => {
+            if (meta.session_id) {
+              setAssistantSessionId(meta.session_id);
+            }
+          },
+          onToken: (token) => {
+            streamedText += token;
+            setAssistantDraft(streamedText);
+          },
+          onProfileJson: (result) => {
+            streamedResult = {
+              profileJson: result.profile_json,
+              warnings: result.warnings,
+              profileHash: result.profile_hash,
+            };
+            setAssistantResult(streamedResult);
+          },
+          onError: (value) => {
+            streamedError = value;
+            setAssistantError(value);
+          },
+        },
+      );
+      if (streamedError) {
+        throw new Error(streamedError);
+      }
+      setAssistantMessages((items) => [
+        ...items,
+        {
+          id: makeLocalId(),
+          role: "assistant",
+          content: streamedText || "已生成 Profile 草案。",
+          profileJson: streamedResult?.profileJson,
+          warnings: streamedResult?.warnings,
+          profileHash: streamedResult?.profileHash,
+        },
+      ]);
+      setAssistantDraft("");
+      setAssistantResult(null);
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : "Profile 助手生成失败";
+      setAssistantError(messageText);
+      onError(error);
+    } finally {
+      setAssistantStreaming(false);
+    }
+  }
+
+  function applyAssistantProfile(profileJson: Record<string, unknown>, warnings: string[] = []) {
+    setJsonText(JSON.stringify(profileJson, null, 2));
+    setMessage(
+      isBuiltin
+        ? "草案已填入高级 JSON。内置 Profile 受保护，请复制后保存。"
+        : warnings.length
+          ? warnings.join("；")
+          : "草案已填入高级 JSON，请检查诊断结果后保存。",
+    );
+    setAssistantOpen(false);
+  }
+
+  if (profilesQuery.isLoading) {
+    return <LoadingBlock rows={3} />;
+  }
+  if (profilesQuery.error) {
+    return <ErrorBlock message={(profilesQuery.error as Error).message} />;
+  }
+
+  const isBuiltin = Boolean(currentProfile?.is_builtin || detailQuery.data?.is_builtin);
+  const selectedProfileCourseIds = currentProfile?.course_ids ?? detailQuery.data?.course_ids ?? [];
+  const deleteBlockedReason = isBuiltin ? "默认内置 Profile 受保护；请复制后编辑。" : null;
+  const deleteImpactMessage =
+    selectedProfileCourseIds.length > 0
+      ? `该 Profile 当前绑定 ${selectedProfileCourseIds.length} 个资料库。删除后，这些资料库会自动切回默认 Profile；已有 chunks、图谱、向量和会话不会被改写。`
+      : "该 Profile 当前没有绑定资料库。删除后会从列表中隐藏，已有历史数据不会被改写。";
+  const hashMismatch = Boolean(
+    selectedCourse?.active_profile_hash &&
+      activeProfile?.profile_hash &&
+      selectedCourse.active_profile_hash !== activeProfile.profile_hash,
+  );
+  const renderAssistantJsonCard = (
+    profileJson: Record<string, unknown>,
+    warnings: string[] = [],
+    profileHash?: string,
+  ) => (
+    <div className="mt-3 rounded-2xl border border-cyan-200/15 bg-black/25 p-3">
+      <div className="mb-2 flex items-center justify-between gap-3 text-xs text-cyan-100/70">
+        <span>高级 JSON 结果</span>
+        {profileHash ? <span className="break-all">hash {profileHash}</span> : null}
+      </div>
+      <pre className="max-h-64 overflow-auto rounded-xl bg-black/35 p-3 font-mono text-[11px] leading-5 text-cyan-50">
+        {JSON.stringify(profileJson, null, 2)}
+      </pre>
+      {warnings.length ? (
+        <div className="mt-2 space-y-1">
+          {warnings.map((warning) => (
+            <p key={warning} className="text-xs leading-5 text-amber-100">
+              {warning}
+            </p>
+          ))}
+        </div>
+      ) : null}
+      <Button type="button" className="mt-3 w-full rounded-full" onClick={() => applyAssistantProfile(profileJson, warnings)}>
+        <Sparkles data-icon="inline-start" />
+        自动填充
+      </Button>
+    </div>
+  );
+
+  return (
+    <section className="grid gap-6 xl:grid-cols-[minmax(300px,0.7fr)_minmax(560px,1.3fr)]">
+      <aside className="space-y-5">
+        <div>
+          <p className="section-kicker">Profile 设置</p>
+          <h2 className="glow-text mt-2 text-3xl font-semibold text-white">资料库 Profile</h2>
+          <p className="mt-4 text-sm leading-7 text-cyan-50/62">
+            Profile 只影响之后启动的新解析、图谱抽取、检索和问答任务；已有 chunks、向量、图谱和会话不会被自动改写。
+          </p>
+        </div>
+        <div className={sectionClass}>
+          <p className="text-sm font-semibold text-white">当前绑定</p>
+          <div className="mt-3 space-y-2 text-sm leading-6 text-white/62">
+            <p>资料库：{selectedCourse?.name ?? "未选择"}</p>
+            <p>Profile：{activeProfile?.name ?? selectedCourse?.active_profile_name ?? "未绑定"}</p>
+            <p className="break-all">Hash：{selectedCourse?.active_profile_hash ?? "missing"}</p>
+          </div>
+          {hashMismatch ? (
+            <p className="mt-4 rounded-xl border border-amber-200/20 bg-amber-200/[0.06] p-3 text-sm leading-6 text-amber-100">
+              当前资料库记录的 Profile hash 与列表中的 Profile hash 不一致。切换或修改后，请显式重新解析或重建图谱。
+            </p>
+          ) : null}
+        </div>
+      </aside>
+
+      <div className="grid gap-5">
+        <section className={sectionClass}>
+          <div className="grid gap-4 md:grid-cols-[1fr_0.7fr]">
+            <label className="flex flex-col gap-2">
+              <span className="text-xs uppercase tracking-[0.2em] text-cyan-100/46">Profile</span>
+              <select
+                value={selectedProfileId}
+                onChange={(event) => setSelectedProfileId(event.target.value)}
+                className={`${inputClass} kg-dark-select outline-none`}
+              >
+                {(profilesQuery.data ?? []).map((profile) => (
+                  <option key={profile.id} value={profile.id}>
+                    {profile.name}{profile.is_builtin ? " / built-in" : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <SettingField label="Library Type" value={libraryType} onChange={setLibraryType} disabled={isBuiltin} />
+            <SettingField label="名称" value={name} onChange={setName} disabled={isBuiltin} className="md:col-span-2" />
+          </div>
+          <div className="mt-4 flex flex-wrap gap-2">
+            <Button type="button" variant="outline" className="rounded-full" onClick={() => copyMutation.mutate()} disabled={!selectedProfileId || copyMutation.isPending}>
+              <Copy data-icon="inline-start" />
+              复制预设
+            </Button>
+            <Button type="button" variant="outline" className="rounded-full" onClick={() => createMutation.mutate()} disabled={createMutation.isPending || hasJsonErrors}>
+              <FilePlus2 data-icon="inline-start" />
+              新建
+            </Button>
+            <Button type="button" variant="outline" className="rounded-full" onClick={() => setAssistantOpen(true)}>
+              <Sparkles data-icon="inline-start" />
+              AI 设置助手
+            </Button>
+            <Button type="button" className="rounded-full" onClick={() => bindMutation.mutate()} disabled={!selectedCourseId || !selectedProfileId || bindMutation.isPending}>
+              设为当前资料库
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              className="rounded-full border-rose-200/20 text-rose-100 disabled:text-white/35"
+              onClick={() => {
+                if (deleteBlockedReason) {
+                  setMessage(deleteBlockedReason);
+                  return;
+                }
+                deleteMutation.reset();
+                setDeleteConfirmOpen(true);
+              }}
+              disabled={Boolean(deleteBlockedReason) || !selectedProfileId || deleteMutation.isPending}
+              title={deleteBlockedReason ?? undefined}
+            >
+              <Trash2 data-icon="inline-start" />
+              删除 Profile
+            </Button>
+          </div>
+          {deleteBlockedReason ? <p className="mt-3 text-sm leading-6 text-amber-100/80">{deleteBlockedReason}</p> : null}
+        </section>
+
+        <section className={sectionClass}>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-semibold text-white">高级 JSON</p>
+              <p className="mt-1 text-sm text-white/52">结构化字段与高级 JSON 共用同一份 Profile schema。</p>
+            </div>
+            <Button type="button" className="rounded-full" onClick={() => saveMutation.mutate()} disabled={isBuiltin || hasJsonErrors || saveMutation.isPending}>
+              {saveMutation.isPending ? <Loader2 data-icon="inline-start" className="animate-spin" /> : <Save data-icon="inline-start" />}
+              保存 Profile
+            </Button>
+          </div>
+          <div className="grid gap-3 lg:grid-cols-[minmax(180px,0.35fr)_minmax(0,1fr)]">
+            <div className="h-[460px] max-h-[460px] overflow-y-auto rounded-2xl border border-white/10 bg-black/20 p-3">
+              <div className="mb-3 flex items-center justify-between gap-2">
+                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-100/55">诊断</p>
+                <span className={`rounded-full px-2 py-0.5 text-[11px] ${hasJsonErrors ? "bg-rose-400/10 text-rose-100" : "bg-emerald-400/10 text-emerald-100"}`}>
+                  {hasJsonErrors ? "error" : "ok"}
+                </span>
+              </div>
+              {jsonDiagnostics.length ? (
+                <div className="space-y-2">
+                  {jsonDiagnostics.map((item, index) => (
+                    <div key={`${item.line}-${item.column}-${index}`} className={`rounded-xl border p-3 text-xs leading-5 ${item.severity === "error" ? "border-rose-200/20 bg-rose-200/[0.06] text-rose-100" : "border-amber-200/20 bg-amber-200/[0.05] text-amber-100"}`}>
+                      <p className="font-semibold">第 {item.line} 行，第 {item.column} 列</p>
+                      <p className="mt-1">{item.message}</p>
+                      <p className="mt-1 text-white/52">原因：{item.reason}</p>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="rounded-xl border border-emerald-200/20 bg-emerald-200/[0.05] p-3 text-xs leading-5 text-emerald-100">
+                  未发现格式错误。保存时仍会执行后端 Profile schema 校验。
+                </p>
+              )}
+            </div>
+            <Textarea
+              value={jsonText}
+              onChange={(event) => setJsonText(event.target.value)}
+              disabled={isBuiltin}
+              spellCheck={false}
+              style={jsonErrorLineStyle}
+              className={`h-[460px] max-h-[460px] resize-none overflow-y-auto rounded-2xl border-white/10 bg-black/20 p-4 font-mono text-xs leading-5 text-cyan-50 ${firstJsonError ? "border-rose-300/40" : ""}`}
+            />
+          </div>
+          <div className="mt-4 grid gap-2">
+            {hasJsonErrors ? <p className="rounded-xl border border-rose-200/20 bg-rose-200/[0.06] p-3 text-sm text-rose-100">请先修正左侧诊断栏中的 JSON 错误。</p> : <p className="text-sm text-emerald-100">JSON 格式有效。</p>}
+            {validationWarnings.map((warning) => (
+              <p key={warning} className="rounded-xl border border-amber-200/20 bg-amber-200/[0.05] p-3 text-sm text-amber-100">
+                {warning}
+              </p>
+            ))}
+            {isBuiltin ? <p className="text-sm text-white/48">内置 Profile 受保护；复制后可编辑。</p> : null}
+            {message ? <p className="text-sm text-cyan-100">{message}</p> : null}
+          </div>
+        </section>
+      </div>
+
+      {assistantOpen ? (
+        <div className="fixed inset-y-0 right-0 z-50 flex w-full max-w-xl flex-col border-l border-white/10 bg-[#07111f]/95 p-5 text-white shadow-2xl backdrop-blur-xl">
+          <div className="flex items-start justify-between gap-4 border-b border-white/10 pb-4">
+            <div>
+              <p className="section-kicker">AI 设置助手</p>
+              <h3 className="mt-2 text-2xl font-semibold">Profile 对话草案</h3>
+              {assistantSessionId ? <p className="mt-1 max-w-sm truncate text-xs text-white/45">Redis 会话：{assistantSessionId}</p> : null}
+            </div>
+            <Button type="button" variant="outline" className="rounded-full" onClick={() => setAssistantOpen(false)}>
+              关闭
+            </Button>
+          </div>
+          <div ref={assistantScrollRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto py-4 pr-1">
+            {assistantMessages.length === 0 && !assistantDraft ? (
+              <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4 text-sm leading-7 text-white/62">
+                输入资料库类型、实体/关系、章节或条款规则、引用要求和检索偏好。助手会先输出说明，再给出一个可填充的高级 JSON 草案。
+              </div>
+            ) : null}
+            {assistantMessages.map((item) => (
+              <div key={item.id} className={`flex ${item.role === "user" ? "justify-end" : "justify-start"}`}>
+                <div className={`max-w-[92%] rounded-2xl border p-3 text-sm leading-7 ${item.role === "user" ? "border-cyan-200/20 bg-cyan-200/[0.08] text-cyan-50" : "border-white/10 bg-white/[0.04] text-white/78"}`}>
+                  {item.role === "assistant" ? (
+                    <div className="mb-2 flex items-center gap-2 text-xs text-cyan-100/65">
+                      <Bot className="size-3.5" />
+                      Profile Assistant
+                    </div>
+                  ) : null}
+                  <p className="whitespace-pre-wrap">{item.content}</p>
+                  {item.profileJson ? renderAssistantJsonCard(item.profileJson, item.warnings ?? [], item.profileHash) : null}
+                </div>
+              </div>
+            ))}
+            {assistantStreaming ? (
+              <div className="flex justify-start">
+                <div className="max-w-[92%] rounded-2xl border border-white/10 bg-white/[0.04] p-3 text-sm leading-7 text-white/78">
+                  <div className="mb-2 flex items-center gap-2 text-xs text-cyan-100/65">
+                    <span className="signal-bars">
+                      <span />
+                      <span />
+                      <span />
+                      <span />
+                    </span>
+                    正在生成
+                  </div>
+                  {assistantDraft ? <p className="whitespace-pre-wrap">{assistantDraft}</p> : null}
+                  {assistantResult ? renderAssistantJsonCard(assistantResult.profileJson, assistantResult.warnings, assistantResult.profileHash) : null}
+                </div>
+              </div>
+            ) : null}
+            {assistantError ? (
+              <p className="rounded-xl border border-rose-200/20 bg-rose-200/[0.06] p-3 text-sm text-rose-100">
+                {assistantError}
+              </p>
+            ) : null}
+          </div>
+          <div className="border-t border-white/10 pt-4">
+            <Textarea
+              value={assistantPrompt}
+              onChange={(event) => setAssistantPrompt(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                  event.preventDefault();
+                  void runAssistant();
+                }
+              }}
+              placeholder="描述资料库类型、实体/关系、引用规则、分区规则和检索偏好。"
+              className="min-h-24 resize-none rounded-2xl border-white/10 bg-white/[0.04] text-white"
+            />
+            <Button type="button" className="mt-3 w-full rounded-full" onClick={() => void runAssistant()} disabled={!assistantPrompt.trim() || assistantStreaming}>
+              {assistantStreaming ? <Loader2 data-icon="inline-start" className="animate-spin" /> : <Send data-icon="inline-start" />}
+              发送
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      <Dialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
+        <DialogContent className="max-h-[calc(100vh-2rem)] w-[min(42rem,calc(100vw-2rem))] overflow-hidden rounded-3xl border border-white/10 bg-[#101826] p-0 text-white shadow-2xl sm:!max-w-xl">
+          <DialogHeader className="border-b border-white/8 px-6 py-5 pr-14">
+            <DialogTitle>确认删除 Profile</DialogTitle>
+            <DialogDescription className="break-words text-cyan-100/70">
+              {currentProfile?.name ? `即将删除「${currentProfile.name}」。默认内置 Profile 不能删除，其他 Profile 删除后会软删除并从列表隐藏。` : "即将删除当前 Profile。"}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[55vh] space-y-4 overflow-y-auto px-6 py-5">
+            <p className="rounded-2xl border border-amber-200/18 bg-amber-200/[0.06] p-4 text-sm leading-6 text-amber-50/85">
+              {deleteImpactMessage}
+            </p>
+            {deleteMutation.error ? <p className="text-sm text-rose-100/80">{(deleteMutation.error as Error).message}</p> : null}
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-3 border-t border-white/10 bg-white/[0.03] px-6 py-4">
+            <Button type="button" variant="outline" className="rounded-full" onClick={() => setDeleteConfirmOpen(false)} disabled={deleteMutation.isPending}>
+              取消
+            </Button>
+            <Button type="button" className="rounded-full" onClick={() => deleteMutation.mutate()} disabled={!selectedProfileId || deleteMutation.isPending}>
+              {deleteMutation.isPending ? <Loader2 data-icon="inline-start" className="animate-spin" /> : <Trash2 data-icon="inline-start" />}
+              删除
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </section>
+  );
+}
+
 export function SettingsWorkspace() {
   const queryClient = useQueryClient();
   const settingsQuery = useQuery({ queryKey: ["model-settings"], queryFn: fetchModelSettings });
@@ -264,6 +944,7 @@ export function SettingsWorkspace() {
   const [apiKeyEditing, setApiKeyEditing] = useState(false);
   const [embeddingApiKeyEditing, setEmbeddingApiKeyEditing] = useState(false);
   const [errorDialog, setErrorDialog] = useState<ErrorDialogState | null>(null);
+  const [activeTab, setActiveTab] = useState<"model" | "profile">("model");
 
   useEffect(() => {
     if (!settingsQuery.data) {
@@ -409,7 +1090,24 @@ export function SettingsWorkspace() {
   return (
     <div className="kg-page">
       <section className="glass-panel rounded-[28px] p-6 lg:p-8">
-        <div className="grid gap-7 xl:grid-cols-[minmax(320px,0.72fr)_minmax(560px,1.28fr)]">
+        <div className="mb-6 flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => setActiveTab("model")}
+            className={`rounded-full border px-4 py-2 text-sm transition ${activeTab === "model" ? "border-cyan-200/30 bg-cyan-300/[0.08] text-cyan-50" : "border-white/10 text-white/58 hover:text-white"}`}
+          >
+            模型与运行配置
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab("profile")}
+            className={`rounded-full border px-4 py-2 text-sm transition ${activeTab === "profile" ? "border-cyan-200/30 bg-cyan-300/[0.08] text-cyan-50" : "border-white/10 text-white/58 hover:text-white"}`}
+          >
+            Profile 设置
+          </button>
+        </div>
+        {activeTab === "profile" ? <ProfileSettingsPanel onError={(error) => setErrorDialog(errorDialogFromUnknown(error))} /> : null}
+        <div className={activeTab === "model" ? "grid gap-7 xl:grid-cols-[minmax(320px,0.72fr)_minmax(560px,1.28fr)]" : "hidden"}>
           <aside className="space-y-6">
             <div>
               <p className="section-kicker">生产参数配置</p>

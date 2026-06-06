@@ -65,6 +65,29 @@
 | 自动超参优化   | `ENABLE_AUTO_HPO=true` 时，图谱重建前自动运行 TPE 寻优最优阈值和权重组合            |
 | 增量图谱更新   | 仅对变更文档关联的图谱局部重算，避免无必要全量重建                                   |
 
+## 资料库 Profile
+
+SymboGraph 现在支持“资料库 Profile”体系，用来把课程、法律文件、企业资料、书籍、数据资料等不同资料库类型的 prompt、schema、解析策略、图谱策略、检索策略和质量准入策略从硬编码中解耦出来。
+
+- 每个资料库都会绑定一个 active Profile。新建资料库默认绑定内置“课程资料库默认 Profile”，因此默认 RAG、图谱、检索和 agent 行为保持兼容。
+- Profile 配置保存在 PostgreSQL 的 `strategy_profiles` 表中，不写入 `.env`；资料库通过 `courses.active_profile_id` 关联当前 Profile。
+- 默认内置 Profile 不能编辑或删除；需要修改时先复制为自定义 Profile。除默认 Profile 外，其他 Profile 都可以删除；若删除时仍有资料库绑定，后端会把这些资料库自动切回默认 Profile。
+- Profile 切换或修改只影响之后启动的新解析、图谱抽取、检索和问答任务，不会自动改写已有 chunks、图谱、向量或会话。图谱抽取运行会记录 Profile hash，用于前端提示旧数据可能需要重新解析或重建。
+- 设置页拆分为“模型与运行配置”和“Profile 设置”。Profile 设置页包含 Profile 选择/复制/新建/保存/绑定/删除、AI 设置助手、结构诊断和高级 JSON 编辑。
+- AI 设置助手使用当前 `chat_model` 生成自然语言说明和 Profile JSON 草案；结果只进入前端草稿，用户点击“自动填充”和“保存 Profile”后才落库。助手会话状态通过 Redis 记录。
+
+Profile JSON 的核心结构包括：
+
+| 字段 | 作用 |
+| --- | --- |
+| `ui_labels` | 资料库、分区、实体、关系、路由等显示名 |
+| `prompt_pack` | 问答、图谱抽取、意图识别、引用验证、反思、社区摘要等 prompt |
+| `schema_pack` | 实体类型、关系类型、别名映射、禁用标签和默认类型 |
+| `parsing_strategy` | 章节/条款/分区识别、内容类型偏好、OCR/表格/代码处理提示 |
+| `graph_strategy` | 抽取预算、关系准入、合并规则、HPO/社区摘要偏好 |
+| `retrieval_strategy` | query 类型、路由词、dense/BM25/rerank 权重提示 |
+| `quality_policy` | 结构噪声词、通用词、实体/关系准入阈值 |
+
 ## 系统架构
 
 ```mermaid
@@ -808,6 +831,7 @@ erDiagram
     Concept ||--o{ ConceptRelation : target
     Course ||--o{ IngestionBatch : batches
     IngestionBatch ||--o{ IngestionJob : jobs
+    StrategyProfile ||--o{ Course : active_profile
     Course ||--o{ QualityProfile : profiles
     Course ||--o{ QASession : sessions
     QASession ||--o{ AgentRun : runs
@@ -825,12 +849,13 @@ erDiagram
 
 | 表                                                  | 作用                                                             |
 | --------------------------------------------------- | ---------------------------------------------------------------- |
-| `courses`                                           | 知识库工作区                                                     |
+| `courses`                                           | 知识库工作区、当前 chunk 版本和 active Profile 绑定              |
 | `documents` / `document_versions`                   | 文件元数据、版本和解析产物路径                                   |
 | `chunks`                                            | 父子文本块、摘要、关键词、embedding text version 和证据文本      |
 | `concepts`                                          | 概念、章节引用、证据数、社区、中心性和图谱排序                   |
 | `concept_aliases`                                   | 概念别名和规范化别名                                             |
 | `concept_relations`                                 | 稀疏边、关系类型、证据 chunk、权重、语义相似度、支持数和推断来源 |
+| `strategy_profiles`                                 | 资料库 Profile JSON、schema/prompt/策略包、hash、内置与启用状态 |
 | `quality_profiles`                                  | 领域质量画像（版本化、分层采样、正负样本、术语基线）             |
 | `ingestion_batches` / `ingestion_jobs`              | 批量导入与单文件任务                                             |
 | `ingestion_logs` / `ingestion_compensation_logs`    | 事件日志与跨存储补偿记录                                         |

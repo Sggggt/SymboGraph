@@ -24,23 +24,9 @@ CourseFileStatus = Literal["pending", "parsing", "parsed", "failed", "skipped"]
 SourceType = Literal["pdf", "ppt", "pptx", "docx", "markdown", "text", "image", "notebook", "html", "unknown"]
 AgentRoute = Literal["direct_answer", "retrieve_notes", "retrieve_exercises", "retrieve_both", "clarify", "multi_hop_research"]
 AgentRunState = Literal["queued", "running", "needs_clarification", "completed", "failed"]
-GraphRelationType = Literal[
-    "is_a",
-    "part_of",
-    "prerequisite_of",
-    "used_for",
-    "causes",
-    "derives_from",
-    "compares_with",
-    "example_of",
-    "defined_by",
-    "formula_of",
-    "solves",
-    "implemented_by",
-    "related_to",
-]
+GraphRelationType = str
 GraphType = Literal["semantic", "structural", "evidence"]
-SemanticEntityType = Literal["concept", "method", "formula", "metric", "algorithm", "definition", "theorem", "problem_type"]
+SemanticEntityType = str
 GraphNodeCategory = Literal["semantic_entity", "course", "document", "chapter", "section", "chunk", "evidence_chunk", "document_version"]
 
 SEMANTIC_ENTITY_TYPE_VALUES = {"concept", "method", "formula", "metric", "algorithm", "definition", "theorem", "problem_type"}
@@ -81,21 +67,33 @@ GRAPH_RELATION_TYPE_ALIASES = {
 
 
 def _normalize_semantic_entity_type(value: object) -> str:
+    from app.services.strategy_profiles import active_profile_json, profile_schema
+
     if not isinstance(value, str):
-        return "concept"
+        value = ""
+    schema_pack = profile_schema(active_profile_json())
+    allowed = set(schema_pack.get("entity_types") or SEMANTIC_ENTITY_TYPE_VALUES)
+    default_type = str(schema_pack.get("default_entity_type") or "concept")
+    aliases = dict(schema_pack.get("entity_aliases") or SEMANTIC_ENTITY_TYPE_ALIASES)
     entity_type = value.strip().lower().replace("-", "_").replace(" ", "_")
-    entity_type = SEMANTIC_ENTITY_TYPE_ALIASES.get(value.strip().lower(), entity_type)
-    entity_type = SEMANTIC_ENTITY_TYPE_ALIASES.get(entity_type, entity_type)
-    return entity_type if entity_type in SEMANTIC_ENTITY_TYPE_VALUES else "concept"
+    entity_type = aliases.get(value.strip().lower(), entity_type)
+    entity_type = aliases.get(entity_type, entity_type)
+    return entity_type if entity_type in allowed else default_type
 
 
 def _normalize_graph_relation_type(value: object) -> str:
+    from app.services.strategy_profiles import active_profile_json, profile_schema
+
     if not isinstance(value, str):
-        return "related_to"
+        value = ""
+    schema_pack = profile_schema(active_profile_json())
+    allowed = set(schema_pack.get("relation_types") or GRAPH_RELATION_TYPE_VALUES)
+    default_type = str(schema_pack.get("default_relation_type") or "related_to")
+    aliases = dict(schema_pack.get("relation_aliases") or GRAPH_RELATION_TYPE_ALIASES)
     relation_type = value.strip().lower().replace("-", "_")
-    relation_type = GRAPH_RELATION_TYPE_ALIASES.get(value.strip().lower(), relation_type)
-    relation_type = GRAPH_RELATION_TYPE_ALIASES.get(relation_type, relation_type)
-    return relation_type if relation_type in GRAPH_RELATION_TYPE_VALUES else "related_to"
+    relation_type = aliases.get(value.strip().lower(), relation_type)
+    relation_type = aliases.get(relation_type, relation_type)
+    return relation_type if relation_type in allowed else default_type
 
 
 def _normalize_unit_interval_score(value: object) -> object:
@@ -410,6 +408,79 @@ class RebuildGraphRequest(BaseModel):
     run_community_summaries: bool | None = None
 
 
+class StrategyProfileSummary(BaseModel):
+    id: str
+    name: str
+    library_type: str = "custom"
+    is_builtin: bool = False
+    is_active: bool = True
+    profile_hash: str
+    course_ids: list[str] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime | None = None
+
+
+class StrategyProfileDetail(StrategyProfileSummary):
+    profile_json: dict = Field(default_factory=dict)
+
+
+class StrategyProfileCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    library_type: str = "custom"
+    profile_json: dict = Field(default_factory=dict)
+
+
+class StrategyProfileUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    library_type: str | None = None
+    profile_json: dict | None = None
+
+
+class StrategyProfileCopyRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+
+
+class StrategyProfileBindRequest(BaseModel):
+    course_id: str
+    profile_id: str
+
+
+class StrategyProfileMutationResponse(BaseModel):
+    profile: StrategyProfileDetail
+    warnings: list[str] = Field(default_factory=list)
+
+
+class StrategyProfileDraftRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=4000)
+    base_profile_id: str | None = None
+    base_profile_json: dict | None = None
+
+
+class StrategyProfileDraftResponse(BaseModel):
+    profile_json: dict
+    warnings: list[str] = Field(default_factory=list)
+    profile_hash: str
+
+
+class StrategyProfileAssistantRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=4000)
+    session_id: str | None = None
+    base_profile_id: str | None = None
+    base_profile_json: dict | None = None
+
+
+class StrategyProfileAssistantStateResponse(BaseModel):
+    session_id: str
+    base_profile_id: str | None = None
+    messages: list[dict] = Field(default_factory=list)
+    latest_profile_json: dict | None = None
+    latest_profile_hash: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+    draft_message: str = ""
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
 class RebuildGraphResponse(BaseModel):
     batch_id: str | None = None
     state: str
@@ -677,6 +748,9 @@ class CourseSummary(BaseModel):
     has_parsed_chunks: bool = False
     can_full_reparse: bool = False
     degraded_mode: bool = False
+    active_profile_id: str | None = None
+    active_profile_name: str | None = None
+    active_profile_hash: str | None = None
 
 
 class CourseCreateRequest(BaseModel):

@@ -34,6 +34,17 @@ import type {
   TaskStatusResponse,
   UploadFileResponse,
   StructuredApiErrorBody,
+  StrategyProfileAssistantRequest,
+  StrategyProfileAssistantStateResponse,
+  StrategyProfileBindRequest,
+  StrategyProfileCopyRequest,
+  StrategyProfileCreateRequest,
+  StrategyProfileDetail,
+  StrategyProfileDraftRequest,
+  StrategyProfileDraftResponse,
+  StrategyProfileMutationResponse,
+  StrategyProfileSummary,
+  StrategyProfileUpdateRequest,
 } from "@course-kg/shared";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api";
@@ -167,6 +178,158 @@ export async function updateModelSettings(payload: ModelSettingsUpdate): Promise
     body: JSON.stringify(payload),
   });
   return parseResponse<ModelSettingsResponse>(response);
+}
+
+export async function fetchStrategyProfiles(): Promise<StrategyProfileSummary[]> {
+  const response = await fetch(buildApiUrl("/settings/profiles"), { cache: "no-store", headers: authHeaders() });
+  return parseResponse<StrategyProfileSummary[]>(response);
+}
+
+export async function fetchStrategyProfile(profileId: string): Promise<StrategyProfileDetail> {
+  const response = await fetch(buildApiUrl(`/settings/profiles/${encodeURIComponent(profileId)}`), { cache: "no-store", headers: authHeaders() });
+  return parseResponse<StrategyProfileDetail>(response);
+}
+
+export async function createStrategyProfile(payload: StrategyProfileCreateRequest): Promise<StrategyProfileMutationResponse> {
+  const response = await fetch(buildApiUrl("/settings/profiles"), {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<StrategyProfileMutationResponse>(response);
+}
+
+export async function updateStrategyProfile(profileId: string, payload: StrategyProfileUpdateRequest): Promise<StrategyProfileMutationResponse> {
+  const response = await fetch(buildApiUrl(`/settings/profiles/${encodeURIComponent(profileId)}`), {
+    method: "PUT",
+    headers: jsonHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<StrategyProfileMutationResponse>(response);
+}
+
+export async function copyStrategyProfile(profileId: string, payload: StrategyProfileCopyRequest): Promise<StrategyProfileMutationResponse> {
+  const response = await fetch(buildApiUrl(`/settings/profiles/${encodeURIComponent(profileId)}/copy`), {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<StrategyProfileMutationResponse>(response);
+}
+
+export async function deleteStrategyProfile(profileId: string): Promise<DeleteResponse> {
+  const response = await fetch(buildApiUrl(`/settings/profiles/${encodeURIComponent(profileId)}`), {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  return parseResponse<DeleteResponse>(response);
+}
+
+export async function bindStrategyProfile(payload: StrategyProfileBindRequest): Promise<CourseSummary> {
+  const response = await fetch(buildApiUrl("/settings/profiles/bind"), {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<CourseSummary>(response);
+}
+
+export async function draftStrategyProfile(payload: StrategyProfileDraftRequest): Promise<StrategyProfileDraftResponse> {
+  const response = await fetch(buildApiUrl("/settings/profile-drafts"), {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<StrategyProfileDraftResponse>(response);
+}
+
+export async function fetchProfileAssistantState(sessionId: string): Promise<StrategyProfileAssistantStateResponse> {
+  const response = await fetch(buildApiUrl(`/settings/profile-assistant/${encodeURIComponent(sessionId)}`), {
+    cache: "no-store",
+    headers: authHeaders(),
+  });
+  return parseResponse<StrategyProfileAssistantStateResponse>(response);
+}
+
+export async function streamProfileAssistant(
+  payload: StrategyProfileAssistantRequest,
+  handlers: {
+    onToken: (value: string) => void;
+    onProfileJson: (value: { profile_json: Record<string, unknown>; warnings: string[]; profile_hash?: string }) => void;
+    onFinal?: (value: StrategyProfileAssistantStateResponse) => void;
+    onMeta?: (value: { session_id?: string; cached?: boolean }) => void;
+    onError?: (value: string) => void;
+  },
+): Promise<void> {
+  const response = await fetch(buildApiUrl("/settings/profile-assistant/stream"), {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const message = extractApiErrorMessage(await response.text(), response.status);
+    handlers.onError?.(message);
+    throw new Error(message);
+  }
+  if (!response.body) {
+    const message = "Browser does not support streaming responses";
+    handlers.onError?.(message);
+    throw new Error(message);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split("\n\n");
+    buffer = events.pop() ?? "";
+    for (const event of events) {
+      const line = event.replace(/^data:\s*/m, "").trim();
+      if (!line || line === "[DONE]") {
+        continue;
+      }
+      let parsed: {
+        type?: string;
+        token?: string;
+        session_id?: string;
+        cached?: boolean;
+        profile_json?: Record<string, unknown>;
+        warnings?: string[];
+        profile_hash?: string;
+        state?: StrategyProfileAssistantStateResponse;
+        error?: string;
+      };
+      try {
+        parsed = JSON.parse(line);
+      } catch (error) {
+        console.warn("Ignoring malformed profile assistant SSE event", { line, error });
+        continue;
+      }
+      if (parsed.type === "meta") {
+        handlers.onMeta?.({ session_id: parsed.session_id, cached: parsed.cached });
+      }
+      if (parsed.type === "error" && parsed.error) {
+        handlers.onError?.(parsed.error);
+      }
+      if (parsed.token) {
+        handlers.onToken(parsed.token);
+      }
+      if (parsed.type === "profile_json" && parsed.profile_json) {
+        handlers.onProfileJson({
+          profile_json: parsed.profile_json,
+          warnings: parsed.warnings ?? [],
+          profile_hash: parsed.profile_hash,
+        });
+      }
+      if (parsed.type === "final" && parsed.state) {
+        handlers.onFinal?.(parsed.state);
+      }
+    }
+  }
 }
 
 export async function fetchCourseFiles(courseId?: string | null): Promise<CourseFileSummary[]> {

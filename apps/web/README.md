@@ -1,6 +1,6 @@
 # SymboGraph Frontend Web App
 
-A sleek, responsive, and visually premium Next.js client for exploring course Knowledge Graphs and interacting with the citation-grounded RAG query interface.
+A sleek, responsive, and visually premium Next.js client for exploring local knowledge graphs, configuring knowledge-base Profiles, and interacting with the citation-grounded RAG query interface.
 
 ---
 
@@ -11,7 +11,8 @@ This application is built with modern, production-grade frontend practices:
 1. **Core Framework**: **Next.js 16.2.4** utilizing the App Router and **React 19** for optimized concurrency and state orchestration.
 2. **State Management**: **TanStack Query (React Query) v5** handles server state synchronization, query caching, and mutation invalidation.
 3. **Styling & UI Components**: Tailored HSL color palettes, modern typography, glassmorphism, dynamic transitions, and polished **Shadcn UI** primitives styled with Vanilla Tailwind CSS.
-4. **Data Graph Visualization**: Interactive force-directed layouts representing course concepts, evidence relationships, topological centrality scores, and Louvain community grouping.
+4. **Data Graph Visualization**: Interactive force-directed layouts representing knowledge-base concepts, evidence relationships, topological centrality scores, and Louvain community grouping.
+5. **Profile Configuration**: The Settings page includes a dedicated Profile tab with active binding status, copy/create/save/delete actions, AI-assisted Profile draft generation, advanced JSON diagnostics, and validation feedback.
 
 ---
 
@@ -37,6 +38,14 @@ This application is built with modern, production-grade frontend practices:
 ### 5. Runtime Settings & Full Reparse Controls
 - Runtime settings writes model endpoints, graph budgets, retrieval toggles, and bounded concurrency controls through the backend `.env` update API.
 - Upload controls expose selected-file parsing separately from full reparse. Full reparse is disabled until the course has active chunks, matching backend chunk-version rules.
+
+### 6. Knowledge-Base Profile Settings
+- New knowledge bases use the built-in default course Profile automatically.
+- The built-in default Profile is read-only and cannot be deleted. Copy it before making custom changes.
+- Any non-default Profile can be deleted. When a deleted Profile is still bound to one or more knowledge bases, the backend automatically rebinds those knowledge bases to the default Profile.
+- The Profile Assistant opens as a streaming side panel. It returns natural-language guidance plus a JSON draft; users explicitly click **Autofill** and then **Save Profile** before the draft is persisted.
+- The Advanced JSON editor shows live diagnostics with line/column, message, reason, and a red highlight on the first error line. The diagnostics pane and JSON editor are fixed-height scroll regions to avoid stretching the page.
+- Creating a new knowledge base shows a visual workflow tutorial for env settings, Profile settings, and the import flow. The "do not show again" choice is stored in browser `localStorage` under `symbograph.hideCreateCourseTutorial`.
 
 ---
 
@@ -84,4 +93,9 @@ npm run typecheck --workspace web
 
 # Run ESLint validation
 npm run lint --workspace web
+
+# Run API contract tests that include Profile endpoints
+npm run test --workspace web -- src/lib/api.test.ts
 ```
+
+Rendered changes to Profile dialogs, the advanced JSON editor, or the new-knowledge-base tutorial should be validated in a browser at `http://127.0.0.1:3000/settings` after the Docker web container has been rebuilt or its `.next` cache cleared.

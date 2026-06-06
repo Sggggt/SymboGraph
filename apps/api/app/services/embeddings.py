@@ -19,6 +19,15 @@ from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.schemas import GraphExtractionPayload
+from app.services.strategy_profiles import (
+    COURSE_ANSWER_SYSTEM_PREFIX,
+    COURSE_CONTEXT_LABEL,
+    COURSE_GRAPH_EXTRACTION_PROMPT,
+    COURSE_NO_CONTEXT_EN,
+    COURSE_NO_CONTEXT_ZH,
+    active_profile_json,
+    profile_prompt,
+)
 
 
 class FallbackDisabledError(RuntimeError):
@@ -40,6 +49,10 @@ def answer_language_name(text: str) -> str:
 
 
 def no_context_answer(question: str) -> str:
+    profile = active_profile_json()
+    if prefers_chinese_answer(question):
+        return profile_prompt(profile, "no_context_answer_zh", COURSE_NO_CONTEXT_ZH)
+    return profile_prompt(profile, "no_context_answer_en", COURSE_NO_CONTEXT_EN)
     if prefers_chinese_answer(question):
         return "课程材料中没有找到足够可靠的上下文来回答这个问题并提供引用。"
     return "I could not find enough reliable course context to answer this question with citations."
@@ -255,20 +268,8 @@ class ChatProvider:
             if not self.settings.enable_model_fallback:
                 raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
             return {"concepts": [], "relations": []}
-        system_prompt = (
-            "You extract a course knowledge graph from teaching material. "
-            "Return JSON only with keys concepts and relations. "
-            "Each concept must contain name, aliases, summary, concept_type, importance_score. "
-            "Each relation must contain source, target, relation_type, confidence. "
-            "Allowed relation_type values: defines, relates_to, prerequisite_of, example_of, solves, compares, extends, mentions. "
-            "Extract 6 to 12 specific course concepts when the excerpt has enough substance, including algorithms, theorems, "
-            "definitions, problem types, complexity classes, graph structures, and proof techniques. "
-            "Extract 6 to 16 useful relations between those concepts. "
-            "Every relation source and target must exactly match a concept name included in concepts. "
-            "Prefer specific names like Breadth-First Search, Dijkstra Algorithm, Spanning Tree, Flow Network, NP-Complete, "
-            "Matching, Cut, Planar Graph, Eulerian Tour, Hamiltonian Cycle, and Matrix Tree Theorem over generic words. "
-            "Skip formatting artifacts, page headers, exercise labels, and generic words."
-        )
+        profile = active_profile_json()
+        system_prompt = profile_prompt(profile, "graph_extraction_system", COURSE_GRAPH_EXTRACTION_PROMPT)
         user_prompt = (
             f"chapter={chapter or 'General'}\n"
             f"source_type={source_type}\n"
@@ -345,15 +346,18 @@ class ChatProvider:
             f"[{i+1}] {ctx.get('document_title', '')}\n{ctx.get('content', '')[:600]}"
             for i, ctx in enumerate(contexts)
         )
+        profile = active_profile_json()
+        reflection_domain = profile_prompt(profile, "reflection_domain", "course knowledge-base assistant")
+        citation_domain = profile_prompt(profile, "citation_domain", "course excerpts")
         system_prompt = (
-            "You are a strict quality reviewer for a course knowledge-base assistant. "
-            "Evaluate whether the assistant's answer is fully supported by the provided course excerpts. "
+            f"You are a strict quality reviewer for a {reflection_domain}. "
+            f"Evaluate whether the assistant's answer is fully supported by the provided {citation_domain}. "
             "Return ONLY a JSON object with keys: has_issue (boolean), issue_type (one of: none, hallucination, insufficient_coverage, contradiction), suggestion (string)."
         )
         user_prompt = (
             f"Question: {question}\n\n"
             f"Answer: {answer}\n\n"
-            f"Course excerpts:\n{context_text}\n\n"
+            f"{citation_domain}:\n{context_text}\n\n"
             "Check: 1) Does the answer contain claims not found in the excerpts? 2) Is the question fully answered? 3) Are there contradictions between the answer and excerpts?"
         )
         payload = {
@@ -398,8 +402,10 @@ class ChatProvider:
             for i, c in enumerate(citations)
             if c.get("chunk_id") in context_map
         )
+        profile = active_profile_json()
+        citation_domain = profile_prompt(profile, "citation_domain", "course excerpts")
         system_prompt = (
-            "You verify whether specific claims in an answer are supported by cited course excerpts. "
+            f"You verify whether specific claims in an answer are supported by cited {citation_domain}. "
             "Return ONLY a JSON object with keys: verified (boolean), unverified_indices (list of citation numbers that are NOT supported)."
         )
         user_prompt = (
@@ -448,11 +454,14 @@ class ChatProvider:
                 "suggested_strategy": "hybrid",
             }
         history_text = "\n".join(f"{item.get('role')}: {item.get('content')}" for item in (history or [])[-4:])
+        profile = active_profile_json()
+        perception_domain = profile_prompt(profile, "perception_domain", "course knowledge-base agent")
+        entity_label = profile_prompt(profile, "entity_label", "course-concept-like terms")
         system_prompt = (
-            "You are a perception module for a course knowledge-base agent. "
+            f"You are a perception module for a {perception_domain}. "
             "Analyze the user's question and return ONLY a JSON object with these exact keys:\n"
             "- intent: one of [definition, comparison, application, procedure, analysis, unknown]\n"
-            "- entities: list of course-concept-like terms explicitly mentioned or implied in the question\n"
+            f"- entities: list of {entity_label} explicitly mentioned or implied in the question\n"
             "- sub_queries: list of simpler sub-questions if the original is complex/multi-hop; otherwise [original_question]\n"
             "- needs_graph: boolean, true if the question asks about relationships, comparisons, connections, or derivations between concepts\n"
             "- suggested_strategy: one of [global_dense, local_graph, hybrid, community]\n"
@@ -501,12 +510,17 @@ class ChatProvider:
             f"[{idx + 1}] {item['document_title']} / {item.get('chapter') or 'General'}\n{item['content']}"
             for idx, item in enumerate(contexts)
         )
+        profile = active_profile_json()
+        context_label = profile_prompt(profile, "context_label", COURSE_CONTEXT_LABEL)
+        context_label_lower = context_label[:1].lower() + context_label[1:] if context_label else "excerpts"
+        coverage_label = profile_prompt(profile, "coverage_label", "course materials")
+        indexed_coverage_label = profile_prompt(profile, "indexed_coverage_label", "indexed course materials")
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are a course knowledge-base assistant. "
-                    "Answer only from the supplied course excerpts and do not invent unsupported facts. "
+                    profile_prompt(profile, "answer_system_prefix", COURSE_ANSWER_SYSTEM_PREFIX)
+                    + f"Answer only from the supplied {context_label_lower} and do not invent unsupported facts. "
                     "Keep the answer direct, concise, and say when the evidence is insufficient. "
                     "Always follow the required answer language below. "
                     "Do not infer the answer language from the retrieved excerpts. "
@@ -524,13 +538,13 @@ class ChatProvider:
                     "each symbol in separate bullets or sentences. "
                     + (
                         "IMPORTANT: The retrieved excerpts may have low relevance to the question. "
-                        "If they do not contain information that directly answers the question, clearly state that the course materials "
+                        f"If they do not contain information that directly answers the question, clearly state that the {coverage_label} "
                         "do not cover this topic, and do NOT force citations from irrelevant excerpts. "
                         "You may provide a brief conceptual answer based on general knowledge, but explicitly note that it is not "
-                        "supported by the indexed course materials."
+                        f"supported by the {indexed_coverage_label}."
                         if evidence_quality == "low"
                         else "If the supplied excerpts do not contain information that directly answers the question, "
-                        "clearly state that the course materials do not cover this topic and do NOT force citations."
+                        f"clearly state that the {coverage_label} do not cover this topic and do NOT force citations."
                     )
                 ),
             },
@@ -540,12 +554,12 @@ class ChatProvider:
                 "content": (
                     f"Question: {question}\n\n"
                     f"Required answer language: {target_language}\n\n"
-                    "Course excerpts:\n"
+                    f"{context_label}:\n"
                     f"{citations}\n\n"
                     + (
                         "Note: the above excerpts have been assessed as potentially irrelevant. "
                         "Only cite them if they truly support a specific claim in your answer. "
-                        "If none are relevant, answer without citations and note the lack of course coverage.\n\n"
+                        f"If none are relevant, answer without citations and note the lack of {coverage_label} coverage.\n\n"
                         if evidence_quality == "low"
                         else ""
                     )
@@ -732,6 +746,28 @@ class ChatProvider:
 
     def _extractive_answer(self, question: str, contexts: list[dict]) -> str:
         lead = next((item for item in contexts if item.get("metadata", {}).get("content_kind") != "code"), contexts[0])
+        profile = active_profile_json()
+        strong_source_label = profile_prompt(profile, "strongest_source_label", "course source")
+        strong_source_label_zh = profile_prompt(profile, "strongest_source_label_zh", "课程来源")
+        relevant_section_label = profile_prompt(profile, "relevant_section_label", "the relevant section")
+        relevant_section_label_zh = profile_prompt(profile, "relevant_section_label_zh", "相关章节")
+        if prefers_chinese_answer(question):
+            lines = [
+                f"最相关的{strong_source_label_zh}是 {lead['document_title']} / {lead.get('chapter') or relevant_section_label_zh}。",
+                lead["snippet"],
+            ]
+            if len(contexts) > 1:
+                lines.append("其他检索片段提供了相关背景；请结合引用检查原始资料。")
+            lines.append(f"Question: {question}")
+            return "\n".join(lines)
+        lines = [
+            f"The strongest {strong_source_label} is {lead['document_title']} in {lead.get('chapter') or relevant_section_label}.",
+            lead["snippet"],
+        ]
+        if len(contexts) > 1:
+            lines.append("Other retrieved excerpts provide related background; use the citations to inspect the source material.")
+        lines.append(f"Question: {question}")
+        return "\n".join(lines)
         if prefers_chinese_answer(question):
             lines = [
                 f"最相关的课程来源是 {lead['document_title']} / {lead.get('chapter') or '相关章节'}。",

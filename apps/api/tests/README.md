@@ -28,8 +28,15 @@ docker exec course-kg-api python -m pytest
 | `test_parsers.py` | Markdown、HTML、Notebook、PDF、DOCX、PPTX 解析和 fallback 禁用行为 |
 | `test_agent_graph.py` | Agent 路由、检索问答、trace 流式事件 |
 | `test_concept_graph.py` | 概念抽取、图谱合并、章节归一化和模型输出容错 |
+| `test_strategy_profiles.py` | Profile CRUD、默认绑定、删除重绑定、schema/prompt 生效、Profile Assistant Redis 状态 |
 
 ## 显式测试命令
+
+Profile 体系回归测试：
+
+```powershell
+docker exec course-kg-api python -m pytest tests/test_strategy_profiles.py
+```
 
 检索、图谱和切块核心测试：
 

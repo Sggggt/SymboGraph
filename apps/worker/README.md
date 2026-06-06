@@ -13,11 +13,13 @@ To prevent blocking the core API event loop and maintain low latency for interac
 - **LLM Graph Extraction**: Managing long-running LLM extract-and-merge pipelines.
 - **Auto HPO Trials**: Running sequential Optuna TPE simulations over candidate parameters.
 - **Phase-aware cancellation**: Preserving committed parse results when cancellation happens during graph work, while rolling back parse-phase writes when cancellation happens before parse commit.
+- **Profile-aware execution**: Background ingestion and graph tasks reuse the API service layer and read the active knowledge-base Profile at task boundaries. Profile changes affect only tasks started after the change and do not rewrite already committed chunks, vectors, or graph objects.
 
 ### 2. Filesystem Synchronization (Course Watcher)
 A lightweight monitoring service using `watchdog` to track file events within your course directories (`DATA_ROOT`):
 - Automatically triggers a sync ingestion batch when course files (`.pdf`, `.ipynb`, `.md`, etc.) are added, updated, or removed from local storage folders.
 - Uses file hashes (checksums) to dynamically deduplicate file writes and prevent redundant pipeline triggers.
+- Does not create, edit, or switch Profiles. New knowledge bases are still created with the built-in default Profile by the API layer.
 
 ---
 

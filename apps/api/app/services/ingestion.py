@@ -23,6 +23,7 @@ from app.services.concept_graph import get_concept_cards, get_graph_payload, gra
 from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded_mode, vector_norm
 from app.services.ingestion_logs import emit_ingestion_log
 from app.services.parsers import derive_chapter, parse_document, sections_to_json
+from app.services.strategy_profiles import get_active_profile_record, use_strategy_profile
 from app.services.storage import compute_checksum, copy_source_file
 from app.services.vector_store import VectorStore
 
@@ -718,12 +719,15 @@ def recompute_course_chunk_version_metadata(db: Session, course: Course) -> int:
 
 
 def summarize_course(db: Session, course: Course) -> dict:
+    from app.services.strategy_profiles import get_active_profile_record
+
     paths = get_course_paths(course.name)
     storage_root = paths["storage_root"]
     document_count = len(collect_source_documents(storage_root)) if storage_root.exists() else db.query(Document).filter(Document.course_id == course.id, Document.is_active.is_(True)).count()
     concept_count = db.query(Concept).filter(Concept.course_id == course.id).count()
     current_chunk_version = sync_course_chunk_version_metadata(db, course)
     parsed_chunks = active_chunk_count(db, course.id)
+    profile = get_active_profile_record(db, course.id)
     db.commit()
     return {
         "id": course.id,
@@ -737,6 +741,9 @@ def summarize_course(db: Session, course: Course) -> dict:
         "has_parsed_chunks": parsed_chunks > 0,
         "can_full_reparse": parsed_chunks > 0,
         "degraded_mode": is_degraded_mode(),
+        "active_profile_id": profile.id,
+        "active_profile_name": profile.name,
+        "active_profile_hash": profile.profile_hash,
     }
 
 
@@ -748,7 +755,10 @@ def create_course_space(db: Session, name: str, description: str | None = None) 
     storage_root = paths["storage_root"]
     course = db.scalar(select(Course).where(Course.name == normalized_name))
     if course is None:
-        course = Course(name=normalized_name, description=description, source_root=str(storage_root))
+        from app.services.strategy_profiles import ensure_builtin_course_profile
+
+        profile = ensure_builtin_course_profile(db)
+        course = Course(name=normalized_name, description=description, source_root=str(storage_root), active_profile_id=profile.id)
         db.add(course)
         db.commit()
         db.refresh(course)
@@ -1602,6 +1612,7 @@ async def _ingest_file_locked(
 ) -> dict:
     job = db.get(IngestionJob, existing_job_id) if existing_job_id else None
     course = resolve_course(db, job.course_id if job is not None else course_id)
+    strategy_profile = get_active_profile_record(db, course.id)
     course_paths = get_course_paths(course.name)
     checksum = compute_checksum(source_path)
     source_title = source_path.stem
@@ -1734,7 +1745,8 @@ async def _ingest_file_locked(
 
     set_job_state(db, job, "chunking", batch_id=batch_id)
     ensure_not_cancelled(db, batch_id)
-    chunk_payloads, chunking_stats = await chunk_sections_hierarchical_async(sections, chapter=chapter, source_type=source_type, batch_id=batch_id)
+    with use_strategy_profile(strategy_profile.profile_json):
+        chunk_payloads, chunking_stats = await chunk_sections_hierarchical_async(sections, chapter=chapter, source_type=source_type, batch_id=batch_id)
     ensure_not_cancelled(db, batch_id)
     existing_hashes = active_chunk_hashes_for_course(
         db,
@@ -1885,8 +1897,8 @@ async def _ingest_file_locked(
     for chunk in created_chunks:
         is_parent = chunk.metadata_json.get("is_parent", False)
         if is_parent:
-            embedding_inputs.append(
-                contextual_embedding_text(
+            with use_strategy_profile(strategy_profile.profile_json):
+                embedding_input = contextual_embedding_text(
                     document_title=document.title,
                     chapter=chunk.chapter,
                     section=chunk.section,
@@ -1898,7 +1910,7 @@ async def _ingest_file_locked(
                     has_table=chunk.metadata_json.get("has_table", False),
                     has_formula=chunk.metadata_json.get("has_formula", False),
                 )
-            )
+            embedding_inputs.append(embedding_input)
         else:
             section_index = int((chunk.metadata_json or {}).get("section_index") or 0)
             parent_chunk = parent_chunks_map.get(section_index)
@@ -1906,8 +1918,8 @@ async def _ingest_file_locked(
             child_index = next((i for i, c in enumerate(children) if c.id == chunk.id), -1)
             prev_summary = chunk_context_summary(children[child_index - 1]) if child_index > 0 else None
             next_summary = chunk_context_summary(children[child_index + 1]) if child_index >= 0 and child_index + 1 < len(children) else None
-            embedding_inputs.append(
-                contextual_embedding_text(
+            with use_strategy_profile(strategy_profile.profile_json):
+                embedding_input = contextual_embedding_text(
                     document_title=document.title,
                     chapter=chunk.chapter,
                     section=chunk.section,
@@ -1922,7 +1934,7 @@ async def _ingest_file_locked(
                     has_table=chunk.metadata_json.get("has_table", False),
                     has_formula=chunk.metadata_json.get("has_formula", False),
                 )
-            )
+            embedding_inputs.append(embedding_input)
     ensure_not_cancelled(db, batch_id)
     embedding_result = await embedder.embed_texts_with_meta(embedding_inputs, text_type="document")
     ensure_not_cancelled(db, batch_id)

@@ -13,12 +13,14 @@ from app.models import Chunk, Concept, ConceptRelation, Course, Document
 from app.services.concept_graph import filter_graph_documents
 from app.services.embeddings import ChatProvider
 from app.services.parsers import is_invalid_chapter_label
+from app.services.strategy_profiles import get_active_profile_record, profile_prompt
 
 
 def build_graph_judge_evidence(db: Session, course_id: str, sample_limit: int = 20) -> dict[str, Any]:
     course = db.get(Course, course_id)
     if course is None:
         raise LookupError(f"Course not found: {course_id}")
+    strategy_profile = get_active_profile_record(db, course_id)
 
     all_concepts = db.scalars(select(Concept).where(Concept.course_id == course.id).order_by(Concept.importance_score.desc(), Concept.canonical_name)).all()
     concepts = all_concepts[:sample_limit]
@@ -58,6 +60,9 @@ def build_graph_judge_evidence(db: Session, course_id: str, sample_limit: int = 
     return {
         "course": course.name,
         "course_id": course.id,
+        "strategy_profile_id": strategy_profile.id,
+        "strategy_profile_name": strategy_profile.name,
+        "strategy_profile_hash": strategy_profile.profile_hash,
         "document_count": document_count,
         "chunk_count": chunk_count,
         "concept_count": concept_count,
@@ -91,13 +96,25 @@ def build_graph_judge_evidence(db: Session, course_id: str, sample_limit: int = 
 
 async def run_graph_judge(db: Session, course_id: str) -> dict[str, Any]:
     evidence = build_graph_judge_evidence(db, course_id)
-    system_prompt = "You are an LLM-as-a-judge for a course knowledge graph pipeline. Return strict JSON."
+    strategy_profile = get_active_profile_record(db, course_id)
+    system_prompt = profile_prompt(
+        strategy_profile.profile_json,
+        "graph_judge_system",
+        "You are an LLM-as-a-judge for a course knowledge graph pipeline. Return strict JSON.",
+    )
+    threshold_hint = profile_prompt(
+        strategy_profile.profile_json,
+        "graph_judge_threshold_hint",
+        (
+            "Use these acceptance thresholds: invalid_chapter_refs must be empty, "
+            "concepts_per_100_chunks >= 5, relations_per_concept >= 2.5, and multi-chapter courses should have at least "
+            "5 distinct chapter_ref_counts entries."
+        ),
+    )
     user_prompt = (
         "Evaluate graph quality and chapter reference correctness. Return JSON with keys: "
         "verdict, severity, concept_density, relation_density, chapter_ref_findings, invalid_chapter_refs, "
-        "recommended_fixes, acceptance_tests. Use these acceptance thresholds: invalid_chapter_refs must be empty, "
-        "concepts_per_100_chunks >= 5, relations_per_concept >= 2.5, and multi-chapter courses should have at least "
-        "5 distinct chapter_ref_counts entries. Do not reject solely for duplicate source copies if the evidence was "
+        f"recommended_fixes, acceptance_tests. {threshold_hint} Do not reject solely for duplicate source copies if the evidence was "
         "already filtered to current graph documents.\n\nEvidence:\n"
         f"{json.dumps(evidence, ensure_ascii=False)}"
     )

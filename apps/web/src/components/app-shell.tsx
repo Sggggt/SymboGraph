@@ -26,6 +26,8 @@ const navigation = [
   { href: "/settings", label: "设置", caption: "模型", icon: Settings },
 ];
 
+const CREATE_COURSE_TUTORIAL_STORAGE_KEY = "symbograph.hideCreateCourseTutorial";
+
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const queryClient = useQueryClient();
@@ -35,6 +37,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [deleteCourseResult, setDeleteCourseResult] = useState<string | null>(null);
   const [nextCourseName, setNextCourseName] = useState("");
   const [refreshDone, setRefreshDone] = useState(false);
+  const [createTutorialOpen, setCreateTutorialOpen] = useState(false);
+  const [hideCreateTutorialDraft, setHideCreateTutorialDraft] = useState(false);
   const refreshMutation = useMutation({
     mutationFn: () => refreshCourse(selectedCourseId),
     onSuccess: async () => {
@@ -229,6 +233,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               await createCourseSpace({ name });
               setNextCourseName("");
               setCreateOpen(false);
+              if (window.localStorage.getItem(CREATE_COURSE_TUTORIAL_STORAGE_KEY) !== "true") {
+                setHideCreateTutorialDraft(false);
+                setCreateTutorialOpen(true);
+              }
             }}
           >
             <label className="flex flex-col gap-2">
@@ -250,6 +258,69 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               </Button>
             </div>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={createTutorialOpen} onOpenChange={setCreateTutorialOpen}>
+        <DialogContent className="max-h-[calc(100vh-2rem)] w-[min(44rem,calc(100vw-2rem))] overflow-hidden border border-white/10 bg-[rgba(3,7,20,0.94)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.42)] backdrop-blur-2xl sm:!max-w-2xl">
+          <DialogHeader className="border-b border-white/8 px-6 py-5 pr-14">
+            <DialogTitle>新资料库操作流程</DialogTitle>
+            <DialogDescription className="break-words text-cyan-100/70">
+              新建资料库默认使用内置课程 Profile；后续可以在设置页复制预设并切换为自定义 Profile。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[calc(100vh-10rem)] space-y-4 overflow-y-auto px-6 py-5">
+            <div className="grid gap-3">
+              <div className="flex min-w-0 gap-4 rounded-2xl border border-cyan-200/15 bg-cyan-300/[0.06] p-4">
+                <div className="grid size-10 shrink-0 place-items-center rounded-full border border-cyan-200/20 bg-cyan-200/[0.08] text-cyan-100">
+                  <TerminalSquare className="size-5" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-white">Env 设置</p>
+                  <p className="mt-2 break-words text-xs leading-5 text-white/60">确认模型桥、聊天模型、Embedding、并发，以及 Redis、PostgreSQL、Qdrant 运行状态。</p>
+                </div>
+              </div>
+              <div className="flex min-w-0 gap-4 rounded-2xl border border-violet-200/15 bg-violet-300/[0.06] p-4">
+                <div className="grid size-10 shrink-0 place-items-center rounded-full border border-violet-200/20 bg-violet-200/[0.08] text-violet-100">
+                  <Settings className="size-5" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-white">Profile 设置</p>
+                  <p className="mt-2 break-words text-xs leading-5 text-white/60">默认 Profile 保持现有课程行为；自定义资料库先复制预设，再编辑 schema、prompt 和策略。</p>
+                </div>
+              </div>
+              <div className="flex min-w-0 gap-4 rounded-2xl border border-emerald-200/15 bg-emerald-300/[0.06] p-4">
+                <div className="grid size-10 shrink-0 place-items-center rounded-full border border-emerald-200/20 bg-emerald-200/[0.08] text-emerald-100">
+                  <Upload className="size-5" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-white">导入全流程</p>
+                  <p className="mt-2 break-words text-xs leading-5 text-white/60">上传文件后执行解析、构图、检索验证和问答检查；Profile 切换只影响之后的新任务。</p>
+                </div>
+              </div>
+            </div>
+            <label className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-3 text-sm text-white/70">
+              <input
+                type="checkbox"
+                checked={hideCreateTutorialDraft}
+                onChange={(event) => setHideCreateTutorialDraft(event.target.checked)}
+                className="size-4 rounded border-white/20 bg-black/30 accent-cyan-300"
+              />
+              不再显示这个教程
+            </label>
+            <div className="flex justify-end">
+              <Button
+                type="button"
+                className="rounded-full"
+                onClick={() => {
+                  window.localStorage.setItem(CREATE_COURSE_TUTORIAL_STORAGE_KEY, hideCreateTutorialDraft ? "true" : "false");
+                  setCreateTutorialOpen(false);
+                }}
+              >
+                我已了解
+              </Button>
+            </div>
+          </div>
         </DialogContent>
       </Dialog>
 

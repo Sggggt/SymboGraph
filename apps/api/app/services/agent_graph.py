@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 from collections.abc import AsyncGenerator
@@ -26,12 +27,40 @@ from app.services.retrieval import (
     plan_evidence_chains,
     select_evidence_anchors,
 )
+from app.services.strategy_profiles import active_profile_json, get_active_profile_record, profile_prompt, use_strategy_profile
 
 
 AgentRoute = Literal["direct_answer", "retrieve_notes", "retrieve_exercises", "retrieve_both", "clarify", "multi_hop_research"]
 NOTE_SOURCE_TYPES = {"pdf", "ppt", "pptx", "docx", "markdown", "text", "html", "image"}
 EXERCISE_MARKERS = ("exercise", "homework", "problem", "assignment", "quiz", "exam")
 _TRACE_SUBSCRIBERS: dict[str, set[asyncio.Queue[dict]]] = {}
+
+
+def _profile_route_terms(kind: str, defaults: tuple[str, ...]) -> tuple[str, ...]:
+    retrieval_strategy = (active_profile_json().get("retrieval_strategy") or {})
+    route_terms = retrieval_strategy.get("route_terms") if isinstance(retrieval_strategy, dict) else None
+    values = route_terms.get(kind) if isinstance(route_terms, dict) else None
+    if isinstance(values, list):
+        normalized = tuple(str(item).lower() for item in values if str(item).strip())
+        return normalized or defaults
+    return defaults
+
+
+def _runtime_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"true", "1", "yes", "on"}
+
+
+def _runtime_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 class AgentState(TypedDict, total=False):
@@ -90,18 +119,38 @@ def _summarize(text: str, limit: int = 280) -> str:
 
 
 def _direct_answer_text(question: str) -> str:
+    profile = active_profile_json()
+    if prefers_chinese_answer(question):
+        return profile_prompt(profile, "agent_direct_answer_zh", "我可以回答已索引资料中的问题，提供引用，并说明检索智能体如何得到答案。")
+    return profile_prompt(profile, "agent_direct_answer_en", "I can answer questions about the indexed course materials, show citations, and explain how the retrieval agent reached its answer.")
     if prefers_chinese_answer(question):
         return "我可以回答已索引课程材料中的问题，提供引用，并说明检索智能体如何得到答案。"
     return "I can answer questions about the indexed course materials, show citations, and explain how the retrieval agent reached its answer."
 
 
 def _clarify_answer_text(question: str) -> str:
+    profile = active_profile_json()
+    if prefers_chinese_answer(question):
+        return profile_prompt(profile, "agent_clarify_answer_zh", "请进一步说明你要检索的实体、分区、任务或比较问题。")
+    return profile_prompt(profile, "agent_clarify_answer_en", "Please clarify the concept, section, task, or comparison you want me to retrieve.")
     if prefers_chinese_answer(question):
         return "请进一步说明你要检索的课程概念、章节、习题或比较问题。"
     return "Please clarify the course concept, chapter, exercise, or comparison you want me to retrieve."
 
 
 def _correction_no_context_answer_text(question: str) -> str:
+    profile = active_profile_json()
+    if prefers_chinese_answer(question):
+        return profile_prompt(
+            profile,
+            "agent_no_context_answer_zh",
+            "资料中没有找到足够相关内容来回答这个问题。如果你希望我基于已检索到的有限资料尝试回答（可能包含推测），请告诉我。",
+        )
+    return profile_prompt(
+        profile,
+        "agent_no_context_answer_en",
+        "I could not find enough relevant course material to answer this question. If you want me to try answering from the limited retrieved material, which may involve inference, please tell me.",
+    )
     if prefers_chinese_answer(question):
         return (
             "课程材料中没有找到足够相关内容来回答这个问题。"
@@ -276,9 +325,9 @@ class Perception:
             route = "clarify"
         elif any(term in question_lower for term in ("compare", "relationship", "related to", "relation between", "difference between", "connect", "derive", "prove", "比较", "关系", "区别", "联系", "推导", "证明")):
             route = "multi_hop_research"
-        elif any(term in question_lower for term in EXERCISE_MARKERS):
+        elif any(term in question_lower for term in _profile_route_terms("exercise", EXERCISE_MARKERS)):
             route = "retrieve_exercises"
-        elif any(term in question_lower for term in ("note", "slide", "definition", "concept", "chapter")):
+        elif any(term in question_lower for term in _profile_route_terms("notes", ("note", "slide", "definition", "concept", "chapter"))):
             route = "retrieve_notes"
         else:
             route = "retrieve_both"
@@ -416,13 +465,14 @@ class Perception:
 async def _llm_translate_query(question: str, target_lang: str) -> str:
     """Minimal LLM query translator for cross-lingual retrieval."""
     chat = ChatProvider()
+    search_domain = profile_prompt(active_profile_json(), "query_translation_domain", "academic course search")
     payload = {
         "model": chat.settings.chat_model,
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    f"You are a query translator for academic course search. "
+                    f"You are a query translator for {search_domain}. "
                     f"Translate the user query to {target_lang} accurately, "
                     f"preserving all technical terminology. Output ONLY the translated query, no explanation."
                 ),
@@ -536,11 +586,11 @@ class Router:
             route: AgentRoute = "direct_answer"
         elif len(terms) == 0 or lower in {"it", "this", "that", "explain it", "why", "这个", "那个", "解释一下", "为什么"}:
             route = "clarify"
-        elif any(marker in lower for marker in EXERCISE_MARKERS):
+        elif any(marker in lower for marker in _profile_route_terms("exercise", EXERCISE_MARKERS)):
             route = "retrieve_exercises"
         elif any(term in lower for term in ("compare", "relationship", "related to", "relation between", "difference between", "connect", "derive", "prove", "比较", "关系", "区别", "联系", "推导", "证明")):
             route = "multi_hop_research"
-        elif any(term in lower for term in ("note", "slide", "definition", "concept", "chapter")):
+        elif any(term in lower for term in _profile_route_terms("notes", ("note", "slide", "definition", "concept", "chapter"))):
             route = "retrieve_notes"
         else:
             route = "retrieve_both"
@@ -988,7 +1038,8 @@ class RetryPlanner:
         start = time.perf_counter()
         db = SessionLocal()
         retry_count = state.get("retry_count", 0) + 1
-        next_question = f"{state.get('rewritten_question') or state['question']} course lecture notes examples"
+        retry_suffix = profile_prompt(active_profile_json(), "retry_query_suffix", "course lecture notes examples")
+        next_question = f"{state.get('rewritten_question') or state['question']} {retry_suffix}"
         await _set_run_state( state["run_id"], "running", current_node="retry_planner", retry_count=retry_count)
         await _trace(
                         state["run_id"],
@@ -1327,11 +1378,14 @@ def route_after_reflection(state: AgentState) -> str:
     reflection = state.get("reflection_result", {})
     retry_count = state.get("retry_count", 0)
     settings = get_settings()
-    if not settings.enable_agentic_reflection:
+    enable_agentic_reflection = _runtime_bool_env("ENABLE_AGENTIC_REFLECTION", settings.enable_agentic_reflection)
+    enable_post_generation_reflection = _runtime_bool_env("ENABLE_POST_GENERATION_REFLECTION", settings.enable_post_generation_reflection)
+    reflection_max_retries = _runtime_int_env("REFLECTION_MAX_RETRIES", settings.reflection_max_retries)
+    if not enable_agentic_reflection:
         return "self_check"
-    if not settings.enable_post_generation_reflection:
+    if not enable_post_generation_reflection:
         return "self_check"
-    if reflection.get("has_issue") and retry_count < settings.reflection_max_retries:
+    if reflection.get("has_issue") and retry_count < reflection_max_retries:
         return "answer_corrector"
     return "self_check"
 
@@ -1492,8 +1546,10 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
     from app.db import _db_context_var, _active_sessions
     token = _db_context_var.set(db)
     sessions_token = _active_sessions.set([])
+    strategy_profile = get_active_profile_record(db, run.course_id)
     try:
-        final_state = await AGENT_GRAPH.ainvoke(initial)
+        with use_strategy_profile(strategy_profile.profile_json):
+            final_state = await AGENT_GRAPH.ainvoke(initial)
         trace_events = db.scalars(select(AgentTraceEvent).where(AgentTraceEvent.run_id == run.id).order_by(AgentTraceEvent.created_at.asc())).all()
         used_chunks = final_state.get("graded_documents", [])
         answer = final_state.get("answer", "")

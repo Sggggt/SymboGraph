@@ -26,11 +26,25 @@ class Course(TimestampMixin, Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_root: Mapped[str] = mapped_column(Text)
     current_chunk_version: Mapped[int] = mapped_column(Integer, default=0)
+    active_profile_id: Mapped[str | None] = mapped_column(ForeignKey("strategy_profiles.id"), nullable=True, index=True)
 
     documents: Mapped[list["Document"]] = relationship(back_populates="course")
     concepts: Mapped[list["Concept"]] = relationship(back_populates="course")
     batches: Mapped[list["IngestionBatch"]] = relationship(back_populates="course")
     model_hyperparameters: Mapped[list["CourseModelHyperparameter"]] = relationship(back_populates="course")
+    active_profile: Mapped["StrategyProfile | None"] = relationship(foreign_keys=[active_profile_id])
+
+
+class StrategyProfile(TimestampMixin, Base):
+    __tablename__ = "strategy_profiles"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    library_type: Mapped[str] = mapped_column(String(64), default="academic", index=True)
+    is_builtin: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    profile_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    profile_hash: Mapped[str] = mapped_column(String(64), index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
 
 class CourseGraphState(TimestampMixin, Base):
@@ -43,6 +57,8 @@ class CourseGraphState(TimestampMixin, Base):
     active_document_version_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     active_chunk_ids_hash: Mapped[str] = mapped_column(String(64), index=True)
     graph_document_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    strategy_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    strategy_profile_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     active_chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     built_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -341,6 +357,8 @@ class GraphExtractionRun(TimestampMixin, Base):
     batch_id: Mapped[str | None] = mapped_column(ForeignKey("ingestion_batches.id"), nullable=True, index=True)
     strategy: Mapped[str] = mapped_column(String(64), default="adaptive_best_first", index=True)
     profile_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    strategy_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    strategy_profile_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     prompt_version: Mapped[str] = mapped_column(String(128), default="graph_extraction_v1")
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="planned", index=True)

@@ -125,6 +125,19 @@ SessionLocal = ContextSessionLocalProxy(_original_SessionLocal)
 SCHEMA_PATCHES: dict[str, dict[str, str]] = {
     "courses": {
         "current_chunk_version": "INTEGER DEFAULT 0",
+        "active_profile_id": "VARCHAR(36)",
+    },
+    "strategy_profiles": {
+        "library_type": "VARCHAR(64) DEFAULT 'academic'",
+        "is_builtin": "BOOLEAN DEFAULT false",
+        "profile_json": "JSON DEFAULT '{}'",
+        "profile_hash": "VARCHAR(64)",
+        "is_active": "BOOLEAN DEFAULT true",
+        "updated_at": "DATETIME",
+    },
+    "course_graph_states": {
+        "strategy_profile_id": "VARCHAR(36)",
+        "strategy_profile_hash": "VARCHAR(64)",
     },
     "chunks": {
         "chunk_version": "INTEGER DEFAULT 1",
@@ -206,6 +219,8 @@ SCHEMA_PATCHES: dict[str, dict[str, str]] = {
         "is_active": "BOOLEAN DEFAULT true",
     },
     "graph_extraction_runs": {
+        "strategy_profile_id": "VARCHAR(36)",
+        "strategy_profile_hash": "VARCHAR(64)",
         "coverage_json": "JSON DEFAULT '{}'",
         "budget_json": "JSON DEFAULT '{}'",
         "stats_json": "JSON DEFAULT '{}'",
@@ -425,6 +440,11 @@ def ensure_schema() -> None:
             connection.execute(
                 text("UPDATE courses SET current_chunk_version = 0 WHERE current_chunk_version IS NULL")
             )
+    from app.services.strategy_profiles import ensure_courses_have_profiles
+
+    with SessionLocal() as session:
+        ensure_courses_have_profiles(session)
+        session.commit()
 
 
 def get_db() -> Generator[Session, None, None]:

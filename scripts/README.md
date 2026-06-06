@@ -31,6 +31,13 @@ docker exec course-kg-api python /app/scripts/quality_gate.py --course-name "课
 
 ## 常用命令
 
+Profile-aware 脚本说明：
+
+- `quality_gate.py` 和质量评估脚本会读取资料库当前 active Profile，并在输出中带出 Profile 相关上下文；默认课程 Profile 下应保持既有断言兼容。
+- Profile 配置保存在 PostgreSQL，不在 `.env` 中。脚本不应直接改写 Profile JSON，除非通过正式 API/服务函数并带有明确测试。
+- 切换或删除 Profile 不会自动重嵌入、重解析或重建图谱；需要验证新 Profile 生效时，应显式运行解析、图谱构建、检索或问答链路。
+- 若脚本生成测试资料库，应默认使用内置课程 Profile；需要自定义 Profile 时，应在脚本输出中记录 Profile id/hash 和绑定操作。
+
 检查单门课 DB/Qdrant 健康：
 ```powershell
 docker exec course-kg-api python /app/scripts/quality_gate.py --course-name "课程名称"

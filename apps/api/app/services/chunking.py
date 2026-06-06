@@ -9,6 +9,7 @@ from app.services.parsers import ParsedSection
 from app.services.embeddings import vector_norm
 from app.services.quality.policies import ChunkQualityPolicy, QualityDecision
 from app.services.quality.signals import build_quality_signals
+from app.services.strategy_profiles import active_profile_json, profile_label
 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
@@ -302,7 +303,10 @@ def is_toc_like(content: str) -> bool:
 
 def should_keep_code_chunk(section_name: str, section_title: str) -> bool:
     text = f"{section_name} {section_title}".lower()
-    return any(marker in text for marker in CODE_KEEP_MARKERS)
+    parsing_strategy = active_profile_json().get("parsing_strategy") or {}
+    configured = parsing_strategy.get("code_keep_markers") if isinstance(parsing_strategy, dict) else None
+    markers = tuple(str(item).lower() for item in configured if str(item).strip()) if isinstance(configured, list) else CODE_KEEP_MARKERS
+    return any(marker in text for marker in markers)
 
 
 def should_keep_chunk(content: str, content_kind: str, section_name: str, section_title: str) -> bool:
@@ -359,10 +363,11 @@ def embedding_text(
     has_table: bool = False,
     has_formula: bool = False,
 ) -> str:
+    profile = active_profile_json()
     parts = [
-        f"Document: {document_title}",
-        f"Chapter: {chapter or ''}",
-        f"Section: {section or ''}",
+        f"{profile_label(profile, 'document', 'Document')}: {document_title}",
+        f"{profile_label(profile, 'chapter', 'Chapter')}: {chapter or ''}",
+        f"{profile_label(profile, 'section', 'Section')}: {section or ''}",
         f"Source Type: {source_type or ''}",
         f"Content Kind: {content_kind or ''}",
     ]
@@ -394,10 +399,11 @@ def contextual_embedding_text(
     has_table: bool = False,
     has_formula: bool = False,
 ) -> str:
+    profile = active_profile_json()
     parts = [
-        f"Document: {document_title}",
-        f"Chapter: {chapter or ''}",
-        f"Section: {section or ''}",
+        f"{profile_label(profile, 'document', 'Document')}: {document_title}",
+        f"{profile_label(profile, 'chapter', 'Chapter')}: {chapter or ''}",
+        f"{profile_label(profile, 'section', 'Section')}: {section or ''}",
         f"Source Type: {source_type or ''}",
         f"Content Kind: {content_kind or ''}",
     ]

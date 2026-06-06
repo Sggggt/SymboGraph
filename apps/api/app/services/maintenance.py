@@ -35,6 +35,7 @@ from app.models import (
 )
 from app.services.concept_graph import is_valid_concept, normalize_relation_type
 from app.services.ingestion import active_batch_for_course
+from app.services.strategy_profiles import get_active_profile_record, profile_schema
 from app.services.vector_store import VectorStore
 
 
@@ -67,6 +68,9 @@ def cleanup_stale_graph_references(db: Session, course_id: str) -> GraphCleanupS
     relations = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course_id)).all()
     if not relations:
         return GraphCleanupStats()
+    strategy_schema = profile_schema(get_active_profile_record(db, course_id).profile_json)
+    allowed_relation_inputs = set(strategy_schema.get("relation_types") or [])
+    allowed_relation_inputs.update((strategy_schema.get("relation_aliases") or {}).keys())
 
     chunk_ids = {relation.evidence_chunk_id for relation in relations if relation.evidence_chunk_id}
     chunks = {chunk.id: chunk for chunk in db.scalars(select(Chunk).where(Chunk.id.in_(chunk_ids))).all()} if chunk_ids else {}
@@ -86,8 +90,11 @@ def cleanup_stale_graph_references(db: Session, course_id: str) -> GraphCleanupS
     migrated_relations = 0
     for relation in relations:
         stale = False
+        raw_relation_type = str(relation.relation_type or "").strip().lower()
         relation_type = normalize_relation_type(relation.relation_type)
-        if not relation_type:
+        if raw_relation_type not in allowed_relation_inputs:
+            stale = True
+        elif not relation_type:
             stale = True
         elif relation_type != relation.relation_type:
             relation.relation_type = relation_type

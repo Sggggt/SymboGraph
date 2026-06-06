@@ -20,6 +20,7 @@ from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded
 from app.services.parsers import derive_chapter, is_invalid_chapter_label
 from app.services.reranker import get_reranker
 from app.services.runtime_settings import read_env_bool
+from app.services.strategy_profiles import active_profile_json, get_active_profile_record, use_strategy_profile
 from app.services.vector_store import VectorStore
 
 
@@ -98,6 +99,29 @@ def tokenize_for_retrieval(text: str) -> list[str]:
 
 def classify_query_type(query: str) -> str:
     lower = query.lower()
+    retrieval_strategy = active_profile_json().get("retrieval_strategy") or {}
+    markers = retrieval_strategy.get("query_type_markers") if isinstance(retrieval_strategy, dict) else None
+
+    def _markers(key: str, defaults: tuple[str, ...]) -> tuple[str, ...]:
+        values = markers.get(key) if isinstance(markers, dict) else None
+        if isinstance(values, list):
+            normalized = tuple(str(item).lower() for item in values if str(item).strip())
+            return normalized or defaults
+        return defaults
+
+    if any(marker in lower for marker in _markers("definition", ("what is", "define", "definition", "meaning", "concept", "什么是", "定义", "概念"))):
+        return "definition"
+    if (
+        any(marker in lower for marker in _markers("formula", ("formula", "theorem", "proof", "derive", "equation", "complexity", "o(", "公式", "定理", "证明")))
+        or re.search(r"[=∑≤≥∞αβγλμ]|p\(|q\(|\\", query)
+    ):
+        return "formula"
+    if any(marker in lower for marker in _markers("example", ("example", "instance", "case", "举例", "例子"))):
+        return "example"
+    if any(marker in lower for marker in _markers("comparison", ("compare", "versus", "vs", "difference", "relationship", "relate", "区别", "比较", "关系"))):
+        return "comparison"
+    if any(marker in lower for marker in _markers("procedure", ("algorithm", "procedure", "steps", "how to", "流程", "步骤", "算法", "如何"))):
+        return "procedure"
     if any(marker in lower for marker in ("what is", "define", "definition", "meaning", "concept", "什么是", "定义", "概念")):
         return "definition"
     if (
@@ -877,9 +901,11 @@ def lexical_search_chunks(db: Session, course_id: str, query: str, filters: Sear
 
 
 async def answer_question(db: Session, course_id: str, question: str, filters: SearchFilters, top_k: int, history: list[dict]) -> dict:
-    results = await search_chunks(db, course_id, question, filters, top_k)
-    chat = ChatProvider()
-    answer = await chat.answer_question(question, results, history)
+    strategy_profile = get_active_profile_record(db, course_id)
+    with use_strategy_profile(strategy_profile.profile_json):
+        results = await search_chunks(db, course_id, question, filters, top_k)
+        chat = ChatProvider()
+        answer = await chat.answer_question(question, results, history)
     return {
         "answer": answer,
         "citations": [citation for result in results for citation in result["citations"]],
@@ -904,6 +930,9 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
                 "has_parsed_chunks": False,
                 "can_full_reparse": False,
                 "degraded_mode": is_degraded_mode(),
+                "active_profile_id": None,
+                "active_profile_name": None,
+                "active_profile_hash": None,
             },
             "tree": [],
             "graph": {"nodes": [], "edges": [], "focus_chapter": None},
@@ -954,6 +983,7 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
     ]
     latest_batch = next((batch for batch in batches if batch.status not in TERMINAL_BATCH_STATES), None)
     graph_payload = get_graph_payload(db, course.id, graph_type="semantic")
+    active_profile = get_active_profile_record(db, course.id)
     return {
         "course": {
             "id": course.id,
@@ -967,6 +997,9 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
             "has_parsed_chunks": chunk_count > 0,
             "can_full_reparse": chunk_count > 0,
             "degraded_mode": is_degraded_mode(),
+            "active_profile_id": active_profile.id,
+            "active_profile_name": active_profile.name,
+            "active_profile_hash": active_profile.profile_hash,
         },
         "tree": tree,
         "graph": graph_payload,

@@ -32,6 +32,27 @@ import { useLocalStorage } from "@/hooks/use-local-storage";
 const sourceOptions: SourceType[] = ["pdf", "notebook", "markdown", "text", "image", "docx", "pptx"];
 const emptySearchResults: SearchResult[] = [];
 
+export function toPureSemanticGraph(graph: GraphResponse | undefined): GraphResponse | undefined {
+  if (!graph) {
+    return undefined;
+  }
+
+  const nodes = graph.nodes.filter((node) => node.category === "semantic_entity");
+  const semanticNodeIds = new Set(nodes.map((node) => node.id));
+  const edges = graph.edges.filter(
+    (edge) => edge.category === "semantic" && semanticNodeIds.has(edge.source) && semanticNodeIds.has(edge.target),
+  );
+
+  return {
+    ...graph,
+    graph_type: "semantic",
+    nodes,
+    edges,
+    node_counts: { semantic_entity: nodes.length },
+    edge_counts: { semantic: edges.length },
+  };
+}
+
 type HoverPreviewState = {
   result: SearchResult;
   top: number;
@@ -410,7 +431,7 @@ function GraphCanvasPanel({
           </div>
         ) : (
           <div className="mx-3 grid h-full min-h-0 w-full flex-1 place-items-center rounded-[1.5rem] border border-white/7 bg-white/[0.025] px-6 text-center text-sm leading-7 text-white/54">
-            {hasResults ? "当前检索结果没有匹配到可审计的语义图关系。" : "发起检索后，这里只展示命中片段相关的语义实体、证据片段和真实关系。"}
+            {hasResults ? "当前检索结果没有匹配到可审计的语义图关系。" : "发起检索后，这里只展示命中片段相关的语义实体和语义关系。"}
           </div>
         )}
       </div>
@@ -573,9 +594,9 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     queryFn: () => fetchQuerySemanticGraph({ course_id: selectedCourseId, query, chunk_ids: resultChunkIds }),
     enabled: resultChunkIds.length > 0,
   });
+  const pureSemanticGraph = useMemo(() => toPureSemanticGraph(querySemanticGraphQuery.data), [querySemanticGraphQuery.data]);
   const selectedResult = results.find((result) => result.chunk_id === activeChunkId) ?? null;
   const focusChapter = selectedResult ? resultChapter(selectedResult) : selectedChapter;
-  const selectedNodeId = selectedResult?.chunk_id ? `evidence_chunk:${selectedResult.chunk_id}` : null;
   const selectedLabel = selectedResult?.document_title ?? selectedResult?.citations[0]?.document_title ?? null;
 
   useEffect(() => {
@@ -693,8 +714,8 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         <GraphCanvasPanel
           selectedLabel={selectedLabel}
           selectedChapter={focusChapter}
-          selectedNodeId={selectedNodeId}
-          graph={querySemanticGraphQuery.data}
+          selectedNodeId={null}
+          graph={pureSemanticGraph}
           hasResults={results.length > 0}
           isLoading={querySemanticGraphQuery.isLoading || searchMutation.isPending}
           error={(querySemanticGraphQuery.error as Error | null) ?? null}
