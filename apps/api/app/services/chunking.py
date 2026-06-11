@@ -49,7 +49,7 @@ CODE_CHUNK_OVERLAP = 100
 EMBEDDING_TEXT_VERSION = "metadata_enriched_v1"
 CURRENT_EMBEDDING_TEXT_VERSION = "contextual_enriched_v3"
 CODE_KEEP_MARKERS = ("centrality", "community", "random network", "configuration model")
-MOJIBAKE_MARKERS = ("�", "鈥", "鐩", "绗", "鍥", "灏", "瀛", "凹", "鍫")
+MOJIBAKE_MARKERS = ("?", "鈥", "鐩", "绗", "鍥", "灏", "瀛", "凹", "鍫")
 
 
 def build_splitter(chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_overlap: int = DEFAULT_CHUNK_OVERLAP):
@@ -353,7 +353,7 @@ def quality_metadata(decision: QualityDecision) -> dict:
 def embedding_text(
     *,
     document_title: str,
-    chapter: str | None,
+    partition: str | None,
     section: str | None,
     source_type: str | None,
     content_kind: str | None,
@@ -366,7 +366,7 @@ def embedding_text(
     profile = active_profile_json()
     parts = [
         f"{profile_label(profile, 'document', 'Document')}: {document_title}",
-        f"{profile_label(profile, 'chapter', 'Chapter')}: {chapter or ''}",
+        f"{profile_label(profile, 'partition', 'partition')}: {partition or ''}",
         f"{profile_label(profile, 'section', 'Section')}: {section or ''}",
         f"Source Type: {source_type or ''}",
         f"Content Kind: {content_kind or ''}",
@@ -386,7 +386,7 @@ def embedding_text(
 def contextual_embedding_text(
     *,
     document_title: str,
-    chapter: str | None,
+    partition: str | None,
     section: str | None,
     source_type: str | None,
     content_kind: str | None,
@@ -402,7 +402,7 @@ def contextual_embedding_text(
     profile = active_profile_json()
     parts = [
         f"{profile_label(profile, 'document', 'Document')}: {document_title}",
-        f"{profile_label(profile, 'chapter', 'Chapter')}: {chapter or ''}",
+        f"{profile_label(profile, 'partition', 'partition')}: {partition or ''}",
         f"{profile_label(profile, 'section', 'Section')}: {section or ''}",
         f"Source Type: {source_type or ''}",
         f"Content Kind: {content_kind or ''}",
@@ -425,7 +425,7 @@ def contextual_embedding_text(
     return "\n".join(parts)
 
 
-def chunk_sections_with_stats(sections: Iterable[ParsedSection], chapter: str, source_type: str) -> tuple[list[dict], dict[str, int]]:
+def chunk_sections_with_stats(sections: Iterable[ParsedSection], partition: str, source_type: str) -> tuple[list[dict], dict[str, int]]:
     chunks: list[dict] = []
     stats = {"chunks_before_filter": 0, "chunks_filtered": 0}
     for section_index, section in enumerate(sections, start=1):
@@ -446,7 +446,7 @@ def chunk_sections_with_stats(sections: Iterable[ParsedSection], chapter: str, s
                 {
                     "content": content,
                     "snippet": snippet,
-                    "chapter": chapter,
+                    "partition": partition,
                     "section": section_name,
                     "page_number": section.page_number,
                     "token_count": rough_token_count(content),
@@ -464,7 +464,7 @@ def chunk_sections_with_stats(sections: Iterable[ParsedSection], chapter: str, s
     return chunks, stats
 
 
-def chunk_sections_semantic(sections: Iterable[ParsedSection], chapter: str, source_type: str) -> tuple[list[dict], dict[str, int]]:
+def chunk_sections_semantic(sections: Iterable[ParsedSection], partition: str, source_type: str) -> tuple[list[dict], dict[str, int]]:
     """语义感知切分：Markdown 用标题切分，其他用句子边界切分。"""
     chunks: list[dict] = []
     stats = {"chunks_before_filter": 0, "chunks_filtered": 0}
@@ -488,7 +488,7 @@ def chunk_sections_semantic(sections: Iterable[ParsedSection], chapter: str, sou
                 {
                     "content": content,
                     "snippet": snippet,
-                    "chapter": chapter,
+                    "partition": partition,
                     "section": section_name,
                     "page_number": section.page_number,
                     "token_count": rough_token_count(content),
@@ -506,7 +506,7 @@ def chunk_sections_semantic(sections: Iterable[ParsedSection], chapter: str, sou
     return chunks, stats
 
 
-def chunk_sections_hierarchical(sections: Iterable[ParsedSection], chapter: str, source_type: str) -> tuple[list[dict], dict[str, int]]:
+def chunk_sections_hierarchical(sections: Iterable[ParsedSection], partition: str, source_type: str) -> tuple[list[dict], dict[str, int]]:
     """语义切分 + 父子块结构。返回的 payload 中 is_parent 标记 parent chunks。"""
     chunks: list[dict] = []
     stats = {"chunks_before_filter": 0, "chunks_filtered": 0, "parents_created": 0, "children_created": 0}
@@ -520,7 +520,7 @@ def chunk_sections_hierarchical(sections: Iterable[ParsedSection], chapter: str,
         parent_payload = {
             "content": section_text,
             "snippet": section_text[:280].strip(),
-            "chapter": chapter,
+            "partition": partition,
             "section": section_name,
             "page_number": section.page_number,
             "token_count": rough_token_count(section_text),
@@ -556,7 +556,7 @@ def chunk_sections_hierarchical(sections: Iterable[ParsedSection], chapter: str,
             child_payload = {
                 "content": content,
                 "snippet": snippet,
-                "chapter": chapter,
+                "partition": partition,
                 "section": section_name,
                 "page_number": section.page_number,
                 "token_count": rough_token_count(content),
@@ -579,7 +579,7 @@ def chunk_sections_hierarchical(sections: Iterable[ParsedSection], chapter: str,
     return chunks, stats
 
 
-async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], chapter: str, source_type: str, batch_id: str | None = None) -> tuple[list[dict], dict[str, int]]:
+async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], partition: str, source_type: str, batch_id: str | None = None) -> tuple[list[dict], dict[str, int]]:
     """Async hierarchical chunking that can use real embeddings for long semantic splits."""
     from app.services.chunk_adaptation import choose_chunking_profile
 
@@ -601,8 +601,12 @@ async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], c
             from app.services.ingestion_logs import emit_ingestion_log
             emit_ingestion_log(
                 batch_id,
-                "chunk_adaptive",
-                f"章节 [{section_title}] 动态特征分析：自适应大小={profile.chunk_size}，重叠={profile.chunk_overlap}，策略={profile.strategy} (F1得分 {profile.score:.3f})"
+                "evidence_section_sizing",
+                (
+                    f"Evidence section sizing: title={section_title or section_name or 'untitled'}, "
+                    f"size={profile.chunk_size}, overlap={profile.chunk_overlap}, "
+                    f"strategy={profile.strategy}, score={profile.score:.3f}"
+                ),
             )
         stats["adaptive_profiles"] += 1
         parent_decision = chunk_quality_decision(section_text, content_kind, section_name, section_title, section.metadata)
@@ -610,7 +614,7 @@ async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], c
         parent_payload = {
             "content": section_text,
             "snippet": section_text[:280].strip(),
-            "chapter": chapter,
+            "partition": partition,
             "section": section_name,
             "page_number": section.page_number,
             "token_count": rough_token_count(section_text),
@@ -659,7 +663,7 @@ async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], c
             child_payload = {
                 "content": content,
                 "snippet": snippet,
-                "chapter": chapter,
+                "partition": partition,
                 "section": section_name,
                 "page_number": section.page_number,
                 "token_count": rough_token_count(content),
@@ -684,5 +688,5 @@ async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], c
     return chunks, stats
 
 
-def chunk_sections(sections: Iterable[ParsedSection], chapter: str, source_type: str) -> list[dict]:
-    return chunk_sections_with_stats(sections, chapter, source_type)[0]
+def chunk_sections(sections: Iterable[ParsedSection], partition: str, source_type: str) -> list[dict]:
+    return chunk_sections_with_stats(sections, partition, source_type)[0]

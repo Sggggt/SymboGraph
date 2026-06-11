@@ -23,6 +23,8 @@ RUN uv pip install --system --no-cache -e ".[rerank,dev,ocr]"
 
 # 复制应用代码
 COPY apps/api/app ./app
+COPY apps/api/alembic.ini ./alembic.ini
+COPY apps/api/migrations ./migrations
 COPY apps/api/tests ./tests
 COPY apps/worker/worker_app /app/apps/worker/worker_app
 COPY .env.example /app/.env.example

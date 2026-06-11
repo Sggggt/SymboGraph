@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 from dataclasses import dataclass
 
@@ -8,34 +9,52 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.models import (
+    ActiveChunk,
     AgentRun,
     AgentTraceEvent,
-    Chunk,
-    Concept,
-    ConceptAlias,
-    ConceptRelation,
-    Course,
-    CourseModelHyperparameter,
+    AnswerSession,
+    CitationVerification,
+    ChunkCandidate,
+    ChunkDecision,
+    CommunityMembership,
+    CommunityState,
+    CommunitySummary,
     Document,
     DocumentVersion,
-    EntityMergeCandidate,
-    EntityMention,
-    GraphExtractionChunkTask,
-    GraphExtractionRun,
-    GraphCommunitySummary,
-    GraphHpoJudgeSample,
-    GraphHpoObjectiveModel,
-    GraphRelationCandidate,
+    EvidenceAtom,
+    EvidenceEdge,
+    EvidenceGraphState,
     IngestionBatch,
     IngestionCompensationLog,
     IngestionJob,
     IngestionLog,
+    KnowledgeBase,
+    ParseJob,
+    PolicyObservation,
+    PolicyState,
+    ProjectionCommunity,
+    ProjectionEdge,
+    ProjectionNode,
+    ProjectionState,
     QASession,
-    QualityProfile,
+    QualityDecision,
+    QualityObservation,
+    RetrievalTrace,
+    RewardEvent,
+    SignalCandidate,
+    SignalCommunity,
+    SignalCommunityMembership,
+    SignalDecision,
+    SignalEdge,
+    SignalNode,
+    SignalRelationSpec,
+    SignalSchemaState,
+    SignalState,
+    SignalTypeSpec,
+    SourceFile,
+    VectorRecord,
 )
-from app.services.concept_graph import is_valid_concept, normalize_relation_type
-from app.services.ingestion import active_batch_for_course
-from app.services.strategy_profiles import get_active_profile_record, profile_schema
+from app.services.ingestion import active_batch_for_knowledge_base
 from app.services.vector_store import VectorStore
 
 
@@ -44,411 +63,364 @@ class MaintenanceConflict(RuntimeError):
 
 
 @dataclass
-class GraphCleanupStats:
-    removed_relations: int = 0
-    removed_aliases: int = 0
-    removed_concepts: int = 0
-    migrated_relations: int = 0
+class EvidenceCleanupStats:
+    removed_evidence_atoms: int = 0
+    removed_evidence_edges: int = 0
+    removed_evidence_graph_states: int = 0
+    removed_chunk_candidates: int = 0
+    removed_chunk_decisions: int = 0
+    removed_quality_decisions: int = 0
+    removed_active_chunks: int = 0
+    removed_community_states: int = 0
+    removed_community_memberships: int = 0
+    removed_community_summaries: int = 0
+    removed_signal_schema_states: int = 0
+    removed_signal_states: int = 0
+    removed_signal_candidates: int = 0
+    removed_signal_decisions: int = 0
+    removed_signal_nodes: int = 0
+    removed_signal_edges: int = 0
+    removed_signal_communities: int = 0
+    removed_signal_community_memberships: int = 0
+    removed_projection_states: int = 0
+    removed_projection_nodes: int = 0
+    removed_projection_edges: int = 0
+    removed_projection_communities: int = 0
+    removed_vector_records: int = 0
 
     def as_dict(self) -> dict[str, int]:
-        return {
-            "removed_relations": self.removed_relations,
-            "removed_aliases": self.removed_aliases,
-            "removed_concepts": self.removed_concepts,
-            "migrated_relations": self.migrated_relations,
-        }
+        return self.__dict__.copy()
 
 
-def ensure_no_active_batch(db: Session, course_id: str) -> None:
-    if active_batch_for_course(db, course_id) is not None:
+def ensure_no_active_batch(db: Session, knowledge_base_id: str) -> None:
+    if active_batch_for_knowledge_base(db, knowledge_base_id) is not None:
         raise MaintenanceConflict("Cannot run maintenance while an ingestion batch is active")
 
 
-def cleanup_stale_graph_references(db: Session, course_id: str) -> GraphCleanupStats:
-    relations = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course_id)).all()
-    if not relations:
-        return GraphCleanupStats()
-    strategy_schema = profile_schema(get_active_profile_record(db, course_id).profile_json)
-    allowed_relation_inputs = set(strategy_schema.get("relation_types") or [])
-    allowed_relation_inputs.update((strategy_schema.get("relation_aliases") or {}).keys())
+def _json_ids(raw: object) -> set[str]:
+    if isinstance(raw, str):
+        return {raw}
+    if isinstance(raw, list):
+        return {str(item) for item in raw if item}
+    return set()
 
-    chunk_ids = {relation.evidence_chunk_id for relation in relations if relation.evidence_chunk_id}
-    chunks = {chunk.id: chunk for chunk in db.scalars(select(Chunk).where(Chunk.id.in_(chunk_ids))).all()} if chunk_ids else {}
-    document_ids = {chunk.document_id for chunk in chunks.values()}
-    documents = {document.id: document for document in db.scalars(select(Document).where(Document.id.in_(document_ids))).all()} if document_ids else {}
 
-    concept_ids = {
-        concept_id
-        for relation in relations
-        for concept_id in (relation.source_concept_id, relation.target_concept_id)
-        if concept_id
+def _active_chunk_ids_for_document(db: Session, knowledge_base_id: str, document_id: str) -> set[str]:
+    ids: set[str] = set()
+    for chunk in db.scalars(select(ActiveChunk).where(ActiveChunk.knowledge_base_id == knowledge_base_id)).all():
+        metadata = chunk.metadata_json or {}
+        if metadata.get("document_id") == document_id:
+            ids.add(chunk.id)
+    return ids
+
+
+def _active_chunk_ids_touching_atoms(db: Session, knowledge_base_id: str, atom_ids: set[str]) -> set[str]:
+    if not atom_ids:
+        return set()
+    ids: set[str] = set()
+    for chunk in db.scalars(select(ActiveChunk).where(ActiveChunk.knowledge_base_id == knowledge_base_id)).all():
+        if _json_ids(chunk.atom_ids_json) & atom_ids:
+            ids.add(chunk.id)
+    return ids
+
+
+def _graph_state_ids_touching_atoms(
+    db: Session,
+    *,
+    knowledge_base_id: str,
+    stale_atom_ids: set[str],
+    inactive_document_version_ids: set[str],
+) -> set[str]:
+    stale_graph_state_ids: set[str] = set()
+    active_atom_ids = set(
+        db.scalars(
+            select(EvidenceAtom.id).where(
+                EvidenceAtom.knowledge_base_id == knowledge_base_id,
+                EvidenceAtom.state == "active",
+            )
+        ).all()
+    ) - stale_atom_ids
+    for state in db.scalars(select(EvidenceGraphState).where(EvidenceGraphState.knowledge_base_id == knowledge_base_id)).all():
+        state_version_ids = _json_ids(state.active_document_version_ids)
+        state_atom_ids = _json_ids(state.active_atom_ids)
+        if (
+            state.state != "active"
+            or bool(state_version_ids & inactive_document_version_ids)
+            or bool(state_atom_ids & stale_atom_ids)
+            or not state_atom_ids.issubset(active_atom_ids)
+        ):
+            stale_graph_state_ids.add(state.id)
+    return stale_graph_state_ids
+
+
+def _delete_signal_and_projection_state(db: Session, stats: EvidenceCleanupStats, signal_state_ids: set[str]) -> None:
+    if not signal_state_ids:
+        return
+    projection_state_ids = set(
+        db.scalars(select(ProjectionState.id).where(ProjectionState.signal_state_id.in_(signal_state_ids))).all()
+    )
+    if projection_state_ids:
+        stats.removed_projection_communities = db.query(ProjectionCommunity).filter(
+            ProjectionCommunity.projection_state_id.in_(projection_state_ids)
+        ).delete(synchronize_session=False)
+        stats.removed_projection_edges = db.query(ProjectionEdge).filter(
+            ProjectionEdge.projection_state_id.in_(projection_state_ids)
+        ).delete(synchronize_session=False)
+        stats.removed_projection_nodes = db.query(ProjectionNode).filter(
+            ProjectionNode.projection_state_id.in_(projection_state_ids)
+        ).delete(synchronize_session=False)
+        stats.removed_projection_states = db.query(ProjectionState).filter(
+            ProjectionState.id.in_(projection_state_ids)
+        ).delete(synchronize_session=False)
+
+    signal_community_ids = set(
+        db.scalars(select(SignalCommunity.id).where(SignalCommunity.signal_state_id.in_(signal_state_ids))).all()
+    )
+    if signal_community_ids:
+        stats.removed_signal_community_memberships = db.query(SignalCommunityMembership).filter(
+            SignalCommunityMembership.signal_community_id.in_(signal_community_ids)
+        ).delete(synchronize_session=False)
+        stats.removed_signal_communities = db.query(SignalCommunity).filter(
+            SignalCommunity.id.in_(signal_community_ids)
+        ).delete(synchronize_session=False)
+
+    stats.removed_signal_edges = db.query(SignalEdge).filter(
+        SignalEdge.signal_state_id.in_(signal_state_ids)
+    ).delete(synchronize_session=False)
+    stats.removed_signal_nodes = db.query(SignalNode).filter(
+        SignalNode.signal_state_id.in_(signal_state_ids)
+    ).delete(synchronize_session=False)
+    stats.removed_signal_decisions = db.query(SignalDecision).filter(
+        SignalDecision.signal_state_id.in_(signal_state_ids)
+    ).delete(synchronize_session=False)
+    stats.removed_signal_candidates = db.query(SignalCandidate).filter(
+        SignalCandidate.signal_state_id.in_(signal_state_ids)
+    ).delete(synchronize_session=False)
+    stats.removed_signal_states = db.query(SignalState).filter(
+        SignalState.id.in_(signal_state_ids)
+    ).delete(synchronize_session=False)
+
+
+def _delete_signal_schemas_for_knowledge_base(db: Session, stats: EvidenceCleanupStats, knowledge_base_id: str) -> None:
+    schema_state_ids = set(
+        db.scalars(select(SignalSchemaState.id).where(SignalSchemaState.knowledge_base_id == knowledge_base_id)).all()
+    )
+    if not schema_state_ids:
+        return
+    db.query(SignalState).filter(SignalState.schema_state_id.in_(schema_state_ids)).update(
+        {"schema_state_id": None},
+        synchronize_session=False,
+    )
+    db.query(SignalState).filter(
+        SignalState.knowledge_base_id == knowledge_base_id,
+        SignalState.evidence_community_state_id.is_not(None),
+    ).update(
+        {"evidence_community_state_id": None},
+        synchronize_session=False,
+    )
+    db.query(SignalRelationSpec).filter(SignalRelationSpec.schema_state_id.in_(schema_state_ids)).delete(
+        synchronize_session=False
+    )
+    db.query(SignalTypeSpec).filter(SignalTypeSpec.schema_state_id.in_(schema_state_ids)).delete(
+        synchronize_session=False
+    )
+    stats.removed_signal_schema_states = db.query(SignalSchemaState).filter(
+        SignalSchemaState.id.in_(schema_state_ids)
+    ).delete(synchronize_session=False)
+
+
+def cleanup_stale_graph(db: Session, knowledge_base_id: str) -> dict[str, int]:
+    ensure_no_active_batch(db, knowledge_base_id)
+    db.commit()
+    return {
+        "removed_evidence_edges": 0,
+        "removed_evidence_atoms": 0,
+        "removed_signal_nodes": 0,
+        "removed_signal_edges": 0,
     }
-    concepts = {concept.id: concept for concept in db.scalars(select(Concept).where(Concept.id.in_(concept_ids))).all()} if concept_ids else {}
 
-    stale_relation_ids: list[str] = []
-    affected_concept_ids: set[str] = set()
-    migrated_relations = 0
-    for relation in relations:
-        stale = False
-        raw_relation_type = str(relation.relation_type or "").strip().lower()
-        relation_type = normalize_relation_type(relation.relation_type)
-        if raw_relation_type not in allowed_relation_inputs:
-            stale = True
-        elif not relation_type:
-            stale = True
-        elif relation_type != relation.relation_type:
-            relation.relation_type = relation_type
-            metadata = dict(getattr(relation, "metadata_json", None) or {})
-            metadata["legacy_relation_type_migrated"] = True
-            relation.metadata_json = metadata
-            stats_migrated = True
-            migrated_relations += 1
-        else:
-            stats_migrated = False
-        source_concept = concepts.get(relation.source_concept_id)
-        target_concept = concepts.get(relation.target_concept_id or "")
-        if source_concept is None or not is_valid_concept(source_concept.canonical_name):
-            stale = True
-        if relation.target_concept_id and (target_concept is None or not is_valid_concept(target_concept.canonical_name)):
-            stale = True
-        if relation.evidence_chunk_id:
-            chunk = chunks.get(relation.evidence_chunk_id)
-            document = documents.get(chunk.document_id) if chunk else None
-            if chunk is None or not chunk.is_active or document is None or not document.is_active:
-                stale = True
-        if stale:
-            stale_relation_ids.append(relation.id)
-            affected_concept_ids.update(
-                concept_id
-                for concept_id in (relation.source_concept_id, relation.target_concept_id)
-                if concept_id
-            )
-        elif stats_migrated:
-            affected_concept_ids.update(
-                concept_id
-                for concept_id in (relation.source_concept_id, relation.target_concept_id)
-                if concept_id
-            )
 
-    stats = GraphCleanupStats()
-    stats.migrated_relations = migrated_relations
-    if stale_relation_ids:
-        stats.removed_relations = db.query(ConceptRelation).filter(ConceptRelation.id.in_(stale_relation_ids)).delete(synchronize_session="fetch")
+def cleanup_stale_evidence_references(
+    db: Session,
+    *,
+    knowledge_base_id: str,
+    inactive_document_version_ids: set[str],
+    inactive_chunk_ids: set[str],
+    stale_qdrant_point_ids: set[str],
+) -> EvidenceCleanupStats:
+    stats = EvidenceCleanupStats()
+    inactive_document_version_ids = {str(item) for item in inactive_document_version_ids if item}
+    inactive_chunk_ids = {str(item) for item in inactive_chunk_ids if item}
+    stale_qdrant_point_ids = {str(item) for item in stale_qdrant_point_ids if item}
 
-    if affected_concept_ids:
-        remaining_relations = db.scalars(
-            select(ConceptRelation).where(
-                ConceptRelation.course_id == course_id,
-                (
-                    ConceptRelation.source_concept_id.in_(affected_concept_ids)
-                    | ConceptRelation.target_concept_id.in_(affected_concept_ids)
+    stale_atom_ids = set(
+        db.scalars(
+            select(EvidenceAtom.id).where(
+                EvidenceAtom.knowledge_base_id == knowledge_base_id,
+                or_(
+                    EvidenceAtom.state != "active",
+                    EvidenceAtom.document_version_id.in_(inactive_document_version_ids or {"__none__"}),
                 ),
             )
         ).all()
-        still_referenced = {
-            concept_id
-            for relation in remaining_relations
-            for concept_id in (relation.source_concept_id, relation.target_concept_id)
-            if concept_id
-        }
-        orphan_concept_ids = sorted(affected_concept_ids - still_referenced)
-        if orphan_concept_ids:
-            db.query(GraphRelationCandidate).filter(
-                or_(
-                    GraphRelationCandidate.source_concept_id.in_(orphan_concept_ids),
-                    GraphRelationCandidate.target_concept_id.in_(orphan_concept_ids),
-                )
-            ).delete(synchronize_session="fetch")
-            stats.removed_aliases = db.query(ConceptAlias).filter(ConceptAlias.concept_id.in_(orphan_concept_ids)).delete(synchronize_session="fetch")
-            stats.removed_concepts = db.query(Concept).filter(
-                Concept.course_id == course_id,
-                Concept.id.in_(orphan_concept_ids),
-            ).delete(synchronize_session="fetch")
+    )
+    stale_graph_state_ids = _graph_state_ids_touching_atoms(
+        db,
+        knowledge_base_id=knowledge_base_id,
+        stale_atom_ids=stale_atom_ids,
+        inactive_document_version_ids=inactive_document_version_ids,
+    )
+
+    candidate_ids = set()
+    if stale_graph_state_ids:
+        candidate_ids.update(
+            db.scalars(select(ChunkCandidate.id).where(ChunkCandidate.graph_state_id.in_(stale_graph_state_ids))).all()
+        )
+
+    decision_ids = set()
+    if stale_graph_state_ids:
+        decision_ids.update(
+            db.scalars(select(ChunkDecision.id).where(ChunkDecision.graph_state_id.in_(stale_graph_state_ids))).all()
+        )
+    if candidate_ids:
+        decision_ids.update(
+            db.scalars(select(ChunkDecision.id).where(ChunkDecision.candidate_id.in_(candidate_ids))).all()
+        )
+
+    stale_active_chunk_ids = set(inactive_chunk_ids)
+    if decision_ids:
+        stale_active_chunk_ids.update(
+            db.scalars(select(ActiveChunk.id).where(ActiveChunk.chunk_decision_id.in_(decision_ids))).all()
+        )
+    stale_active_chunk_ids.update(
+        db.scalars(
+            select(ActiveChunk.id).where(
+                ActiveChunk.knowledge_base_id == knowledge_base_id,
+                ActiveChunk.state != "active",
+            )
+        ).all()
+    )
+    stale_active_chunk_ids.update(_active_chunk_ids_touching_atoms(db, knowledge_base_id, stale_atom_ids))
+
+    if stale_active_chunk_ids or stale_qdrant_point_ids:
+        conditions = []
+        if stale_active_chunk_ids:
+            conditions.append(VectorRecord.active_chunk_id.in_(stale_active_chunk_ids))
+        if stale_qdrant_point_ids:
+            conditions.append(VectorRecord.qdrant_point_id.in_(stale_qdrant_point_ids))
+        stats.removed_vector_records = db.query(VectorRecord).filter(or_(*conditions)).delete(synchronize_session="fetch")
+
+    if stale_graph_state_ids:
+        signal_state_ids = set(
+            db.scalars(select(SignalState.id).where(SignalState.evidence_graph_state_id.in_(stale_graph_state_ids))).all()
+        )
+        _delete_signal_and_projection_state(db, stats, signal_state_ids)
+
+        community_state_ids = set(
+            db.scalars(select(CommunityState.id).where(CommunityState.graph_state_id.in_(stale_graph_state_ids))).all()
+        )
+        if community_state_ids:
+            stats.removed_community_summaries = db.query(CommunitySummary).filter(
+                CommunitySummary.community_state_id.in_(community_state_ids)
+            ).delete(synchronize_session=False)
+            stats.removed_community_memberships = db.query(CommunityMembership).filter(
+                CommunityMembership.community_state_id.in_(community_state_ids)
+            ).delete(synchronize_session=False)
+            stats.removed_community_states = db.query(CommunityState).filter(
+                CommunityState.id.in_(community_state_ids)
+            ).delete(synchronize_session=False)
+
+    if stale_active_chunk_ids:
+        stats.removed_active_chunks = db.query(ActiveChunk).filter(
+            ActiveChunk.id.in_(stale_active_chunk_ids)
+        ).delete(synchronize_session="fetch")
+
+    if decision_ids:
+        stats.removed_chunk_decisions = db.query(ChunkDecision).filter(
+            ChunkDecision.id.in_(decision_ids)
+        ).delete(synchronize_session="fetch")
+
+    if candidate_ids:
+        stats.removed_quality_decisions = db.query(QualityDecision).filter(
+            QualityDecision.candidate_id.in_(candidate_ids)
+        ).delete(synchronize_session="fetch")
+        stats.removed_chunk_candidates = db.query(ChunkCandidate).filter(
+            ChunkCandidate.id.in_(candidate_ids)
+        ).delete(synchronize_session="fetch")
+
+    edge_conditions = []
+    if stale_graph_state_ids:
+        edge_conditions.append(EvidenceEdge.graph_state_id.in_(stale_graph_state_ids))
+    if stale_atom_ids:
+        edge_conditions.extend(
+            [
+                EvidenceEdge.source_atom_id.in_(stale_atom_ids),
+                EvidenceEdge.target_atom_id.in_(stale_atom_ids),
+            ]
+        )
+    if edge_conditions:
+        stats.removed_evidence_edges = db.query(EvidenceEdge).filter(or_(*edge_conditions)).delete(
+            synchronize_session="fetch"
+        )
+
+    if stale_graph_state_ids:
+        stats.removed_evidence_graph_states = db.query(EvidenceGraphState).filter(
+            EvidenceGraphState.id.in_(stale_graph_state_ids)
+        ).delete(synchronize_session="fetch")
+
+    if stale_atom_ids:
+        stats.removed_evidence_atoms = db.query(EvidenceAtom).filter(
+            EvidenceAtom.id.in_(stale_atom_ids)
+        ).delete(synchronize_session="fetch")
 
     return stats
 
 
-def cleanup_stale_graph(db: Session, course_id: str) -> dict[str, int]:
-    ensure_no_active_batch(db, course_id)
-    stats = cleanup_stale_graph_references(db, course_id)
-    db.commit()
-    return stats.as_dict()
-
-
-def _metadata_chunk_ids(metadata: dict | None) -> set[str]:
-    values: set[str] = set()
-    if not isinstance(metadata, dict):
-        return values
-    for key in ("chunk_ids", "evidence_chunk_ids", "support_chunk_ids"):
-        raw = metadata.get(key)
-        if isinstance(raw, str):
-            values.add(raw)
-        elif isinstance(raw, list):
-            values.update(str(item) for item in raw if item)
-    return values
-
-
-def _active_chunk_ids(db: Session, course_id: str, chunk_ids: set[str]) -> set[str]:
-    if not chunk_ids:
-        return set()
-    return set(
-        db.scalars(
-            select(Chunk.id).where(
-                Chunk.course_id == course_id,
-                Chunk.id.in_(chunk_ids),
-                Chunk.is_active.is_(True),
-            )
-        ).all()
+def delete_document_graph_incremental(db: Session, knowledge_base_id: str, document_id: str) -> dict[str, int]:
+    document_version_ids = set(
+        db.scalars(select(DocumentVersion.id).where(DocumentVersion.document_id == document_id)).all()
     )
-
-
-def _concept_mention_chunk_ids(
-    db: Session,
-    course_id: str,
-    concept_id: str | None,
-    source_document_ids: set[str],
-) -> set[str]:
-    if not concept_id:
-        return set()
-    query = select(EntityMention.chunk_id).where(
-        EntityMention.course_id == course_id,
-        EntityMention.concept_id == concept_id,
-        EntityMention.chunk_id.is_not(None),
+    active_chunk_ids = _active_chunk_ids_for_document(db, knowledge_base_id, document_id)
+    stats = cleanup_stale_evidence_references(
+        db,
+        knowledge_base_id=knowledge_base_id,
+        inactive_document_version_ids=document_version_ids,
+        inactive_chunk_ids=active_chunk_ids,
+        stale_qdrant_point_ids=set(),
     )
-    if source_document_ids:
-        query = query.where(EntityMention.document_id.in_(source_document_ids))
-    return {str(chunk_id) for chunk_id in db.scalars(query).all() if chunk_id}
-
-
-def _recalculate_edge_support_count(
-    db: Session,
-    *,
-    course_id: str,
-    source_concept_id: str,
-    target_concept_id: str | None,
-    source_document_ids: list[str] | None,
-    evidence_chunk_id: str | None,
-    metadata_json: dict | None,
-) -> int:
-    source_ids = {str(item) for item in (source_document_ids or []) if item}
-    evidence_chunk_ids = _metadata_chunk_ids(metadata_json)
-    if evidence_chunk_id:
-        evidence_chunk_ids.add(str(evidence_chunk_id))
-
-    source_chunks = _concept_mention_chunk_ids(db, course_id, source_concept_id, source_ids)
-    if target_concept_id:
-        target_chunks = _concept_mention_chunk_ids(db, course_id, target_concept_id, source_ids)
-        co_mention_chunks = source_chunks.intersection(target_chunks)
-        evidence_chunk_ids.update(co_mention_chunks)
-    else:
-        evidence_chunk_ids.update(source_chunks)
-
-    active_evidence_chunks = _active_chunk_ids(db, course_id, evidence_chunk_ids)
-    if active_evidence_chunks:
-        return len(active_evidence_chunks)
-    return max(1, len(source_ids))
-
-
-def delete_document_graph_incremental(db: Session, course_id: str, document_id: str) -> dict[str, int]:
-    """Remove one document's graph evidence without committing.
-
-    Concepts and relations shared with other documents are retained with the
-    document_id stripped from their source lists. Orphan concepts and dangling
-    relation/candidate rows are physically removed.
-    """
-    document_ids = {document_id}
-    chunk_ids = set(db.scalars(select(Chunk.id).where(Chunk.course_id == course_id, Chunk.document_id == document_id)).all())
-    affected_concept_ids = set(
-        db.scalars(
-            select(EntityMention.concept_id).where(
-                EntityMention.course_id == course_id,
-                EntityMention.document_id == document_id,
-                EntityMention.concept_id.is_not(None),
-            )
-        ).all()
-    )
-    affected_concept_ids.discard(None)
-    removed_mentions = db.query(EntityMention).filter(
-        EntityMention.course_id == course_id,
-        EntityMention.document_id == document_id,
-    ).delete(synchronize_session=False)
-
-    removed_relations = 0
-    for relation in db.scalars(
-        select(ConceptRelation).where(ConceptRelation.course_id == course_id)
-    ).all():
-        sources = set(relation.source_document_ids or [])
-        evidence_from_document = bool(relation.evidence_chunk_id and relation.evidence_chunk_id in chunk_ids)
-        if not evidence_from_document and not sources.intersection(document_ids):
-            continue
-        affected_concept_ids.add(relation.source_concept_id)
-        if relation.target_concept_id:
-            affected_concept_ids.add(relation.target_concept_id)
-        if not sources and evidence_from_document:
-            db.delete(relation)
-            removed_relations += 1
-            continue
-        if sources and sources.issubset(document_ids):
-            db.delete(relation)
-            removed_relations += 1
-            continue
-        if sources.intersection(document_ids):
-            relation.source_document_ids = sorted(sources - document_ids)
-            if evidence_from_document:
-                relation.evidence_chunk_id = None
-            relation.support_count = _recalculate_edge_support_count(
-                db,
-                course_id=course_id,
-                source_concept_id=relation.source_concept_id,
-                target_concept_id=relation.target_concept_id,
-                source_document_ids=relation.source_document_ids,
-                evidence_chunk_id=relation.evidence_chunk_id,
-                metadata_json=relation.metadata_json,
-            )
-
-    removed_candidates = 0
-    for candidate in db.scalars(select(GraphRelationCandidate).where(GraphRelationCandidate.course_id == course_id)).all():
-        sources = set(candidate.source_document_ids or [])
-        evidence_from_document = bool(candidate.evidence_chunk_id and candidate.evidence_chunk_id in chunk_ids)
-        affected_concept_ids.add(candidate.source_concept_id)
-        if candidate.target_concept_id:
-            affected_concept_ids.add(candidate.target_concept_id)
-        if (not sources and evidence_from_document) or (sources and sources.issubset(document_ids)):
-            db.delete(candidate)
-            removed_candidates += 1
-        elif sources.intersection(document_ids):
-            candidate.source_document_ids = sorted(sources - document_ids)
-            if evidence_from_document:
-                candidate.evidence_chunk_id = None
-            candidate.support_count = _recalculate_edge_support_count(
-                db,
-                course_id=course_id,
-                source_concept_id=candidate.source_concept_id,
-                target_concept_id=candidate.target_concept_id,
-                source_document_ids=candidate.source_document_ids,
-                evidence_chunk_id=candidate.evidence_chunk_id,
-                metadata_json=candidate.metadata_json,
-            )
-
-    removed_concepts = 0
-    removed_aliases = 0
-    concepts_to_delete: set[str] = set()
-    for concept in db.scalars(select(Concept).where(Concept.course_id == course_id)).all():
-        sources = set(concept.source_document_ids or [])
-        if sources.intersection(document_ids):
-            affected_concept_ids.add(concept.id)
-            sources -= document_ids
-        if concept.id in affected_concept_ids:
-            mention_rows = db.execute(
-                select(EntityMention.document_id, EntityMention.chunk_id).where(
-                    EntityMention.course_id == course_id,
-                    EntityMention.concept_id == concept.id,
-                )
-            ).all()
-            mention_doc_ids = {row[0] for row in mention_rows if row[0]}
-            mention_chunk_ids = {row[1] for row in mention_rows if row[1]}
-            sources.update(mention_doc_ids)
-            concept.source_document_ids = sorted(sources)
-            concept.evidence_count = max(len(mention_rows), len(mention_chunk_ids), len(sources))
-
-    db.flush()
-    incident_relation_ids = set(
-        db.scalars(
-            select(ConceptRelation.source_concept_id).where(ConceptRelation.course_id == course_id)
-        ).all()
-    )
-    incident_relation_ids.update(
-        concept_id
-        for concept_id in db.scalars(
-            select(ConceptRelation.target_concept_id).where(
-                ConceptRelation.course_id == course_id,
-                ConceptRelation.target_concept_id.is_not(None),
-            )
-        ).all()
-        if concept_id
-    )
-    incident_relation_ids.update(
-        db.scalars(
-            select(GraphRelationCandidate.source_concept_id).where(GraphRelationCandidate.course_id == course_id)
-        ).all()
-    )
-    incident_relation_ids.update(
-        concept_id
-        for concept_id in db.scalars(
-            select(GraphRelationCandidate.target_concept_id).where(
-                GraphRelationCandidate.course_id == course_id,
-                GraphRelationCandidate.target_concept_id.is_not(None),
-            )
-        ).all()
-        if concept_id
-    )
-    for concept in db.scalars(select(Concept).where(Concept.course_id == course_id)).all():
-        if concept.source_document_ids or concept.evidence_count > 0:
-            continue
-        if concept.id in incident_relation_ids:
-            continue
-        has_mentions = db.scalar(
-            select(EntityMention.id).where(EntityMention.course_id == course_id, EntityMention.concept_id == concept.id).limit(1)
-        )
-        if has_mentions:
-            continue
-        concepts_to_delete.add(concept.id)
-
-    if concepts_to_delete:
-        deleted_concepts = db.scalars(select(Concept).where(Concept.id.in_(concepts_to_delete))).all()
-        deleted_keys = {concept.normalized_name for concept in deleted_concepts if concept.normalized_name}
-        removed_relations += db.query(ConceptRelation).filter(
-            ConceptRelation.course_id == course_id,
-            (
-                ConceptRelation.source_concept_id.in_(concepts_to_delete)
-                | ConceptRelation.target_concept_id.in_(concepts_to_delete)
-            ),
-        ).delete(synchronize_session=False)
-        removed_candidates += db.query(GraphRelationCandidate).filter(
-            GraphRelationCandidate.course_id == course_id,
-            (
-                GraphRelationCandidate.source_concept_id.in_(concepts_to_delete)
-                | GraphRelationCandidate.target_concept_id.in_(concepts_to_delete)
-            ),
-        ).delete(synchronize_session=False)
-        removed_aliases = db.query(ConceptAlias).filter(ConceptAlias.concept_id.in_(concepts_to_delete)).delete(synchronize_session=False)
-        if deleted_keys:
-            db.query(EntityMergeCandidate).filter(
-                EntityMergeCandidate.course_id == course_id,
-                (
-                    EntityMergeCandidate.left_key.in_(deleted_keys)
-                    | EntityMergeCandidate.right_key.in_(deleted_keys)
-                ),
-            ).delete(synchronize_session=False)
-        removed_concepts = db.query(Concept).filter(
-            Concept.course_id == course_id,
-            Concept.id.in_(concepts_to_delete),
-        ).delete(synchronize_session=False)
-
+    deleted_parse_jobs = db.query(ParseJob).filter(ParseJob.document_id == document_id).delete(synchronize_session=False)
+    deleted_source_files = db.query(SourceFile).filter(SourceFile.document_id == document_id).delete(synchronize_session=False)
     db.flush()
     return {
-        "graph_removed_mentions": removed_mentions,
-        "graph_removed_relations": removed_relations,
-        "graph_removed_candidates": removed_candidates,
-        "graph_removed_aliases": removed_aliases,
-        "graph_removed_concepts": removed_concepts,
+        "deleted_parse_jobs": deleted_parse_jobs,
+        "deleted_source_files": deleted_source_files,
+        **stats.as_dict(),
     }
 
 
-def cleanup_stale_data(db: Session, course_id: str, course_name: str) -> dict[str, int]:
+def cleanup_stale_data(db: Session, knowledge_base_id: str, knowledge_base_name: str) -> dict[str, int]:
     from app.services.ingestion import create_vector_compensation_log, mark_vector_compensation_log
 
-    ensure_no_active_batch(db, course_id)
-    graph_stats = cleanup_stale_graph_references(db, course_id)
+    ensure_no_active_batch(db, knowledge_base_id)
 
     active_chunk_ids = set(
-        db.scalars(select(Chunk.id).where(Chunk.course_id == course_id, Chunk.is_active.is_(True))).all()
+        db.scalars(
+            select(ActiveChunk.id).where(
+                ActiveChunk.knowledge_base_id == knowledge_base_id,
+                ActiveChunk.state == "active",
+            )
+        ).all()
     )
-    vector_store = VectorStore(course_name=course_name)
-    stale_vector_ids = sorted(set(vector_store.list_ids(course_id)) - active_chunk_ids)
+    vector_store = VectorStore(knowledge_base_name=knowledge_base_name)
+    stale_vector_ids = sorted(set(vector_store.list_ids(knowledge_base_id)) - active_chunk_ids)
 
     inactive_document_ids = set(
-        db.scalars(select(Document.id).where(Document.course_id == course_id, Document.is_active.is_(False))).all()
+        db.scalars(
+            select(Document.id).where(
+                Document.knowledge_base_id == knowledge_base_id,
+                Document.is_active.is_(False),
+            )
+        ).all()
     )
     if inactive_document_ids:
         db.query(IngestionJob).filter(IngestionJob.document_id.in_(inactive_document_ids)).update(
@@ -456,22 +428,34 @@ def cleanup_stale_data(db: Session, course_id: str, course_name: str) -> dict[st
             synchronize_session="fetch",
         )
 
-    inactive_version_ids = db.scalars(
-        select(DocumentVersion.id)
-        .join(Document, Document.id == DocumentVersion.document_id)
-        .where(
-            Document.course_id == course_id,
-            or_(DocumentVersion.is_active.is_(False), Document.is_active.is_(False)),
-        )
-    ).all()
-    inactive_chunk_ids = set(
-        db.scalars(select(Chunk.id).where(Chunk.course_id == course_id, Chunk.is_active.is_(False))).all()
+    inactive_version_ids = set(
+        db.scalars(
+            select(DocumentVersion.id)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .where(
+                Document.knowledge_base_id == knowledge_base_id,
+                or_(DocumentVersion.is_active.is_(False), Document.is_active.is_(False)),
+            )
+        ).all()
     )
-    if inactive_chunk_ids:
-        db.query(GraphExtractionChunkTask).filter(
-            GraphExtractionChunkTask.chunk_id.in_(inactive_chunk_ids)
-        ).delete(synchronize_session="fetch")
-    deleted_chunks = db.query(Chunk).filter(Chunk.course_id == course_id, Chunk.is_active.is_(False)).delete(synchronize_session="fetch")
+    inactive_active_chunk_ids = set(
+        db.scalars(
+            select(ActiveChunk.id).where(
+                ActiveChunk.knowledge_base_id == knowledge_base_id,
+                ActiveChunk.state != "active",
+            )
+        ).all()
+    )
+    for document_id in inactive_document_ids:
+        inactive_active_chunk_ids.update(_active_chunk_ids_for_document(db, knowledge_base_id, document_id))
+
+    evidence_stats = cleanup_stale_evidence_references(
+        db,
+        knowledge_base_id=knowledge_base_id,
+        inactive_document_version_ids=inactive_version_ids,
+        inactive_chunk_ids=inactive_active_chunk_ids,
+        stale_qdrant_point_ids=set(stale_vector_ids),
+    )
     deleted_document_versions = (
         db.query(DocumentVersion)
         .filter(DocumentVersion.id.in_(inactive_version_ids))
@@ -479,14 +463,16 @@ def cleanup_stale_data(db: Session, course_id: str, course_name: str) -> dict[st
         if inactive_version_ids
         else 0
     )
-    deleted_documents = db.query(Document).filter(Document.course_id == course_id, Document.is_active.is_(False)).delete(synchronize_session="fetch")
+    deleted_documents = db.query(Document).filter(
+        Document.knowledge_base_id == knowledge_base_id,
+        Document.is_active.is_(False),
+    ).delete(synchronize_session="fetch")
     db.commit()
 
-    # Delete Qdrant vectors AFTER DB commit to maintain cross-store consistency.
     if stale_vector_ids:
         delete_log = create_vector_compensation_log(
             db,
-            course_id=course_id,
+            knowledge_base_id=knowledge_base_id,
             job_id=None,
             operation="delete",
             vector_ids=stale_vector_ids,
@@ -501,94 +487,352 @@ def cleanup_stale_data(db: Session, course_id: str, course_name: str) -> dict[st
 
     return {
         "deleted_vectors": len(stale_vector_ids),
-        "deleted_chunks": deleted_chunks,
+        "deleted_chunks": evidence_stats.removed_active_chunks,
         "deleted_document_versions": deleted_document_versions,
         "deleted_documents": deleted_documents,
-        "removed_graph_relations": graph_stats.removed_relations,
-        "removed_graph_concepts": graph_stats.removed_concepts,
+        **evidence_stats.as_dict(),
     }
 
 
-def delete_course_data(db: Session, course: Course) -> dict[str, int]:
-    ensure_no_active_batch(db, course.id)
+async def reconcile_vector_store(db: Session, knowledge_base_id: str | None = None, *, reembed_missing: bool = True) -> dict[str, int]:
+    from app.services.chunking import CURRENT_EMBEDDING_TEXT_VERSION, contextual_embedding_text
+    from app.services.embeddings import EmbeddingProvider
+    from app.services.evidence_graph import stable_hash
+    from app.services.ingestion import process_pending_vector_compensations
+
+    processed_compensations = process_pending_vector_compensations(db)
+    knowledge_bases = db.scalars(
+        select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
+        if knowledge_base_id
+        else select(KnowledgeBase)
+    ).all()
+    stats = {
+        "processed_compensations": processed_compensations,
+        "scanned_knowledge_bases": len(knowledge_bases),
+        "deleted_orphan_points": 0,
+        "removed_orphan_vector_records": 0,
+        "missing_points": 0,
+        "reembedded_missing_points": 0,
+        "upserted_vector_records": 0,
+    }
+    for knowledge_base in knowledge_bases:
+        vector_store = VectorStore(knowledge_base_name=knowledge_base.name)
+        qdrant_ids = set(vector_store.list_ids(knowledge_base.id))
+        active_chunks = db.scalars(
+            select(ActiveChunk).where(
+                ActiveChunk.knowledge_base_id == knowledge_base.id,
+                ActiveChunk.state == "active",
+            )
+        ).all()
+        active_by_id = {chunk.id: chunk for chunk in active_chunks}
+        active_ids = set(active_by_id)
+        orphan_ids = sorted(qdrant_ids - active_ids)
+        if orphan_ids:
+            await vector_store.async_delete(orphan_ids)
+            stats["deleted_orphan_points"] += len(orphan_ids)
+            stats["removed_orphan_vector_records"] += db.query(VectorRecord).filter(
+                VectorRecord.knowledge_base_id == knowledge_base.id,
+                VectorRecord.qdrant_point_id.in_(orphan_ids),
+            ).delete(synchronize_session=False)
+
+        missing_ids = sorted(active_ids - qdrant_ids)
+        if not missing_ids:
+            db.commit()
+            continue
+        stats["missing_points"] += len(missing_ids)
+        if not reembed_missing:
+            db.commit()
+            continue
+        missing_chunks = [active_by_id[chunk_id] for chunk_id in missing_ids]
+        embedding_inputs: list[str] = []
+        payloads: list[dict] = []
+        for chunk in missing_chunks:
+            metadata = chunk.metadata_json or {}
+            document = db.get(Document, metadata.get("document_id")) if metadata.get("document_id") else None
+            document_title = document.title if document else str(metadata.get("document_title") or "Document")
+            content_kind = metadata.get("content_kind")
+            embedding_inputs.append(
+                contextual_embedding_text(
+                    document_title=document_title,
+                    partition=metadata.get("partition"),
+                    section=metadata.get("section"),
+                    source_type=metadata.get("source_type"),
+                    content_kind=content_kind,
+                    content=chunk.text,
+                    summary=metadata.get("summary"),
+                    keywords=list(metadata.get("keywords") or []),
+                    has_table=bool(metadata.get("has_table")),
+                    has_formula=bool(metadata.get("has_formula")),
+                )
+            )
+            payloads.append(
+                {
+                    "knowledge_base_id": knowledge_base.id,
+                    "active_chunk_id": chunk.id,
+                    "document_id": metadata.get("document_id"),
+                    "document_title": document_title,
+                    "source_path": document.source_path if document else metadata.get("source_path"),
+                    "partition": metadata.get("partition"),
+                    "section": metadata.get("section"),
+                    "page_number": metadata.get("page_number"),
+                    "snippet": metadata.get("snippet") or chunk.text[:240],
+                    "source_type": metadata.get("source_type"),
+                    "content": chunk.text,
+                    "content_kind": content_kind,
+                    "embedding_text_version": CURRENT_EMBEDDING_TEXT_VERSION,
+                    "evidence_atom_ids": list(chunk.atom_ids_json or []),
+                    "source_span_union": dict(chunk.source_span_union_json or {}),
+                    "graph_state_hash": chunk.graph_state_hash,
+                    "quality_decision_id": chunk.quality_decision_id,
+                    "policy_state_id": chunk.policy_state_id,
+                    "community_ids": list(chunk.community_ids_json or []),
+                }
+            )
+        embedding_result = await EmbeddingProvider().embed_texts_with_meta(embedding_inputs, text_type="document")
+        points = [
+            {"id": chunk.id, "vector": vector, "payload": payload}
+            for chunk, vector, payload in zip(missing_chunks, embedding_result.vectors, payloads)
+        ]
+        await vector_store.async_upsert(points)
+        stats["reembedded_missing_points"] += len(points)
+        for chunk, point in zip(missing_chunks, points):
+            payload_hash = stable_hash(point["payload"])
+            db.query(VectorRecord).filter(VectorRecord.active_chunk_id == chunk.id).delete(synchronize_session=False)
+            db.add(
+                VectorRecord(
+                    knowledge_base_id=knowledge_base.id,
+                    active_chunk_id=chunk.id,
+                    qdrant_point_id=chunk.id,
+                    embedding_model=EmbeddingProvider().settings.embedding_model,
+                    embedding_text_version=CURRENT_EMBEDDING_TEXT_VERSION,
+                    payload_hash=payload_hash,
+                    vector_status="ready",
+                    diagnostics_json={"source": "vector_store_reconcile", "payload_hash": payload_hash},
+                )
+            )
+            stats["upserted_vector_records"] += 1
+        db.commit()
+    return stats
+
+
+def reconcile_vector_store_orphans(db: Session, knowledge_base_id: str | None = None) -> dict[str, int]:
+    knowledge_bases = db.scalars(
+        select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
+        if knowledge_base_id
+        else select(KnowledgeBase)
+    ).all()
+    stats = {
+        "scanned_knowledge_bases": len(knowledge_bases),
+        "deleted_orphan_points": 0,
+        "removed_orphan_vector_records": 0,
+        "missing_points": 0,
+    }
+    for knowledge_base in knowledge_bases:
+        vector_store = VectorStore(knowledge_base_name=knowledge_base.name)
+        qdrant_ids = set(vector_store.list_ids(knowledge_base.id))
+        active_ids = set(
+            db.scalars(
+                select(ActiveChunk.id).where(
+                    ActiveChunk.knowledge_base_id == knowledge_base.id,
+                    ActiveChunk.state == "active",
+                )
+            ).all()
+        )
+        orphan_ids = sorted(qdrant_ids - active_ids)
+        if orphan_ids:
+            vector_store.delete(orphan_ids)
+            stats["deleted_orphan_points"] += len(orphan_ids)
+            stats["removed_orphan_vector_records"] += db.query(VectorRecord).filter(
+                VectorRecord.knowledge_base_id == knowledge_base.id,
+                VectorRecord.qdrant_point_id.in_(orphan_ids),
+            ).delete(synchronize_session=False)
+        stats["missing_points"] += len(active_ids - qdrant_ids)
+        db.commit()
+    return stats
+
+
+def reconcile_vector_store_sync(db: Session, knowledge_base_id: str | None = None, *, reembed_missing: bool = True) -> dict[str, int]:
+    return asyncio.run(reconcile_vector_store(db, knowledge_base_id=knowledge_base_id, reembed_missing=reembed_missing))
+
+
+def reconcile_policy_state(db: Session, knowledge_base_id: str | None = None, *, cold_arm_event_threshold: int = 20) -> int:
+    from app.services.evidence_graph import BANDIT_ARMS, BANDIT_CONTEXT_FEATURES, _normalize_policy_posterior
+
+    query = select(PolicyState)
+    if knowledge_base_id:
+        query = query.where(PolicyState.knowledge_base_id == knowledge_base_id)
+    states = db.scalars(query).all()
+    reconciled = 0
+    dimension = len(BANDIT_CONTEXT_FEATURES)
+    for state in states:
+        posterior = _normalize_policy_posterior(state)
+        summary = dict(state.reward_summary_json or {})
+        events = int(summary.get("events") or 0)
+        changed = False
+        if events >= cold_arm_event_threshold:
+            for arm in BANDIT_ARMS:
+                arm_state = posterior["arms"].setdefault(arm, {})
+                if int(arm_state.get("count") or 0) == 0:
+                    arm_state.update(
+                        {
+                            "A_diag": [1.0 for _ in range(dimension)],
+                            "b": [0.0 for _ in range(dimension)],
+                            "count": 0,
+                            "reward_sum": 0.0,
+                            "last_reward": None,
+                            "token_cost_sum": 0.0,
+                            "reconciled_reason": "cold_arm_prior_reset",
+                        }
+                    )
+                    changed = True
+        exploration = dict(state.exploration_json or {})
+        alpha = float(exploration.get("alpha") or 0.25)
+        if alpha > 0.5:
+            exploration["alpha"] = 0.5
+            exploration["warning"] = "alpha_capped_by_policy_reconcile"
+            changed = True
+        if changed:
+            state.posterior_json = posterior
+            state.exploration_json = exploration
+            state.reward_summary_json = {
+                **summary,
+                "last_policy_reconcile_at": datetime.utcnow().isoformat(),
+                "policy_reconcile_protocol": "policy_reconcile_v1",
+            }
+            reconciled += 1
+    if reconciled:
+        db.flush()
+    return reconciled
+
+
+def delete_knowledge_base_data(db: Session, knowledge_base: KnowledgeBase) -> dict[str, int]:
+    ensure_no_active_batch(db, knowledge_base.id)
     settings = get_settings()
-    course_paths = settings.course_paths_for_name(course.name)
+    knowledge_base_paths = settings.knowledge_base_paths_for_name(knowledge_base.name)
     data_root = settings.data_root.resolve()
-    course_root = course_paths["course_root"].resolve()
-    if course_root != data_root and data_root not in course_root.parents:
-        raise RuntimeError(f"Refusing to delete course directory outside DATA_ROOT: {course_root}")
+    knowledge_base_root = knowledge_base_paths["knowledge_base_root"].resolve()
+    if knowledge_base_root != data_root and data_root not in knowledge_base_root.parents:
+        raise RuntimeError(f"Refusing to delete knowledge base directory outside DATA_ROOT: {knowledge_base_root}")
 
-    vector_store = VectorStore(course_name=course.name)
-    vector_ids = vector_store.list_ids(course.id)
+    vector_store = VectorStore(knowledge_base_name=knowledge_base.name)
+    vector_ids = vector_store.list_ids(knowledge_base.id)
 
-    run_ids = db.scalars(select(AgentRun.id).where(AgentRun.course_id == course.id)).all()
-    batch_ids = db.scalars(select(IngestionBatch.id).where(IngestionBatch.course_id == course.id)).all()
-    concept_ids = db.scalars(select(Concept.id).where(Concept.course_id == course.id)).all()
-    document_ids = db.scalars(select(Document.id).where(Document.course_id == course.id)).all()
-    graph_run_ids = db.scalars(select(GraphExtractionRun.id).where(GraphExtractionRun.course_id == course.id)).all()
+    run_ids = set(db.scalars(select(AgentRun.id).where(AgentRun.knowledge_base_id == knowledge_base.id)).all())
+    batch_ids = set(db.scalars(select(IngestionBatch.id).where(IngestionBatch.knowledge_base_id == knowledge_base.id)).all())
+    document_ids = set(db.scalars(select(Document.id).where(Document.knowledge_base_id == knowledge_base.id)).all())
+    graph_state_ids = set(
+        db.scalars(select(EvidenceGraphState.id).where(EvidenceGraphState.knowledge_base_id == knowledge_base.id)).all()
+    )
+    candidate_ids = (
+        set(db.scalars(select(ChunkCandidate.id).where(ChunkCandidate.graph_state_id.in_(graph_state_ids))).all())
+        if graph_state_ids
+        else set()
+    )
+    signal_state_ids = set(db.scalars(select(SignalState.id).where(SignalState.knowledge_base_id == knowledge_base.id)).all())
+    community_state_ids = set(db.scalars(select(CommunityState.id).where(CommunityState.knowledge_base_id == knowledge_base.id)).all())
 
+    stats = EvidenceCleanupStats()
+    deleted_reward_events = db.query(RewardEvent).filter(RewardEvent.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    deleted_policy_observations = db.query(PolicyObservation).filter(PolicyObservation.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    deleted_quality_observations = db.query(QualityObservation).filter(QualityObservation.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    deleted_citation_verifications = db.query(CitationVerification).filter(CitationVerification.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    deleted_answer_sessions = db.query(AnswerSession).filter(AnswerSession.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    deleted_retrieval_traces = db.query(RetrievalTrace).filter(RetrievalTrace.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
     deleted_trace_events = db.query(AgentTraceEvent).filter(AgentTraceEvent.run_id.in_(run_ids)).delete(synchronize_session=False) if run_ids else 0
-    deleted_agent_runs = db.query(AgentRun).filter(AgentRun.course_id == course.id).delete(synchronize_session=False)
-    deleted_sessions = db.query(QASession).filter(QASession.course_id == course.id).delete(synchronize_session=False)
+    deleted_agent_runs = db.query(AgentRun).filter(AgentRun.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    deleted_sessions = db.query(QASession).filter(QASession.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
 
+    deleted_vector_records = db.query(VectorRecord).filter(VectorRecord.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    _delete_signal_and_projection_state(db, stats, signal_state_ids)
+    _delete_signal_schemas_for_knowledge_base(db, stats, knowledge_base.id)
+
+    deleted_active_chunks = db.query(ActiveChunk).filter(ActiveChunk.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    deleted_chunk_decisions = db.query(ChunkDecision).filter(ChunkDecision.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    deleted_quality_decisions = (
+        db.query(QualityDecision)
+        .filter(QualityDecision.candidate_id.in_(candidate_ids or {"__none__"}))
+        .delete(synchronize_session=False)
+    )
+    deleted_chunk_candidates = db.query(ChunkCandidate).filter(ChunkCandidate.id.in_(candidate_ids or {"__none__"})).delete(synchronize_session=False)
+
+    deleted_community_summaries = db.query(CommunitySummary).filter(
+        CommunitySummary.community_state_id.in_(community_state_ids)
+    ).delete(synchronize_session=False) if community_state_ids else 0
+    deleted_community_memberships = db.query(CommunityMembership).filter(
+        CommunityMembership.community_state_id.in_(community_state_ids)
+    ).delete(synchronize_session=False) if community_state_ids else 0
+    deleted_community_states = db.query(CommunityState).filter(CommunityState.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    deleted_evidence_edges = db.query(EvidenceEdge).filter(
+        EvidenceEdge.graph_state_id.in_(graph_state_ids or {"__none__"})
+    ).delete(synchronize_session=False)
+    deleted_evidence_graph_states = db.query(EvidenceGraphState).filter(EvidenceGraphState.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    deleted_evidence_atoms = db.query(EvidenceAtom).filter(EvidenceAtom.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    deleted_policy_states = db.query(PolicyState).filter(PolicyState.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+
+    deleted_parse_jobs = db.query(ParseJob).filter(ParseJob.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    deleted_source_files = db.query(SourceFile).filter(SourceFile.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
     deleted_ingestion_logs = db.query(IngestionLog).filter(IngestionLog.batch_id.in_(batch_ids)).delete(synchronize_session=False) if batch_ids else 0
-    deleted_compensations = db.query(IngestionCompensationLog).filter(IngestionCompensationLog.course_id == course.id).delete(synchronize_session=False)
-    deleted_jobs = db.query(IngestionJob).filter(IngestionJob.course_id == course.id).delete(synchronize_session=False)
-    deleted_graph_extraction_tasks = db.query(GraphExtractionChunkTask).filter(GraphExtractionChunkTask.course_id == course.id).delete(synchronize_session=False)
-    deleted_graph_extraction_runs = db.query(GraphExtractionRun).filter(GraphExtractionRun.id.in_(graph_run_ids)).delete(synchronize_session=False) if graph_run_ids else 0
-    deleted_batches = db.query(IngestionBatch).filter(IngestionBatch.course_id == course.id).delete(synchronize_session=False)
+    deleted_compensations = db.query(IngestionCompensationLog).filter(IngestionCompensationLog.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    deleted_jobs = db.query(IngestionJob).filter(IngestionJob.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
+    deleted_batches = db.query(IngestionBatch).filter(IngestionBatch.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
 
-    deleted_hpo_judge_samples = db.query(GraphHpoJudgeSample).filter(GraphHpoJudgeSample.course_id == course.id).delete(synchronize_session=False)
-    deleted_hpo_objective_models = db.query(GraphHpoObjectiveModel).filter(GraphHpoObjectiveModel.course_id == course.id).delete(synchronize_session=False)
-    deleted_model_hyperparameters = db.query(CourseModelHyperparameter).filter(CourseModelHyperparameter.course_id == course.id).delete(synchronize_session=False)
-    deleted_quality_profiles = db.query(QualityProfile).filter(QualityProfile.course_id == course.id).delete(synchronize_session=False)
-    deleted_community_summaries = db.query(GraphCommunitySummary).filter(GraphCommunitySummary.course_id == course.id).delete(synchronize_session=False)
-    deleted_relation_candidates = db.query(GraphRelationCandidate).filter(GraphRelationCandidate.course_id == course.id).delete(synchronize_session=False)
-    deleted_mentions = db.query(EntityMention).filter(EntityMention.course_id == course.id).delete(synchronize_session=False)
-    deleted_merge_candidates = db.query(EntityMergeCandidate).filter(EntityMergeCandidate.course_id == course.id).delete(synchronize_session=False)
-    deleted_relations = db.query(ConceptRelation).filter(ConceptRelation.course_id == course.id).delete(synchronize_session=False)
-    deleted_aliases = db.query(ConceptAlias).filter(ConceptAlias.concept_id.in_(concept_ids)).delete(synchronize_session=False) if concept_ids else 0
-    deleted_concepts = db.query(Concept).filter(Concept.course_id == course.id).delete(synchronize_session=False)
-
-    deleted_chunks = db.query(Chunk).filter(Chunk.course_id == course.id).delete(synchronize_session=False)
     deleted_versions = db.query(DocumentVersion).filter(DocumentVersion.document_id.in_(document_ids)).delete(synchronize_session=False) if document_ids else 0
-    deleted_documents = db.query(Document).filter(Document.course_id == course.id).delete(synchronize_session=False)
+    deleted_documents = db.query(Document).filter(Document.knowledge_base_id == knowledge_base.id).delete(synchronize_session=False)
 
-    db.delete(course)
+    db.delete(knowledge_base)
     db.commit()
 
     vector_store.delete(vector_ids)
 
     deleted_directory = 0
-    if course_root.exists():
-        shutil.rmtree(course_root)
+    if knowledge_base_root.exists():
+        shutil.rmtree(knowledge_base_root)
         deleted_directory = 1
 
     return {
         "deleted_vectors": len(vector_ids),
+        "deleted_vector_records": deleted_vector_records,
+        "deleted_active_chunks": deleted_active_chunks,
+        "deleted_chunk_decisions": deleted_chunk_decisions,
+        "deleted_quality_decisions": deleted_quality_decisions,
+        "deleted_chunk_candidates": deleted_chunk_candidates,
+        "deleted_evidence_atoms": deleted_evidence_atoms,
+        "deleted_evidence_edges": deleted_evidence_edges,
+        "deleted_evidence_graph_states": deleted_evidence_graph_states,
+        "deleted_community_states": deleted_community_states,
+        "deleted_community_memberships": deleted_community_memberships,
+        "deleted_community_summaries": deleted_community_summaries,
+        "deleted_signal_schema_states": stats.removed_signal_schema_states,
+        "deleted_signal_states": stats.removed_signal_states,
+        "deleted_signal_candidates": stats.removed_signal_candidates,
+        "deleted_signal_decisions": stats.removed_signal_decisions,
+        "deleted_signal_nodes": stats.removed_signal_nodes,
+        "deleted_signal_edges": stats.removed_signal_edges,
+        "deleted_signal_communities": stats.removed_signal_communities,
+        "deleted_signal_community_memberships": stats.removed_signal_community_memberships,
+        "deleted_projection_states": stats.removed_projection_states,
+        "deleted_projection_nodes": stats.removed_projection_nodes,
+        "deleted_projection_edges": stats.removed_projection_edges,
+        "deleted_projection_communities": stats.removed_projection_communities,
+        "deleted_policy_states": deleted_policy_states,
+        "deleted_policy_observations": deleted_policy_observations,
+        "deleted_quality_observations": deleted_quality_observations,
+        "deleted_retrieval_traces": deleted_retrieval_traces,
+        "deleted_answer_sessions": deleted_answer_sessions,
+        "deleted_citation_verifications": deleted_citation_verifications,
+        "deleted_reward_events": deleted_reward_events,
         "deleted_trace_events": deleted_trace_events,
         "deleted_agent_runs": deleted_agent_runs,
         "deleted_sessions": deleted_sessions,
+        "deleted_parse_jobs": deleted_parse_jobs,
+        "deleted_source_files": deleted_source_files,
         "deleted_ingestion_logs": deleted_ingestion_logs,
         "deleted_compensations": deleted_compensations,
         "deleted_jobs": deleted_jobs,
-        "deleted_graph_extraction_tasks": deleted_graph_extraction_tasks,
-        "deleted_graph_extraction_runs": deleted_graph_extraction_runs,
         "deleted_batches": deleted_batches,
-        "deleted_hpo_judge_samples": deleted_hpo_judge_samples,
-        "deleted_hpo_objective_models": deleted_hpo_objective_models,
-        "deleted_model_hyperparameters": deleted_model_hyperparameters,
-        "deleted_quality_profiles": deleted_quality_profiles,
-        "deleted_community_summaries": deleted_community_summaries,
-        "deleted_relation_candidates": deleted_relation_candidates,
-        "deleted_mentions": deleted_mentions,
-        "deleted_merge_candidates": deleted_merge_candidates,
-        "deleted_relations": deleted_relations,
-        "deleted_aliases": deleted_aliases,
-        "deleted_concepts": deleted_concepts,
-        "deleted_chunks": deleted_chunks,
+        "deleted_chunks": deleted_active_chunks,
         "deleted_document_versions": deleted_versions,
         "deleted_documents": deleted_documents,
-        "deleted_courses": 1,
+        "deleted_knowledge_bases": 1,
         "deleted_directory": deleted_directory,
     }

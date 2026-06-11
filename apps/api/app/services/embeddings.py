@@ -5,7 +5,6 @@ import asyncio
 import json
 import math
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -15,26 +14,20 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from pydantic import ValidationError
 
+from app.core.concurrency import model_request_slot
 from app.core.config import get_settings
-from app.schemas import GraphExtractionPayload
 from app.services.strategy_profiles import (
-    COURSE_ANSWER_SYSTEM_PREFIX,
-    COURSE_CONTEXT_LABEL,
-    COURSE_GRAPH_EXTRACTION_PROMPT,
-    COURSE_NO_CONTEXT_EN,
-    COURSE_NO_CONTEXT_ZH,
+    DEFAULT_ANSWER_SYSTEM_PREFIX,
+    DEFAULT_CONTEXT_LABEL,
+    DEFAULT_NO_CONTEXT_EN,
+    DEFAULT_NO_CONTEXT_ZH,
     active_profile_json,
     profile_prompt,
 )
 
 
 class FallbackDisabledError(RuntimeError):
-    pass
-
-
-class GraphExtractionError(RuntimeError):
     pass
 
 
@@ -51,11 +44,8 @@ def answer_language_name(text: str) -> str:
 def no_context_answer(question: str) -> str:
     profile = active_profile_json()
     if prefers_chinese_answer(question):
-        return profile_prompt(profile, "no_context_answer_zh", COURSE_NO_CONTEXT_ZH)
-    return profile_prompt(profile, "no_context_answer_en", COURSE_NO_CONTEXT_EN)
-    if prefers_chinese_answer(question):
-        return "课程材料中没有找到足够可靠的上下文来回答这个问题并提供引用。"
-    return "I could not find enough reliable course context to answer this question with citations."
+        return profile_prompt(profile, "no_context_answer_zh", DEFAULT_NO_CONTEXT_ZH)
+    return profile_prompt(profile, "no_context_answer_en", DEFAULT_NO_CONTEXT_EN)
 
 
 def vector_norm(vector: list[float]) -> float:
@@ -263,34 +253,6 @@ class ChatProvider:
                 fallback_reason=f"{type(exc).__name__}: {exc}",
             )
 
-    async def extract_graph_payload(self, text: str, chapter: str | None, source_type: str) -> dict[str, Any]:
-        if not self.settings.openai_api_key:
-            if not self.settings.enable_model_fallback:
-                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
-            return {"concepts": [], "relations": []}
-        profile = active_profile_json()
-        system_prompt = profile_prompt(profile, "graph_extraction_system", COURSE_GRAPH_EXTRACTION_PROMPT)
-        user_prompt = (
-            f"chapter={chapter or 'General'}\n"
-            f"source_type={source_type}\n"
-            "material:\n"
-            f"{text[:7000]}"
-        )
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-        schema_format: dict[str, Any] = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "graph_extraction_payload",
-                "schema": GraphExtractionPayload.model_json_schema(),
-            },
-        }
-        try:
-            return await self._extract_graph_payload_with_format(messages, schema_format)
-        except Exception as exc:
-            if not self.settings.enable_model_fallback:
-                raise
-            return {"concepts": [], "relations": []}
-
     async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
         if not self.settings.openai_api_key:
             if not self.settings.enable_model_fallback:
@@ -347,8 +309,8 @@ class ChatProvider:
             for i, ctx in enumerate(contexts)
         )
         profile = active_profile_json()
-        reflection_domain = profile_prompt(profile, "reflection_domain", "course knowledge-base assistant")
-        citation_domain = profile_prompt(profile, "citation_domain", "course excerpts")
+        reflection_domain = profile_prompt(profile, "reflection_domain", "KnowledgeBase knowledge-base assistant")
+        citation_domain = profile_prompt(profile, "citation_domain", "KnowledgeBase excerpts")
         system_prompt = (
             f"You are a strict quality reviewer for a {reflection_domain}. "
             f"Evaluate whether the assistant's answer is fully supported by the provided {citation_domain}. "
@@ -403,7 +365,7 @@ class ChatProvider:
             if c.get("chunk_id") in context_map
         )
         profile = active_profile_json()
-        citation_domain = profile_prompt(profile, "citation_domain", "course excerpts")
+        citation_domain = profile_prompt(profile, "citation_domain", "KnowledgeBase excerpts")
         system_prompt = (
             f"You verify whether specific claims in an answer are supported by cited {citation_domain}. "
             "Return ONLY a JSON object with keys: verified (boolean), unverified_indices (list of citation numbers that are NOT supported)."
@@ -438,7 +400,7 @@ class ChatProvider:
 
         Returns a dict with keys:
         - intent: one of definition, comparison, application, procedure, analysis, unknown
-        - entities: list of concept-like terms found in the question
+        - entities: list of source-grounded evidence signals found in the question
         - sub_queries: list of sub-questions if multi-hop
         - needs_graph: whether graph search is likely helpful
         - suggested_strategy: one of global_dense, local_graph, hybrid, community
@@ -455,18 +417,18 @@ class ChatProvider:
             }
         history_text = "\n".join(f"{item.get('role')}: {item.get('content')}" for item in (history or [])[-4:])
         profile = active_profile_json()
-        perception_domain = profile_prompt(profile, "perception_domain", "course knowledge-base agent")
-        entity_label = profile_prompt(profile, "entity_label", "course-concept-like terms")
+        perception_domain = profile_prompt(profile, "perception_domain", "evidence-grounded knowledge-base agent")
+        entity_label = profile_prompt(profile, "entity_label", "source-grounded evidence signals")
         system_prompt = (
             f"You are a perception module for a {perception_domain}. "
             "Analyze the user's question and return ONLY a JSON object with these exact keys:\n"
             "- intent: one of [definition, comparison, application, procedure, analysis, unknown]\n"
             f"- entities: list of {entity_label} explicitly mentioned or implied in the question\n"
             "- sub_queries: list of simpler sub-questions if the original is complex/multi-hop; otherwise [original_question]\n"
-            "- needs_graph: boolean, true if the question asks about relationships, comparisons, connections, or derivations between concepts\n"
+            "- needs_graph: boolean, true if the question asks about observed connections, comparisons, dependencies, or derivations across evidence\n"
             "- suggested_strategy: one of [global_dense, local_graph, hybrid, community]\n"
             "  * global_dense: simple definition, formula, or single-fact lookup\n"
-            "  * local_graph: question centers around specific concepts and their relationships\n"
+            "  * local_graph: question centers around specific evidence signals and observed connections\n"
             "  * hybrid: multi-aspect or comparison questions\n"
             "  * community: broad summary or overview questions\n"
         )
@@ -507,19 +469,19 @@ class ChatProvider:
     async def _openai_compatible_chat(self, question: str, contexts: list[dict], history: list[dict], evidence_quality: str = "normal") -> str:
         target_language = answer_language_name(question)
         citations = "\n\n".join(
-            f"[{idx + 1}] {item['document_title']} / {item.get('chapter') or 'General'}\n{item['content']}"
+            f"[{idx + 1}] {item['document_title']} / {item.get('partition') or 'General'}\n{item['content']}"
             for idx, item in enumerate(contexts)
         )
         profile = active_profile_json()
-        context_label = profile_prompt(profile, "context_label", COURSE_CONTEXT_LABEL)
+        context_label = profile_prompt(profile, "context_label", DEFAULT_CONTEXT_LABEL)
         context_label_lower = context_label[:1].lower() + context_label[1:] if context_label else "excerpts"
-        coverage_label = profile_prompt(profile, "coverage_label", "course materials")
-        indexed_coverage_label = profile_prompt(profile, "indexed_coverage_label", "indexed course materials")
+        coverage_label = profile_prompt(profile, "coverage_label", "KnowledgeBase materials")
+        indexed_coverage_label = profile_prompt(profile, "indexed_coverage_label", "indexed KnowledgeBase materials")
         messages = [
             {
                 "role": "system",
                 "content": (
-                    profile_prompt(profile, "answer_system_prefix", COURSE_ANSWER_SYSTEM_PREFIX)
+                    profile_prompt(profile, "answer_system_prefix", DEFAULT_ANSWER_SYSTEM_PREFIX)
                     + f"Answer only from the supplied {context_label_lower} and do not invent unsupported facts. "
                     "Keep the answer direct, concise, and say when the evidence is insufficient. "
                     "Always follow the required answer language below. "
@@ -599,58 +561,6 @@ class ChatProvider:
                 if not self._is_unsupported_response_format_error(exc):
                     raise
         raise RuntimeError(f"Chat JSON request failed after response_format fallback: {last_error}")
-
-    async def _extract_graph_payload_with_format(self, messages: list[dict[str, str]], response_format: dict[str, Any]) -> dict[str, Any]:
-        raw_text = await self._post_chat_text_with_response_format_fallback(
-            {
-                "model": self.settings.chat_model,
-                "messages": messages,
-                "temperature": 0.1,
-                "response_format": response_format,
-            }
-        )
-        try:
-            parsed = json.loads(raw_text.strip())
-        except json.JSONDecodeError:
-            raw_text = await self._repair_graph_payload(raw_text, response_format)
-            try:
-                parsed = json.loads(raw_text.strip())
-            except json.JSONDecodeError as exc:
-                raise GraphExtractionError(f"Graph extraction JSON parse failed after repair: {exc}") from exc
-        try:
-            return GraphExtractionPayload.model_validate(parsed).model_dump()
-        except ValidationError as exc:
-            raise GraphExtractionError(f"Graph extraction payload failed schema validation: {exc}") from exc
-
-    async def _repair_graph_payload(self, raw_text: str, response_format: dict[str, Any]) -> str:
-        payload: dict[str, Any] = {
-            "model": self.settings.chat_model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "Repair the user-provided graph extraction output into strict JSON that matches the schema. "
-                        "Return only the JSON object with concepts and relations. Do not add markdown or commentary."
-                    ),
-                },
-                {"role": "user", "content": raw_text[:12000]},
-            ],
-            "temperature": 0.0,
-            "response_format": response_format,
-        }
-        return await self._post_chat_text_with_response_format_fallback(payload)
-
-    async def _post_chat_text_with_response_format_fallback(self, payload: dict[str, Any]) -> str:
-        last_error: Exception | None = None
-        for candidate in self._response_format_candidates(payload.get("response_format")):
-            candidate_payload = self._payload_with_response_format(payload, candidate)
-            try:
-                return await self._post_chat_text(candidate_payload)
-            except Exception as exc:
-                last_error = exc
-                if not self._is_unsupported_response_format_error(exc):
-                    raise
-        raise RuntimeError(f"Chat request failed after response_format fallback: {last_error}")
 
     def _response_format_candidates(self, response_format: dict[str, Any] | None) -> list[dict[str, Any] | None]:
         if not response_format:
@@ -747,42 +657,25 @@ class ChatProvider:
     def _extractive_answer(self, question: str, contexts: list[dict]) -> str:
         lead = next((item for item in contexts if item.get("metadata", {}).get("content_kind") != "code"), contexts[0])
         profile = active_profile_json()
-        strong_source_label = profile_prompt(profile, "strongest_source_label", "course source")
-        strong_source_label_zh = profile_prompt(profile, "strongest_source_label_zh", "课程来源")
+        strong_source_label = profile_prompt(profile, "strongest_source_label", "knowledge-base source")
+        strong_source_label_zh = profile_prompt(profile, "strongest_source_label_zh", "source")
         relevant_section_label = profile_prompt(profile, "relevant_section_label", "the relevant section")
-        relevant_section_label_zh = profile_prompt(profile, "relevant_section_label_zh", "相关章节")
+        relevant_section_label_zh = profile_prompt(profile, "relevant_section_label_zh", "section")
         if prefers_chinese_answer(question):
             lines = [
-                f"最相关的{strong_source_label_zh}是 {lead['document_title']} / {lead.get('chapter') or relevant_section_label_zh}。",
+                f"{strong_source_label_zh}: {lead['document_title']} / {lead.get('partition') or relevant_section_label_zh}.",
                 lead["snippet"],
             ]
             if len(contexts) > 1:
-                lines.append("其他检索片段提供了相关背景；请结合引用检查原始资料。")
+                lines.append("Other retrieved excerpts provide related background; use the citations to inspect the source material.")
             lines.append(f"Question: {question}")
             return "\n".join(lines)
         lines = [
-            f"The strongest {strong_source_label} is {lead['document_title']} in {lead.get('chapter') or relevant_section_label}.",
+            f"The strongest {strong_source_label} is {lead['document_title']} in {lead.get('partition') or relevant_section_label}.",
             lead["snippet"],
         ]
         if len(contexts) > 1:
             lines.append("Other retrieved excerpts provide related background; use the citations to inspect the source material.")
-        lines.append(f"Question: {question}")
-        return "\n".join(lines)
-        if prefers_chinese_answer(question):
-            lines = [
-                f"最相关的课程来源是 {lead['document_title']} / {lead.get('chapter') or '相关章节'}。",
-                lead["snippet"],
-            ]
-        else:
-            lines = [
-                f"The strongest course source is {lead['document_title']} in {lead.get('chapter') or 'the relevant section'}.",
-                lead["snippet"],
-            ]
-        if len(contexts) > 1:
-            if prefers_chinese_answer(question):
-                lines.append("其他检索片段提供了相关背景；请结合引用检查原始课程材料。")
-            else:
-                lines.append("Other retrieved excerpts provide related background; use the citations to inspect the source material.")
         lines.append(f"Question: {question}")
         return "\n".join(lines)
 
@@ -814,17 +707,18 @@ async def post_openai_compatible_json(
     last_error: Exception | None = None
     for attempt in range(1, 4):
         try:
-            if normalized_resolve_ip:
-                return await asyncio.to_thread(_post_json_with_curl_resolve, url, payload, headers, timeout, normalized_resolve_ip)
-            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-                response = await client.post(url, json=payload, headers=headers)
-                if response.status_code >= 400:
-                    raise httpx.HTTPStatusError(
-                        f"OpenAI-compatible request failed with HTTP {response.status_code}: {response.text}",
-                        request=response.request,
-                        response=response,
-                    )
-                return response.json()
+            async with model_request_slot():
+                if normalized_resolve_ip:
+                    return await asyncio.to_thread(_post_json_with_curl_resolve, url, payload, headers, timeout, normalized_resolve_ip)
+                async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+                    response = await client.post(url, json=payload, headers=headers)
+                    if response.status_code >= 400:
+                        raise httpx.HTTPStatusError(
+                            f"OpenAI-compatible request failed with HTTP {response.status_code}: {response.text}",
+                            request=response.request,
+                            response=response,
+                        )
+                    return response.json()
         except Exception as exc:
             last_error = exc
             if attempt >= 3 or not _is_retryable_openai_error(exc):
@@ -873,9 +767,9 @@ def _post_json_with_curl_resolve(
     parsed = urlparse(url)
     if not parsed.hostname:
         raise ValueError(f"Invalid OpenAI-compatible URL: {url}")
-    _cleanup_private_temp_dirs("coursekg-openai-", max_age_seconds=3600)
+    _cleanup_private_temp_dirs("symbograph-openai-", max_age_seconds=3600)
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    temp_dir = tempfile.mkdtemp(prefix="coursekg-openai-")
+    temp_dir = tempfile.mkdtemp(prefix="symbograph-openai-")
     try:
         os.chmod(temp_dir, 0o700)
     except OSError:

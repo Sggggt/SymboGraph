@@ -1,7 +1,7 @@
 [project]
-name = "course-kg-worker"
+name = "KnowledgeBase-kg-worker"
 version = "0.1.0"
-description = "Celery worker and file watcher for course knowledge base ingestion"
+description = "Celery worker and file watcher for KnowledgeBase knowledge base ingestion"
 requires-python = ">=3.11"
 dependencies = [
   "celery[redis]>=5.4.0",

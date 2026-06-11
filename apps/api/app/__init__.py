@@ -1,1 +1,1 @@
-"""Course knowledge base API package."""
+"""KnowledgeBase knowledge base API package."""

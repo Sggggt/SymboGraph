@@ -1,35 +1,33 @@
 import { describe, expect, it } from "vitest";
 
 import type { GraphResponse } from "@course-kg/shared";
-import { toPureSemanticGraph } from "@/components/search-workspace";
+import { toQueryEvidenceGraph } from "@/components/search-workspace";
 
-describe("toPureSemanticGraph", () => {
-  it("keeps only semantic entities and semantic relations for the search canvas", () => {
+describe("toQueryEvidenceGraph", () => {
+  it("keeps evidence graph nodes and edges for the search canvas", () => {
     const graph: GraphResponse = {
       graph_type: "evidence",
       schema_version: "typed_graph_v1",
-      node_counts: { semantic_entity: 2, evidence_chunk: 1, document_version: 1 },
-      edge_counts: { semantic: 1, evidence: 2 },
+      node_counts: { evidence_atom: 1, active_chunk: 1, document_version: 1 },
+      edge_counts: { observation: 1, active_chunk: 1 },
       freshness: { is_stale: false },
       nodes: [
-        { id: "semantic:a", name: "Independence", category: "semantic_entity" },
-        { id: "semantic:b", name: "Mutual exclusivity", category: "semantic_entity" },
-        { id: "evidence_chunk:c1", name: "Evidence", category: "evidence_chunk" },
+        { id: "atom:a", name: "Independence", category: "evidence_atom" },
+        { id: "active_chunk:c1", name: "Evidence", category: "active_chunk" },
         { id: "document_version:v1", name: "Lecture", category: "document_version" },
       ],
       edges: [
-        { source: "semantic:a", target: "semantic:b", label: "contrasts_with", category: "semantic" },
-        { source: "semantic:a", target: "evidence_chunk:c1", label: "evidenced_by", category: "evidence" },
-        { source: "evidence_chunk:c1", target: "document_version:v1", label: "from_version", category: "evidence" },
+        { source: "active_chunk:c1", target: "atom:a", label: "grounded_by", category: "active_chunk" },
+        { source: "atom:a", target: "document_version:v1", label: "from_version", category: "traceability" },
       ],
     };
 
-    const semanticGraph = toPureSemanticGraph(graph);
+    const evidenceGraph = toQueryEvidenceGraph(graph);
 
-    expect(semanticGraph?.graph_type).toBe("semantic");
-    expect(semanticGraph?.nodes.map((node) => node.id)).toEqual(["semantic:a", "semantic:b"]);
-    expect(semanticGraph?.edges.map((edge) => edge.label)).toEqual(["contrasts_with"]);
-    expect(semanticGraph?.node_counts).toEqual({ semantic_entity: 2 });
-    expect(semanticGraph?.edge_counts).toEqual({ semantic: 1 });
+    expect(evidenceGraph?.graph_type).toBe("evidence");
+    expect(evidenceGraph?.nodes.map((node) => node.id)).toEqual(["atom:a", "active_chunk:c1", "document_version:v1"]);
+    expect(evidenceGraph?.edges.map((edge) => edge.label)).toEqual(["grounded_by", "from_version"]);
+    expect(evidenceGraph?.node_counts).toEqual({ evidence_atom: 1, active_chunk: 1, document_version: 1 });
+    expect(evidenceGraph?.edge_counts).toEqual({ observation: 1, active_chunk: 1 });
   });
 });

@@ -13,22 +13,24 @@ const ReactECharts = dynamic(
 );
 
 const palette: Record<string, string> = {
-  course: "#a5e9ff",
-  chapter: "#8f97ff",
+  knowledge_base: "#a5e9ff",
+  partition: "#8f97ff",
   document: "#6be2bf",
   section: "#7dd3fc",
-  chunk: "#94a3b8",
-  semantic_entity: "#63cbff",
+  active_chunk: "#94a3b8",
+  evidence_atom: "#fbbf24",
+  signal_node: "#c084fc",
   evidence_chunk: "#fbbf24",
   document_version: "#6be2bf",
-  concept: "#63cbff",
+  topic: "#63cbff",
+  observation: "#a78bfa",
+  claim: "#fb7185",
   method: "#5eead4",
   formula: "#facc15",
   metric: "#fb7185",
   algorithm: "#60a5fa",
   definition: "#c084fc",
   theorem: "#f59e0b",
-  problem_type: "#34d399",
 };
 const communityPalette = [
   "#5eead4",
@@ -46,20 +48,20 @@ const communityPalette = [
 ];
 
 function colorForNode(node: GraphResponse["nodes"][number]): string {
-  if (node.category === "semantic_entity" && typeof node.community_louvain === "number") {
+  if (node.category === "signal_node" && typeof node.community_louvain === "number") {
     return communityPalette[Math.abs(node.community_louvain) % communityPalette.length];
   }
-  if (node.category === "semantic_entity" && node.entity_type) {
-    return palette[node.entity_type] ?? palette.semantic_entity;
+  if (node.category === "signal_node" && node.entity_type) {
+    return palette[node.entity_type] ?? palette.signal_node;
   }
   return palette[node.category] ?? "#63cbff";
 }
 
 function symbolSizeForNode(node: GraphResponse["nodes"][number]): number {
-  if (node.category === "semantic_entity") {
+  if (node.category === "signal_node") {
     return 14 + Math.min(26, Math.max((node.value ?? 2) * 0.75, (node.centrality_score ?? 0) * 48, (node.graph_rank_score ?? 0) * 34));
   }
-  if (node.category === "evidence_chunk" || node.category === "chunk") {
+  if (node.category === "evidence_chunk" || node.category === "active_chunk" || node.category === "evidence_atom") {
     return 10 + Math.min(10, (node.value ?? 1) * 2);
   }
   if (node.category === "document" || node.category === "document_version") {
@@ -200,10 +202,10 @@ export function buildBaseOption(graph: GraphResponse): EChartsOption {
           symbolSize: symbolSizeForNode(node),
           itemStyle: {
             color: colorForNode(node),
-            borderWidth: node.category === "semantic_entity" && (node.centrality_score ?? 0) > 0.18 ? 1.8 : 0.8,
-            borderColor: node.category === "semantic_entity" && (node.centrality_score ?? 0) > 0.18 ? "rgba(255,255,255,0.72)" : "rgba(255,255,255,0.14)",
-            shadowBlur: node.category === "semantic_entity" ? 10 + Math.min(16, (node.centrality_score ?? 0) * 44) : 7,
-            shadowColor: node.category === "semantic_entity" ? "rgba(255, 255, 255, 0.16)" : "rgba(99, 203, 255, 0.08)",
+            borderWidth: node.category === "signal_node" && (node.centrality_score ?? 0) > 0.18 ? 1.8 : 0.8,
+            borderColor: node.category === "signal_node" && (node.centrality_score ?? 0) > 0.18 ? "rgba(255,255,255,0.72)" : "rgba(255,255,255,0.14)",
+            shadowBlur: node.category === "signal_node" ? 10 + Math.min(16, (node.centrality_score ?? 0) * 44) : 7,
+            shadowColor: node.category === "signal_node" ? "rgba(255, 255, 255, 0.16)" : "rgba(99, 203, 255, 0.08)",
           },
           label: {
             color: "#dff7ff",
@@ -217,9 +219,9 @@ export function buildBaseOption(graph: GraphResponse): EChartsOption {
           category: edge.category,
           evidence_chunk_id: edge.evidence_chunk_id,
           lineStyle: {
-            color: edge.is_inferred ? "rgba(255, 207, 112, 0.26)" : edge.category === "semantic" ? "rgba(84, 213, 255, 0.18)" : "rgba(155, 165, 255, 0.11)",
-            width: edge.category === "semantic" ? 0.8 + Math.min(2.8, (edge.weight ?? edge.confidence ?? 0.4) * 2.6) : 0.8,
-            opacity: edge.category === "semantic" ? 0.36 + Math.min(0.48, (edge.weight ?? 0.3) * 0.55) : 0.38,
+            color: edge.is_inferred ? "rgba(255, 207, 112, 0.26)" : edge.category === "signal_projection" ? "rgba(216, 180, 254, 0.24)" : edge.category === "semantic" ? "rgba(84, 213, 255, 0.18)" : "rgba(155, 165, 255, 0.11)",
+            width: edge.category === "signal_projection" || edge.category === "semantic" ? 0.8 + Math.min(2.8, (edge.weight ?? edge.confidence ?? 0.4) * 2.6) : 0.8,
+            opacity: edge.category === "signal_projection" || edge.category === "semantic" ? 0.36 + Math.min(0.48, (edge.weight ?? 0.3) * 0.55) : 0.38,
             type: edge.is_inferred ? "dashed" : "solid",
           },
         })),
@@ -453,12 +455,12 @@ export const NetworkCanvas = forwardRef<NetworkCanvasHandle, NetworkCanvasProps>
         onEvents={{
           click: (params: { data?: { id?: string; category?: string } }) => {
             if (params.data?.id) {
-              onNodeClick?.(params.data.id, params.data.category ?? "concept");
+              onNodeClick?.(params.data.id, params.data.category ?? "signal_node");
             }
           },
           dblclick: (params: { data?: { id?: string; category?: string } }) => {
             if (params.data?.id) {
-              onNodeDoubleClick?.(params.data.id, params.data.category ?? "concept");
+              onNodeDoubleClick?.(params.data.id, params.data.category ?? "signal_node");
             }
           },
         }}

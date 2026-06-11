@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { createPortal } from "react-dom";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -22,34 +22,23 @@ import {
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { NetworkCanvas } from "@/components/network-canvas";
-import { useCourseContext } from "@/components/course-context";
+import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { fetchDashboard, fetchQuerySemanticGraph, searchKnowledge } from "@/lib/api";
+import { fetchDashboard, fetchQueryEvidenceGraph, searchKnowledge } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 
 const sourceOptions: SourceType[] = ["pdf", "notebook", "markdown", "text", "image", "docx", "pptx"];
 const emptySearchResults: SearchResult[] = [];
 
-export function toPureSemanticGraph(graph: GraphResponse | undefined): GraphResponse | undefined {
+export function toQueryEvidenceGraph(graph: GraphResponse | undefined): GraphResponse | undefined {
   if (!graph) {
     return undefined;
   }
-
-  const nodes = graph.nodes.filter((node) => node.category === "semantic_entity");
-  const semanticNodeIds = new Set(nodes.map((node) => node.id));
-  const edges = graph.edges.filter(
-    (edge) => edge.category === "semantic" && semanticNodeIds.has(edge.source) && semanticNodeIds.has(edge.target),
-  );
-
   return {
     ...graph,
-    graph_type: "semantic",
-    nodes,
-    edges,
-    node_counts: { semantic_entity: nodes.length },
-    edge_counts: { semantic: edges.length },
+    graph_type: "evidence",
   };
 }
 
@@ -82,9 +71,9 @@ function scoreLabel(key: string) {
   return labels[key] ?? key;
 }
 
-function resultChapter(result: SearchResult | undefined) {
+function resultPartition(result: SearchResult | undefined) {
   if (!result) return "通用";
-  return result.chapter ?? (result.metadata.chapter as string | undefined) ?? result.citations[0]?.chapter ?? "通用";
+  return result.partition ?? (result.metadata.partition as string | undefined) ?? result.citations[0]?.partition ?? "通用";
 }
 
 function resultSourceType(result: SearchResult | undefined) {
@@ -146,7 +135,7 @@ function SearchHero({
                 }
               }}
               className="h-12 min-w-0 flex-1 bg-transparent text-lg text-white outline-none placeholder:text-white/28"
-              placeholder="输入概念、定理、练习或关系问题..."
+              placeholder="输入要从本地资料中检索的问题或证据线索..."
             />
             <div className="hidden items-center gap-2 md:flex">
               <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{hitCount} 条结果</span>
@@ -185,17 +174,17 @@ function SearchHero({
 }
 
 function SearchFilterBar({
-  chapter,
+  partition,
   sourceType,
   onOpenFilters,
-  onClearChapter,
+  onClearPartition,
   onClearSource,
   degradedMode,
 }: {
-  chapter: string;
+  partition: string;
   sourceType: string;
   onOpenFilters: () => void;
-  onClearChapter: () => void;
+  onClearPartition: () => void;
   onClearSource: () => void;
   degradedMode: boolean;
 }) {
@@ -206,9 +195,9 @@ function SearchFilterBar({
           <SlidersHorizontal />
           筛选
         </button>
-        <button type="button" onClick={onClearChapter} className="kg-micro-chip rounded-full px-3 py-2 text-xs">
-          目录：{chapter || "全部"}
-          {chapter ? <X /> : null}
+        <button type="button" onClick={onClearPartition} className="kg-micro-chip rounded-full px-3 py-2 text-xs">
+          目录：{partition || "全部"}
+          {partition ? <X /> : null}
         </button>
         <button type="button" onClick={onClearSource} className="kg-micro-chip rounded-full px-3 py-2 text-xs">
           来源：{sourceType || "全部"}
@@ -274,7 +263,7 @@ function ResultRow({
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm font-medium text-white">{result.document_title ?? result.citations[0]?.document_title ?? "资料来源"}</span>
             <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultSourceType(result)}</span>
-            <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultChapter(result)}</span>
+            <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultPartition(result)}</span>
           </div>
           <MarkdownRenderer content={result.snippet} compact className="mt-3 line-clamp-2 text-white/62" />
         </div>
@@ -369,7 +358,7 @@ function HoverPreviewOverlay({ preview }: { preview: HoverPreviewState | null })
             <div className="flex items-center justify-between gap-3">
               <p className="text-xs uppercase tracking-[0.22em] text-cyan-100/55">悬停预览</p>
               <div className="flex flex-wrap gap-2">
-                <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultChapter(preview.result)}</span>
+                <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultPartition(preview.result)}</span>
                 <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultSourceType(preview.result)}</span>
               </div>
             </div>
@@ -387,7 +376,7 @@ function HoverPreviewOverlay({ preview }: { preview: HoverPreviewState | null })
 
 function GraphCanvasPanel({
   selectedLabel,
-  selectedChapter,
+  selectedPartition,
   selectedNodeId,
   graph,
   hasResults,
@@ -395,7 +384,7 @@ function GraphCanvasPanel({
   error,
 }: {
   selectedLabel: string | null;
-  selectedChapter: string;
+  selectedPartition: string;
   selectedNodeId: string | null;
   graph: GraphResponse | undefined;
   hasResults: boolean;
@@ -408,12 +397,12 @@ function GraphCanvasPanel({
       <div className="relative z-10 flex items-center justify-between gap-3 px-5 py-4">
         <div>
           <p className="section-kicker">知识画布</p>
-          <h3 className="mt-1 text-xl font-semibold text-white">{selectedLabel ?? "查询语义子图"}</h3>
-          <p className="mt-1 text-sm text-white/42">{selectedChapter || "当前检索结果的语义邻域"}</p>
+          <h3 className="mt-1 text-xl font-semibold text-white">{selectedLabel ?? "查询证据子图"}</h3>
+          <p className="mt-1 text-sm text-white/42">{selectedPartition || "当前检索结果的语义邻域"}</p>
         </div>
         <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
           <GitBranch data-icon="inline-start" />
-          语义子图
+          证据子图
         </span>
       </div>
       <div className="relative z-10 flex min-h-0 flex-1 px-2 pb-2">
@@ -431,7 +420,7 @@ function GraphCanvasPanel({
           </div>
         ) : (
           <div className="mx-3 grid h-full min-h-0 w-full flex-1 place-items-center rounded-[1.5rem] border border-white/7 bg-white/[0.025] px-6 text-center text-sm leading-7 text-white/54">
-            {hasResults ? "当前检索结果没有匹配到可审计的语义图关系。" : "发起检索后，这里只展示命中片段相关的语义实体和语义关系。"}
+            {hasResults ? "当前检索结果没有匹配到可审计的证据子图。" : "发起检索后，这里展示命中片段相关的 evidence graph 子图。"}
           </div>
         )}
       </div>
@@ -450,7 +439,7 @@ function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | n
         {result ? (
           <div className="custom-scrollbar flex-1 overflow-y-auto p-6">
             <div className="flex flex-wrap gap-2">
-              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{resultChapter(result)}</span>
+              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{resultPartition(result)}</span>
               <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{resultSourceType(result)}</span>
               <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">分数 {result.score.toFixed(3)}</span>
             </div>
@@ -488,19 +477,19 @@ function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | n
 function AdvancedFilterDrawer({
   open,
   onOpenChange,
-  chapter,
-  setChapter,
+  partition,
+  setPartition,
   sourceType,
   setSourceType,
-  chapterOptions,
+  partitionOptions,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  chapter: string;
-  setChapter: (value: string) => void;
+  partition: string;
+  setPartition: (value: string) => void;
   sourceType: string;
   setSourceType: (value: string) => void;
-  chapterOptions: string[];
+  partitionOptions: string[];
 }) {
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -512,9 +501,9 @@ function AdvancedFilterDrawer({
         <div className="flex flex-col gap-6 p-6">
           <label className="flex flex-col gap-2">
             <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">目录</span>
-            <select value={chapter} onChange={(event) => setChapter(event.target.value)} className="rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-3 text-white outline-none">
+            <select value={partition} onChange={(event) => setPartition(event.target.value)} className="rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-3 text-white outline-none">
               <option value="">全部目录</option>
-              {chapterOptions.map((option) => (
+              {partitionOptions.map((option) => (
                 <option key={option} value={option}>
                   {option}
                 </option>
@@ -542,18 +531,18 @@ function AdvancedFilterDrawer({
   );
 }
 
-function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | null }) {
-  const storageScope = selectedCourseId ?? "unassigned";
+function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBaseId: string | null }) {
+  const storageScope = selectedKnowledgeBaseId ?? "unassigned";
   const dashboardQuery = useQuery({
-    queryKey: ["dashboard", selectedCourseId],
-    queryFn: () => fetchDashboard(selectedCourseId),
-    enabled: Boolean(selectedCourseId),
+    queryKey: ["dashboard", selectedKnowledgeBaseId],
+    queryFn: () => fetchDashboard(selectedKnowledgeBaseId),
+    enabled: Boolean(selectedKnowledgeBaseId),
   });
   const [query, setQuery] = useLocalStorage(`search.query.${storageScope}`, "");
   const [searchHistory, setSearchHistory] = useLocalStorage<string[]>(`search.history.${storageScope}`, []);
-  const [chapter, setChapter] = useLocalStorage(`search.chapter.${storageScope}`, "");
+  const [partition, setPartition] = useLocalStorage(`search.partition.${storageScope}`, "");
   const [sourceType, setSourceType] = useLocalStorage(`search.sourceType.${storageScope}`, "");
-  const [selectedChapter, setSelectedChapter] = useLocalStorage(`search.selectedChapter.${storageScope}`, "");
+  const [selectedPartition, setSelectedPartition] = useLocalStorage(`search.selectedPartition.${storageScope}`, "");
   const [activeChunkId, setActiveChunkId] = useLocalStorage<string | null>(`search.activeChunkId.${storageScope}`, null);
   const [searchResults, setSearchResults] = useLocalStorage<{ results: SearchResult[]; degraded_mode: boolean } | null>(`search.results.${storageScope}`, null);
   const [hoverPreview, setHoverPreview] = useState<HoverPreviewState | null>(null);
@@ -564,11 +553,11 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   const searchMutation = useMutation({
     mutationFn: (searchText: string) =>
       searchKnowledge({
-        course_id: selectedCourseId,
+        knowledge_base_id: selectedKnowledgeBaseId,
         query: searchText,
         top_k: 8,
         filters: {
-          chapter: chapter || undefined,
+          partition: partition || undefined,
           source_type: (sourceType || undefined) as never,
         },
       }),
@@ -576,8 +565,8 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       setSearchResults({ results: data.results, degraded_mode: Boolean(data.degraded_mode) });
       setSearchHistory((current) => [searchText, ...current.filter((item) => item !== searchText)].slice(0, 50));
       const firstResult = data.results[0];
-      const nextChapter = chapter || (firstResult ? resultChapter(firstResult) : undefined) || (dashboardQuery.data?.tree[0]?.title ?? "");
-      setSelectedChapter(nextChapter);
+      const nextPartition = partition || (firstResult ? resultPartition(firstResult) : undefined) || (dashboardQuery.data?.tree[0]?.title ?? "");
+      setSelectedPartition(nextPartition);
       setActiveChunkId(firstResult?.chunk_id ?? null);
     },
     onError: () => {
@@ -586,17 +575,17 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     },
   });
 
-  const chapterOptions = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title) ?? [], [dashboardQuery.data]);
+  const partitionOptions = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title) ?? [], [dashboardQuery.data]);
   const results = searchResults?.results ?? emptySearchResults;
   const resultChunkIds = useMemo(() => results.map((result) => result.chunk_id), [results]);
-  const querySemanticGraphQuery = useQuery({
-    queryKey: ["search-semantic-graph", selectedCourseId, query, resultChunkIds],
-    queryFn: () => fetchQuerySemanticGraph({ course_id: selectedCourseId, query, chunk_ids: resultChunkIds }),
+  const queryEvidenceGraphQuery = useQuery({
+    queryKey: ["search-evidence-graph", selectedKnowledgeBaseId, query, resultChunkIds],
+    queryFn: () => fetchQueryEvidenceGraph({ knowledge_base_id: selectedKnowledgeBaseId, query, chunk_ids: resultChunkIds }),
     enabled: resultChunkIds.length > 0,
   });
-  const pureSemanticGraph = useMemo(() => toPureSemanticGraph(querySemanticGraphQuery.data), [querySemanticGraphQuery.data]);
+  const queryEvidenceGraph = useMemo(() => toQueryEvidenceGraph(queryEvidenceGraphQuery.data), [queryEvidenceGraphQuery.data]);
   const selectedResult = results.find((result) => result.chunk_id === activeChunkId) ?? null;
-  const focusChapter = selectedResult ? resultChapter(selectedResult) : selectedChapter;
+  const focusPartition = selectedResult ? resultPartition(selectedResult) : selectedPartition;
   const selectedLabel = selectedResult?.document_title ?? selectedResult?.citations[0]?.document_title ?? null;
 
   useEffect(() => {
@@ -682,10 +671,10 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         }}
       />
       <SearchFilterBar
-        chapter={chapter}
+        partition={partition}
         sourceType={sourceType}
         onOpenFilters={() => setFiltersOpen(true)}
-        onClearChapter={() => setChapter("")}
+        onClearPartition={() => setPartition("")}
         onClearSource={() => setSourceType("")}
         degradedMode={Boolean(searchResults?.degraded_mode)}
       />
@@ -707,18 +696,18 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
             }
             setHoverPreview(null);
             setActiveChunkId(result.chunk_id);
-            setSelectedChapter(resultChapter(result));
+            setSelectedPartition(resultPartition(result));
             setDetailResult(result);
           }}
         />
         <GraphCanvasPanel
           selectedLabel={selectedLabel}
-          selectedChapter={focusChapter}
+          selectedPartition={focusPartition}
           selectedNodeId={null}
-          graph={pureSemanticGraph}
+          graph={queryEvidenceGraph}
           hasResults={results.length > 0}
-          isLoading={querySemanticGraphQuery.isLoading || searchMutation.isPending}
-          error={(querySemanticGraphQuery.error as Error | null) ?? null}
+          isLoading={queryEvidenceGraphQuery.isLoading || searchMutation.isPending}
+          error={(queryEvidenceGraphQuery.error as Error | null) ?? null}
         />
       </section>
 
@@ -726,11 +715,11 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       <AdvancedFilterDrawer
         open={filtersOpen}
         onOpenChange={setFiltersOpen}
-        chapter={chapter}
-        setChapter={setChapter}
+        partition={partition}
+        setPartition={setPartition}
         sourceType={sourceType}
         setSourceType={setSourceType}
-        chapterOptions={chapterOptions}
+        partitionOptions={partitionOptions}
       />
       <HoverPreviewOverlay preview={hoverPreview} />
     </div>
@@ -738,6 +727,6 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
 }
 
 export function SearchWorkspace() {
-  const { selectedCourseId } = useCourseContext();
-  return <SearchWorkspaceContent key={selectedCourseId ?? "unassigned"} selectedCourseId={selectedCourseId} />;
+  const { selectedKnowledgeBaseId } = useKnowledgeBaseContext();
+  return <SearchWorkspaceContent key={selectedKnowledgeBaseId ?? "unassigned"} selectedKnowledgeBaseId={selectedKnowledgeBaseId} />;
 }

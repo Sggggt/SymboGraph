@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Export quality decision distributions and review samples.
+"""Export evidence chunk quality decision distributions and review samples.
 
 Run inside the API container:
-    python /app/scripts/evaluate_quality_decisions.py --course-name "Course Name"
+    python /app/scripts/evaluate_quality_decisions.py --KnowledgeBase-name "KnowledgeBase Name"
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "api"))
 from sqlalchemy import select
 
 from app.db import SessionLocal, ensure_schema
-from app.models import Chunk, Concept, ConceptRelation, Course, GraphRelationCandidate, QualityProfile
+from app.models import ActiveChunk, ChunkCandidate, ChunkDecision, EvidenceGraphState, KnowledgeBase, QualityDecision
 
 
 def _jsonable(value: Any) -> Any:
@@ -35,162 +35,114 @@ def _counter_dict(counter: Counter[str]) -> dict[str, int]:
     return dict(sorted(counter.items(), key=lambda item: (-item[1], item[0])))
 
 
-def _first_reason(decision: dict[str, Any]) -> str:
-    reasons = decision.get("reasons")
-    if isinstance(reasons, list) and reasons:
-        return str(reasons[0])
-    return "missing_reason"
-
-
-def _sample(item_type: str, item_id: str, text: str, decision: dict[str, Any]) -> dict[str, Any]:
+def _sample(candidate: ChunkCandidate, decision: QualityDecision) -> dict[str, Any]:
+    diagnostics = decision.diagnostics_json or {}
     return {
-        "type": item_type,
-        "id": item_id,
-        "text": text[:500],
-        "action": decision.get("action"),
-        "score": decision.get("score"),
-        "reasons": decision.get("reasons", []),
+        "candidate_id": candidate.id,
+        "decision_id": decision.id,
+        "generator": candidate.generator_name,
+        "generator_version": candidate.generator_version,
+        "atom_count": len(candidate.atom_ids_json or []),
+        "token_count": candidate.token_count,
+        "gate_passed": decision.gate_passed,
+        "action": decision.decision_action,
+        "confidence": decision.confidence,
+        "risk_flags": decision.risk_flags_json or [],
+        "diagnostics": _jsonable(diagnostics),
     }
 
 
-def build_course_report(db, course: Course, sample_limit: int) -> dict[str, Any]:
-    chunks = db.scalars(select(Chunk).where(Chunk.course_id == course.id, Chunk.is_active.is_(True))).all()
-    concepts = db.scalars(select(Concept).where(Concept.course_id == course.id)).all()
-    relations = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course.id)).all()
-    candidates = db.scalars(select(GraphRelationCandidate).where(GraphRelationCandidate.course_id == course.id)).all()
-    profile = db.scalar(
-        select(QualityProfile)
-        .where(QualityProfile.course_id == course.id, QualityProfile.is_active.is_(True))
-        .order_by(QualityProfile.created_at.desc())
-    )
+def build_report(db, knowledge_base: KnowledgeBase, sample_limit: int) -> dict[str, Any]:
+    graph_states = db.scalars(
+        select(EvidenceGraphState).where(EvidenceGraphState.knowledge_base_id == knowledge_base.id)
+    ).all()
+    graph_state_ids = {state.id for state in graph_states}
+    candidates = db.scalars(
+        select(ChunkCandidate).where(ChunkCandidate.graph_state_id.in_(graph_state_ids or {"__none__"}))
+    ).all()
+    candidate_by_id = {candidate.id: candidate for candidate in candidates}
+    decisions = db.scalars(
+        select(QualityDecision).where(QualityDecision.candidate_id.in_(candidate_by_id.keys() or {"__none__"}))
+    ).all()
+    chunk_decisions = db.scalars(
+        select(ChunkDecision).where(ChunkDecision.knowledge_base_id == knowledge_base.id)
+    ).all()
+    active_chunks = db.scalars(
+        select(ActiveChunk).where(ActiveChunk.knowledge_base_id == knowledge_base.id, ActiveChunk.state == "active")
+    ).all()
 
-    chunk_actions: Counter[str] = Counter()
-    chunk_reasons: Counter[str] = Counter()
-    chunk_retention: Counter[str] = Counter()
-    chunk_routes: Counter[str] = Counter()
-    concept_actions: Counter[str] = Counter()
-    concept_reasons: Counter[str] = Counter()
-    relation_actions: Counter[str] = Counter()
-    relation_reasons: Counter[str] = Counter()
-    candidate_actions: Counter[str] = Counter()
-    candidate_reasons: Counter[str] = Counter()
+    action_counts: Counter[str] = Counter()
+    gate_counts: Counter[str] = Counter()
+    risk_counts: Counter[str] = Counter()
+    generator_counts: Counter[str] = Counter()
+    feedback_counts: Counter[str] = Counter()
     review_samples: list[dict[str, Any]] = []
 
-    for chunk in chunks:
-        metadata = chunk.metadata_json or {}
-        action = str(metadata.get("quality_action") or "missing")
-        chunk_actions[action] += 1
-        if metadata.get("quality_retain") is False:
-            chunk_retention["discarded"] += 1
-        elif "quality_retain" in metadata:
-            chunk_retention["retained"] += 1
-        else:
-            chunk_retention["missing"] += 1
-        routes = metadata.get("route_eligibility")
-        if isinstance(routes, dict):
-            for route_name in ("embed", "retrieval", "graph_extraction", "summary", "evidence_only"):
-                if routes.get(route_name):
-                    chunk_routes[route_name] += 1
-        else:
-            chunk_routes["missing"] += 1
-        for reason in metadata.get("quality_reasons") or ["missing_reason"]:
-            chunk_reasons[str(reason)] += 1
-        if action in {"discard", "embed_only", "evidence_only", "summary_only"} and len(review_samples) < sample_limit:
-            review_samples.append(
-                _sample(
-                    "chunk",
-                    chunk.id,
-                    chunk.snippet or chunk.content or "",
-                    {"action": action, "score": metadata.get("quality_score"), "reasons": metadata.get("quality_reasons", [])},
-                )
-            )
+    for decision in decisions:
+        candidate = candidate_by_id.get(decision.candidate_id)
+        if candidate is None:
+            continue
+        action_counts[str(decision.decision_action or "missing")] += 1
+        gate_counts["passed" if decision.gate_passed else "rejected"] += 1
+        generator_counts[str(candidate.generator_name or "missing")] += 1
+        for flag in decision.risk_flags_json or ["none"]:
+            risk_counts[str(flag)] += 1
+        feedback = decision.feedback_json or {}
+        for key, value in feedback.items():
+            if value:
+                feedback_counts[str(key)] += 1
+        if (not decision.gate_passed or decision.risk_flags_json) and len(review_samples) < sample_limit:
+            review_samples.append(_sample(candidate, decision))
 
-    for concept in concepts:
-        audit = (concept.quality_json or {}).get("concept_gate") or {}
-        action = "accept" if audit.get("gate_reason") in {None, "policy_passed", "existing_concept"} else "reject_or_pruned"
-        concept_actions[action] += 1
-        concept_reasons[str(audit.get("gate_reason") or "missing_reason")] += 1
-        if action != "accept" and len(review_samples) < sample_limit:
-            review_samples.append(_sample("concept", concept.id, concept.canonical_name, {"action": action, "score": audit.get("specificity_score"), "reasons": [audit.get("gate_reason")]}))
-
-    for relation in relations:
-        decision = ((relation.metadata_json or {}).get("quality_decision") or {})
-        action = str(decision.get("action") or "missing")
-        relation_actions[action] += 1
-        relation_reasons[_first_reason(decision)] += 1
-
-    for candidate in candidates:
-        decision = candidate.decision_json or {}
-        action = str(decision.get("action") or "candidate_only")
-        candidate_actions[action] += 1
-        candidate_reasons[_first_reason(decision)] += 1
-        if len(review_samples) < sample_limit:
-            review_samples.append(
-                _sample(
-                    "relation_candidate",
-                    candidate.id,
-                    f"{candidate.source_concept_id} {candidate.relation_type} {candidate.target_name}",
-                    decision,
-                )
-            )
-
-    accepted_relations = len(relations)
-    candidate_relations = len(candidates)
     return {
-        "course_id": course.id,
-        "course_name": course.name,
-        "quality_profile_version": profile.version if profile else None,
+        "knowledge_base_id": knowledge_base.id,
+        "knowledge_base_name": knowledge_base.name,
         "counts": {
-            "chunks": len(chunks),
-            "concepts": len(concepts),
-            "accepted_relations": accepted_relations,
-            "relation_candidates": candidate_relations,
-            "candidate_to_accepted_relation_ratio": round(candidate_relations / max(accepted_relations, 1), 4),
+            "graph_states": len(graph_states),
+            "chunk_candidates": len(candidates),
+            "quality_decisions": len(decisions),
+            "chunk_decisions": len(chunk_decisions),
+            "active_chunks": len(active_chunks),
         },
         "distributions": {
-            "chunk_actions": _counter_dict(chunk_actions),
-            "chunk_reasons": _counter_dict(chunk_reasons),
-            "chunk_retention": _counter_dict(chunk_retention),
-            "chunk_routes": _counter_dict(chunk_routes),
-            "concept_actions": _counter_dict(concept_actions),
-            "concept_reasons": _counter_dict(concept_reasons),
-            "relation_actions": _counter_dict(relation_actions),
-            "relation_reasons": _counter_dict(relation_reasons),
-            "candidate_actions": _counter_dict(candidate_actions),
-            "candidate_reasons": _counter_dict(candidate_reasons),
+            "actions": _counter_dict(action_counts),
+            "gate": _counter_dict(gate_counts),
+            "risks": _counter_dict(risk_counts),
+            "generators": _counter_dict(generator_counts),
+            "feedback": _counter_dict(feedback_counts),
         },
-        "active_learning_samples": review_samples,
+        "review_samples": review_samples,
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Export quality decision audit report.")
-    parser.add_argument("--course-name", default=None)
-    parser.add_argument("--course-id", default=None)
+    parser = argparse.ArgumentParser(description="Export evidence quality decision audit report.")
+    parser.add_argument("--KnowledgeBase-name", "--knowledge-base-name", dest="knowledge_base_name", default=None)
+    parser.add_argument("--KnowledgeBase-id", "--knowledge-base-id", dest="knowledge_base_id", default=None)
     parser.add_argument("--sample-limit", type=int, default=50)
     parser.add_argument("--output-dir", default="output")
     args = parser.parse_args()
 
     ensure_schema()
     with SessionLocal() as db:
-        course_query = select(Course)
-        if args.course_id:
-            course_query = course_query.where(Course.id == args.course_id)
-        if args.course_name:
-            course_query = course_query.where(Course.name == args.course_name)
-        courses = db.scalars(course_query.order_by(Course.name.asc())).all()
-        if not courses:
-            raise SystemExit("No matching courses found.")
+        kb_query = select(KnowledgeBase)
+        if args.knowledge_base_id:
+            kb_query = kb_query.where(KnowledgeBase.id == args.knowledge_base_id)
+        if args.knowledge_base_name:
+            kb_query = kb_query.where(KnowledgeBase.name == args.knowledge_base_name)
+        knowledge_bases = db.scalars(kb_query.order_by(KnowledgeBase.name.asc())).all()
+        if not knowledge_bases:
+            raise SystemExit("No matching knowledge_bases found.")
         report = {
             "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-            "courses": [build_course_report(db, course, args.sample_limit) for course in courses],
+            "knowledge_bases": [build_report(db, knowledge_base, args.sample_limit) for knowledge_base in knowledge_bases],
         }
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"quality_decisions_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}.json"
-    output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=_jsonable), encoding="utf-8")
-    print(f"Wrote {output_path}")
+    output_path = output_dir / f"quality_decisions_{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.json"
+    output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({"output": str(output_path), "knowledge_bases": len(report["knowledge_bases"])}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

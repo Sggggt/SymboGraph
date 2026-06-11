@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 import re
@@ -8,80 +8,9 @@ from typing import Any
 
 
 MOJIBAKE_MARKERS = ("\ufffd", "\u00c3", "\u00c2", "\u00e2", "\u9208", "\u9365", "\u9429", "\u95b3", "\u951f", "\u7d34", "\u6d93", "\u934f")
-STRUCTURAL_ROLE_TERMS = {
-    "chapter",
-    "section",
-    "unit",
-    "module",
-    "lecture",
-    "slide",
-    "page",
-    "course",
-    "syllabus",
-    "outline",
-    "agenda",
-    "summary",
-    "appendix",
-    "reference",
-    "solution",
-    "homework",
-    "assignment",
-    "quiz",
-    "exam",
-    "lab",
-    "worksheet",
-}
-GENERIC_CONCEPT_TERMS = {
-    "algorithm",
-    "method",
-    "data",
-    "model",
-    "result",
-    "example",
-    "problem",
-    "system",
-    "approach",
-    "process",
-    "value",
-    "function",
-    "feature",
-    "task",
-    "step",
-    "算法",
-    "方法",
-    "数据",
-    "模型",
-    "问题",
-    "系统",
-    "过程",
-    "结果",
-    "示例",
-    "特征",
-    "任务",
-}
-DEFINITION_MARKERS = (
-    " is ",
-    " are ",
-    " refers to ",
-    " defined as ",
-    " means ",
-    " denotes ",
-    " definition ",
-    " 定义 ",
-    " 定义为 ",
-    " 是 ",
-    " 指 ",
-    " 称为 ",
-)
 FORMULA_RE = re.compile(r"[\u2211\u222b\u2202\u221a\u221e\u2248\u2260\u2264\u2265\u00b1\u00d7\u00f7\u2208\u2209\u2282\u2286\u222a\u2229\u2192\u2190\u2194\u2200\u2203\u2207=<>^]")
 FILENAME_RE = re.compile(r"^[\w .()\-\u4e00-\u9fff]+\.(?:pdf|pptx?|docx?|xlsx?|csv|txt|md|html?|ipynb|png|jpe?g|gif)$", re.IGNORECASE)
 PATH_FRAGMENT_RE = re.compile(r"(?:[A-Za-z]:[\\/]|[/\\]|(?:^|[\s])\.\.?[/\\])")
-STRUCTURAL_LABEL_RE = re.compile(
-    r"^(?:chapter|chap|section|unit|module|lecture|lec|week|slide|page|lab)\s*"
-    r"(?:\d+[a-z]?|[ivxlcdm]+)?(?:\s*[-:]\s*)?"
-    r"(?:slides?|notes?|solutions?|answers?|questions?|review|summary|worksheet)?$",
-    re.IGNORECASE,
-)
 DATE_OR_NUMBER_RE = re.compile(r"^(?:(?:19|20)\d{2}[-_/]?\d{1,2}[-_/]?\d{1,2}|\d{6,8}|p(?:age)?\s*\d+|\d+(?:\.\d+){1,4})$", re.IGNORECASE)
 CAPITALIZED_TERM_RE = re.compile(r"\b[A-Z][A-Za-z0-9\-]+(?:\s+[A-Z][A-Za-z0-9\-]+){0,4}\b")
 
@@ -152,7 +81,7 @@ class ModelJudgment:
 
 @dataclass(frozen=True)
 class Provenance:
-    course_id: str | None = None
+    knowledge_base_id: str | None = None
     document_id: str | None = None
     document_version_id: str | None = None
     chunk_id: str | None = None
@@ -189,7 +118,8 @@ def normalize_concept_text(text: str | None) -> str:
     value = re.sub(r"\\\((.*?)\\\)|\\\[(.*?)\\\]", lambda match: match.group(1) or match.group(2) or "", value)
     value = value.replace("_", " ").replace("-", " ")
     value = re.sub(r"[`~*#\[\]{}]", " ", value)
-    value = re.sub(r"[’‘]", "'", value)
+    for marker in ("鈥", "欌", "€", "榏"):
+        value = value.replace(marker, "'")
     value = re.sub(r"\b([A-Za-z])'s\b", r"\1s", value)
     value = re.sub(r"[^0-9A-Za-z\u3400-\u4dbf\u4e00-\u9fff\u0370-\u03ff+\-/*^=<>()\s']", " ", value)
     value = re.sub(r"\s+", " ", value).strip().lower()
@@ -235,6 +165,10 @@ def repeated_line_ratio(text: str) -> float:
     return max(0.0, 1.0 - unique / len(lines))
 
 
+def ends_with_sentence_punctuation(text: str) -> bool:
+    return (text or "").rstrip().endswith((".", "!", "?", "。", "！", "？"))
+
+
 def structural_role_for_text(text: str, *, title: str | None = None, section: str | None = None, content_kind: str | None = None) -> StructuralRole:
     haystack = normalize_concept_text(" ".join(item for item in (title, section, text[:200]) if item))
     roles: set[str] = set()
@@ -243,11 +177,26 @@ def structural_role_for_text(text: str, *, title: str | None = None, section: st
     if is_toc_like(text):
         roles.add("toc")
     raw_text = normalize_text_for_quality(text)
-    if STRUCTURAL_LABEL_RE.fullmatch(raw_text) or STRUCTURAL_LABEL_RE.fullmatch(haystack) or DATE_OR_NUMBER_RE.fullmatch(raw_text):
+    short_label = len(raw_text) <= 36 and len(tokenize(raw_text)) <= 3 and not ends_with_sentence_punctuation(raw_text)
+    numeric_or_dated_label = DATE_OR_NUMBER_RE.fullmatch(raw_text) is not None
+    formula_like = bool(FORMULA_RE.search(raw_text))
+    mixed_short_number_label = short_label and not formula_like and any(char.isdigit() for char in raw_text) and len(tokenize(raw_text)) <= 4
+    sparse_label = short_label and (
+        numeric_or_dated_label
+        or mixed_short_number_label
+        or (text_quality_for_text(raw_text, raw_text).digit_ratio >= 0.25 and text_quality_for_text(raw_text, raw_text).alpha_ratio <= 0.65)
+    )
+    if sparse_label:
         roles.add("structural_label")
     if PATH_FRAGMENT_RE.search(text or "") or FILENAME_RE.fullmatch((text or "").strip()):
         roles.add("path_or_filename")
-    if any(term in haystack.split() for term in STRUCTURAL_ROLE_TERMS):
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    label_like_lines = sum(
+        1
+        for line in lines
+        if len(line) <= 48 and len(tokenize(line)) <= 4 and not ends_with_sentence_punctuation(line)
+    )
+    if len(lines) >= 4 and label_like_lines / max(len(lines), 1) >= 0.75:
         roles.add("container_hint")
     score = 0.0
     if roles.intersection({"toc", "structural_label", "path_or_filename"}):
@@ -285,7 +234,7 @@ def semantic_density_for_text(text: str, *, content_kind: str | None = None, met
     normalized = normalize_text_for_quality(text)
     tokens = tokenize(normalized)
     unique_ratio = len(set(tokens)) / max(len(tokens), 1)
-    definition_score = 1.0 if any(marker in f" {normalized.lower()} " for marker in DEFINITION_MARKERS) else 0.0
+    definition_score = 1.0 if re.search(r"(^|\n)\s*.{2,120}?\s+(?:is|are|means|refers\s+to|defined\s+as|denotes|represents)\s+.{2,}", normalized, flags=re.IGNORECASE) or re.search(r"[\u4e00-\u9fffA-Za-z0-9 _/-]{2,80}(?:鏄寚|鎸囩殑鏄瘄瀹氫箟涓簗琛ㄧず涓簗绉颁负)[\u4e00-\u9fffA-Za-z0-9 _/-]{2,}", normalized) else 0.0
     capitalized_terms = CAPITALIZED_TERM_RE.findall(text or "")
     entity_density = min(1.0, len(capitalized_terms) / max(len(tokens), 1))
     long_terms = [token for token in tokens if len(token) >= 6 or re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", token)]
@@ -306,7 +255,20 @@ def semantic_density_for_text(text: str, *, content_kind: str | None = None, met
 def domain_specificity_for_text(normalized_text: str, *, corpus_texts: list[str] | None = None, genericity_hint: bool = False) -> DomainSpecificity:
     tokens = tokenize(normalized_text)
     compact = normalized_text.replace(" ", "")
-    genericity = 1.0 if normalized_text in GENERIC_CONCEPT_TERMS or compact in GENERIC_CONCEPT_TERMS or genericity_hint else 0.0
+    shape = {
+        "token_count": len(tokens),
+        "char_count": len(compact),
+        "digit_ratio": sum(char.isdigit() for char in compact) / max(len(compact), 1),
+        "symbol_ratio": sum((not char.isalnum()) for char in compact) / max(len(compact), 1),
+    }
+    shape_generic = (
+        compact.isascii()
+        and shape["token_count"] <= 1
+        and shape["char_count"] <= 12
+        and shape["digit_ratio"] == 0
+        and shape["symbol_ratio"] == 0
+    )
+    genericity = 1.0 if genericity_hint or shape_generic else 0.0
     local_idf: float | None = None
     document_frequency: int | None = None
     if corpus_texts:
@@ -361,7 +323,7 @@ def build_quality_signals(
     content_kind: str | None = None,
     metadata: dict[str, Any] | None = None,
     corpus_texts: list[str] | None = None,
-    course_id: str | None = None,
+    knowledge_base_id: str | None = None,
     document_id: str | None = None,
     document_version_id: str | None = None,
     chunk_id: str | None = None,
@@ -391,7 +353,7 @@ def build_quality_signals(
             support_count=support_count,
         ),
         provenance=Provenance(
-            course_id=course_id,
+            knowledge_base_id=knowledge_base_id,
             document_id=document_id,
             document_version_id=document_version_id,
             chunk_id=chunk_id,

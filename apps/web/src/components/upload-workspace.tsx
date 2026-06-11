@@ -1,18 +1,18 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
-import type { CourseFileStatus, CourseFileSummary, IngestionLogEvent } from "@course-kg/shared";
-import { AlertCircle, CheckCircle2, Clock3, Database, FileCheck2, Files, LoaderCircle, Network, PanelRightOpen, RefreshCcw, Trash2, UploadCloud, X } from "lucide-react";
+import type { KnowledgeBaseFileStatus, KnowledgeBaseFileSummary, IngestionLogEvent } from "@course-kg/shared";
+import { AlertCircle, CheckCircle2, Clock3, Database, FileCheck2, Files, LoaderCircle, PanelRightOpen, RefreshCcw, Trash2, UploadCloud, X } from "lucide-react";
 
-import { cancelBatch, cleanupStaleData, cleanupStaleGraph, createBatchLogToken, fetchBatchStatus, fetchCourseFiles, fetchDashboard, getBatchLogUrl, parseUploadedFiles, rebuildGraph, removeCourseFile, uploadFile } from "@/lib/api";
-import { useCourseContext } from "@/components/course-context";
+import { cancelBatch, cleanupStaleData, createBatchLogToken, fetchBatchStatus, fetchKnowledgeBaseFiles, fetchDashboard, getBatchLogUrl, parseUploadedFiles, removeKnowledgeBaseFile, uploadFile } from "@/lib/api";
+import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
-import { graphLogSummary, hpoLogSummary, logEventLabel as richLogEventLabel, logVisualTone } from "@/lib/ingestion-log-meta";
+import { graphLogSummary, logEventLabel as richLogEventLabel, logVisualTone } from "@/lib/ingestion-log-meta";
 
 type UploadedFile = {
   name: string;
@@ -20,7 +20,7 @@ type UploadedFile = {
 };
 
 const terminalLogEvents = new Set(["batch_completed", "batch_failed", "batch_partial_failed", "batch_skipped", "batch_cancelled", "batch_missing"]);
-const failureLogEvents = new Set(["batch_failed", "batch_partial_failed", "graph_failed"]);
+const failureLogEvents = new Set(["batch_failed", "batch_partial_failed", "graph_failed", "global_graph_failed", "signal_schema_failed", "signal_layer_failed"]);
 const terminalBatchStates = new Set(["completed", "partial_failed", "failed", "skipped", "cancelled"]);
 const failureBatchStates = new Set(["partial_failed", "failed"]);
 const logStreamMaxRetries = 3;
@@ -36,9 +36,18 @@ const logEventLabels: Record<string, string> = {
   file_failed: "文件失败",
   batch_graph_started: "图谱生成",
   batch_graph_selected: "图谱片段选择",
-  batch_graph_progress: "图谱抽取进度",
-  graph_rebuilt: "图谱完成",
-  graph_failed: "图谱失败",
+  batch_graph_progress: "Evidence graph 进度",
+  graph_rebuilt: "Evidence graph 完成",
+  graph_failed: "Evidence graph 失败",
+  global_graph_scanning: "Global evidence graph publish",
+  global_graph_active: "Global evidence graph active",
+  global_graph_failed: "Global evidence graph failed",
+  signal_candidate_scanning: "Signal candidate scan",
+  signal_candidate_gate: "Signal candidate gate",
+  signal_schema_failed: "Signal schema failed",
+  signal_layer_assembling: "Signal layer assembling",
+  signal_layer_active: "Signal layer active",
+  signal_layer_failed: "Signal layer failed",
   batch_completed: "批次完成",
   batch_partial_failed: "部分失败",
   batch_failed: "批次失败",
@@ -47,10 +56,9 @@ const logEventLabels: Record<string, string> = {
   batch_skipped: "批次跳过",
   batch_missing: "批次丢失",
   log_stream_retry: "日志重连",
-  chunk_adaptive: "分块自适应",
-  hpo_started: "自动调参开始",
-  hpo_completed: "自动调参完成",
-  hpo_failed: "自动调参失败",
+  log_stream_warning: "日志流告警",
+  evidence_section_sizing: "Evidence section sizing",
+  chunk_adaptive: "Evidence section sizing",
 };
 
 function logEventLabel(event: string): string {
@@ -104,11 +112,11 @@ function formatBatchFailureDetails(errors?: Array<{ source_path?: string | null;
     .join("\n");
 }
 
-type FileBrowserItem = CourseFileSummary & {
+type FileBrowserItem = KnowledgeBaseFileSummary & {
   localOnly?: boolean;
 };
 
-const fileStatusMeta: Record<CourseFileStatus, { label: string; className: string }> = {
+const fileStatusMeta: Record<KnowledgeBaseFileStatus, { label: string; className: string }> = {
   pending: { label: "待解析", className: "border-amber-200/24 bg-amber-300/10 text-amber-100" },
   parsed: { label: "已解析", className: "border-emerald-200/24 bg-emerald-300/10 text-emerald-100" },
   parsing: { label: "解析中", className: "border-cyan-200/28 bg-cyan-300/10 text-cyan-100" },
@@ -116,7 +124,7 @@ const fileStatusMeta: Record<CourseFileStatus, { label: string; className: strin
   skipped: { label: "已跳过", className: "border-white/14 bg-white/[0.05] text-white/58" },
 };
 
-function FileStatusBadge({ status }: { status: CourseFileStatus }) {
+function FileStatusBadge({ status }: { status: KnowledgeBaseFileStatus }) {
   const meta = fileStatusMeta[status];
   const Icon = status === "parsed" ? CheckCircle2 : status === "failed" ? AlertCircle : status === "parsing" ? LoaderCircle : Clock3;
   return (
@@ -127,7 +135,7 @@ function FileStatusBadge({ status }: { status: CourseFileStatus }) {
   );
 }
 
-const fileProgressMeta: Record<CourseFileStatus, { value: number; barClassName: string; pulse?: boolean }> = {
+const fileProgressMeta: Record<KnowledgeBaseFileStatus, { value: number; barClassName: string; pulse?: boolean }> = {
   pending: { value: 8, barClassName: "bg-amber-200/60" },
   parsing: { value: 58, barClassName: "bg-[linear-gradient(90deg,#64dfff,#7b7cff,#64dfff)]", pulse: true },
   parsed: { value: 100, barClassName: "bg-emerald-300/80" },
@@ -135,7 +143,7 @@ const fileProgressMeta: Record<CourseFileStatus, { value: number; barClassName: 
   skipped: { value: 100, barClassName: "bg-white/28" },
 };
 
-function FileProgressBar({ status }: { status: CourseFileStatus }) {
+function FileProgressBar({ status }: { status: KnowledgeBaseFileStatus }) {
   const meta = fileProgressMeta[status];
   return (
     <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/7">
@@ -151,9 +159,9 @@ function fileNameFromPath(path: string): string {
   return path.split(/[\\/]/).pop() || path;
 }
 
-function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | null }) {
+function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBaseId: string | null }) {
   const queryClient = useQueryClient();
-  const storageScope = selectedCourseId ?? "unassigned";
+  const storageScope = selectedKnowledgeBaseId ?? "unassigned";
   const [batchId, setBatchId] = useLocalStorage<string | null>(`upload.batchId.${storageScope}`, null);
   const [dismissedBatchId, setDismissedBatchId] = useLocalStorage<string | null>(`upload.dismissedBatchId.${storageScope}`, null);
   const [uploadProgress, setUploadProgress] = useState({ completed: 0, total: 0 });
@@ -171,34 +179,30 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
 
   const [selectedFilePathValues, setSelectedFilePathValues] = useLocalStorage<string[]>(`upload.selectedFilePaths.${storageScope}`, []);
   const [cleanupMessage, setCleanupMessage] = useState<string | null>(null);
-  const [cleanupDialog, setCleanupDialog] = useState<"data" | "graph" | null>(null);
+  const [cleanupDialog, setCleanupDialog] = useState<"data" | null>(null);
   const [failureDialog, setFailureDialog] = useState<{ title: string; message: string; details?: string | null } | null>(null);
   const [noticeDialog, setNoticeDialog] = useState<{ title: string; message: string } | null>(null);
   const [logStreamRetryCount, setLogStreamRetryCount] = useState(0);
-  const [rebuildMode, setRebuildMode] = useState<"incremental" | "full">("incremental");
-  const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
-  const [autoFullGraphRebuild, setAutoFullGraphRebuild] = useState(false);
   const [confirmDialog, setConfirmDialog] = useState<{
     title: string;
     message: string;
-    onConfirm: (autoFullGraphRebuild?: boolean) => void;
+    onConfirm: () => void;
     confirmText?: string;
     variant?: "default" | "danger";
-    includeGraphRebuildOption?: boolean;
   } | null>(null);
   const [removeFileTarget, setRemoveFileTarget] = useState<FileBrowserItem | null>(null);
   const uploadAbortControllerRef = useRef<AbortController | null>(null);
 
   const dashboardQuery = useQuery({
-    queryKey: ["dashboard", selectedCourseId],
-    queryFn: () => fetchDashboard(selectedCourseId),
-    enabled: Boolean(selectedCourseId),
+    queryKey: ["dashboard", selectedKnowledgeBaseId],
+    queryFn: () => fetchDashboard(selectedKnowledgeBaseId),
+    enabled: Boolean(selectedKnowledgeBaseId),
   });
   const activeBatchCandidate = batchId ?? dashboardQuery.data?.batch_status?.batch_id ?? null;
   const isBatchTerminal = dashboardQuery.data?.batch_status?.state && terminalBatchStates.has(dashboardQuery.data.batch_status.state);
   const activeBatchId = activeBatchCandidate && (activeBatchCandidate !== dismissedBatchId || !isBatchTerminal) ? activeBatchCandidate : null;
   const batchQuery = useQuery({
-    queryKey: ["batch", selectedCourseId, activeBatchId],
+    queryKey: ["batch", selectedKnowledgeBaseId, activeBatchId],
     queryFn: () => fetchBatchStatus(activeBatchId as string),
     enabled: Boolean(activeBatchId),
     retry: (failureCount, error) => !isBatchNotFoundError(error) && failureCount < 2,
@@ -207,17 +211,17 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       return state && terminalBatchStates.has(state) ? false : 3000;
     },
   });
-  const courseFilesQuery = useQuery({
-    queryKey: ["course-files", selectedCourseId],
-    queryFn: () => fetchCourseFiles(selectedCourseId),
-    enabled: Boolean(selectedCourseId),
+  const knowledgeBaseFilesQuery = useQuery({
+    queryKey: ["knowledgeBase-files", selectedKnowledgeBaseId],
+    queryFn: () => fetchKnowledgeBaseFiles(selectedKnowledgeBaseId),
+    enabled: Boolean(selectedKnowledgeBaseId),
     refetchInterval: () => (activeBatchId && !terminalBatchStates.has(batchQuery.data?.state ?? "") ? 3000 : false),
   });
   const visibleBatch = batchQuery.data && !terminalBatchStates.has(batchQuery.data.state) ? batchQuery.data : null;
   const isGraphBuilding = visibleBatch?.state === "extracting_graph";
   const remoteParseablePaths = useMemo(
-    () => (courseFilesQuery.data ?? []).filter((file) => file.status !== "parsing").map((file) => file.source_path),
-    [courseFilesQuery.data],
+    () => (knowledgeBaseFilesQuery.data ?? []).filter((file) => file.status !== "parsing").map((file) => file.source_path),
+    [knowledgeBaseFilesQuery.data],
   );
   const parseTargetPaths = useMemo(() => {
     return Array.from(new Set([...uploadedFiles.map((file) => file.path), ...remoteParseablePaths]));
@@ -228,7 +232,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     [parseTargetPaths, selectedFilePaths],
   );
   const effectiveParseTargetPaths = selectedParseTargetPaths.length > 0 ? selectedParseTargetPaths : parseTargetPaths;
-  const canFullReparse = Boolean(dashboardQuery.data?.course.can_full_reparse);
+  const canFullReparse = Boolean(dashboardQuery.data?.knowledge_base.can_full_reparse);
   const uploadMutation = useMutation({
     mutationFn: async (files: File[]) => {
       setUploadProgress({ completed: 0, total: files.length });
@@ -236,7 +240,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       uploadAbortControllerRef.current = controller;
       const responses = await Promise.all(
         files.map(async (file) => {
-          const response = await uploadFile(file, selectedCourseId, controller.signal);
+          const response = await uploadFile(file, selectedKnowledgeBaseId, controller.signal);
           setUploadProgress((progress) => ({ ...progress, completed: progress.completed + 1 }));
           return response;
         }),
@@ -251,8 +255,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
           path: item.source_path,
         })),
       ]);
-      void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
-      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["knowledgeBase-files", selectedKnowledgeBaseId] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedKnowledgeBaseId] });
     },
     onSettled: () => {
       setUploadProgress({ completed: 0, total: 0 });
@@ -270,8 +274,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   });
 
   const parseUploadsMutation = useMutation({
-    mutationFn: ({ paths, force, rebuildGraphMode, fullReparse }: { paths: string[]; force: boolean; rebuildGraphMode: "none" | "full"; fullReparse?: boolean }) =>
-      parseUploadedFiles(paths, selectedCourseId, force, rebuildGraphMode, fullReparse ?? false),
+    mutationFn: ({ paths, force, fullReparse }: { paths: string[]; force: boolean; fullReparse?: boolean }) =>
+      parseUploadedFiles(paths, selectedKnowledgeBaseId, force, fullReparse ?? false),
     onSuccess: (data) => {
       setBatchId(data.batch_id);
       setDismissedBatchId(null);
@@ -280,8 +284,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       setLogOpen(true);
       setUploadedFiles([]);
       setSelectedFilePathValues([]);
-      void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
-      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["knowledgeBase-files", selectedKnowledgeBaseId] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedKnowledgeBaseId] });
     },
     onError: (error) => {
       setFailureDialog({
@@ -292,13 +296,13 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   });
 
   const cancelBatchMutation = useMutation({
-    mutationFn: (targetBatchId: string) => cancelBatch(targetBatchId, selectedCourseId),
+    mutationFn: (targetBatchId: string) => cancelBatch(targetBatchId, selectedKnowledgeBaseId),
     onSuccess: (data) => {
       setBatchId(data.batch_id);
-      void queryClient.invalidateQueries({ queryKey: ["batch", selectedCourseId, data.batch_id] });
-      void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
-      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
-      void queryClient.invalidateQueries({ queryKey: ["graph", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["batch", selectedKnowledgeBaseId, data.batch_id] });
+      void queryClient.invalidateQueries({ queryKey: ["knowledgeBase-files", selectedKnowledgeBaseId] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedKnowledgeBaseId] });
+      void queryClient.invalidateQueries({ queryKey: ["graph", selectedKnowledgeBaseId] });
       if (data.state === "cancelled") {
         const graphPhase = data.phase === "graph" && data.parse_committed;
         setNoticeDialog({
@@ -317,62 +321,28 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     },
   });
 
-  const rebuildGraphMutation = useMutation({
-    mutationFn: () => rebuildGraph(selectedCourseId, rebuildMode, false),
-    onSuccess: (data) => {
-      if (!data.batch_id) {
-        return;
-      }
-      setBatchId(data.batch_id);
-      setDismissedBatchId(null);
-      setActiveLogBatchId(data.batch_id);
-      setLogs([]);
-      setLogOpen(true);
-      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
-      void queryClient.invalidateQueries({ queryKey: ["graph", selectedCourseId] });
-      void queryClient.invalidateQueries({ queryKey: ["concepts", selectedCourseId] });
-    },
-    onError: (error) => {
-      setFailureDialog({
-        title: rebuildMode === "incremental" ? "图谱最小更新启动失败" : "图谱重建启动失败",
-        message: error instanceof Error ? error.message : "图谱重建任务启动失败，后端未返回错误详情。",
-      });
-    },
-  });
-
   const removeFileMutation = useMutation({
-    mutationFn: (sourcePath: string) => removeCourseFile(sourcePath, selectedCourseId),
+    mutationFn: (sourcePath: string) => removeKnowledgeBaseFile(sourcePath, selectedKnowledgeBaseId),
     onSuccess: (_data, sourcePath) => {
       setUploadedFiles((current) => current.filter((file) => file.path !== sourcePath));
-      void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
-      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["knowledgeBase-files", selectedKnowledgeBaseId] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedKnowledgeBaseId] });
       if (activeBatchId) {
-        void queryClient.invalidateQueries({ queryKey: ["batch", selectedCourseId, activeBatchId] });
+        void queryClient.invalidateQueries({ queryKey: ["batch", selectedKnowledgeBaseId, activeBatchId] });
       }
     },
   });
   const cleanupStaleDataMutation = useMutation({
-    mutationFn: () => cleanupStaleData(selectedCourseId),
+    mutationFn: () => cleanupStaleData(selectedKnowledgeBaseId),
     onSuccess: (stats) => {
       setCleanupMessage(
-        `旧数据清理完成：向量 ${stats.deleted_vectors}，片段 ${stats.deleted_chunks}，版本 ${stats.deleted_document_versions}，文档 ${stats.deleted_documents}，图谱关系 ${stats.removed_graph_relations}，图谱概念 ${stats.removed_graph_concepts}`,
+        `旧数据清理完成：Qdrant 向量 ${stats.deleted_vectors}，向量记录 ${stats.removed_vector_records}，旧派生 chunks ${stats.deleted_chunks}，版本 ${stats.deleted_document_versions}，文档 ${stats.deleted_documents}，evidence atoms ${stats.removed_evidence_atoms}，evidence graph states ${stats.removed_evidence_graph_states}，active chunks ${stats.removed_active_chunks}`,
       );
-      void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
-      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
-      void queryClient.invalidateQueries({ queryKey: ["graph", selectedCourseId] });
-      void queryClient.invalidateQueries({ queryKey: ["concepts", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["knowledgeBase-files", selectedKnowledgeBaseId] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedKnowledgeBaseId] });
+      void queryClient.invalidateQueries({ queryKey: ["graph", selectedKnowledgeBaseId] });
     },
   });
-  const cleanupStaleGraphMutation = useMutation({
-    mutationFn: () => cleanupStaleGraph(selectedCourseId),
-    onSuccess: (stats) => {
-      setCleanupMessage(`旧图谱清理完成：关系 ${stats.removed_relations}，别名 ${stats.removed_aliases}，概念 ${stats.removed_concepts}`);
-      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
-      void queryClient.invalidateQueries({ queryKey: ["graph", selectedCourseId] });
-      void queryClient.invalidateQueries({ queryKey: ["concepts", selectedCourseId] });
-    },
-  });
-
   const uploadPercent = uploadProgress.total > 0 ? (uploadProgress.completed / uploadProgress.total) * 100 : 0;
   const modelAudit = useMemo(() => {
     const latestEmbeddingAudit = [...logs].reverse().find((item) => item.event === "embedding_audit");
@@ -386,17 +356,16 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     const externalCalled = audit.external_called ?? audit.embedding_external_called ?? false;
     const fallbackReason = audit.fallback_reason ?? audit.embedding_fallback_reason ?? null;
     const fallbackMethod = audit.embedding_fallback_method ?? (provider === "fake" ? "deterministic_local_hash_embedding" : null);
-    const graphProvider = audit.graph_extraction_provider;
-    const graphModel = audit.graph_extraction_model ?? graphProvider;
+    const graphRuntime = audit.graph_runtime;
     const embeddingText =
       provider === "fake"
         ? `向量模型 ${embeddingModel}（${provider} 降级：${fallbackMethodLabel(fallbackMethod ?? fallbackReason)}）`
         : `向量模型 ${embeddingModel}（${provider}${externalCalled ? "，已调用外部 API" : ""}）`;
-    const graphText = graphProvider ? `；图谱抽取 ${graphModel}（${graphProvider}）` : "";
+    const graphText = graphRuntime ? `；evidence graph ${graphRuntime}` : "";
     return `模型：${embeddingText}${graphText}`;
   }, [logs]);
   const fileItems = useMemo<FileBrowserItem[]>(() => {
-    const remoteFiles = courseFilesQuery.data ?? [];
+    const remoteFiles = knowledgeBaseFilesQuery.data ?? [];
     const remotePaths = new Set(remoteFiles.map((file) => file.source_path));
     const pendingUploads = uploadedFiles
       .filter((file) => !remotePaths.has(file.path))
@@ -406,7 +375,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         title: file.name,
         source_path: file.path,
                 source_type: "未知",
-        chapter: null,
+        partition: null,
         status: "pending",
         job_state: null,
         batch_id: null,
@@ -416,7 +385,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         localOnly: true,
       }));
     return [...pendingUploads, ...remoteFiles];
-  }, [courseFilesQuery.data, uploadedFiles]);
+  }, [knowledgeBaseFilesQuery.data, uploadedFiles]);
 
   const handleRemoveFile = (file: FileBrowserItem) => {
     if (file.localOnly) {
@@ -526,13 +495,22 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         }
         retryCount = 0;
         setLogStreamRetryCount(0);
-        const rawItem = JSON.parse(event.data) as IngestionLogEvent;
+        let rawItem: IngestionLogEvent;
+        try {
+          rawItem = JSON.parse(event.data) as IngestionLogEvent;
+        } catch (error) {
+          appendLog({
+            timestamp: new Date().toISOString(),
+            event: "log_stream_warning",
+            message: "收到无法解析的日志流事件，已忽略该事件并继续监听。",
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return;
+        }
         const mappedMessage = rawItem.message
           ? rawItem.message
               .replace(/增量更新/g, "最小更新")
               .replace(/增量重建/g, "最小重建")
-              .replace(/正在增量更新课程图谱/g, "正在最小更新课程图谱")
-              .replace(/增量图谱更新失败/g, "最小图谱更新失败")
               .replace(/没有检测到变更文档，跳过增量更新/g, "没有检测到变更文档，跳过最小更新")
           : rawItem.message;
         const item = {
@@ -541,8 +519,10 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         };
         appendLog(item);
         if (failureLogEvents.has(item.event)) {
+          const isGraphFailure = item.event === "graph_failed" || item.event === "global_graph_failed";
+          const isSignalFailure = item.event.startsWith("signal_");
           setFailureDialog({
-            title: item.event === "graph_failed" ? (item.message?.includes("最小") ? "图谱更新失败" : "图谱重建失败") : "解析失败",
+            title: isGraphFailure ? "Evidence graph 更新失败" : isSignalFailure ? "Signal layer 更新失败" : "解析失败",
             message: item.message || "任务失败，后端未返回错误详情。",
             details: item.error ?? null,
           });
@@ -554,9 +534,9 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
             setBatchId(null);
             setDismissedBatchId(streamBatchId);
           }
-          void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
-          void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
-          void queryClient.invalidateQueries({ queryKey: ["batch", selectedCourseId, streamBatchId] });
+          void queryClient.invalidateQueries({ queryKey: ["knowledgeBase-files", selectedKnowledgeBaseId] });
+          void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedKnowledgeBaseId] });
+          void queryClient.invalidateQueries({ queryKey: ["batch", selectedKnowledgeBaseId, streamBatchId] });
         }
       };
       source.onerror = () => {
@@ -587,7 +567,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
           message: "日志流重连失败，任务状态可能仍在后端继续执行。请刷新批次状态或重新打开日志查看最新结果。",
         });
         setActiveLogBatchId(null);
-        void queryClient.invalidateQueries({ queryKey: ["batch", selectedCourseId, streamBatchId] });
+        void queryClient.invalidateQueries({ queryKey: ["batch", selectedKnowledgeBaseId, streamBatchId] });
       };
     };
     void connect();
@@ -598,7 +578,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       }
       closeSource();
     };
-  }, [activeLogBatchId, queryClient, selectedCourseId]);
+  }, [activeLogBatchId, queryClient, selectedKnowledgeBaseId]);
 
   useEffect(() => {
     if (batchQuery.data?.state && terminalBatchStates.has(batchQuery.data.state)) {
@@ -614,10 +594,10 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         setBatchId(null);
         setDismissedBatchId(activeBatchId);
       });
-      void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
-      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["knowledgeBase-files", selectedKnowledgeBaseId] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedKnowledgeBaseId] });
     }
-  }, [activeBatchId, batchQuery.data?.state, queryClient, selectedCourseId]);
+  }, [activeBatchId, batchQuery.data?.state, queryClient, selectedKnowledgeBaseId]);
 
   useEffect(() => {
     if (!activeBatchId || !isBatchNotFoundError(batchQuery.error)) {
@@ -637,9 +617,9 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         },
       ].slice(-300));
     });
-    void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
-    void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
-  }, [activeBatchId, batchQuery.error, queryClient, selectedCourseId]);
+    void queryClient.invalidateQueries({ queryKey: ["knowledgeBase-files", selectedKnowledgeBaseId] });
+    void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedKnowledgeBaseId] });
+  }, [activeBatchId, batchQuery.error, queryClient, selectedKnowledgeBaseId]);
 
   const inclusionRules = useMemo(
     () => [
@@ -649,13 +629,10 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     ],
     [],
   );
-  const cleanupPending = cleanupStaleDataMutation.isPending || cleanupStaleGraphMutation.isPending;
-  const cleanupError = (cleanupStaleDataMutation.error ?? cleanupStaleGraphMutation.error) as Error | null;
-  const cleanupTitle = cleanupDialog === "data" ? "清理数据库" : "清理图谱";
-  const cleanupDescription =
-    cleanupDialog === "data"
-      ? "清理当前资料库的旧版本/陈旧 inactive 数据库记录和 Qdrant 向量，仅保留当前最新版本的有效数据。"
-      : "清理当前资料库的旧版本/陈旧图谱关系和孤立概念，仅保留当前最新版本的有效图谱数据。";
+  const cleanupPending = cleanupStaleDataMutation.isPending;
+  const cleanupError = cleanupStaleDataMutation.error as Error | null;
+  const cleanupTitle = "清理数据库";
+  const cleanupDescription = "清理当前资料库的旧版本/陈旧 inactive 数据库记录和 Qdrant 向量，仅保留当前最新版本的有效数据。";
 
   if (dashboardQuery.isLoading) {
     return <LoadingBlock rows={4} />;
@@ -682,13 +659,11 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                 type="button"
                 onClick={() => {
                   if (effectiveParseTargetPaths.length === 0) return;
-                  setAutoFullGraphRebuild(false);
                   setConfirmDialog({
                     title: "确认解析文件",
-                    message: `即将强制解析 ${effectiveParseTargetPaths.length} 个文件，包括切块与向量化。可选择解析完成后自动全量重建图谱。`,
-                    onConfirm: (auto) => parseUploadsMutation.mutate({ paths: effectiveParseTargetPaths, force: true, rebuildGraphMode: auto ? "full" : "none", fullReparse: false }),
+                    message: `即将强制解析 ${effectiveParseTargetPaths.length} 个文件，包括切块、证据图构建与向量化。`,
+                    onConfirm: () => parseUploadsMutation.mutate({ paths: effectiveParseTargetPaths, force: true, fullReparse: false }),
                     confirmText: "确认解析",
-                    includeGraphRebuildOption: true,
                   });
                 }}
                 disabled={parseUploadsMutation.isPending || effectiveParseTargetPaths.length === 0}
@@ -701,14 +676,12 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                 type="button"
                 onClick={() => {
                   if (parseTargetPaths.length === 0 || !canFullReparse) return;
-                  setAutoFullGraphRebuild(false);
                   setConfirmDialog({
                     title: "确认全量重新解析",
-                    message: "强制重建当前资料库所有文件的片段、向量和 Qdrant 向量记录。可选择解析完成后自动全量重建图谱；该选项会清空当前图谱数据。",
-                    onConfirm: (auto) => parseUploadsMutation.mutate({ paths: parseTargetPaths, force: true, rebuildGraphMode: auto ? "full" : "none", fullReparse: true }),
+                    message: "强制重建当前资料库所有文件的片段、证据图、向量和 Qdrant 向量记录。",
+                    onConfirm: () => parseUploadsMutation.mutate({ paths: parseTargetPaths, force: true, fullReparse: true }),
                     confirmText: "确认重建",
                     variant: "danger",
-                    includeGraphRebuildOption: true,
                   });
                 }}
                 disabled={parseUploadsMutation.isPending || parseTargetPaths.length === 0 || !canFullReparse}
@@ -744,15 +717,6 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               >
                 {cancelBatchMutation.isPending ? <LoaderCircle className="mr-2 inline size-3.5 animate-spin" /> : <X className="mr-2 inline size-3.5" />}
                 {cancelBatchMutation.isPending ? "取消中..." : "取消"}
-              </button>
-              <button
-                type="button"
-                onClick={() => setRebuildDialogOpen(true)}
-                disabled={rebuildGraphMutation.isPending || !selectedCourseId}
-                className="rounded-full border border-cyan-200/30 bg-cyan-300/10 px-4 py-3 text-xs uppercase tracking-[0.2em] text-cyan-50/80 transition hover:text-white disabled:opacity-45"
-              >
-                {rebuildGraphMutation.isPending ? <LoaderCircle className="mr-2 inline size-3.5 animate-spin" /> : <Network className="mr-2 inline size-3.5" />}
-                {rebuildGraphMutation.isPending ? "重建中..." : "重建图谱"}
               </button>
               <label
                 aria-disabled={uploadMutation.isPending}
@@ -805,8 +769,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               <p className="text-xs uppercase tracking-[0.2em] text-white/36">按住 Shift 并左键点击文件可多选；未选择时解析按钮按原逻辑处理待解析/变更文件。</p>
             )}
             {cleanupMessage ? <p className="text-xs leading-5 text-emerald-100/72">{cleanupMessage}</p> : null}
-            {cleanupStaleDataMutation.error || cleanupStaleGraphMutation.error ? (
-              <p className="text-xs leading-5 text-rose-100/72">{((cleanupStaleDataMutation.error ?? cleanupStaleGraphMutation.error) as Error).message}</p>
+            {cleanupStaleDataMutation.error ? (
+              <p className="text-xs leading-5 text-rose-100/72">{(cleanupStaleDataMutation.error as Error).message}</p>
             ) : null}
             {uploadMutation.isPending ? (
               <div className="max-w-md">
@@ -863,9 +827,9 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                 hint: "当前资料库有效版本",
               },
               {
-                label: "图谱关系",
-                value: String(dashboardQuery.data?.graph_relation_count ?? 0),
-                hint: "概念关系边总数",
+                label: "证据边",
+                value: String(dashboardQuery.data?.evidence_edge_count ?? 0),
+                hint: "当前 evidence graph 观测边",
               },
             ].map((item) => (
               <div key={item.label} className="border-l border-white/10 px-4 py-3">
@@ -891,37 +855,21 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               onClick={() => {
                 setCleanupMessage(null);
                 cleanupStaleDataMutation.reset();
-                cleanupStaleGraphMutation.reset();
                 setCleanupDialog("data");
               }}
-              disabled={!selectedCourseId || Boolean(activeBatchId) || cleanupStaleDataMutation.isPending || cleanupStaleGraphMutation.isPending}
+              disabled={!selectedKnowledgeBaseId || Boolean(activeBatchId) || cleanupStaleDataMutation.isPending}
               className="inline-flex items-center gap-1.5 rounded-full border border-amber-200/18 bg-amber-300/[0.055] px-3 py-1.5 text-[11px] text-amber-50/72 transition hover:border-amber-200/36 hover:text-white disabled:pointer-events-none disabled:opacity-40"
                 title={activeBatchId ? "当前有导入批次运行，暂不能清理" : "清理非活跃数据和失效向量"}
             >
               {cleanupStaleDataMutation.isPending ? <LoaderCircle className="size-3.5 animate-spin" /> : <Database className="size-3.5" />}
               清理数据库
             </button>
-            <button
-              type="button"
-              onClick={() => {
-                setCleanupMessage(null);
-                cleanupStaleDataMutation.reset();
-                cleanupStaleGraphMutation.reset();
-                setCleanupDialog("graph");
-              }}
-              disabled={!selectedCourseId || Boolean(activeBatchId) || cleanupStaleDataMutation.isPending || cleanupStaleGraphMutation.isPending}
-              className="inline-flex items-center gap-1.5 rounded-full border border-cyan-200/18 bg-cyan-300/[0.055] px-3 py-1.5 text-[11px] text-cyan-50/72 transition hover:border-cyan-200/36 hover:text-white disabled:pointer-events-none disabled:opacity-40"
-                title={activeBatchId ? "当前有导入批次运行，暂不能清理" : "清理失效图谱关系"}
-            >
-              {cleanupStaleGraphMutation.isPending ? <LoaderCircle className="size-3.5 animate-spin" /> : <Network className="size-3.5" />}
-              清理图谱
-            </button>
             <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">{fileItems.length} 个文件</span>
           </div>
         </div>
 
         <div className="custom-scrollbar kg-rounded-scrollbar mt-5 min-h-[18rem] flex-1 overflow-y-auto overscroll-contain rounded-[24px] border border-white/8 bg-black/10 pr-1">
-          {courseFilesQuery.isLoading && fileItems.length === 0 ? (
+          {knowledgeBaseFilesQuery.isLoading && fileItems.length === 0 ? (
             <div className="kg-shimmer px-5 py-8 text-sm text-white/50">正在加载文件...</div>
           ) : fileItems.length === 0 ? (
             <div className="px-5 py-8 text-sm text-white/50">暂无文件。上传文件后会先显示为待解析。</div>
@@ -975,7 +923,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-white/42">
                   <span className="rounded-full border border-white/8 px-2.5 py-1">{file.source_type || "未知"}</span>
-                  {file.chapter ? <span className="rounded-full border border-white/8 px-2.5 py-1">{file.chapter}</span> : null}
+                  {file.partition ? <span className="rounded-full border border-white/8 px-2.5 py-1">{file.partition}</span> : null}
                   <span className="rounded-full border border-white/8 px-2.5 py-1">{file.chunk_count} 个片段</span>
                   {isSelected ? <span className="rounded-full border border-cyan-200/30 bg-cyan-300/10 px-2.5 py-1 text-cyan-50">已选择</span> : null}
                 </div>
@@ -1014,9 +962,9 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               type="button"
               className="rounded-full border border-white/10 p-2 text-white/65 transition hover:text-white"
               onClick={() => {
-                void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
+                void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedKnowledgeBaseId] });
                 if (activeBatchId) {
-                  void queryClient.invalidateQueries({ queryKey: ["batch", selectedCourseId, activeBatchId] });
+                  void queryClient.invalidateQueries({ queryKey: ["batch", selectedKnowledgeBaseId, activeBatchId] });
                 }
               }}
             >
@@ -1033,8 +981,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                     <LoaderCircle className="size-6 animate-spin text-cyan-100" />
                   </div>
                   <div className="min-w-0">
-                    <p className="text-sm font-semibold text-cyan-50">正在生成资料库图谱</p>
-                    <p className="mt-2 text-sm leading-6 text-cyan-50/72">图谱关系抽取和绘制需要等待模型完成，请不要关闭页面、停止后端或重启服务。</p>
+                    <p className="text-sm font-semibold text-cyan-50">正在更新 evidence graph</p>
+                    <p className="mt-2 text-sm leading-6 text-cyan-50/72">Evidence atoms、观测边、候选 chunks 和向量索引正在提交，请不要关闭页面、停止后端或重启服务。</p>
                     <div className="mt-4 flex items-center gap-2">
                       {[0, 1, 2, 3].map((item) => (
                         <span key={item} className="size-2 animate-pulse rounded-full bg-cyan-100/80" style={{ animationDelay: `${item * 150}ms` }} />
@@ -1098,20 +1046,6 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
             <DialogDescription>{confirmDialog?.message ?? "请确认是否继续执行此操作。"}</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 px-6 py-5">
-            {confirmDialog?.includeGraphRebuildOption ? (
-              <label className="flex cursor-pointer items-start gap-3 rounded-2xl border border-rose-200/16 bg-rose-300/[0.045] px-4 py-3 text-sm leading-6 text-rose-50/80">
-                <input
-                  type="checkbox"
-                  className="mt-1"
-                  checked={autoFullGraphRebuild}
-                  onChange={(event) => setAutoFullGraphRebuild(event.target.checked)}
-                />
-                <span>
-                  自动全量重建图谱
-                  <span className="mt-1 block text-xs leading-5 text-rose-50/62">该操作会清空当前图谱数据，并在解析完成后重新生成 Semantic KG。</span>
-                </span>
-              </label>
-            ) : null}
             <div className="flex justify-end gap-2">
               <button
                 type="button"
@@ -1123,7 +1057,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               <button
                 type="button"
                 onClick={() => {
-                  confirmDialog?.onConfirm(autoFullGraphRebuild);
+                  confirmDialog?.onConfirm();
                   setConfirmDialog(null);
                 }}
                 className={`rounded-full border px-4 py-2 text-sm transition hover:text-white ${
@@ -1174,66 +1108,6 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         </DialogContent>
       </Dialog>
 
-      {/* 重建图谱模式选择弹窗 */}
-      <Dialog open={rebuildDialogOpen} onOpenChange={(open) => setRebuildDialogOpen(open)}>
-        <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.92)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl">
-          <DialogHeader className="border-b border-white/8 px-6 py-5">
-            <DialogTitle>重建课程图谱</DialogTitle>
-            <DialogDescription>
-              选择重建模式。重建会直接覆盖现有图谱数据，并通过日志流展示实时进度。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 px-6 py-5">
-            <label className={`flex cursor-pointer items-start gap-3 rounded-2xl border p-4 transition ${rebuildMode === "incremental" ? "border-cyan-200/30 bg-cyan-300/[0.06]" : "border-white/10 bg-white/[0.035] hover:bg-white/[0.05]"}`}>
-              <input
-                type="radio"
-                name="rebuild-mode"
-                className="mt-1"
-                checked={rebuildMode === "incremental"}
-                onChange={() => setRebuildMode("incremental")}
-              />
-              <div>
-                <p className="text-sm font-medium text-white">最小更新（推荐）</p>
-                <p className="mt-1 text-xs leading-5 text-white/60">仅更新变更文档相关的分块与图谱，直接覆盖且不备份，速度极快。</p>
-              </div>
-            </label>
-            <label className={`flex cursor-pointer items-start gap-3 rounded-2xl border p-4 transition ${rebuildMode === "full" ? "border-cyan-200/30 bg-cyan-300/[0.06]" : "border-white/10 bg-white/[0.035] hover:bg-white/[0.05]"}`}>
-              <input
-                type="radio"
-                name="rebuild-mode"
-                className="mt-1"
-                checked={rebuildMode === "full"}
-                onChange={() => setRebuildMode("full")}
-              />
-              <div>
-                <p className="text-sm font-medium text-white">全量重建</p>
-                <p className="mt-1 text-xs leading-5 text-white/60">完整重建当前资料库的 Semantic KG，耗时较长，会自动保留备份并在失败时回滚。</p>
-              </div>
-            </label>
-            <div className="flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setRebuildDialogOpen(false)}
-                className="rounded-full border border-white/12 px-4 py-2 text-sm text-white/70 transition hover:text-white"
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                disabled={!selectedCourseId || rebuildGraphMutation.isPending}
-                onClick={() => {
-                  setRebuildDialogOpen(false);
-                  rebuildGraphMutation.mutate();
-                }}
-                className="rounded-full border border-cyan-200/24 bg-cyan-300/[0.08] px-4 py-2 text-sm text-cyan-50/82 transition hover:text-white disabled:pointer-events-none disabled:opacity-45"
-              >
-                {rebuildGraphMutation.isPending ? "启动中..." : "确认重建"}
-              </button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
-
       <Dialog
         open={cleanupDialog !== null}
         onOpenChange={(open) => {
@@ -1273,14 +1147,10 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               {!cleanupMessage ? (
                 <button
                   type="button"
-                  disabled={!selectedCourseId || cleanupPending}
+                  disabled={!selectedKnowledgeBaseId || cleanupPending}
                   onClick={() => {
                     setCleanupMessage(null);
-                    if (cleanupDialog === "data") {
-                      cleanupStaleDataMutation.mutate();
-                    } else if (cleanupDialog === "graph") {
-                      cleanupStaleGraphMutation.mutate();
-                    }
+                    cleanupStaleDataMutation.mutate();
                   }}
                   className="rounded-full border border-cyan-200/24 bg-cyan-300/[0.08] px-4 py-2 text-sm text-cyan-50/82 transition hover:text-white disabled:pointer-events-none disabled:opacity-45"
                 >
@@ -1366,40 +1236,27 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                 <div className="space-y-3">
                   {logs.map((item, index) => {
                     const tone = logVisualTone(item);
-                    const hpoSummary = hpoLogSummary(item);
                     const graphSummary = graphLogSummary(item);
-                    const phaseSummary = hpoSummary ?? graphSummary;
+                    const phaseSummary = graphSummary;
                     const borderClass =
-                      tone === "adaptive"
-                        ? "border-cyan-500/20 bg-cyan-950/10"
-                        : tone === "graph"
+                      tone === "graph"
                         ? "border-sky-500/20 bg-sky-950/10"
-                        : tone === "hpo"
-                        ? "border-purple-500/20 bg-purple-950/10"
                         : tone === "warning"
                         ? "border-amber-400/22 bg-amber-950/10"
                         : tone === "failure"
                         ? "border-rose-400/24 bg-rose-950/12"
                         : "border-white/8 bg-white/[0.03]";
                     const tagColorClass =
-                      tone === "adaptive"
-                        ? "text-cyan-400 font-medium"
-                        : tone === "graph"
+                      tone === "graph"
                         ? "text-sky-300 font-medium"
-                        : tone === "hpo"
-                        ? "text-purple-300 font-semibold"
                         : tone === "warning"
                         ? "text-amber-200 font-semibold"
                         : tone === "failure"
                         ? "text-rose-200 font-semibold"
                         : "text-cyan-100/54";
                     const messageColorClass =
-                      tone === "hpo"
-                        ? "text-purple-100/90"
-                        : tone === "graph"
+                      tone === "graph"
                         ? "text-sky-100/90"
-                        : tone === "adaptive"
-                        ? "text-cyan-100/90"
                         : tone === "failure"
                         ? "text-rose-100/90"
                         : "text-white/72";
@@ -1437,6 +1294,6 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
 }
 
 export function UploadWorkspace() {
-  const { selectedCourseId } = useCourseContext();
-  return <UploadWorkspaceContent key={selectedCourseId ?? "unassigned"} selectedCourseId={selectedCourseId} />;
+  const { selectedKnowledgeBaseId } = useKnowledgeBaseContext();
+  return <UploadWorkspaceContent key={selectedKnowledgeBaseId ?? "unassigned"} selectedKnowledgeBaseId={selectedKnowledgeBaseId} />;
 }

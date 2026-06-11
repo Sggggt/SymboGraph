@@ -17,13 +17,39 @@ def _patch_agent_state_writes(monkeypatch):
     return agent_graph
 
 
+def _patch_agent_embeddings(monkeypatch):
+    from app.services.embeddings import EmbeddingProvider
+
+    async def fake_embed_texts(self, texts, text_type="document"):
+        return [[1.0, 0.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr(EmbeddingProvider, "embed_texts", fake_embed_texts)
+
+
+def _patch_optional_agent_llm_steps(monkeypatch, agent_graph):
+    from app.services.embeddings import ChatProvider
+
+    async def fake_translate(question: str, target_lang: str) -> str:
+        return question
+
+    async def fake_verify(self, answer, citations, graded):
+        return {"unverified_indices": []}
+
+    async def fake_reflect(self, question, answer, contexts):
+        return {"has_issue": False, "issue_type": "none", "suggestion": ""}
+
+    monkeypatch.setattr(agent_graph, "_llm_translate_query", fake_translate)
+    monkeypatch.setattr(ChatProvider, "verify_citations", fake_verify)
+    monkeypatch.setattr(ChatProvider, "reflect_answer", fake_reflect)
+
+
 @pytest.mark.asyncio
-async def test_agent_clarify_route_does_not_use_fallback(db_session, sample_course):
+async def test_agent_clarify_route_does_not_use_fallback(db_session, sample_knowledge_base):
     from app.core.config import get_settings
     from app.services.agent_graph import run_agent
 
     assert get_settings().enable_model_fallback is False
-    response = await run_agent(db_session, AgentRequest(question="it", course_id=sample_course.id))
+    response = await run_agent(db_session, AgentRequest(question="it", knowledge_base_id=sample_knowledge_base.id))
 
     assert response["route"] == "clarify"
     assert response["citations"] == []
@@ -33,10 +59,12 @@ async def test_agent_clarify_route_does_not_use_fallback(db_session, sample_cour
 
 
 @pytest.mark.asyncio
-async def test_agent_retrieval_qa_path_uses_real_provider_metadata(db_session, sample_course, indexed_chunks, monkeypatch):
+async def test_agent_retrieval_qa_path_uses_real_provider_metadata(db_session, sample_knowledge_base, indexed_chunks, monkeypatch):
     import app.services.agent_graph as agent_graph
     from app.services.embeddings import ChatProvider
 
+    _patch_agent_embeddings(monkeypatch)
+    _patch_optional_agent_llm_steps(monkeypatch, agent_graph)
     _, chunks = indexed_chunks
     search_payload = {
         "chunk_id": chunks[0].id,
@@ -46,19 +74,29 @@ async def test_agent_retrieval_qa_path_uses_real_provider_metadata(db_session, s
             {
                 "chunk_id": chunks[0].id,
                 "document_id": chunks[0].document_id,
-                "document_title": "Centrality Notes",
+                "document_title": "Centrality sources",
                 "source_path": "centrality.md",
-                "chapter": "L3",
+                "partition": "L3",
                 "section": "Centrality",
                 "page_number": None,
                 "snippet": chunks[0].snippet,
+                    "active_chunk_id": chunks[0].id,
+                "evidence_atom_ids": ["atom-1"],
+                "source_span": {"spans": [{"evidence_atom_id": "atom-1", "start": 0, "end": 12}]},
             }
         ],
-        "metadata": {"scores": {"dense": 1.0}},
+        "metadata": {
+            "scores": {"dense": 1.0},
+                "active_chunk_id": chunks[0].id,
+            "evidence_atom_ids": ["atom-1"],
+            "signal_state_hash": "signal-state-agent",
+            "signal_node_ids": ["signal-node-1"],
+            "retrieval_signal_node_ids": ["signal-node-1"],
+        },
         "content": chunks[0].content,
-        "document_title": "Centrality Notes",
+        "document_title": "Centrality sources",
         "source_path": "centrality.md",
-        "chapter": "L3",
+        "partition": "L3",
         "source_type": "markdown",
     }
 
@@ -74,8 +112,8 @@ async def test_agent_retrieval_qa_path_uses_real_provider_metadata(db_session, s
             "suggested_strategy": "base_retrieval",
         }
 
-    async def fake_hybrid_search(db, course_id, query, filters, top_k):
-        return [search_payload]
+    async def fake_evidence_search(db, knowledge_base_id, query, filters, top_k, route="agent_base_retrieval"):
+        return [search_payload], {"retrieval_pipeline": route}
 
     async def fake_answer(self, question, contexts, history=None, evidence_quality="normal"):
         return ChatCallResult(
@@ -89,28 +127,33 @@ async def test_agent_retrieval_qa_path_uses_real_provider_metadata(db_session, s
     monkeypatch.setattr(ChatProvider, "rewrite_question", fake_rewrite)
     monkeypatch.setattr(ChatProvider, "perceive_question", fake_perceive)
     monkeypatch.setattr(ChatProvider, "answer_question_with_meta", fake_answer)
-    monkeypatch.setattr(agent_graph, "hybrid_search_chunks", fake_hybrid_search)
+    monkeypatch.setattr(agent_graph, "evidence_first_search_chunks_with_audit", fake_evidence_search)
 
     response = await agent_graph.run_agent(
         db_session,
-        AgentRequest(question="define degree centrality concept", course_id=sample_course.id, top_k=3),
+        AgentRequest(question="definition of degree centrality", knowledge_base_id=sample_knowledge_base.id, top_k=3),
     )
 
-    assert response["route"] == "retrieve_notes"
+    assert response["route"] == "retrieve_sources"
     assert response["answer"]
     assert response["citations"][0]["chunk_id"] == chunks[0].id
     assert response["answer_model_audit"]["provider"] == "openai_compatible_chat"
     assert response["answer_model_audit"]["external_called"] is True
+    assert response["answer_model_audit"]["signal_state_hash"] == "signal-state-agent"
+    assert response["answer_model_audit"]["signal_node_ids"] == ["signal-node-1"]
+    assert response["answer_model_audit"]["signal_expansion_used"] is False
     answer_trace = next(item for item in response["trace"] if item["node"] == "answer_generator")
     assert "provider=openai_compatible_chat" in answer_trace["output_summary"]
     assert "fallback=None" in answer_trace["output_summary"]
 
 
 @pytest.mark.asyncio
-async def test_related_question_in_this_course_routes_to_multi_hop(db_session, sample_course, indexed_chunks, monkeypatch):
+async def test_related_question_in_this_knowledge_base_routes_to_multi_hop(db_session, sample_knowledge_base, indexed_chunks, monkeypatch):
     import app.services.agent_graph as agent_graph
     from app.services.embeddings import ChatProvider
 
+    _patch_agent_embeddings(monkeypatch)
+    _patch_optional_agent_llm_steps(monkeypatch, agent_graph)
     _, chunks = indexed_chunks
     search_payload = {
         "chunk_id": chunks[0].id,
@@ -120,9 +163,9 @@ async def test_related_question_in_this_course_routes_to_multi_hop(db_session, s
             {
                 "chunk_id": chunks[0].id,
                 "document_id": chunks[0].document_id,
-                "document_title": "Centrality Notes",
+                "document_title": "Centrality sources",
                 "source_path": "centrality.md",
-                "chapter": "L3",
+                "partition": "L3",
                 "section": "Centrality",
                 "page_number": None,
                 "snippet": chunks[0].snippet,
@@ -130,9 +173,9 @@ async def test_related_question_in_this_course_routes_to_multi_hop(db_session, s
         ],
         "metadata": {"scores": {"dense": 1.0}},
         "content": chunks[0].content,
-        "document_title": "Centrality Notes",
+        "document_title": "Centrality sources",
         "source_path": "centrality.md",
-        "chapter": "L3",
+        "partition": "L3",
         "source_type": "markdown",
     }
 
@@ -148,12 +191,12 @@ async def test_related_question_in_this_course_routes_to_multi_hop(db_session, s
             "suggested_strategy": "evidence_chain",
         }
 
-    async def fake_hybrid_search(db, course_id, query, filters, top_k):
-        return [search_payload]
+    async def fake_evidence_search(db, knowledge_base_id, query, filters, top_k, route="agent_base_retrieval"):
+        return [search_payload], {"retrieval_pipeline": route}
 
     async def fake_answer(self, question, contexts, history=None, evidence_quality="normal"):
         return ChatCallResult(
-            answer="The two concepts are related in the course notes.",
+            answer="The two concepts are related in the KnowledgeBase sources.",
             provider="openai_compatible_chat",
             model="unit-test-chat",
             external_called=True,
@@ -163,11 +206,11 @@ async def test_related_question_in_this_course_routes_to_multi_hop(db_session, s
     monkeypatch.setattr(ChatProvider, "rewrite_question", fake_rewrite)
     monkeypatch.setattr(ChatProvider, "perceive_question", fake_perceive)
     monkeypatch.setattr(ChatProvider, "answer_question_with_meta", fake_answer)
-    monkeypatch.setattr(agent_graph, "hybrid_search_chunks", fake_hybrid_search)
+    monkeypatch.setattr(agent_graph, "evidence_first_search_chunks_with_audit", fake_evidence_search)
 
     response = await agent_graph.run_agent(
         db_session,
-        AgentRequest(question="Explain how degree centrality is related to closeness centrality in this course.", course_id=sample_course.id, top_k=3),
+        AgentRequest(question="Explain how degree centrality is related to closeness centrality in this KnowledgeBase.", knowledge_base_id=sample_knowledge_base.id, top_k=3),
     )
 
     assert response["route"] == "multi_hop_research"
@@ -176,7 +219,7 @@ async def test_related_question_in_this_course_routes_to_multi_hop(db_session, s
 
 
 @pytest.mark.asyncio
-async def test_retrieval_decision_skips_retrieval_for_pronoun_with_history(db_session, sample_course, monkeypatch):
+async def test_retrieval_decision_skips_retrieval_for_pronoun_with_history(db_session, sample_knowledge_base, monkeypatch):
     from app.services.agent_graph import RetrievalDecision
 
     decision = RetrievalDecision()
@@ -198,7 +241,77 @@ async def test_retrieval_decision_skips_retrieval_for_pronoun_with_history(db_se
 
 
 @pytest.mark.asyncio
-async def test_route_after_reflection_respects_max_retries(db_session, sample_course, monkeypatch):
+async def test_retrieval_planner_uses_dynamic_budget_formula(db_session, sample_knowledge_base, indexed_chunks, monkeypatch):
+    agent_graph = _patch_agent_state_writes(monkeypatch)
+    from app.schemas import SearchFilters
+
+    async def fake_translate(question: str, target_lang: str) -> str:
+        return f"{question} translated"
+
+    monkeypatch.setattr(agent_graph, "_llm_translate_query", fake_translate)
+    planner = agent_graph.RetrievalPlanner()
+    state = {
+        "run_id": "run-budget",
+        "knowledge_base_id": sample_knowledge_base.id,
+        "question": "Compare the relationship",
+        "top_k": 3,
+        "filters": SearchFilters(),
+        "route": "multi_hop_research",
+        "perception_result": {
+            "intent": "comparison",
+            "entities": [],
+            "sub_queries": ["Compare the relationship"],
+            "needs_graph": True,
+            "suggested_strategy": "community",
+        },
+    }
+
+    result = await planner(state)
+
+    params = result["retrieval_params"]
+    assert params["top_k"] == 3
+    assert params["candidate_budget"] > params["top_k"]
+    assert params["budget"]["formula"].startswith("B(q)=min")
+    assert params["budget"]["signals"]["active_chunk_count"] >= 1
+    assert 0 <= params["budget"]["signals"]["query_uncertainty"] <= 1
+
+
+@pytest.mark.asyncio
+async def test_base_retrieval_uses_candidate_budget_for_evidence_search(db_session, sample_knowledge_base, monkeypatch):
+    agent_graph = _patch_agent_state_writes(monkeypatch)
+    from app.schemas import SearchFilters
+
+    seen_top_k: list[int] = []
+
+    async def fake_evidence_search(db, knowledge_base_id, query, filters, top_k, route="agent_base_retrieval"):
+        seen_top_k.append(top_k)
+        return [], {"retrieval_pipeline": route}
+
+    monkeypatch.setattr(agent_graph, "evidence_first_search_chunks_with_audit", fake_evidence_search)
+    node = agent_graph.BaseRetrieval()
+    state = {
+        "run_id": "run-base-budget",
+        "knowledge_base_id": sample_knowledge_base.id,
+        "question": "compare evidence",
+        "rewritten_question": "compare evidence",
+        "top_k": 3,
+        "filters": SearchFilters(),
+        "route": "retrieve_sources",
+        "retrieval_params": {
+            "top_k": 3,
+            "candidate_budget": 17,
+            "sub_queries": ["compare evidence"],
+        },
+    }
+
+    await node(state)
+
+    assert seen_top_k
+    assert set(seen_top_k) == {17}
+
+
+@pytest.mark.asyncio
+async def test_route_after_reflection_respects_max_retries(db_session, sample_knowledge_base, monkeypatch):
     from app.core.config import get_settings
     from app.services.agent_graph import route_after_reflection
 
@@ -234,7 +347,7 @@ def test_route_after_corrector_routes_by_issue_type():
 
 
 @pytest.mark.asyncio
-async def test_answer_corrector_updates_params_by_issue_type(db_session, sample_course):
+async def test_answer_corrector_updates_params_by_issue_type(db_session, sample_knowledge_base):
     from app.services.agent_graph import AnswerCorrector
 
     corrector = AnswerCorrector()
@@ -268,7 +381,7 @@ async def test_answer_corrector_updates_params_by_issue_type(db_session, sample_
 
 
 @pytest.mark.asyncio
-async def test_stream_agent_events_emits_trace_before_answer_tokens(db_session, sample_course, monkeypatch):
+async def test_stream_agent_events_emits_trace_before_answer_tokens(db_session, sample_knowledge_base, monkeypatch):
     import asyncio
     import app.services.agent_graph as agent_graph
 
@@ -277,7 +390,7 @@ async def test_stream_agent_events_emits_trace_before_answer_tokens(db_session, 
             await agent_graph._trace(
                 initial["run_id"],
                 "router",
-                output_summary="route=retrieve_notes",
+                output_summary="route=retrieve_sources",
             )
             await asyncio.sleep(0)
             await agent_graph._trace(
@@ -289,7 +402,7 @@ async def test_stream_agent_events_emits_trace_before_answer_tokens(db_session, 
                 "answer": "streamed answer",
                 "citations": [],
                 "graded_documents": [],
-                "route": "retrieve_notes",
+                "route": "retrieve_sources",
             }
 
     monkeypatch.setattr(agent_graph, "AGENT_GRAPH", FakeGraph())
@@ -297,7 +410,7 @@ async def test_stream_agent_events_emits_trace_before_answer_tokens(db_session, 
     events = []
     async for event in agent_graph.stream_agent_events(
         db_session,
-        AgentRequest(question="define centrality", course_id=sample_course.id, top_k=3, stream_trace=True),
+        AgentRequest(question="define centrality", knowledge_base_id=sample_knowledge_base.id, top_k=3, stream_trace=True),
     ):
         events.append(event)
 
@@ -433,7 +546,7 @@ def test_agent_fixed_answers_follow_question_language():
     assert _correction_no_context_answer_text("What is a graph?").startswith("I could not find")
     assert _direct_answer_text("\u4f60\u597d").startswith("\u6211\u53ef\u4ee5")
     assert _clarify_answer_text("\u8fd9\u4e2a").startswith("\u8bf7\u8fdb\u4e00\u6b65")
-    assert _correction_no_context_answer_text("\u4ec0\u4e48\u662f\u56fe\uff1f").startswith("\u8bfe\u7a0b\u6750\u6599")
+    assert _correction_no_context_answer_text("\u4ec0\u4e48\u662f\u56fe\uff1f").startswith("\u7d22\u5f15\u8d44\u6599")
 
 
 @pytest.mark.asyncio
@@ -441,6 +554,7 @@ async def test_document_grader_keeps_english_evidence_when_rewritten_query_is_ch
     from app.core.config import get_settings
     import app.services.agent_graph as agent_graph
 
+    _patch_agent_embeddings(monkeypatch)
     monkeypatch.setenv("RETRIEVAL_LAYER_ENABLED", "false")
     get_settings.cache_clear()
 
@@ -454,7 +568,7 @@ async def test_document_grader_keeps_english_evidence_when_rewritten_query_is_ch
     rewritten_question = "\u4ec0\u4e48\u662f\u901a\u8def\u3001\u8ff9\u548c\u8def\u5f84\u4e4b\u95f4\u7684\u533a\u522b\uff1f"
     document = {
         "chunk_id": "walk-trail-path",
-        "document_title": "Chapter 1",
+        "document_title": "partition 1",
         "snippet": "A walk may repeat vertices and edges. A trail has no repeated edges. A path has no repeated vertices.",
         "content": "The difference between a walk, a trail, and a path is based on repeated edges and vertices.",
         "score": 0.42,
@@ -486,6 +600,7 @@ async def test_document_grader_keeps_english_evidence_for_chinese_question_with_
     from app.core.config import get_settings
     import app.services.agent_graph as agent_graph
 
+    _patch_agent_embeddings(monkeypatch)
     monkeypatch.setenv("RETRIEVAL_LAYER_ENABLED", "false")
     get_settings.cache_clear()
 
@@ -499,7 +614,7 @@ async def test_document_grader_keeps_english_evidence_for_chinese_question_with_
     rewritten_question = "What is the difference between a walk, a trail, and a path?"
     document = {
         "chunk_id": "walk-trail-path",
-        "document_title": "Chapter 1",
+        "document_title": "partition 1",
         "snippet": "A walk may repeat vertices and edges. A trail has no repeated edges. A path has no repeated vertices.",
         "content": "The difference between a walk, a trail, and a path is based on repeated edges and vertices.",
         "score": 0.42,

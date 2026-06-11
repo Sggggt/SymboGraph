@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ModelSettingsUpdate, RuntimeCheckResponse, RuntimeIssue, StrategyProfileDetail, StructuredApiErrorBody } from "@course-kg/shared";
@@ -22,7 +22,7 @@ import {
   XCircle,
 } from "lucide-react";
 
-import { useCourseContext } from "@/components/course-context";
+import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
 import {
@@ -57,18 +57,11 @@ type SettingsForm = {
   embedding_model: string;
   chat_model: string;
   embedding_dimensions: string;
-  graph_extraction_strategy: string;
-  graph_extraction_soft_start_budget: string;
-  graph_extraction_max_model_calls_per_run: string;
-  graph_extraction_min_marginal_gain: string;
-  graph_extraction_stall_rounds: string;
-  graph_extraction_concurrency: string;
-  graph_extraction_resume_batch_size: string;
   worker_concurrency: string;
   ingestion_file_concurrency: string;
   model_request_concurrency: string;
   model_request_timeout_seconds: string;
-  hpo_concurrency: string;
+  chunk_token_budget: string;
   api_key: string;
   clear_api_key: boolean;
   embedding_api_key: string;
@@ -77,6 +70,7 @@ type SettingsForm = {
   reranker_enabled: boolean;
   reranker_model: string;
   reranker_max_length: string;
+  reranker_device: "cpu" | "cuda";
   semantic_chunking_enabled: boolean;
   semantic_chunking_min_length: string;
   retrieval_layer_enabled: boolean;
@@ -85,8 +79,15 @@ type SettingsForm = {
   enable_post_generation_reflection: boolean;
   citation_verification_sample_max: string;
   reflection_max_retries: string;
-  enable_auto_hpo: boolean;
   enable_graph_community_summaries: boolean;
+  signal_extraction_max_model_batches: string;
+  signal_extraction_max_candidates_per_batch: string;
+  signal_extraction_max_tokens_per_batch: string;
+  signal_candidate_keep_threshold: string;
+  community_louvain_resolution: string;
+  community_min_modularity_warn: string;
+  graph_overview_max_nodes: string;
+  graph_overview_max_edges: string;
 };
 
 type ErrorDialogState = {
@@ -354,13 +355,13 @@ function getProfileJsonDiagnostics(text: string): JsonDiagnostic[] {
   }
   const schemaPack = profile.schema_pack;
   if (!schemaPack || typeof schemaPack !== "object" || Array.isArray(schemaPack)) {
-    diagnostics.push({
-      line: getLineForKey(text, "schema_pack"),
-      column: 1,
-      severity: "error",
-      message: "schema_pack 必须是对象",
-      reason: "实体类型、关系类型、别名和禁用标签都需要放在 schema_pack 中。",
-    });
+      diagnostics.push({
+        line: getLineForKey(text, "schema_pack"),
+        column: 1,
+        severity: "error",
+        message: "schema_pack 必须是对象",
+        reason: "Evidence atom、观测边类型、别名和禁用标签都需要放在 schema_pack 中。",
+      });
     return diagnostics;
   }
   const schema = schemaPack as Record<string, unknown>;
@@ -372,7 +373,7 @@ function getProfileJsonDiagnostics(text: string): JsonDiagnostic[] {
       column: 1,
       severity: "error",
       message: "schema_pack.entity_types 必须是非空字符串数组",
-      reason: "图谱抽取和实体归一需要至少一个合法实体类型。",
+      reason: "Evidence atom 归一和诊断视图需要至少一个合法类型。",
     });
   }
   if (!Array.isArray(relationTypes) || relationTypes.some((item) => typeof item !== "string" || !item.trim())) {
@@ -381,7 +382,7 @@ function getProfileJsonDiagnostics(text: string): JsonDiagnostic[] {
       column: 1,
       severity: "error",
       message: "schema_pack.relation_types 必须是非空字符串数组",
-      reason: "关系候选准入和归一需要至少一个合法关系类型。",
+      reason: "Evidence edge 观测类型需要至少一个合法类型。",
     });
   }
   const promptPack = profile.prompt_pack;
@@ -391,15 +392,7 @@ function getProfileJsonDiagnostics(text: string): JsonDiagnostic[] {
       column: 1,
       severity: "error",
       message: "prompt_pack 必须是对象",
-      reason: "问答、图谱抽取、反思和社区摘要 prompt 都需要从 prompt_pack 读取。",
-    });
-  } else if (typeof (promptPack as Record<string, unknown>).graph_extraction_system !== "string") {
-    diagnostics.push({
-      line: getLineForKey(text, "graph_extraction_system"),
-      column: 1,
-      severity: "warning",
-      message: "缺少 prompt_pack.graph_extraction_system",
-      reason: "缺少图谱抽取 prompt 会降低自定义资料库类型的约束力。",
+      reason: "答案 grounding、引用验证、反思和社区摘要 prompt 都需要从 prompt_pack 读取。",
     });
   }
   return diagnostics;
@@ -419,7 +412,7 @@ function parseProfileJson(text: string): { value?: Record<string, unknown>; erro
 
 function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }) {
   const queryClient = useQueryClient();
-  const { selectedCourseId, selectedCourse } = useCourseContext();
+  const { selectedKnowledgeBaseId, selectedKnowledgeBase } = useKnowledgeBaseContext();
   const profilesQuery = useQuery({ queryKey: ["strategy-profiles"], queryFn: fetchStrategyProfiles });
   const [selectedProfileId, setSelectedProfileId] = useState("");
   const [name, setName] = useState("");
@@ -438,7 +431,7 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
   const assistantScrollRef = useRef<HTMLDivElement | null>(null);
 
   const currentProfile = profilesQuery.data?.find((profile) => profile.id === selectedProfileId) ?? null;
-  const activeProfile = profilesQuery.data?.find((profile) => profile.id === selectedCourse?.active_profile_id) ?? null;
+  const activeProfile = profilesQuery.data?.find((profile) => profile.id === selectedKnowledgeBase?.active_profile_id) ?? null;
   const detailQuery = useQuery({
     queryKey: ["strategy-profile", selectedProfileId],
     queryFn: () => fetchStrategyProfile(selectedProfileId),
@@ -468,12 +461,12 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
     if (!profilesQuery.data?.length) {
       return;
     }
-    const nextId = selectedCourse?.active_profile_id || profilesQuery.data[0]?.id || "";
+    const nextId = selectedKnowledgeBase?.active_profile_id || profilesQuery.data[0]?.id || "";
     if (!selectedProfileId || !profilesQuery.data.some((profile) => profile.id === selectedProfileId)) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelectedProfileId(nextId);
     }
-  }, [profilesQuery.data, selectedCourse?.active_profile_id, selectedProfileId]);
+  }, [profilesQuery.data, selectedKnowledgeBase?.active_profile_id, selectedProfileId]);
 
   useEffect(() => {
     if (!detailQuery.data) {
@@ -489,9 +482,9 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["strategy-profiles"] }),
       queryClient.invalidateQueries({ queryKey: ["strategy-profile", selectedProfileId] }),
-      queryClient.invalidateQueries({ queryKey: ["courses"] }),
-      queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] }),
-      queryClient.invalidateQueries({ queryKey: ["graph", selectedCourseId] }),
+      queryClient.invalidateQueries({ queryKey: ["knowledgeBases"] }),
+      queryClient.invalidateQueries({ queryKey: ["dashboard", selectedKnowledgeBaseId] }),
+      queryClient.invalidateQueries({ queryKey: ["graph", selectedKnowledgeBaseId] }),
     ]);
   };
 
@@ -547,10 +540,10 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
 
   const bindMutation = useMutation({
     mutationFn: () => {
-      if (!selectedCourseId) {
+      if (!selectedKnowledgeBaseId) {
         throw new Error("请先选择资料库。");
       }
-      return bindStrategyProfile({ course_id: selectedCourseId, profile_id: selectedProfileId });
+      return bindStrategyProfile({ knowledge_base_id: selectedKnowledgeBaseId, profile_id: selectedProfileId });
     },
     onSuccess: async () => {
       setMessage("已设为当前资料库 Profile。");
@@ -650,16 +643,16 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
   }
 
   const isBuiltin = Boolean(currentProfile?.is_builtin || detailQuery.data?.is_builtin);
-  const selectedProfileCourseIds = currentProfile?.course_ids ?? detailQuery.data?.course_ids ?? [];
+  const selectedProfileKnowledgeBaseIds = currentProfile?.knowledge_base_ids ?? detailQuery.data?.knowledge_base_ids ?? [];
   const deleteBlockedReason = isBuiltin ? "默认内置 Profile 受保护；请复制后编辑。" : null;
   const deleteImpactMessage =
-    selectedProfileCourseIds.length > 0
-      ? `该 Profile 当前绑定 ${selectedProfileCourseIds.length} 个资料库。删除后，这些资料库会自动切回默认 Profile；已有 chunks、图谱、向量和会话不会被改写。`
+    selectedProfileKnowledgeBaseIds.length > 0
+      ? `该 Profile 当前绑定 ${selectedProfileKnowledgeBaseIds.length} 个资料库。删除后，这些资料库会自动切回默认 Profile；已有 chunks、图谱、向量和会话不会被改写。`
       : "该 Profile 当前没有绑定资料库。删除后会从列表中隐藏，已有历史数据不会被改写。";
   const hashMismatch = Boolean(
-    selectedCourse?.active_profile_hash &&
+    selectedKnowledgeBase?.active_profile_hash &&
       activeProfile?.profile_hash &&
-      selectedCourse.active_profile_hash !== activeProfile.profile_hash,
+      selectedKnowledgeBase.active_profile_hash !== activeProfile.profile_hash,
   );
   const renderAssistantJsonCard = (
     profileJson: Record<string, unknown>,
@@ -697,15 +690,15 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
           <p className="section-kicker">Profile 设置</p>
           <h2 className="glow-text mt-2 text-3xl font-semibold text-white">资料库 Profile</h2>
           <p className="mt-4 text-sm leading-7 text-cyan-50/62">
-            Profile 只影响之后启动的新解析、图谱抽取、检索和问答任务；已有 chunks、向量、图谱和会话不会被自动改写。
+            Profile 只影响之后启动的新解析、evidence graph、检索和问答任务；已有 chunks、向量、图谱和会话不会被自动改写。
           </p>
         </div>
         <div className={sectionClass}>
           <p className="text-sm font-semibold text-white">当前绑定</p>
           <div className="mt-3 space-y-2 text-sm leading-6 text-white/62">
-            <p>资料库：{selectedCourse?.name ?? "未选择"}</p>
-            <p>Profile：{activeProfile?.name ?? selectedCourse?.active_profile_name ?? "未绑定"}</p>
-            <p className="break-all">Hash：{selectedCourse?.active_profile_hash ?? "missing"}</p>
+            <p>资料库：{selectedKnowledgeBase?.name ?? "未选择"}</p>
+            <p>Profile：{activeProfile?.name ?? selectedKnowledgeBase?.active_profile_name ?? "未绑定"}</p>
+            <p className="break-all">Hash：{selectedKnowledgeBase?.active_profile_hash ?? "missing"}</p>
           </div>
           {hashMismatch ? (
             <p className="mt-4 rounded-xl border border-amber-200/20 bg-amber-200/[0.06] p-3 text-sm leading-6 text-amber-100">
@@ -748,7 +741,7 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
               <Sparkles data-icon="inline-start" />
               AI 设置助手
             </Button>
-            <Button type="button" className="rounded-full" onClick={() => bindMutation.mutate()} disabled={!selectedCourseId || !selectedProfileId || bindMutation.isPending}>
+            <Button type="button" className="rounded-full" onClick={() => bindMutation.mutate()} disabled={!selectedKnowledgeBaseId || !selectedProfileId || bindMutation.isPending}>
               设为当前资料库
             </Button>
             <Button
@@ -959,18 +952,11 @@ export function SettingsWorkspace() {
       embedding_model: settingsQuery.data.embedding_model,
       chat_model: settingsQuery.data.chat_model,
       embedding_dimensions: String(settingsQuery.data.embedding_dimensions),
-      graph_extraction_strategy: settingsQuery.data.graph_extraction_strategy ?? "adaptive_best_first",
-      graph_extraction_soft_start_budget: String(settingsQuery.data.graph_extraction_soft_start_budget ?? 24),
-      graph_extraction_max_model_calls_per_run: String(settingsQuery.data.graph_extraction_max_model_calls_per_run ?? 24),
-      graph_extraction_min_marginal_gain: String(settingsQuery.data.graph_extraction_min_marginal_gain ?? 0.03),
-      graph_extraction_stall_rounds: String(settingsQuery.data.graph_extraction_stall_rounds ?? 2),
-      graph_extraction_concurrency: String(settingsQuery.data.graph_extraction_concurrency ?? 2),
-      graph_extraction_resume_batch_size: String(settingsQuery.data.graph_extraction_resume_batch_size ?? 6),
       worker_concurrency: String(settingsQuery.data.worker_concurrency ?? 3),
       ingestion_file_concurrency: String(settingsQuery.data.ingestion_file_concurrency ?? 3),
       model_request_concurrency: String(settingsQuery.data.model_request_concurrency ?? 3),
       model_request_timeout_seconds: String(settingsQuery.data.model_request_timeout_seconds ?? 240),
-      hpo_concurrency: String(settingsQuery.data.hpo_concurrency ?? 1),
+      chunk_token_budget: String(settingsQuery.data.chunk_token_budget ?? 2400),
       api_key: "",
       clear_api_key: false,
       embedding_api_key: "",
@@ -979,6 +965,7 @@ export function SettingsWorkspace() {
       reranker_enabled: settingsQuery.data.reranker_enabled ?? false,
       reranker_model: settingsQuery.data.reranker_model ?? "cross-encoder/ms-marco-MiniLM-L-6-v2",
       reranker_max_length: String(settingsQuery.data.reranker_max_length ?? 512),
+      reranker_device: settingsQuery.data.reranker_device === "cuda" ? "cuda" : "cpu",
       semantic_chunking_enabled: settingsQuery.data.semantic_chunking_enabled ?? false,
       semantic_chunking_min_length: String(settingsQuery.data.semantic_chunking_min_length ?? 2000),
       retrieval_layer_enabled: settingsQuery.data.retrieval_layer_enabled ?? true,
@@ -987,8 +974,15 @@ export function SettingsWorkspace() {
       enable_post_generation_reflection: settingsQuery.data.enable_post_generation_reflection ?? false,
       citation_verification_sample_max: String(settingsQuery.data.citation_verification_sample_max ?? 3),
       reflection_max_retries: String(settingsQuery.data.reflection_max_retries ?? 2),
-      enable_auto_hpo: settingsQuery.data.enable_auto_hpo ?? true,
       enable_graph_community_summaries: settingsQuery.data.enable_graph_community_summaries ?? true,
+      signal_extraction_max_model_batches: String(settingsQuery.data.signal_extraction_max_model_batches ?? 4),
+      signal_extraction_max_candidates_per_batch: String(settingsQuery.data.signal_extraction_max_candidates_per_batch ?? 40),
+      signal_extraction_max_tokens_per_batch: String(settingsQuery.data.signal_extraction_max_tokens_per_batch ?? 6000),
+      signal_candidate_keep_threshold: String(settingsQuery.data.signal_candidate_keep_threshold ?? 0.62),
+      community_louvain_resolution: String(settingsQuery.data.community_louvain_resolution ?? 1.0),
+      community_min_modularity_warn: String(settingsQuery.data.community_min_modularity_warn ?? 0.18),
+      graph_overview_max_nodes: String(settingsQuery.data.graph_overview_max_nodes ?? 260),
+      graph_overview_max_edges: String(settingsQuery.data.graph_overview_max_edges ?? 800),
     });
     setApiKeyEditing(false);
     setEmbeddingApiKeyEditing(false);
@@ -1004,7 +998,7 @@ export function SettingsWorkspace() {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["model-settings"] }),
         queryClient.invalidateQueries({ queryKey: ["runtime-check"] }),
-        queryClient.invalidateQueries({ queryKey: ["courses"] }),
+        queryClient.invalidateQueries({ queryKey: ["knowledgeBases"] }),
       ]);
     },
     onError: (error) => setErrorDialog(errorDialogFromUnknown(error)),
@@ -1013,6 +1007,7 @@ export function SettingsWorkspace() {
   const settings = settingsQuery.data;
   const showApiKeyMask = Boolean(settings?.has_api_key && !apiKeyEditing && !form?.clear_api_key);
   const showEmbeddingApiKeyMask = Boolean(settings?.has_embedding_api_key && !embeddingApiKeyEditing && !form?.clear_embedding_api_key);
+  const crossEncoderStatus = runtimeQuery.data?.reranker;
 
   if (settingsQuery.isLoading || !form) {
     return <LoadingBlock rows={4} />;
@@ -1033,18 +1028,11 @@ export function SettingsWorkspace() {
     embedding_model: form.embedding_model.trim(),
     chat_model: form.chat_model.trim(),
     embedding_dimensions: parseIntField(form.embedding_dimensions),
-    graph_extraction_strategy: form.graph_extraction_strategy.trim() || "adaptive_best_first",
-    graph_extraction_soft_start_budget: parseIntField(form.graph_extraction_soft_start_budget),
-    graph_extraction_max_model_calls_per_run: parseIntField(form.graph_extraction_max_model_calls_per_run),
-    graph_extraction_min_marginal_gain: parseFloatField(form.graph_extraction_min_marginal_gain),
-    graph_extraction_stall_rounds: parseIntField(form.graph_extraction_stall_rounds),
-    graph_extraction_concurrency: parseIntField(form.graph_extraction_concurrency),
-    graph_extraction_resume_batch_size: parseIntField(form.graph_extraction_resume_batch_size),
     worker_concurrency: parseIntField(form.worker_concurrency),
     ingestion_file_concurrency: parseIntField(form.ingestion_file_concurrency),
     model_request_concurrency: parseIntField(form.model_request_concurrency),
     model_request_timeout_seconds: parseIntField(form.model_request_timeout_seconds),
-    hpo_concurrency: parseIntField(form.hpo_concurrency),
+    chunk_token_budget: parseIntField(form.chunk_token_budget),
     api_key: form.api_key.trim() || null,
     clear_api_key: form.clear_api_key,
     embedding_api_key: form.embedding_api_key.trim() || null,
@@ -1053,6 +1041,7 @@ export function SettingsWorkspace() {
     reranker_enabled: form.reranker_enabled,
     reranker_model: form.reranker_model.trim(),
     reranker_max_length: parseIntField(form.reranker_max_length),
+    reranker_device: form.reranker_device,
     semantic_chunking_enabled: form.semantic_chunking_enabled,
     semantic_chunking_min_length: parseIntField(form.semantic_chunking_min_length),
     retrieval_layer_enabled: form.retrieval_layer_enabled,
@@ -1061,8 +1050,15 @@ export function SettingsWorkspace() {
     enable_post_generation_reflection: form.enable_post_generation_reflection,
     citation_verification_sample_max: parseIntField(form.citation_verification_sample_max),
     reflection_max_retries: parseIntField(form.reflection_max_retries),
-    enable_auto_hpo: form.enable_auto_hpo,
     enable_graph_community_summaries: form.enable_graph_community_summaries,
+    signal_extraction_max_model_batches: parseIntField(form.signal_extraction_max_model_batches),
+    signal_extraction_max_candidates_per_batch: parseIntField(form.signal_extraction_max_candidates_per_batch),
+    signal_extraction_max_tokens_per_batch: parseIntField(form.signal_extraction_max_tokens_per_batch),
+    signal_candidate_keep_threshold: parseFloatField(form.signal_candidate_keep_threshold),
+    community_louvain_resolution: parseFloatField(form.community_louvain_resolution),
+    community_min_modularity_warn: parseFloatField(form.community_min_modularity_warn),
+    graph_overview_max_nodes: parseIntField(form.graph_overview_max_nodes),
+    graph_overview_max_edges: parseIntField(form.graph_overview_max_edges),
   });
 
   const handleSubmit = async () => {
@@ -1113,7 +1109,7 @@ export function SettingsWorkspace() {
               <p className="section-kicker">生产参数配置</p>
               <h2 className="glow-text mt-2 text-4xl font-semibold text-white">运行时设置</h2>
               <p className="mt-4 max-w-xl text-sm leading-7 text-cyan-50/62">
-                这里配置会写入根目录 .env，并通过后端热加载影响新任务。模型名、并发、图谱预算、检索增强和 HPO 都按当前生产参数表组织。
+                这里配置会写入根目录 .env，并通过后端热加载影响新任务。模型名、并发、检索增强和质量参数都按当前生产参数表组织。
               </p>
             </div>
 
@@ -1122,6 +1118,7 @@ export function SettingsWorkspace() {
               <StatusPill ok={Boolean(settings?.has_embedding_api_key)}>Embedding Key {settings?.has_embedding_api_key ? "已配置" : "未配置"}</StatusPill>
               <StatusPill ok={Boolean(runtimeQuery.data?.env_sync.synced)}>{runtimeQuery.data?.env_sync.synced ? ".env 已同步" : ".env 需检查"}</StatusPill>
               <StatusPill ok={!settings?.enable_model_fallback && !settings?.enable_database_fallback}>Fallback 已禁用</StatusPill>
+              <StatusPill ok={Boolean(settings?.runtime_settings_version)}>Runtime {settings?.runtime_settings_version ? settings.runtime_settings_version.slice(0, 12) : "pending"}</StatusPill>
             </div>
 
             <div className={sectionClass}>
@@ -1161,35 +1158,20 @@ export function SettingsWorkspace() {
                 <SettingField label="Embedding Base URL" value={form.embedding_base_url} onChange={(value) => updateForm("embedding_base_url", value)} className="md:col-span-2" />
                 <SettingField label="Chat DNS Override IP" value={form.chat_resolve_ip} onChange={(value) => updateForm("chat_resolve_ip", value)} placeholder="可选，留空使用系统 DNS" />
                 <SettingField label="Embedding DNS Override IP" value={form.embedding_resolve_ip} onChange={(value) => updateForm("embedding_resolve_ip", value)} placeholder="可选，留空使用系统 DNS" />
-                <SettingField label="Chat / 图谱模型" value={form.chat_model} onChange={(value) => updateForm("chat_model", value)} />
+                <SettingField label="Chat 模型" value={form.chat_model} onChange={(value) => updateForm("chat_model", value)} />
                 <SettingField label="Embedding 模型" value={form.embedding_model} onChange={(value) => updateForm("embedding_model", value)} />
                 <SettingField label="Embedding 维度" type="number" min={1} max={8192} value={form.embedding_dimensions} onChange={(value) => updateForm("embedding_dimensions", value)} />
               </div>
             </section>
 
             <section className={sectionClass}>
-              <p className="text-sm font-semibold text-white">图谱抽取预算</p>
-              <p className="mt-1 text-sm text-white/52">生产推荐值是 24 次模型调用、2 路图谱抽取并发、每次 resume 6 个 chunk。</p>
-              <div className="mt-5 grid gap-4 md:grid-cols-2">
-                <SettingField label="抽取策略" value={form.graph_extraction_strategy} onChange={(value) => updateForm("graph_extraction_strategy", value)} />
-                <SettingField label="Soft Start Budget" type="number" min={1} value={form.graph_extraction_soft_start_budget} onChange={(value) => updateForm("graph_extraction_soft_start_budget", value)} />
-                <SettingField label="Max Model Calls / Run" type="number" min={1} value={form.graph_extraction_max_model_calls_per_run} onChange={(value) => updateForm("graph_extraction_max_model_calls_per_run", value)} />
-                <SettingField label="Graph 并发" type="number" min={1} max={8} value={form.graph_extraction_concurrency} onChange={(value) => updateForm("graph_extraction_concurrency", value)} />
-                <SettingField label="Resume Batch Size" type="number" min={1} max={100} value={form.graph_extraction_resume_batch_size} onChange={(value) => updateForm("graph_extraction_resume_batch_size", value)} />
-                <SettingField label="Min Marginal Gain" type="number" min={0} max={1} step={0.01} value={form.graph_extraction_min_marginal_gain} onChange={(value) => updateForm("graph_extraction_min_marginal_gain", value)} />
-                <SettingField label="Stall Rounds" type="number" min={1} max={20} value={form.graph_extraction_stall_rounds} onChange={(value) => updateForm("graph_extraction_stall_rounds", value)} />
-              </div>
-            </section>
-
-            <section className={sectionClass}>
               <p className="text-sm font-semibold text-white">并发与超时</p>
-              <p className="mt-1 text-sm text-white/52">这些值控制 worker、文件解析、模型请求和 HPO 的上限，避免无界并发。</p>
+              <p className="mt-1 text-sm text-white/52">这些值控制 worker、文件解析和模型请求的上限，避免无界并发。</p>
               <div className="mt-5 grid gap-4 md:grid-cols-3">
                 <SettingField label="Worker Concurrency" type="number" min={1} max={32} value={form.worker_concurrency} onChange={(value) => updateForm("worker_concurrency", value)} />
                 <SettingField label="文件解析并发" type="number" min={1} max={8} value={form.ingestion_file_concurrency} onChange={(value) => updateForm("ingestion_file_concurrency", value)} />
                 <SettingField label="模型请求并发" type="number" min={1} max={16} value={form.model_request_concurrency} onChange={(value) => updateForm("model_request_concurrency", value)} />
                 <SettingField label="模型超时秒数" type="number" min={5} max={600} value={form.model_request_timeout_seconds} onChange={(value) => updateForm("model_request_timeout_seconds", value)} />
-                <SettingField label="HPO 并发" type="number" min={1} max={8} value={form.hpo_concurrency} onChange={(value) => updateForm("hpo_concurrency", value)} />
               </div>
             </section>
 
@@ -1232,14 +1214,6 @@ export function SettingsWorkspace() {
               <p className="text-sm font-semibold text-white">图谱质量增强</p>
               <div className="mt-5 grid gap-4">
                 <SwitchRow
-                  title="Auto HPO"
-                  description="生产建议开启；全量重建跑全量 HPO，最小更新只针对受影响子图。"
-                  checked={form.enable_auto_hpo}
-                  onChange={() => updateForm("enable_auto_hpo", !form.enable_auto_hpo)}
-                  disabled={saveMutation.isPending}
-                  badge="ENABLE_AUTO_HPO"
-                />
-                <SwitchRow
                   title="社区摘要"
                   description="生产建议开启；全量重建生成全量摘要，最小更新只重算变化社区。"
                   checked={form.enable_graph_community_summaries}
@@ -1247,6 +1221,16 @@ export function SettingsWorkspace() {
                   disabled={saveMutation.isPending}
                   badge="ENABLE_GRAPH_COMMUNITY_SUMMARIES"
                 />
+                <div className="grid gap-4 md:grid-cols-4">
+                  <SettingField label="Signal Model Batches" type="number" min={0} max={64} value={form.signal_extraction_max_model_batches} onChange={(value) => updateForm("signal_extraction_max_model_batches", value)} />
+                  <SettingField label="Signal Batch Size" type="number" min={1} max={500} value={form.signal_extraction_max_candidates_per_batch} onChange={(value) => updateForm("signal_extraction_max_candidates_per_batch", value)} />
+                  <SettingField label="Signal Tokens/Batch" type="number" min={500} max={50000} value={form.signal_extraction_max_tokens_per_batch} onChange={(value) => updateForm("signal_extraction_max_tokens_per_batch", value)} />
+                  <SettingField label="Signal Keep Threshold" type="number" min={0} max={1} step={0.01} value={form.signal_candidate_keep_threshold} onChange={(value) => updateForm("signal_candidate_keep_threshold", value)} />
+                  <SettingField label="Louvain Resolution" type="number" min={0.05} max={5} step={0.05} value={form.community_louvain_resolution} onChange={(value) => updateForm("community_louvain_resolution", value)} />
+                  <SettingField label="Modularity Warn" type="number" min={-1} max={1} step={0.01} value={form.community_min_modularity_warn} onChange={(value) => updateForm("community_min_modularity_warn", value)} />
+                  <SettingField label="Overview Nodes" type="number" min={20} max={2000} value={form.graph_overview_max_nodes} onChange={(value) => updateForm("graph_overview_max_nodes", value)} />
+                  <SettingField label="Overview Edges" type="number" min={20} max={5000} value={form.graph_overview_max_edges} onChange={(value) => updateForm("graph_overview_max_edges", value)} />
+                </div>
               </div>
             </section>
 
@@ -1269,10 +1253,54 @@ export function SettingsWorkspace() {
                   disabled={saveMutation.isPending}
                   badge="RERANKER_ENABLED"
                 />
+                <div className="rounded-xl border border-fuchsia-200/15 bg-fuchsia-300/[0.055] p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-white">Cross-Encoder 模型配置</p>
+                      <p className="mt-1 text-sm leading-6 text-white/56">
+                        保存后写入共享 .env，并通过 runtime settings version 广播；API 与 worker 会在任务边界刷新并清理 reranker 单例。
+                      </p>
+                    </div>
+                    <StatusPill ok={Boolean(crossEncoderStatus?.healthy)}>
+                      {crossEncoderStatus?.enabled ? (crossEncoderStatus.healthy ? "loaded" : "enabled") : "disabled"}
+                    </StatusPill>
+                  </div>
+                  <div className="mt-4 grid gap-3 text-sm text-white/62 md:grid-cols-2">
+                    <div className="rounded-xl border border-white/8 bg-black/10 p-3">
+                      <p className="text-xs uppercase tracking-[0.2em] text-white/38">Configured Model</p>
+                      <p className="mt-2 break-words text-white/78">{form.reranker_model || "n/a"}</p>
+                    </div>
+                    <div className="rounded-xl border border-white/8 bg-black/10 p-3">
+                      <p className="text-xs uppercase tracking-[0.2em] text-white/38">Runtime Model</p>
+                      <p className="mt-2 break-words text-white/78">{crossEncoderStatus?.reported_model ?? crossEncoderStatus?.model ?? "not loaded"}</p>
+                    </div>
+                    <div className="rounded-xl border border-white/8 bg-black/10 p-3">
+                      <p className="text-xs uppercase tracking-[0.2em] text-white/38">Configured Device</p>
+                      <p className="mt-2 text-white/78">{form.reranker_device}</p>
+                    </div>
+                    <div className="rounded-xl border border-white/8 bg-black/10 p-3">
+                      <p className="text-xs uppercase tracking-[0.2em] text-white/38">Runtime Device</p>
+                      <p className="mt-2 text-white/78">{crossEncoderStatus?.reported_device ?? crossEncoderStatus?.device ?? "not loaded"}</p>
+                    </div>
+                  </div>
+                </div>
                 <div className="grid gap-4 md:grid-cols-3">
                   <SettingField label="Semantic 最小长度" type="number" min={500} max={5000} value={form.semantic_chunking_min_length} onChange={(value) => updateForm("semantic_chunking_min_length", value)} />
                   <SettingField label="Reranker 模型" value={form.reranker_model} onChange={(value) => updateForm("reranker_model", value)} className="md:col-span-2" />
-                  <SettingField label="Reranker Max Length" type="number" min={64} max={2048} value={form.reranker_max_length} onChange={(value) => updateForm("reranker_max_length", value)} />
+                  <SettingField label="Cross-Encoder Max Length" type="number" min={64} max={2048} value={form.reranker_max_length} onChange={(value) => updateForm("reranker_max_length", value)} />
+                  <label className="flex flex-col gap-2">
+                    <span className="text-xs uppercase tracking-[0.2em] text-cyan-100/46">Cross-Encoder Device</span>
+                    <select
+                      value={form.reranker_device}
+                      onChange={(event) => updateForm("reranker_device", event.target.value === "cuda" ? "cuda" : "cpu")}
+                      disabled={saveMutation.isPending}
+                      className={inputClass}
+                    >
+                      <option value="cpu" className="bg-[#081126] text-white">cpu</option>
+                      <option value="cuda" className="bg-[#081126] text-white">cuda</option>
+                    </select>
+                  </label>
+                  <SettingField label="Chunk Token Budget" type="number" min={256} max={20000} value={form.chunk_token_budget} onChange={(value) => updateForm("chunk_token_budget", value)} />
                 </div>
               </div>
             </section>

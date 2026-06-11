@@ -10,7 +10,7 @@ def no_fallback_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     data_root = tmp_path / "data"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
     monkeypatch.setenv("DATA_ROOT", str(data_root))
-    monkeypatch.setenv("COURSE_NAME", "Unit Test Course")
+    monkeypatch.setenv("knowledge_base_name", "Unit Test KnowledgeBase")
     monkeypatch.setenv("OPENAI_API_KEY", "unit-test-key")
     monkeypatch.setenv("CHAT_BASE_URL", "https://api.openai.test/v1")
     monkeypatch.setenv("EMBEDDING_API_KEY", "unit-test-embedding-key")
@@ -52,23 +52,34 @@ def db_session(no_fallback_env: Path):
 
 
 @pytest.fixture
-def sample_course(db_session):
-    from app.models import Course
+def sample_knowledge_base(db_session):
+    from app.models import KnowledgeBase
 
-    course = Course(name="Unit Test Course", description="tests", source_root="unit-tests")
-    db_session.add(course)
+    KnowledgeBase = KnowledgeBase(name="Unit Test KnowledgeBase", description="tests", source_root="unit-tests")
+    db_session.add(KnowledgeBase)
     db_session.commit()
-    db_session.refresh(course)
-    return course
+    db_session.refresh(KnowledgeBase)
+    return KnowledgeBase
 
 
 @pytest.fixture
-def indexed_chunks(db_session, sample_course):
-    from app.models import Chunk, Document, DocumentVersion
+def indexed_chunks(db_session, sample_knowledge_base):
+    from app.models import (
+        ActiveChunk,
+        ChunkCandidate,
+        ChunkDecision,
+        Document,
+        DocumentVersion,
+        EvidenceAtom,
+        EvidenceGraphState,
+        PolicyState,
+        QualityDecision,
+    )
+    from app.services.evidence_graph import stable_hash
 
     document = Document(
-        course_id=sample_course.id,
-        title="Centrality Notes",
+        knowledge_base_id=sample_knowledge_base.id,
+        title="Centrality sources",
         source_path="centrality.md",
         source_type="markdown",
         tags=["L3"],
@@ -86,33 +97,119 @@ def indexed_chunks(db_session, sample_course):
     )
     db_session.add(version)
     db_session.flush()
-    chunks = [
-        Chunk(
-            course_id=sample_course.id,
-            document_id=document.id,
-            document_version_id=version.id,
-            content="Degree centrality counts the number of incident edges for a node.",
-            snippet="Degree centrality counts incident edges.",
-            chapter="L3",
-            section="Centrality",
-            source_type="markdown",
-            metadata_json={"content_kind": "markdown"},
-            embedding_status="ready",
-        ),
-        Chunk(
-            course_id=sample_course.id,
-            document_id=document.id,
-            document_version_id=version.id,
-            content="Betweenness centrality measures how often a node lies on shortest paths.",
-            snippet="Betweenness centrality uses shortest paths.",
-            chapter="L3",
-            section="Centrality",
-            source_type="markdown",
-            metadata_json={"content_kind": "markdown"},
-            embedding_status="ready",
-        ),
+    policy_state = PolicyState(
+        knowledge_base_id=sample_knowledge_base.id,
+        profile_objective_hash="unit-profile",
+        posterior_json={},
+        constraints_json={},
+        exploration_json={},
+        reward_summary_json={},
+        state_hash="unit-policy",
+    )
+    db_session.add(policy_state)
+    db_session.flush()
+    source_texts = [
+        "Degree centrality counts the number of incident edges for a node.",
+        "Betweenness centrality measures how often a node lies on shortest paths.",
     ]
-    db_session.add_all(chunks)
+    atoms = []
+    for index, text in enumerate(source_texts):
+        atom = EvidenceAtom(
+            knowledge_base_id=sample_knowledge_base.id,
+            document_id=document.id,
+            document_version_id=version.id,
+            atom_index=index,
+            atom_type="paragraph",
+            text=text,
+            text_hash=stable_hash({"text": text}),
+            source_span_json={"spans": [{"start": 0, "end": len(text), "section": "Centrality"}]},
+            layout_json={},
+            metadata_json={"section": "Centrality", "section_index": 0},
+            state="active",
+        )
+        db_session.add(atom)
+        atoms.append(atom)
+    db_session.flush()
+    graph_state = EvidenceGraphState(
+        knowledge_base_id=sample_knowledge_base.id,
+        scope_type="global",
+        state_hash="unit-graph",
+        atom_scope_hash="unit-atoms",
+        active_document_version_ids=[version.id],
+        active_atom_ids=[atom.id for atom in atoms],
+        policy_state_id=policy_state.id,
+        stats_json={},
+        diagnostics_json={},
+        state="active",
+    )
+    db_session.add(graph_state)
+    db_session.flush()
+
+    chunks = []
+    for index, (text, atom) in enumerate(zip(source_texts, atoms)):
+        candidate = ChunkCandidate(
+            graph_state_id=graph_state.id,
+            generator_name="unit_fixture",
+            generator_version="unit_v1",
+            atom_ids_json=[atom.id],
+            source_span_union_json={"spans": [atom.source_span_json["spans"][0]]},
+            token_count=12,
+            graph_features_json={"fixture": True},
+            cost_json={},
+            diagnostics_json={},
+        )
+        db_session.add(candidate)
+        db_session.flush()
+        quality = QualityDecision(
+            candidate_id=candidate.id,
+            policy_state_id=policy_state.id,
+            decision_action="answer_candidate",
+            gate_passed=True,
+            confidence=1.0,
+            diagnostics_json={},
+            reward_features_json={},
+            feedback_json={},
+        )
+        db_session.add(quality)
+        db_session.flush()
+        decision = ChunkDecision(
+            knowledge_base_id=sample_knowledge_base.id,
+            graph_state_id=graph_state.id,
+            candidate_id=candidate.id,
+            quality_decision_id=quality.id,
+            policy_state_id=policy_state.id,
+            action="activate",
+        )
+        db_session.add(decision)
+        db_session.flush()
+        snippet = "Degree centrality counts incident edges." if index == 0 else "Betweenness centrality uses shortest paths."
+        active_chunk = ActiveChunk(
+            knowledge_base_id=sample_knowledge_base.id,
+            chunk_decision_id=decision.id,
+            document_version_scope_hash="unit-version-scope",
+            graph_state_hash=graph_state.state_hash,
+            atom_ids_json=[atom.id],
+            text=text,
+            source_span_union_json={"spans": [atom.source_span_json["spans"][0]]},
+            boundary_policy_version="unit_fixture_v1",
+            quality_decision_id=quality.id,
+            policy_state_id=policy_state.id,
+            community_ids_json=[],
+            metadata_json={
+                "document_id": document.id,
+                "document_version_id": version.id,
+                "chunk_version": 1,
+                "partition": "L3",
+                "section": "Centrality",
+                "source_type": "markdown",
+                "content_kind": "markdown",
+                "snippet": snippet,
+                "is_parent": False,
+            },
+            state="active",
+        )
+        db_session.add(active_chunk)
+        chunks.append(active_chunk)
     db_session.commit()
     for item in (document, version, *chunks):
         db_session.refresh(item)

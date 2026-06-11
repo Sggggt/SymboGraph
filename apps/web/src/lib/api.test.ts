@@ -14,7 +14,7 @@ describe("api client", () => {
     vi.stubEnv("NEXT_PUBLIC_API_KEY", "test-key");
   });
 
-  it("starts parse batches with graph rebuild mode and cancels batches", async () => {
+  it("starts parse batches with built-in evidence graph and cancels batches", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse({ batch_id: "batch-1", state: "queued" }))
@@ -22,26 +22,24 @@ describe("api client", () => {
     vi.stubGlobal("fetch", fetchMock);
     const { parseUploadedFiles, cancelBatch } = await import("./api");
 
-    await parseUploadedFiles(["/data/course/a.pdf"], "course-1", true, "full");
-    await cancelBatch("batch-1", "course-1");
+    await parseUploadedFiles(["/data/knowledge-base/a.pdf"], "knowledge-base-1", true);
+    await cancelBatch("batch-1", "knowledge-base-1");
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      "http://api.test/api/ingestion/parse-uploaded-files?course_id=course-1",
+      "http://api.test/api/ingestion/parse-uploaded-files?knowledge_base_id=knowledge-base-1",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({
-          file_paths: ["/data/course/a.pdf"],
+          file_paths: ["/data/knowledge-base/a.pdf"],
           force: true,
           full_reparse: false,
-          rebuild_graph_mode: "full",
-          confirm_destructive_graph_rebuild: true,
         }),
       }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      "http://api.test/api/ingestion/batches/batch-1/cancel?course_id=course-1",
+      "http://api.test/api/ingestion/batches/batch-1/cancel?knowledge_base_id=knowledge-base-1",
       expect.objectContaining({ method: "POST", headers: { "X-API-Key": "test-key" } }),
     );
   });
@@ -73,14 +71,11 @@ describe("api client", () => {
     const { updateModelSettings } = await import("./api");
 
     await updateModelSettings({
-      graph_extraction_max_model_calls_per_run: 24,
-      graph_extraction_min_marginal_gain: 0.03,
-      graph_extraction_stall_rounds: 2,
       worker_concurrency: 3,
       ingestion_file_concurrency: 3,
       model_request_concurrency: 3,
       model_request_timeout_seconds: 240,
-      hpo_concurrency: 1,
+      chunk_token_budget: 2400,
       retrieval_layer_enabled: true,
       retrieval_cache_ttl_seconds: 120,
       enable_agentic_reflection: true,
@@ -89,18 +84,18 @@ describe("api client", () => {
       reflection_max_retries: 2,
       enable_graph_community_summaries: true,
       semantic_chunking_enabled: false,
+      reranker_enabled: true,
       reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2",
+      reranker_max_length: 512,
+      reranker_device: "cpu",
     });
 
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
-      graph_extraction_max_model_calls_per_run: 24,
-      graph_extraction_min_marginal_gain: 0.03,
-      graph_extraction_stall_rounds: 2,
       worker_concurrency: 3,
       ingestion_file_concurrency: 3,
       model_request_concurrency: 3,
       model_request_timeout_seconds: 240,
-      hpo_concurrency: 1,
+      chunk_token_budget: 2400,
       retrieval_layer_enabled: true,
       retrieval_cache_ttl_seconds: 120,
       enable_agentic_reflection: true,
@@ -109,28 +104,27 @@ describe("api client", () => {
       reflection_max_retries: 2,
       enable_graph_community_summaries: true,
       semantic_chunking_enabled: false,
+      reranker_enabled: true,
       reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2",
+      reranker_max_length: 512,
+      reranker_device: "cpu",
     });
   });
 
-  it("passes graph rebuild stage toggles", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ batch_id: "batch-graph", state: "extracting_graph", mode: "full", affected_documents: 1 }));
+  it("requests evidence graph status refresh", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ batch_id: null, state: "evidence_graph_active", mode: "evidence", affected_documents: 1 }));
     vi.stubGlobal("fetch", fetchMock);
     const { rebuildGraph } = await import("./api");
 
-    await rebuildGraph("course-1", "full", false, { run_llm_merge: false, run_hpo: false, run_community_summaries: false });
+    await rebuildGraph("knowledge-base-1");
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://api.test/api/maintenance/rebuild-graph?course_id=course-1",
+      "http://api.test/api/maintenance/rebuild-graph?knowledge_base_id=knowledge-base-1",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({
-          mode: "full",
-          confirm_destructive: true,
+          mode: "evidence",
           dry_run: false,
-          run_llm_merge: false,
-          run_hpo: false,
-          run_community_summaries: false,
         }),
       }),
     );
@@ -189,25 +183,33 @@ describe("api client", () => {
     expect(getBatchLogUrl("batch-1", "stream-token")).toBe("http://api.test/api/ingestion/batches/batch-1/logs?token=stream-token");
   });
 
-  it("calls stale cleanup endpoints with API key headers", async () => {
+  it("calls stale data cleanup endpoint with API key headers", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse({ deleted_vectors: 1, deleted_chunks: 2, deleted_document_versions: 3, deleted_documents: 4, removed_graph_relations: 5, removed_graph_concepts: 6 }))
-      .mockResolvedValueOnce(jsonResponse({ removed_relations: 1, removed_aliases: 2, removed_concepts: 3 }));
+      .mockResolvedValueOnce(jsonResponse({
+        deleted_vectors: 1,
+        deleted_chunks: 2,
+        deleted_document_versions: 3,
+        deleted_documents: 4,
+        removed_vector_records: 5,
+        removed_evidence_atoms: 6,
+        removed_evidence_edges: 7,
+        removed_evidence_graph_states: 8,
+        removed_active_chunks: 9,
+        removed_chunk_candidates: 10,
+        removed_chunk_decisions: 11,
+        removed_quality_decisions: 12,
+        removed_community_states: 13,
+        removed_community_memberships: 14,
+        removed_community_summaries: 15,
+      }));
     vi.stubGlobal("fetch", fetchMock);
-    const { cleanupStaleData, cleanupStaleGraph } = await import("./api");
+    const { cleanupStaleData } = await import("./api");
 
-    await cleanupStaleData("course-1");
-    await cleanupStaleGraph("course-1");
+    await cleanupStaleData("knowledge-base-1");
 
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      1,
-      "http://api.test/api/maintenance/cleanup-stale-data?course_id=course-1",
-      expect.objectContaining({ method: "POST", headers: { "X-API-Key": "test-key" } }),
-    );
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
-      "http://api.test/api/maintenance/cleanup-stale-graph?course_id=course-1",
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://api.test/api/maintenance/cleanup-stale-data?knowledge_base_id=knowledge-base-1",
       expect.objectContaining({ method: "POST", headers: { "X-API-Key": "test-key" } }),
     );
   });
@@ -215,49 +217,49 @@ describe("api client", () => {
   it("requires graph_type on graph requests and confirms destructive rebuilds", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse({ graph_type: "semantic", schema_version: "typed_graph_v1", nodes: [], edges: [], node_counts: {}, edge_counts: {}, freshness: { is_stale: false } }))
       .mockResolvedValueOnce(jsonResponse({ graph_type: "evidence", schema_version: "typed_graph_v1", nodes: [], edges: [], node_counts: {}, edge_counts: {}, freshness: { is_stale: false } }))
-      .mockResolvedValueOnce(jsonResponse({ batch_id: "batch-1", state: "extracting_graph", mode: "full" }))
-      .mockResolvedValueOnce(jsonResponse({ batch_id: null, state: "dry_run", mode: "full", dry_run: true, affected_documents: 3 }));
+      .mockResolvedValueOnce(jsonResponse({ graph_type: "evidence", schema_version: "typed_graph_v1", nodes: [], edges: [], node_counts: {}, edge_counts: {}, freshness: { is_stale: false } }))
+      .mockResolvedValueOnce(jsonResponse({ batch_id: null, state: "evidence_graph_active", mode: "evidence" }))
+      .mockResolvedValueOnce(jsonResponse({ batch_id: null, state: "evidence_graph_active", mode: "evidence", dry_run: true, affected_documents: 3 }));
     vi.stubGlobal("fetch", fetchMock);
-    const { fetchGraph, fetchChapterGraph, rebuildGraph } = await import("./api");
+    const { fetchGraph, fetchPartitionGraph, rebuildGraph } = await import("./api");
 
-    await fetchGraph("course-1", "semantic");
-    await fetchChapterGraph("Lecture 1", "course-1", "evidence");
-    await rebuildGraph("course-1", "full");
-    await rebuildGraph("course-1", "full", true);
+    await fetchGraph("knowledge-base-1", "evidence");
+    await fetchPartitionGraph("Lecture 1", "knowledge-base-1", "evidence");
+    await rebuildGraph("knowledge-base-1");
+    await rebuildGraph("knowledge-base-1", "evidence", true);
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      "http://api.test/api/courses/current/graph?course_id=course-1&graph_type=semantic",
+      "http://api.test/api/knowledge_bases/current/graph?knowledge_base_id=knowledge-base-1&graph_type=evidence&view=overview",
       expect.objectContaining({ cache: "no-store", headers: { "X-API-Key": "test-key" } }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      "http://api.test/api/graph/chapters/Lecture%201?course_id=course-1&graph_type=evidence",
+      "http://api.test/api/graph/partitions/Lecture%201?knowledge_base_id=knowledge-base-1&graph_type=evidence&view=detail",
       expect.objectContaining({ cache: "no-store", headers: { "X-API-Key": "test-key" } }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       3,
-      "http://api.test/api/maintenance/rebuild-graph?course_id=course-1",
-      expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "full", confirm_destructive: true, dry_run: false }) }),
+      "http://api.test/api/maintenance/rebuild-graph?knowledge_base_id=knowledge-base-1",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "evidence", dry_run: false }) }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       4,
-      "http://api.test/api/maintenance/rebuild-graph?course_id=course-1",
-      expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "full", confirm_destructive: false, dry_run: true }) }),
+      "http://api.test/api/maintenance/rebuild-graph?knowledge_base_id=knowledge-base-1",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "evidence", dry_run: true }) }),
     );
   });
 
-  it("deletes courses with API key headers", async () => {
+  it("deletes knowledge bases with API key headers", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ deleted: true }));
     vi.stubGlobal("fetch", fetchMock);
-    const { deleteCourse } = await import("./api");
+    const { deleteKnowledgeBase } = await import("./api");
 
-    await deleteCourse("course-1");
+    await deleteKnowledgeBase("knowledge-base-1");
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://api.test/api/courses/course-1",
+      "http://api.test/api/knowledge_bases/knowledge-base-1",
       expect.objectContaining({ method: "DELETE", headers: { "X-API-Key": "test-key" } }),
     );
   });
@@ -268,7 +270,7 @@ describe("api client", () => {
         const encoder = new TextEncoder();
         controller.enqueue(encoder.encode('data: {"type":"meta","run_id":"run-1","session_id":"session-1"}\n\n'));
         controller.enqueue(encoder.encode('data: {"token":"hello"}\n\n'));
-        controller.enqueue(encoder.encode('data: {"type":"final","response":{"run_id":"run-1","session_id":"session-1","answer":"done","citations":[],"used_chunks":[],"route":"retrieve_notes","trace":[],"degraded_mode":false}}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"final","response":{"run_id":"run-1","session_id":"session-1","answer":"done","citations":[],"used_chunks":[],"route":"retrieve_sources","trace":[],"degraded_mode":false}}\n\n'));
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         controller.close();
       },
@@ -289,7 +291,7 @@ describe("api client", () => {
 
     expect(tokens).toEqual(["hello"]);
     expect(meta).toContainEqual({ run_id: "run-1", session_id: "session-1", route: undefined });
-    expect(meta).toContainEqual({ degraded_mode: false, run_id: "run-1", session_id: "session-1", route: "retrieve_notes" });
+    expect(meta).toContainEqual({ degraded_mode: false, run_id: "run-1", session_id: "session-1", route: "retrieve_sources" });
   });
 
   it("parses profile assistant SSE chunks", async () => {

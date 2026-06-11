@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import re
 import time
@@ -10,27 +11,31 @@ from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
-from sqlalchemy import or_, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
-from app.models import AgentRun, AgentTraceEvent, QASession
+from app.models import ActiveChunk, AgentRun, AgentTraceEvent, AnswerSession, CitationVerification, EvidenceAtom, PolicyState, QASession, QualityDecision, RetrievalTrace, RewardEvent
 from app.schemas import AgentRequest, SearchFilters
 from app.core.config import get_settings
 from app.services.embeddings import ChatProvider, EmbeddingProvider, FallbackDisabledError, is_degraded_mode, prefers_chinese_answer
-from app.services.ingestion import resolve_course
+from app.services.ingestion import resolve_knowledge_base
 from app.services.retrieval import (
     assemble_evidence_documents,
+    active_signal_layer_for_retrieval,
+    controlled_signal_enhancement,
     controlled_graph_enhancement,
     cosine_similarity,
-    hybrid_search_chunks,
+    evidence_first_search_chunks_with_audit,
     plan_evidence_chains,
+    plan_signal_projection_paths,
     select_evidence_anchors,
 )
+from app.services.evidence_graph import REWARD_PROTOCOL_VERSION, update_policy_from_reward_event
 from app.services.strategy_profiles import active_profile_json, get_active_profile_record, profile_prompt, use_strategy_profile
 
 
-AgentRoute = Literal["direct_answer", "retrieve_notes", "retrieve_exercises", "retrieve_both", "clarify", "multi_hop_research"]
+AgentRoute = Literal["direct_answer", "retrieve_sources", "retrieve_tasks", "retrieve_both", "clarify", "multi_hop_research"]
 NOTE_SOURCE_TYPES = {"pdf", "ppt", "pptx", "docx", "markdown", "text", "html", "image"}
 EXERCISE_MARKERS = ("exercise", "homework", "problem", "assignment", "quiz", "exam")
 _TRACE_SUBSCRIBERS: dict[str, set[asyncio.Queue[dict]]] = {}
@@ -66,7 +71,7 @@ def _runtime_int_env(name: str, default: int) -> int:
 class AgentState(TypedDict, total=False):
     run_id: str
     session_id: str
-    course_id: str
+    knowledge_base_id: str
     question: str
     rewritten_question: str
     history: list[dict]
@@ -94,6 +99,7 @@ class AgentState(TypedDict, total=False):
     base_documents: list[dict]
     evidence_anchors: list[dict]
     evidence_chain_plan: list[dict]
+    signal_projection_plan: list[dict]
     graph_enhanced_documents: list[dict]
     evidence_assembly: dict
     graph_navigation_audit: dict
@@ -102,7 +108,7 @@ class AgentState(TypedDict, total=False):
 class QueryAnalysis(BaseModel):
     normalized_question: str
     token_count: int
-    likely_course_query: bool
+    likely_knowledge_base_query: bool
     needs_clarification: bool
     is_multi_hop: bool
 
@@ -118,24 +124,45 @@ def _summarize(text: str, limit: int = 280) -> str:
     return compact[:limit]
 
 
+def _signal_audit_from_documents(documents: list[dict]) -> dict[str, Any]:
+    signal_hash = next(
+        (
+            str((item.get("metadata") or {}).get("signal_state_hash"))
+            for item in documents
+            if (item.get("metadata") or {}).get("signal_state_hash")
+        ),
+        None,
+    )
+    signal_node_ids = sorted(
+        {
+            str(node_id)
+            for item in documents
+            for node_id in [
+                *((item.get("metadata") or {}).get("retrieval_signal_node_ids") or []),
+                *((item.get("metadata") or {}).get("signal_node_ids") or []),
+            ]
+            if node_id
+        }
+    )
+    return {
+        "signal_state_hash": signal_hash,
+        "signal_node_ids": signal_node_ids,
+        "signal_expansion_used": any((item.get("metadata") or {}).get("evidence_role") == "signal_neighbor" for item in documents),
+    }
+
+
 def _direct_answer_text(question: str) -> str:
     profile = active_profile_json()
     if prefers_chinese_answer(question):
-        return profile_prompt(profile, "agent_direct_answer_zh", "我可以回答已索引资料中的问题，提供引用，并说明检索智能体如何得到答案。")
-    return profile_prompt(profile, "agent_direct_answer_en", "I can answer questions about the indexed course materials, show citations, and explain how the retrieval agent reached its answer.")
-    if prefers_chinese_answer(question):
-        return "我可以回答已索引课程材料中的问题，提供引用，并说明检索智能体如何得到答案。"
-    return "I can answer questions about the indexed course materials, show citations, and explain how the retrieval agent reached its answer."
+        return profile_prompt(profile, "agent_direct_answer_zh", "???????????????????????????????????")
+    return profile_prompt(profile, "agent_direct_answer_en", "I can answer questions about the indexed knowledge-base materials, show citations, and explain how the retrieval agent reached its answer.")
 
 
 def _clarify_answer_text(question: str) -> str:
     profile = active_profile_json()
     if prefers_chinese_answer(question):
-        return profile_prompt(profile, "agent_clarify_answer_zh", "请进一步说明你要检索的实体、分区、任务或比较问题。")
-    return profile_prompt(profile, "agent_clarify_answer_en", "Please clarify the concept, section, task, or comparison you want me to retrieve.")
-    if prefers_chinese_answer(question):
-        return "请进一步说明你要检索的课程概念、章节、习题或比较问题。"
-    return "Please clarify the course concept, chapter, exercise, or comparison you want me to retrieve."
+        return profile_prompt(profile, "agent_clarify_answer_zh", "?????????????????????????")
+    return profile_prompt(profile, "agent_clarify_answer_en", "Please clarify the entity, partition, task, or comparison you want me to retrieve.")
 
 
 def _correction_no_context_answer_text(question: str) -> str:
@@ -144,21 +171,12 @@ def _correction_no_context_answer_text(question: str) -> str:
         return profile_prompt(
             profile,
             "agent_no_context_answer_zh",
-            "资料中没有找到足够相关内容来回答这个问题。如果你希望我基于已检索到的有限资料尝试回答（可能包含推测），请告诉我。",
+            "?????????????????????????????????????????????????????????",
         )
     return profile_prompt(
         profile,
         "agent_no_context_answer_en",
-        "I could not find enough relevant course material to answer this question. If you want me to try answering from the limited retrieved material, which may involve inference, please tell me.",
-    )
-    if prefers_chinese_answer(question):
-        return (
-            "课程材料中没有找到足够相关内容来回答这个问题。"
-            "如果你希望我基于已经检索到的有限材料尝试回答（可能包含推测），请告诉我。"
-        )
-    return (
-        "I could not find enough relevant course material to answer this question. "
-        "If you want me to try answering from the limited retrieved material, which may involve inference, please tell me."
+        "I could not find enough relevant indexed material to answer this question. If you want me to try answering from the limited retrieved material, which may involve inference, please tell me.",
     )
 
 
@@ -308,7 +326,7 @@ class Perception:
         start = time.perf_counter()
         db = SessionLocal()
         question = state["question"].strip()
-        course_id = state["course_id"]
+        knowledge_base_id = state["knowledge_base_id"]
 
         # Fast-path: detect clarify / direct_answer before expensive LLM call
         question_lower = question.lower()
@@ -325,10 +343,10 @@ class Perception:
             route = "clarify"
         elif any(term in question_lower for term in ("compare", "relationship", "related to", "relation between", "difference between", "connect", "derive", "prove", "比较", "关系", "区别", "联系", "推导", "证明")):
             route = "multi_hop_research"
-        elif any(term in question_lower for term in _profile_route_terms("exercise", EXERCISE_MARKERS)):
-            route = "retrieve_exercises"
-        elif any(term in question_lower for term in _profile_route_terms("notes", ("note", "slide", "definition", "concept", "chapter"))):
-            route = "retrieve_notes"
+        elif any(term in question_lower for term in _profile_route_terms("tasks", EXERCISE_MARKERS)):
+            route = "retrieve_tasks"
+        elif any(term in question_lower for term in _profile_route_terms("sources", ("note", "slide", "definition", "concept", "partition"))):
+            route = "retrieve_sources"
         else:
             route = "retrieve_both"
 
@@ -372,73 +390,55 @@ class Perception:
                     "suggested_strategy": "base_retrieval",
                 }
 
-        # 2. Graph entity matching
-        matched_concepts: list[dict] = []
-        seed_concept_ids: set[str] = set()
-        perceived_communities: set[int | None] = set()
+        # 2. Evidence atom matching
+        matched_evidence_atoms: list[dict] = []
+        seed_atom_ids: set[str] = set()
+        perceived_communities: set[str] = set()
         perceived_neighbors: list[dict] = []
 
         entities = llm_perception.get("entities", [])
         if entities:
-            from app.models import Concept, ConceptAlias, ConceptRelation
-            from app.services.concept_graph import normalize_concept_name
-
-            normalized_entities = [normalize_concept_name(e) for e in entities if isinstance(e, str)]
-            if normalized_entities:
-                # Match by normalized_name or alias
-                alias_matches = db.scalars(
-                    select(ConceptAlias).where(
-                        ConceptAlias.normalized_alias.in_(normalized_entities),
+            entity_terms = [str(entity).strip() for entity in entities if isinstance(entity, str) and str(entity).strip()]
+            for term in entity_terms[:8]:
+                atom_matches = db.scalars(
+                    select(EvidenceAtom)
+                    .where(
+                        EvidenceAtom.knowledge_base_id == knowledge_base_id,
+                        EvidenceAtom.state == "active",
+                        EvidenceAtom.text.ilike(f"%{term[:80]}%"),
                     )
+                    .order_by(EvidenceAtom.created_at.desc())
+                    .limit(5)
                 ).all()
-                matched_ids = {a.concept_id for a in alias_matches}
-
-                name_matches = db.scalars(
-                    select(Concept).where(
-                        Concept.course_id == course_id,
-                        Concept.normalized_name.in_(normalized_entities),
+                for atom in atom_matches:
+                    if atom.id in seed_atom_ids:
+                        continue
+                    seed_atom_ids.add(atom.id)
+                    matched_evidence_atoms.append(
+                        {
+                            "id": atom.id,
+                            "document_id": atom.document_id,
+                            "document_version_id": atom.document_version_id,
+                            "atom_type": atom.atom_type,
+                            "text_hash": atom.text_hash,
+                            "source_span": atom.source_span_json or {},
+                        }
                     )
-                ).all()
-                matched_ids |= {c.id for c in name_matches}
-
-                if matched_ids:
-                    concepts = db.scalars(
-                        select(Concept).where(Concept.id.in_(list(matched_ids)), Concept.course_id == course_id)
-                    ).all()
-                    for concept in concepts:
-                        matched_concepts.append({
-                            "id": concept.id,
-                            "name": concept.canonical_name,
-                            "community": concept.community_louvain,
-                        })
-                        seed_concept_ids.add(concept.id)
-                        if concept.community_louvain is not None:
-                            perceived_communities.add(concept.community_louvain)
-
-                    # Fetch 1-hop neighbors
-                    if seed_concept_ids:
-                        neighbor_relations = db.scalars(
-                            select(ConceptRelation).where(
-                                ConceptRelation.course_id == course_id,
-                                or_(
-                                    ConceptRelation.source_concept_id.in_(seed_concept_ids),
-                                    ConceptRelation.target_concept_id.in_(seed_concept_ids),
-                                ),
-                            )
-                        ).all()
-                        for rel in neighbor_relations:
-                            neighbor_id = rel.target_concept_id if rel.source_concept_id in seed_concept_ids else rel.source_concept_id
-                            if neighbor_id and neighbor_id not in seed_concept_ids:
-                                perceived_neighbors.append({
-                                    "concept_id": neighbor_id,
-                                    "relation_type": rel.relation_type,
-                                    "via": rel.source_concept_id if rel.source_concept_id in seed_concept_ids else rel.target_concept_id,
-                                })
+            if seed_atom_ids:
+                for active_chunk in db.scalars(
+                    select(ActiveChunk).where(
+                        ActiveChunk.knowledge_base_id == knowledge_base_id,
+                        ActiveChunk.state == "active",
+                    )
+                ).all():
+                    if set(active_chunk.atom_ids_json or []).intersection(seed_atom_ids):
+                        perceived_communities.update(str(community_id) for community_id in (active_chunk.community_ids_json or []) if community_id)
 
         perception_result = {
             "intent": llm_perception.get("intent", "unknown"),
             "entities": entities,
-            "matched_concepts": matched_concepts,
+            "matched_evidence_atoms": matched_evidence_atoms,
+            "seed_atom_ids": sorted(seed_atom_ids),
             "perceived_communities": sorted(perceived_communities) if perceived_communities else [],
             "perceived_neighbors": perceived_neighbors,
             "sub_queries": llm_perception.get("sub_queries", [question]),
@@ -454,7 +454,7 @@ class Perception:
             output_summary=(
                 f"intent={perception_result['intent']} "
                 f"entities={len(perception_result['entities'])} "
-                f"matched={len(matched_concepts)} "
+                f"matched={len(matched_evidence_atoms)} "
                 f"strategy={perception_result['suggested_strategy']}"
             ),
             duration_ms=int((time.perf_counter() - start) * 1000),
@@ -465,7 +465,7 @@ class Perception:
 async def _llm_translate_query(question: str, target_lang: str) -> str:
     """Minimal LLM query translator for cross-lingual retrieval."""
     chat = ChatProvider()
-    search_domain = profile_prompt(active_profile_json(), "query_translation_domain", "academic course search")
+    search_domain = profile_prompt(active_profile_json(), "query_translation_domain", "academic KnowledgeBase search")
     payload = {
         "model": chat.settings.chat_model,
         "messages": [
@@ -487,6 +487,106 @@ async def _llm_translate_query(question: str, target_lang: str) -> str:
         return question
 
 
+def _query_uncertainty(question: str, perception: dict[str, Any]) -> float:
+    tokens = _terms(question)
+    entities = perception.get("entities") or []
+    sub_queries = perception.get("sub_queries") or []
+    uncertainty = 0.15
+    if len(tokens) <= 3:
+        uncertainty += 0.25
+    if not entities:
+        uncertainty += 0.2
+    if perception.get("needs_graph"):
+        uncertainty += 0.15
+    if perception.get("intent") in {"comparison", "analysis", "unknown"}:
+        uncertainty += 0.15
+    if len(sub_queries) > 1:
+        uncertainty += 0.1
+    return max(0.0, min(1.0, uncertainty))
+
+
+def _normalized_entropy(values: list[float]) -> float:
+    positive = [value for value in values if value > 0]
+    if not positive:
+        return 1.0
+    total = sum(positive)
+    if total <= 0:
+        return 1.0
+    entropy = -sum((value / total) * math.log(value / total) for value in positive)
+    return max(0.0, min(1.0, entropy / math.log(max(len(positive), 2))))
+
+
+def _policy_entropy(db: Session, knowledge_base_id: str) -> float:
+    policy_state = db.scalar(
+        select(PolicyState)
+        .where(PolicyState.knowledge_base_id == knowledge_base_id)
+        .order_by(PolicyState.created_at.desc())
+    )
+    if policy_state is None:
+        return 1.0
+    arms = (policy_state.posterior_json or {}).get("arms") or {}
+    counts = [float((arm_state or {}).get("count") or 0.0) for arm_state in arms.values()]
+    return _normalized_entropy(counts)
+
+
+def _recent_retrieval_failure_rate(db: Session, knowledge_base_id: str, sample_size: int = 50) -> float:
+    traces = db.scalars(
+        select(RetrievalTrace)
+        .where(RetrievalTrace.knowledge_base_id == knowledge_base_id)
+        .order_by(RetrievalTrace.created_at.desc())
+        .limit(sample_size)
+    ).all()
+    if not traces:
+        return 0.0
+    failed = sum(1 for trace in traces if not (trace.result_active_chunk_ids_json or []))
+    return failed / max(len(traces), 1)
+
+
+def retrieval_budget_from_context(
+    db: Session,
+    *,
+    knowledge_base_id: str,
+    question: str,
+    perception: dict[str, Any],
+    requested_top_k: int,
+) -> dict[str, Any]:
+    corpus_size = int(
+        db.scalar(
+            select(func.count(ActiveChunk.id)).where(
+                ActiveChunk.knowledge_base_id == knowledge_base_id,
+                ActiveChunk.state == "active",
+            )
+        )
+        or 0
+    )
+    uncertainty = _query_uncertainty(question, perception)
+    policy_entropy = _policy_entropy(db, knowledge_base_id)
+    failure_rate = _recent_retrieval_failure_rate(db, knowledge_base_id)
+    weights = {"uncertainty": 8.0, "corpus": 2.5, "policy_entropy": 5.0, "failure_rate": 7.0}
+    max_budget = max(12, min(48, requested_top_k * 6))
+    raw_budget = (
+        weights["uncertainty"] * uncertainty
+        + weights["corpus"] * math.log1p(max(corpus_size, 0))
+        + weights["policy_entropy"] * policy_entropy
+        + weights["failure_rate"] * failure_rate
+    )
+    budget = min(max_budget, max(requested_top_k, int(math.ceil(raw_budget))))
+    return {
+        "candidate_budget": budget,
+        "display_top_k": requested_top_k,
+        "max_budget": max_budget,
+        "raw_budget": round(raw_budget, 6),
+        "formula": "B(q)=min(B_max, alpha*U(q)+beta*log(1+|C|)+gamma*H(pi)+delta*R_f)",
+        "weights": weights,
+        "signals": {
+            "query_uncertainty": round(uncertainty, 6),
+            "active_chunk_count": corpus_size,
+            "policy_entropy": round(policy_entropy, 6),
+            "retrieval_failure_rate": round(failure_rate, 6),
+        },
+    }
+
+
 class RetrievalPlanner:
     """Planning layer: choose retrieval strategy based on perception."""
 
@@ -496,18 +596,23 @@ class RetrievalPlanner:
         perception = state.get("perception_result", {})
         intent = perception.get("intent", "unknown")
         needs_graph = perception.get("needs_graph", False)
-        matched_concepts = perception.get("matched_concepts", [])
+        matched_evidence_atoms = perception.get("matched_evidence_atoms", [])
 
         strategy = "evidence_first"
         use_graph = bool(needs_graph or intent in {"comparison", "procedure"} or state.get("route") == "multi_hop_research")
         use_community = bool(intent == "analysis" or perception.get("suggested_strategy") == "community")
 
-        top_k = state["top_k"]
-        # Increase recall for broader intents
-        if intent in {"comparison", "analysis"}:
-            top_k = max(top_k, 8)
+        display_top_k = state["top_k"]
+        budget = retrieval_budget_from_context(
+            db,
+            knowledge_base_id=state["knowledge_base_id"],
+            question=state["question"],
+            perception=perception,
+            requested_top_k=display_top_k,
+        )
+        candidate_budget = int(budget["candidate_budget"])
 
-        seed_concept_ids = [c["id"] for c in matched_concepts]
+        seed_atom_ids = [atom["id"] for atom in matched_evidence_atoms if isinstance(atom, dict) and atom.get("id")]
         original_sub_queries = perception.get("sub_queries", [state["question"]])
 
         # Cross-lingual retrieval: translate the query so BM25 can match
@@ -521,8 +626,10 @@ class RetrievalPlanner:
         sub_queries = list(dict.fromkeys([state["question"], translated] + original_sub_queries))
 
         retrieval_params = {
-            "top_k": top_k,
-            "graph_seed_concept_ids": seed_concept_ids if use_graph else [],
+            "top_k": display_top_k,
+            "candidate_budget": candidate_budget,
+            "budget": budget,
+            "graph_seed_atom_ids": seed_atom_ids if use_graph else [],
             "community_ids": perception.get("perceived_communities", []),
             "sub_queries": sub_queries,
             "use_graph": use_graph,
@@ -534,7 +641,10 @@ class RetrievalPlanner:
                         state["run_id"],
             "retrieval_planner",
             input_summary=f"intent={intent} needs_graph={needs_graph}",
-            output_summary=f"strategy={strategy} top_k={top_k} queries={len(sub_queries)} graph={use_graph} community={use_community}",
+            output_summary=(
+                f"strategy={strategy} top_k={display_top_k} candidate_budget={candidate_budget} "
+                f"queries={len(sub_queries)} graph={use_graph} community={use_community}"
+            ),
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
         return {
@@ -554,7 +664,7 @@ class QueryAnalyzer:
         analysis = QueryAnalysis(
             normalized_question=question,
             token_count=len(tokens),
-            likely_course_query=not any(term in lower for term in ("weather", "stock price", "joke", "movie ticket")),
+            likely_knowledge_base_query=not any(term in lower for term in ("weather", "stock price", "joke", "movie ticket")),
             needs_clarification=len(tokens) == 0 or lower in {"it", "this", "that", "explain it", "why", "这个", "那个", "解释一下", "为什么"},
             is_multi_hop=any(term in lower for term in ("compare", "relationship", "difference between", "connect", "derive", "prove")),
         )
@@ -586,12 +696,12 @@ class Router:
             route: AgentRoute = "direct_answer"
         elif len(terms) == 0 or lower in {"it", "this", "that", "explain it", "why", "这个", "那个", "解释一下", "为什么"}:
             route = "clarify"
-        elif any(marker in lower for marker in _profile_route_terms("exercise", EXERCISE_MARKERS)):
-            route = "retrieve_exercises"
+        elif any(marker in lower for marker in _profile_route_terms("tasks", EXERCISE_MARKERS)):
+            route = "retrieve_tasks"
         elif any(term in lower for term in ("compare", "relationship", "related to", "relation between", "difference between", "connect", "derive", "prove", "比较", "关系", "区别", "联系", "推导", "证明")):
             route = "multi_hop_research"
-        elif any(term in lower for term in _profile_route_terms("notes", ("note", "slide", "definition", "concept", "chapter"))):
-            route = "retrieve_notes"
+        elif any(term in lower for term in _profile_route_terms("sources", ("note", "slide", "definition", "concept", "partition"))):
+            route = "retrieve_sources"
         else:
             route = "retrieve_both"
         await _set_run_state( state["run_id"], "running", current_node="router", route=route)
@@ -669,16 +779,24 @@ class BaseRetrieval:
         start = time.perf_counter()
         db = SessionLocal()
         params = state.get("retrieval_params", {})
-        course_id = state["course_id"]
+        knowledge_base_id = state["knowledge_base_id"]
         filters = state["filters"]
-        top_k = params.get("top_k", state["top_k"])
+        top_k = int(params.get("top_k", state["top_k"]))
+        candidate_budget = int(params.get("candidate_budget", max(top_k * 3, top_k)))
         queries = params.get("sub_queries", [state.get("rewritten_question") or state["question"]])
         route = state.get("route", "retrieve_both")
 
         all_results: dict[str, dict] = {}
         for query in queries:
             for flt in expand_route_filters(route, filters):
-                results = await hybrid_search_chunks(db, course_id, query, flt, max(top_k * 3, top_k))
+                results, _audit = await evidence_first_search_chunks_with_audit(
+                    db,
+                    knowledge_base_id,
+                    query,
+                    flt,
+                    max(candidate_budget, top_k),
+                    route="agent_base_retrieval",
+                )
                 for result in results:
                     result.setdefault("metadata", {})["retrieval_stage"] = "base_retrieval"
                     result.setdefault("metadata", {})["evidence_role"] = "base_candidate"
@@ -693,7 +811,7 @@ class BaseRetrieval:
                         state["run_id"],
             "base_retrieval",
             input_summary=f"route={route} | " + " | ".join(queries),
-            output_summary=f"base_candidates={len(documents)}",
+            output_summary=f"base_candidates={len(documents)} candidate_budget={candidate_budget}",
             document_ids=[item["chunk_id"] for item in documents],
             scores={item["chunk_id"]: item.get("metadata", {}).get("scores", {}) for item in documents},
             duration_ms=int((time.perf_counter() - start) * 1000),
@@ -705,7 +823,7 @@ class EvidenceAnchorSelector:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
         db = SessionLocal()
-        anchors, audit = select_evidence_anchors(db, state["course_id"], state.get("base_documents", []))
+        anchors, audit = select_evidence_anchors(db, state["knowledge_base_id"], state.get("base_documents", []))
         await _set_run_state( state["run_id"], "running", current_node="evidence_anchor_selector")
         await _trace(
                         state["run_id"],
@@ -713,7 +831,7 @@ class EvidenceAnchorSelector:
             input_summary=f"{len(state.get('base_documents', []))} base candidates",
             output_summary=(
                 f"anchors={audit.get('anchor_count', 0)} "
-                f"verified_anchor_relations={audit.get('verified_anchor_relations', 0)}"
+                f"evidence_anchored={audit.get('evidence_anchored', 0)}"
             ),
             document_ids=[item["chunk_id"] for item in anchors],
             scores={item["chunk_id"]: {"anchor_score": item.get("metadata", {}).get("anchor_score")} for item in anchors},
@@ -731,18 +849,37 @@ class EvidenceChainPlanner:
         query_type = perception.get("intent") or "default"
         use_graph = bool(params.get("use_graph") or state.get("route") == "multi_hop_research")
         use_community = bool(params.get("use_community"))
+        top_query = (params.get("sub_queries") or [state.get("rewritten_question") or state["question"]])[0]
         paths: list[dict] = []
-        audit = {"planned_paths": 0, "verified_edges": 0, "skipped_reason": "simple_query"}
+        audit = {"planned_paths": 0, "observed_edges": 0, "skipped_reason": "simple_query"}
         if use_graph or use_community:
             paths, audit = plan_evidence_chains(
                 db,
-                state["course_id"],
+                state["knowledge_base_id"],
                 state.get("evidence_anchors", []),
                 query_type=query_type,
                 community_ids=params.get("community_ids") if use_community else [],
             )
+        signal_state, signal_layer_audit = active_signal_layer_for_retrieval(db, state["knowledge_base_id"])
+        signal_paths, signal_audit = plan_signal_projection_paths(
+            db,
+            state["knowledge_base_id"],
+            state.get("evidence_anchors", []),
+            query=top_query,
+            signal_state=signal_state,
+        ) if state.get("evidence_anchors") else (
+            [],
+            {
+                **signal_layer_audit,
+                "planned_paths": 0,
+                "expanded_active_chunks": 0,
+                "skipped_reason": signal_layer_audit.get("skipped_reason") or "no_anchors",
+            },
+        )
+        signal_audit = {**signal_layer_audit, **signal_audit}
         previous_audit = dict(state.get("graph_navigation_audit", {}))
         previous_audit["paths"] = audit
+        previous_audit["signal"] = signal_audit
         await _set_run_state( state["run_id"], "running", current_node="evidence_chain_planner")
         await _trace(
                         state["run_id"],
@@ -750,13 +887,13 @@ class EvidenceChainPlanner:
             input_summary=f"use_graph={use_graph} use_community={use_community}",
             output_summary=(
                 f"planned_paths={audit.get('planned_paths', 0)} "
-                f"verified_edges={audit.get('verified_edges', 0)} "
-                f"community_summaries={audit.get('community_summaries', 0)}"
+                f"observed_edges={audit.get('observed_edges', 0)} "
+                f"signal_paths={signal_audit.get('planned_paths', 0)}"
             ),
             scores={"audit": audit},
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
-        return {"evidence_chain_plan": paths, "graph_navigation_audit": previous_audit}
+        return {"evidence_chain_plan": paths, "signal_projection_plan": signal_paths, "graph_navigation_audit": previous_audit}
 
 
 class ControlledGraphEnhancer:
@@ -767,14 +904,24 @@ class ControlledGraphEnhancer:
         top_query = (params.get("sub_queries") or [state.get("rewritten_question") or state["question"]])[0]
         docs, audit = controlled_graph_enhancement(
             db,
-            state["course_id"],
+            state["knowledge_base_id"],
             top_query,
             state["filters"],
             {str(item["chunk_id"]) for item in state.get("base_documents", [])},
             state.get("evidence_chain_plan", []),
         )
+        signal_docs, signal_audit = controlled_signal_enhancement(
+            db,
+            state["knowledge_base_id"],
+            top_query,
+            state["filters"],
+            {str(item["chunk_id"]) for item in state.get("base_documents", [])},
+            state.get("signal_projection_plan", []),
+        )
         previous_audit = dict(state.get("graph_navigation_audit", {}))
         previous_audit["graph"] = audit
+        previous_audit["signal"] = {**(previous_audit.get("signal") or {}), **signal_audit}
+        enhanced_docs = docs + signal_docs
         await _set_run_state( state["run_id"], "running", current_node="controlled_graph_enhancer")
         await _trace(
                         state["run_id"],
@@ -782,13 +929,13 @@ class ControlledGraphEnhancer:
             input_summary=f"{len(state.get('evidence_chain_plan', []))} planned paths",
             output_summary=(
                 f"graph_enhanced_chunks={audit.get('graph_enhanced_chunks', 0)} "
-                f"path_evidence_chunks={audit.get('path_evidence_chunks', 0)}"
+                f"signal_enhanced_chunks={signal_audit.get('signal_enhanced_chunks', 0)}"
             ),
-            document_ids=[item["chunk_id"] for item in docs],
-            scores={"audit": audit},
+            document_ids=[item["chunk_id"] for item in enhanced_docs],
+            scores={"audit": {"graph": audit, "signal": signal_audit}},
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
-        return {"graph_enhanced_documents": docs, "graph_navigation_audit": previous_audit}
+        return {"graph_enhanced_documents": enhanced_docs, "graph_navigation_audit": previous_audit}
 
 
 class EvidenceAssembler:
@@ -901,7 +1048,7 @@ class DocumentGrader:
             primary_pass = grade_score >= 0.35
             # Cross-language bridge: if embedding similarity is strong, the chunk is
             # semantically related even when term overlap is zero (e.g. Chinese query
-            # vs. English course material).  This prevents multilingual dense recall
+            # vs. English KnowledgeBase material).  This prevents multilingual dense recall
             # from being killed by monolingual term-matching.
             cross_lang_pass = embedding_sim >= 0.45
             # Secondary: reasonable term overlap AND original retrieval score is not noise
@@ -1038,7 +1185,7 @@ class RetryPlanner:
         start = time.perf_counter()
         db = SessionLocal()
         retry_count = state.get("retry_count", 0) + 1
-        retry_suffix = profile_prompt(active_profile_json(), "retry_query_suffix", "course lecture notes examples")
+        retry_suffix = profile_prompt(active_profile_json(), "retry_query_suffix", "KnowledgeBase lecture sources examples")
         next_question = f"{state.get('rewritten_question') or state['question']} {retry_suffix}"
         await _set_run_state( state["run_id"], "running", current_node="retry_planner", retry_count=retry_count)
         await _trace(
@@ -1072,7 +1219,7 @@ class ContextSynthesizer:
                 # Budget: base 800 + up to 1200 extra for highest score
                 char_budget = int(800 + normalized_score * 1200)
                 content = item.get("content", "")[:char_budget]
-                parts.append(f"[{idx + 1}] {item['document_title']} / {item.get('chapter') or 'General'}\n{content}")
+                parts.append(f"[{idx + 1}] {item['document_title']} / {item.get('partition') or 'General'}\n{content}")
             context = "\n\n".join(parts)
 
         await _set_run_state( state["run_id"], "running", current_node="context_synthesizer")
@@ -1150,6 +1297,9 @@ class AnswerGenerator:
                 else:
                     citations = [citation for item in used_chunks for citation in item["citations"]]
         audit = state.get("answer_model_audit", {})
+        if state.get("graded_documents"):
+            audit.update(_signal_audit_from_documents(state.get("graded_documents", [])))
+            state["answer_model_audit"] = audit
         await _set_run_state( state["run_id"], "running", current_node="answer_generator")
         await _trace(
                         state["run_id"],
@@ -1330,11 +1480,11 @@ def split_multi_hop_query(question: str) -> list[str]:
 def expand_route_filters(route: AgentRoute, filters: SearchFilters) -> list[SearchFilters]:
     if filters.source_type:
         return [filters]
-    if route == "retrieve_exercises":
+    if route == "retrieve_tasks":
         next_filters = filters.model_copy()
         next_filters.source_type = "notebook"
         return [next_filters]
-    if route == "retrieve_notes":
+    if route == "retrieve_sources":
         return [filters.model_copy(update={"source_type": source_type}) for source_type in sorted(NOTE_SOURCE_TYPES)]
     return [filters]
 
@@ -1476,12 +1626,12 @@ def build_agent_graph():
 AGENT_GRAPH = build_agent_graph()
 
 
-def create_or_get_session(db: Session, course_id: str, session_id: str | None, question: str) -> QASession:
+def create_or_get_session(db: Session, knowledge_base_id: str, session_id: str | None, question: str) -> QASession:
     session = db.get(QASession, session_id) if session_id else None
-    if session is not None and session.course_id != course_id:
+    if session is not None and session.knowledge_base_id != knowledge_base_id:
         session = None
     if session is None:
-        session = QASession(course_id=course_id, title=_summarize(question, 80), transcript=[])
+        session = QASession(knowledge_base_id=knowledge_base_id, title=_summarize(question, 80), transcript=[])
         db.add(session)
         db.commit()
         db.refresh(session)
@@ -1502,6 +1652,201 @@ def append_session_turn(db: Session, session_id: str, question: str, answer: str
     db.commit()
 
 
+def record_answer_audit(
+    db: Session,
+    *,
+    knowledge_base_id: str,
+    qa_session_id: str,
+    question: str,
+    answer: str,
+    citations: list[dict],
+    used_chunks: list[dict],
+    answer_model_audit: dict,
+    agent_state: dict[str, Any] | None = None,
+    trace_events: list[AgentTraceEvent] | None = None,
+) -> AnswerSession:
+    agent_state = agent_state or {}
+    trace_events = trace_events or []
+    retrieval_trace_id = next(
+        (
+            str(value)
+            for value in [
+                *[(item.get("metadata") or {}).get("retrieval_trace_id") for item in used_chunks],
+                *[citation.get("retrieval_trace_id") for citation in citations if isinstance(citation, dict)],
+            ]
+            if value
+        ),
+        None,
+    )
+    active_chunk_ids = sorted(
+        {
+            str(value)
+            for value in [
+                *[(item.get("active_chunk_id") or (item.get("metadata") or {}).get("active_chunk_id")) for item in used_chunks],
+                *[citation.get("active_chunk_id") for citation in citations if isinstance(citation, dict)],
+            ]
+            if value
+        }
+    )
+    answer_session = AnswerSession(
+        knowledge_base_id=knowledge_base_id,
+        retrieval_trace_id=retrieval_trace_id,
+        qa_session_id=qa_session_id,
+        question=question,
+        answer=answer,
+        citation_ids_json=[],
+        active_chunk_ids_json=active_chunk_ids,
+        prompt_protocol_version="answer_grounding_v1",
+        model_json=answer_model_audit or {},
+        diagnostics_json={
+            "citation_count": len(citations),
+            "used_chunk_count": len(used_chunks),
+            "signal_state_hash": (answer_model_audit or {}).get("signal_state_hash"),
+            "signal_node_ids": (answer_model_audit or {}).get("signal_node_ids") or [],
+            "signal_expansion_used": bool((answer_model_audit or {}).get("signal_expansion_used")),
+        },
+    )
+    db.add(answer_session)
+    db.flush()
+
+    active_chunks_by_id = {
+        chunk.id: chunk
+        for chunk in db.scalars(select(ActiveChunk).where(ActiveChunk.id.in_(active_chunk_ids))).all()
+    } if active_chunk_ids else {}
+    verification_ids: list[str] = []
+    for citation in citations:
+        if not isinstance(citation, dict):
+            continue
+        active_chunk_id = citation.get("active_chunk_id")
+        source_span = citation.get("source_span") or {}
+        evidence_atom_ids = list(citation.get("evidence_atom_ids") or [])
+        verdict = "supported" if source_span and evidence_atom_ids else "unverified"
+        verification = CitationVerification(
+            knowledge_base_id=knowledge_base_id,
+            answer_session_id=answer_session.id,
+            retrieval_trace_id=retrieval_trace_id,
+            active_chunk_id=active_chunk_id if active_chunk_id in active_chunks_by_id else None,
+            claim_text=answer[:1000],
+            source_span_json=source_span,
+            evidence_atom_ids_json=evidence_atom_ids,
+            verdict=verdict,
+            confidence=0.95 if verdict == "supported" else 0.35,
+            diagnostics_json={
+                "verification_method": "source_span_presence_v1",
+                "reason": "citation_has_evidence_atom_and_source_span" if verdict == "supported" else "missing_evidence_atom_or_source_span",
+            },
+        )
+        db.add(verification)
+        db.flush()
+        citation["citation_verification_id"] = verification.id
+        verification_ids.append(verification.id)
+    answer_session.citation_ids_json = verification_ids
+
+    policy_state_id = next(
+        (chunk.policy_state_id for chunk in active_chunks_by_id.values() if chunk.policy_state_id),
+        None,
+    )
+    graded_documents = list(agent_state.get("graded_documents") or used_chunks or [])
+    graded_scores = [
+        float((item.get("metadata") or {}).get("scores", {}).get("grade_score") or 0.0)
+        for item in graded_documents
+        if isinstance(item, dict)
+    ]
+    strong_evidence_flags: list[bool] = []
+    rerank_gains: list[float] = []
+    for item in graded_documents:
+        if not isinstance(item, dict):
+            continue
+        scores = (item.get("metadata") or {}).get("scores") or {}
+        grade = float(scores.get("grade_score") or 0.0)
+        embedding = float(scores.get("grader_embedding_sim") or 0.0)
+        overlap = float(scores.get("term_overlap_ratio") or 0.0)
+        strong_evidence_flags.append(grade >= 0.35 or embedding >= 0.45 or overlap >= 0.5)
+        rerank = scores.get("rerank")
+        baseline = scores.get("fused") if scores.get("fused") is not None else scores.get("unified")
+        if rerank is not None and baseline is not None:
+            try:
+                rerank_gains.append(max(0.0, float(rerank) - float(baseline)))
+            except (TypeError, ValueError):
+                pass
+    context_precision = (
+        sum(1 for score in graded_scores if score >= 0.35) / max(len(graded_scores), 1)
+        if graded_scores
+        else 0.0
+    )
+    context_recall = (
+        sum(1 for value in strong_evidence_flags if value) / max(len(strong_evidence_flags), 1)
+        if strong_evidence_flags
+        else (1.0 if (agent_state.get("evidence_evaluation") or {}).get("sufficient") else 0.0)
+    )
+    rerank_gain = min(1.0, sum(rerank_gains) / max(len(rerank_gains), 1)) if rerank_gains else 0.0
+    latency_cost = sum(max(int(event.duration_ms or 0), 0) for event in trace_events) / 1000.0
+    context_text = str(agent_state.get("context") or "")
+    token_budget = max(int(get_settings().chunk_token_budget or 1), 1)
+    token_cost = min(1.0, max(0.0, (len(context_text) / 4.0) / token_budget))
+    intent = str((agent_state.get("perception_result") or {}).get("intent") or "default")
+    expected_answer_length = {
+        "definition": 360,
+        "procedure": 520,
+        "comparison": 700,
+        "analysis": 780,
+        "application": 620,
+    }.get(intent, 480)
+    answer_completeness = min(1.0, len(answer.strip()) / max(expected_answer_length, 1)) if answer else 0.0
+    recent_quality_decisions = (
+        db.scalars(
+            select(QualityDecision)
+            .where(QualityDecision.policy_state_id == policy_state_id)
+            .order_by(QualityDecision.created_at.desc())
+            .limit(100)
+        ).all()
+        if policy_state_id
+        else []
+    )
+    rechunk_rate = (
+        sum(1 for decision in recent_quality_decisions if decision.decision_action == "needs_rechunk")
+        / max(len(recent_quality_decisions), 1)
+        if recent_quality_decisions
+        else 0.0
+    )
+    reward_event = RewardEvent(
+        knowledge_base_id=knowledge_base_id,
+        policy_state_id=policy_state_id,
+        retrieval_trace_id=retrieval_trace_id,
+        answer_session_id=answer_session.id,
+        active_chunk_ids_json=active_chunk_ids,
+        context_json={
+            "question_length": len(question),
+            "used_chunks": len(used_chunks),
+            "graded_documents": len(graded_documents),
+            "intent": intent,
+        },
+        action_json={"route": "agent_answer", "prompt_protocol_version": "answer_grounding_v1"},
+        reward_json={
+            "protocol_version": REWARD_PROTOCOL_VERSION,
+            "retrieval_hit": 1.0 if used_chunks else 0.0,
+            "context_precision": round(context_precision, 6),
+            "context_recall": round(context_recall, 6),
+            "citation_utilization": min(1.0, len(citations) / max(len(used_chunks), 1)) if used_chunks else 0.0,
+            "answer_groundedness": 1.0 if verification_ids else 0.0,
+            "answer_completeness": round(answer_completeness, 6),
+            "rerank_gain": round(rerank_gain, 6),
+            "latency_cost": round(latency_cost, 6),
+            "token_cost": round(token_cost, 6),
+            "user_acceptance": None,
+            "rechunk_rate": round(rechunk_rate, 6),
+        },
+        propensity=1.0,
+        diagnostics_json={"source": "qa_response_audit_v1"},
+    )
+    db.add(reward_event)
+    db.flush()
+    update_policy_from_reward_event(db, reward_event)
+    db.commit()
+    db.refresh(answer_session)
+    return answer_session
+
+
 def run_to_task_status(run: AgentRun) -> dict:
     return {
         "run_id": run.id,
@@ -1516,10 +1861,10 @@ def run_to_task_status(run: AgentRun) -> dict:
 
 
 def create_agent_run_context(db: Session, request: AgentRequest) -> tuple[QASession, AgentRun, AgentState]:
-    course = resolve_course(db, request.course_id)
-    session = create_or_get_session(db, course.id, request.session_id, request.question)
+    KnowledgeBase = resolve_knowledge_base(db, request.knowledge_base_id)
+    session = create_or_get_session(db, KnowledgeBase.id, request.session_id, request.question)
     run = AgentRun(
-        course_id=course.id,
+        knowledge_base_id=KnowledgeBase.id,
         session_id=session.id,
         question=request.question,
         status="queued",
@@ -1532,7 +1877,7 @@ def create_agent_run_context(db: Session, request: AgentRequest) -> tuple[QASess
     initial: AgentState = {
         "run_id": run.id,
         "session_id": session.id,
-        "course_id": course.id,
+        "knowledge_base_id": KnowledgeBase.id,
         "question": request.question,
         "history": history,
         "filters": request.filters,
@@ -1546,7 +1891,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
     from app.db import _db_context_var, _active_sessions
     token = _db_context_var.set(db)
     sessions_token = _active_sessions.set([])
-    strategy_profile = get_active_profile_record(db, run.course_id)
+    strategy_profile = get_active_profile_record(db, run.knowledge_base_id)
     try:
         with use_strategy_profile(strategy_profile.profile_json):
             final_state = await AGENT_GRAPH.ainvoke(initial)
@@ -1554,6 +1899,18 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
         used_chunks = final_state.get("graded_documents", [])
         answer = final_state.get("answer", "")
         citations = final_state.get("citations", [])
+        record_answer_audit(
+            db,
+            knowledge_base_id=run.knowledge_base_id,
+            qa_session_id=session.id,
+            question=request.question,
+            answer=answer,
+            citations=citations,
+            used_chunks=used_chunks,
+            answer_model_audit=final_state.get("answer_model_audit") or {},
+            agent_state=final_state,
+            trace_events=trace_events,
+        )
         append_session_turn(db, session.id, request.question, answer, run.id, citations)
         return {
             "run_id": run.id,

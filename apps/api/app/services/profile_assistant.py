@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -9,7 +9,7 @@ from typing import Any
 
 from app.services.cache_manager import get_cache_manager
 from app.services.embeddings import ChatProvider
-from app.services.strategy_profiles import default_course_profile_payload, profile_hash, validate_profile_payload
+from app.services.strategy_profiles import default_profile_payload, profile_hash, validate_profile_payload
 
 
 PROFILE_ASSISTANT_CACHE_NAMESPACE = "profile_assistant"
@@ -67,7 +67,7 @@ def _assistant_system_prompt() -> str:
 
 
 async def generate_profile_assistant_response(prompt: str, base_profile: dict[str, Any] | None = None) -> dict[str, Any]:
-    base = base_profile or default_course_profile_payload()
+    base = base_profile or default_profile_payload()
     user_prompt = (
         f"User request:\n{prompt.strip()}\n\n"
         "Base profile JSON:\n"

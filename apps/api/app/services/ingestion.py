@@ -16,13 +16,24 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.utils import source_type_from_path
-from app.models import Chunk, Concept, Course, Document, DocumentVersion, IngestionBatch, IngestionCompensationLog, IngestionJob
+from app.models import ActiveChunk, EvidenceAtom, EvidenceGraphState, KnowledgeBase, Document, DocumentVersion, IngestionBatch, IngestionCompensationLog, IngestionJob, VectorRecord, generate_uuid
+KnowledgeBaseModel = KnowledgeBase
 from app.services.chunking import CURRENT_EMBEDDING_TEXT_VERSION, chunk_sections_hierarchical_async, contextual_embedding_text, normalize_for_dedup
 from app.services.cancellation import CANCEL_REQUESTED, CANCELLED, IngestionCancelled, ensure_not_cancelled, is_cancel_requested
-from app.services.concept_graph import get_concept_cards, get_graph_payload, graph_extraction_provider, rebuild_course_graph, incremental_update_course_graph
+from app.services.evidence_graph_payload import get_graph_payload
 from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded_mode, vector_norm
+from app.services.evidence_graph import (
+    ChunkDraft,
+    EvidencePipelineResult,
+    activate_evidence_chunks,
+    apply_evidence_pipeline_for_chunks,
+    enrich_vector_payload,
+    publish_global_evidence_graph_state,
+    record_vector_records,
+)
 from app.services.ingestion_logs import emit_ingestion_log
-from app.services.parsers import derive_chapter, parse_document, sections_to_json
+from app.services.parsers import derive_partition, parse_document, sections_to_json
+from app.services.runtime_settings import refresh_runtime_settings_if_needed
 from app.services.strategy_profiles import get_active_profile_record, use_strategy_profile
 from app.services.storage import compute_checksum, copy_source_file
 from app.services.vector_store import VectorStore
@@ -150,26 +161,26 @@ def source_path_lock(path: Path) -> asyncio.Lock | _RedisDistributedLock:
         return _SOURCE_PATH_LOCKS[key]
 
 
-def _course_graph_lock_id(course_id: str) -> int:
-    """Deterministic lock ID derived from course_id for PostgreSQL advisory lock."""
+def _knowledge_base_graph_lock_id(knowledge_base_id: str) -> int:
+    """Deterministic lock ID derived from knowledge_base_id for PostgreSQL advisory lock."""
     import zlib
-    return zlib.crc32(course_id.encode()) & 0x7FFFFFFFFFFFFFFF
+    return zlib.crc32(knowledge_base_id.encode()) & 0x7FFFFFFFFFFFFFFF
 
 
-def acquire_course_graph_lock(db: Session, course_id: str) -> bool:
+def acquire_knowledge_base_graph_lock(db: Session, knowledge_base_id: str) -> bool:
     """Try to acquire a PostgreSQL advisory lock for graph rebuild.
     Returns True if lock acquired, False if another session holds it.
     """
     from sqlalchemy import text
-    lock_id = _course_graph_lock_id(course_id)
+    lock_id = _knowledge_base_graph_lock_id(knowledge_base_id)
     result = db.scalar(text("SELECT pg_try_advisory_lock(:lock_id)"), {"lock_id": lock_id})
     return bool(result)
 
 
-def release_course_graph_lock(db: Session, course_id: str) -> None:
+def release_knowledge_base_graph_lock(db: Session, knowledge_base_id: str) -> None:
     """Release the PostgreSQL advisory lock for graph rebuild."""
     from sqlalchemy import text
-    lock_id = _course_graph_lock_id(course_id)
+    lock_id = _knowledge_base_graph_lock_id(knowledge_base_id)
     db.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
 
 
@@ -221,10 +232,10 @@ def batch_cancel_is_control_plane_safe(batch: IngestionBatch) -> bool:
     return False
 
 
-def active_batch_for_course(db: Session, course_id: str) -> IngestionBatch | None:
+def active_batch_for_knowledge_base(db: Session, knowledge_base_id: str) -> IngestionBatch | None:
     batches = db.scalars(
         select(IngestionBatch)
-        .where(IngestionBatch.course_id == course_id, IngestionBatch.status.notin_(TERMINAL_STATES))
+        .where(IngestionBatch.knowledge_base_id == knowledge_base_id, IngestionBatch.status.notin_(TERMINAL_STATES))
         .order_by(IngestionBatch.created_at.desc())
     ).all()
     for batch in batches:
@@ -237,14 +248,14 @@ def active_batch_for_course(db: Session, course_id: str) -> IngestionBatch | Non
 def create_vector_compensation_log(
     db: Session,
     *,
-    course_id: str,
+    knowledge_base_id: str,
     job_id: str | None,
     operation: str,
     vector_ids: list[str],
     payload_json: dict | None = None,
 ) -> IngestionCompensationLog:
     log = IngestionCompensationLog(
-        course_id=course_id,
+        knowledge_base_id=knowledge_base_id,
         job_id=job_id,
         operation=operation,
         vector_ids=vector_ids,
@@ -272,20 +283,20 @@ def process_pending_vector_compensations(db: Session) -> int:
     ).all()
     processed = 0
     for log in pending:
-        course = db.get(Course, log.course_id)
-        if course is None:
+        KnowledgeBase = db.get(KnowledgeBaseModel, log.knowledge_base_id)
+        if KnowledgeBase is None:
             log.status = "failed"
-            log.error_message = "Course no longer exists"
+            log.error_message = "KnowledgeBase no longer exists"
             continue
         try:
-            vector_store = VectorStore(course_name=course.name)
+            vector_store = VectorStore(knowledge_base_name=KnowledgeBase.name)
             if log.operation == "upsert":
                 active_ids = set(
                     db.scalars(
-                        select(Chunk.id).where(
-                            Chunk.course_id == log.course_id,
-                            Chunk.id.in_(log.vector_ids),
-                            Chunk.is_active.is_(True),
+                        select(ActiveChunk.id).where(
+                            ActiveChunk.knowledge_base_id == log.knowledge_base_id,
+                            ActiveChunk.id.in_(log.vector_ids),
+                            ActiveChunk.state == "active",
                         )
                     ).all()
                 )
@@ -318,9 +329,7 @@ def finalize_graph_generation_failure(session: Session, batch_id: str, exc: Exce
         "graph_rebuilt": False,
         "graph_nodes": 0,
         "graph_edges": 0,
-        "concepts": 0,
-        "relations": 0,
-        "graph_extraction_provider": graph_extraction_provider(),
+        "graph_runtime": "evidence_graph",
         "graph_error": error_message,
     }
     batch.stats = {**stats, **graph_stats}
@@ -345,37 +354,11 @@ def finalize_graph_generation_failure(session: Session, batch_id: str, exc: Exce
     return summarize_batch(batch)
 
 
-async def rebuild_course_graph_for_batch(
-    session: Session,
-    course_id: str,
-    batch_id: str,
-    *,
-    run_llm_merge: bool | None = None,
-    run_hpo: bool | None = None,
-    run_community_summaries: bool | None = None,
-) -> dict:
-    try:
-        return await rebuild_course_graph(
-            session,
-            course_id,
-            batch_id=batch_id,
-            run_llm_merge=run_llm_merge,
-            run_hpo=run_hpo,
-            run_community_summaries=run_community_summaries,
-        )
-    except TypeError as exc:
-        if "unexpected keyword argument 'batch_id'" not in str(exc):
-            raise
-        return await rebuild_course_graph(session, course_id)
-
-
-async def recover_existing_graph_algorithm_metrics(session: Session, course_id: str, enricher=None) -> dict:
+async def recover_existing_graph_algorithm_metrics(session: Session, knowledge_base_id: str, enricher=None) -> dict:
     if enricher is None:
-        from app.services.graph_algorithms import enrich_course_graph_without_completion
-
-        enricher = enrich_course_graph_without_completion
+        return {"graph_algorithm_recovered_existing": False, "skipped_reason": "legacy_graph_algorithms_removed"}
     try:
-        stats = await enricher(session, course_id)
+        stats = await enricher(session, knowledge_base_id)
         session.commit()
         return {"graph_algorithm_recovered_existing": True, **stats}
     except Exception as exc:
@@ -386,236 +369,47 @@ async def recover_existing_graph_algorithm_metrics(session: Session, course_id: 
         }
 
 
-async def run_graph_rebuild(
-    batch_id: str,
-    course_id: str,
-    mode: str = "full",
-    *,
-    run_llm_merge: bool | None = None,
-    run_hpo: bool | None = None,
-    run_community_summaries: bool | None = None,
-) -> dict:
-    from app.db import SessionLocal
-    from app.services.concept_graph import incremental_update_course_graph, _backup_course_graph_tables, _restore_course_graph_from_backup, has_resumable_graph_extraction
-    from app.models import Document, IngestionBatch
-
-    session = SessionLocal()
-    lock_acquired = False
-    try:
-        lock_deadline = time.monotonic() + GRAPH_LOCK_WAIT_SECONDS
-        while True:
-            lock_acquired = acquire_course_graph_lock(session, course_id)
-            if lock_acquired:
-                break
-            if is_cancel_requested(session, batch_id):
-                await compensate_cancelled_batch(session, batch_id)
-                return summarize_batch(session.get(IngestionBatch, batch_id))
-            if time.monotonic() >= lock_deadline:
-                break
-            await asyncio.sleep(0.5)
-        if not lock_acquired:
-            message = "课程图谱正在重建中，请等待当前任务完成"
-            batch = session.get(IngestionBatch, batch_id)
-            if batch is not None:
-                batch.status = "failed"
-                batch.last_error = message
-                batch.completed_at = datetime.utcnow()
-                batch.worker_id = None
-                batch.heartbeat_at = None
-                batch.stats = {
-                    **(batch.stats or {}),
-                    "phase": "graph",
-                    "parse_committed": True,
-                    "graph_rebuilt": False,
-                    "graph_error": message,
-                    "graph_extraction_provider": graph_extraction_provider(),
-                }
-                session.commit()
-                emit_ingestion_log(batch_id, "graph_failed", message)
-                emit_ingestion_log(batch_id, "batch_failed", message)
-            raise RuntimeError(message)
-        batch = session.get(IngestionBatch, batch_id)
-        if batch is None:
-            raise RuntimeError(f"Batch {batch_id} not found")
-        if is_cancel_requested(session, batch_id):
-            await compensate_cancelled_batch(session, batch_id)
-            return summarize_batch(session.get(IngestionBatch, batch_id))
-        batch.status = "extracting_graph"
-        batch.stats = {
-            **(batch.stats or {}),
-            "phase": "graph",
-            "parse_committed": True,
-            "run_llm_merge": run_llm_merge,
-            "run_hpo": run_hpo,
-            "run_community_summaries": run_community_summaries,
-        }
-        batch.started_at = datetime.utcnow()
-        mark_batch_worker_heartbeat(session, batch, phase="graph")
-        _backup_course_graph_tables(session, course_id)
-        session.commit()
-
-        if mode == "incremental":
-            emit_ingestion_log(batch_id, "batch_graph_started", "正在增量更新课程图谱")
-            # Find documents updated since the last completed graph batch
-            last_graph_batch = session.scalar(
-                select(IngestionBatch)
-                .where(
-                    IngestionBatch.course_id == course_id,
-                    IngestionBatch.status == "completed",
-                    IngestionBatch.trigger_source == "rebuild_graph",
-                    IngestionBatch.id != batch_id,
-                )
-                .order_by(IngestionBatch.completed_at.desc())
-            )
-            last_completed_at = last_graph_batch.completed_at if last_graph_batch else None
-            if last_completed_at:
-                changed_documents = session.scalars(
-                    select(Document).where(
-                        Document.course_id == course_id,
-                        Document.is_active.is_(True),
-                        Document.updated_at > last_completed_at,
-                    )
-                ).all()
-            else:
-                # No previous graph batch; fall back to full rebuild
-                mode = "full"
-            if mode == "incremental" and changed_documents:
-                changed_document_ids = [doc.id for doc in changed_documents]
-                try:
-                    graph_stats = await incremental_update_course_graph(
-                        session,
-                        course_id,
-                        changed_document_ids,
-                        batch_id,
-                        run_hpo=run_hpo,
-                        run_community_summaries=run_community_summaries,
-                    )
-                    mark_batch_worker_heartbeat(session, batch, phase="graph")
-                    ensure_not_cancelled(session, batch_id)
-                except IngestionCancelled:
-                    session.rollback()
-                    try:
-                        _restore_course_graph_from_backup(session, course_id)
-                        session.commit()
-                    except Exception:
-                        session.rollback()
-                    await compensate_cancelled_batch(session, batch_id)
-                    return summarize_batch(session.get(IngestionBatch, batch_id))
-                except Exception as exc:
-                    session.rollback()
-                    emit_ingestion_log(batch_id, "graph_incremental_failed", f"增量图谱更新失败，尝试全量重建：{exception_message(exc)}")
-                    mode = "full"
-            elif mode == "incremental" and has_resumable_graph_extraction(session, course_id):
-                emit_ingestion_log(batch_id, "batch_graph_resume_started", "检测到未完成的自适应图谱抽取任务，正在继续生成")
-                mode = "full"
-            elif mode == "incremental":
-                emit_ingestion_log(batch_id, "graph_incremental_skipped", "没有检测到变更文档，跳过增量更新")
-                graph_stats = {"graph_rebuilt": False, "reason": "no_changed_documents"}
-        else:
-            emit_ingestion_log(batch_id, "batch_graph_started", "正在重建课程图谱")
-
-        if mode == "full":
-            try:
-                ensure_not_cancelled(session, batch_id)
-                mark_batch_worker_heartbeat(session, batch, phase="graph")
-                session.commit()
-                graph_stats = await rebuild_course_graph_for_batch(
-                    session,
-                    course_id,
-                    batch_id,
-                    run_llm_merge=run_llm_merge,
-                    run_hpo=run_hpo,
-                    run_community_summaries=run_community_summaries,
-                )
-                mark_batch_worker_heartbeat(session, batch, phase="graph")
-                ensure_not_cancelled(session, batch_id)
-            except IngestionCancelled:
-                session.rollback()
-                try:
-                    _restore_course_graph_from_backup(session, course_id)
-                    session.commit()
-                except Exception:
-                    session.rollback()
-                await compensate_cancelled_batch(session, batch_id)
-                return summarize_batch(session.get(IngestionBatch, batch_id))
-            except Exception as exc:
-                session.rollback()
-                try:
-                    _restore_course_graph_from_backup(session, course_id)
-                    session.commit()
-                    recovery_stats = {"graph_restored_from_backup": True}
-                except Exception:
-                    session.rollback()
-                    recovery_stats = await recover_existing_graph_algorithm_metrics(session, course_id)
-                batch = session.get(IngestionBatch, batch_id)
-                if batch is not None:
-                    graph_stats = {
-                        "graph_rebuilt": False,
-                        "graph_nodes": 0,
-                        "graph_edges": 0,
-                        "concepts": 0,
-                        "relations": 0,
-                        "graph_extraction_provider": graph_extraction_provider(),
-                        "graph_error": exception_message(exc),
-                        **recovery_stats,
-                    }
-                    batch.stats = {**(batch.stats or {}), **graph_stats}
-                    batch.status = "failed"
-                    batch.last_error = exception_message(exc)
-                    batch.completed_at = datetime.utcnow()
-                    batch.worker_id = None
-                    batch.heartbeat_at = None
-                    session.commit()
-                emit_ingestion_log(batch_id, "graph_failed", f"图谱重建失败：{exception_message(exc)}")
-                emit_ingestion_log(batch_id, "batch_failed", f"批次失败：{exception_message(exc)}")
-                raise
-
-        batch = session.get(IngestionBatch, batch_id)
-        if batch is None:
-            raise RuntimeError(f"Batch {batch_id} disappeared")
-        try:
-            ensure_not_cancelled(session, batch_id)
-        except IngestionCancelled:
-            session.rollback()
-            await compensate_cancelled_batch(session, batch_id)
-            return summarize_batch(session.get(IngestionBatch, batch_id))
-        batch.status = "completed"
-        batch.completed_at = datetime.utcnow()
-        batch.worker_id = None
-        batch.heartbeat_at = None
-        batch.stats = {**(batch.stats or {}), **graph_stats}
-        session.commit()
-        emit_ingestion_log(batch_id, "graph_rebuilt", f"图谱已重建：{graph_stats.get('graph_nodes', 0)} 个节点，{graph_stats.get('graph_edges', 0)} 条边", **graph_stats)
-        emit_ingestion_log(batch_id, "batch_completed", "图谱重建完成")
-        return graph_stats
-    finally:
-        if lock_acquired:
-            try:
-                release_course_graph_lock(session, course_id)
-            except Exception:
-                pass
-        session.close()
-
-
-def run_graph_rebuild_background(
-    batch_id: str,
-    course_id: str,
-    mode: str = "full",
-    run_llm_merge: bool | None = None,
-    run_hpo: bool | None = None,
-    run_community_summaries: bool | None = None,
-) -> dict:
-    """Run graph rebuild from FastAPI BackgroundTasks without blocking the API event loop."""
-    return asyncio.run(
-        run_graph_rebuild(
-            batch_id,
-            course_id,
-            mode,
-            run_llm_merge=run_llm_merge,
-            run_hpo=run_hpo,
-            run_community_summaries=run_community_summaries,
-        )
-    )
+def evidence_graph_stats_for_batch(session: Session, batch_id: str) -> dict:
+    jobs = session.scalars(select(IngestionJob).where(IngestionJob.batch_id == batch_id)).all()
+    totals = Counter()
+    signal_layer_flags: list[bool] = []
+    for job in jobs:
+        stats = job.stats or {}
+        if stats.get("evidence_atoms"):
+            signal_layer_flags.append(bool(stats.get("signal_layer_complete")))
+        for key in (
+            "evidence_atoms",
+            "evidence_edges",
+            "chunk_candidates",
+            "quality_decisions",
+            "active_chunks",
+            "community_regions",
+            "signal_candidates",
+            "signal_nodes",
+            "signal_edges",
+            "signal_communities",
+            "signal_estimated_tokens",
+        ):
+            totals[key] += int(stats.get(key) or 0)
+    return {
+        "graph_rebuilt": True,
+        "graph_runtime": "evidence_graph",
+        "graph_rebuild_mode_ignored": True,
+        "graph_nodes": totals["evidence_atoms"] + totals["active_chunks"] + totals["community_regions"] + totals["signal_nodes"],
+        "graph_edges": totals["evidence_edges"] + totals["signal_edges"],
+        "evidence_atoms": totals["evidence_atoms"],
+        "evidence_edges": totals["evidence_edges"],
+        "chunk_candidates": totals["chunk_candidates"],
+        "quality_decisions": totals["quality_decisions"],
+        "active_chunks": totals["active_chunks"],
+        "community_regions": totals["community_regions"],
+        "signal_candidates": totals["signal_candidates"],
+        "signal_nodes": totals["signal_nodes"],
+        "signal_edges": totals["signal_edges"],
+        "signal_communities": totals["signal_communities"],
+        "signal_estimated_tokens": totals["signal_estimated_tokens"],
+        "signal_layer_complete": all(signal_layer_flags) if signal_layer_flags else totals["evidence_atoms"] == 0,
+    }
 
 
 def embedding_audit_payload(provider: str, external_called: bool, fallback_reason: str | None, vector_count: int) -> dict:
@@ -625,7 +419,7 @@ def embedding_audit_payload(provider: str, external_called: bool, fallback_reaso
         "embedding_fallback_reason": fallback_reason,
         "embedding_vector_count": vector_count,
         "graph_embedding_external_called": False,
-        "graph_extraction_provider": graph_extraction_provider(),
+        "graph_runtime": "evidence_graph",
     }
 
 
@@ -643,7 +437,7 @@ def embedding_fallback_reason() -> str | None:
     return None
 
 
-def chunk_context_summary(chunk: Chunk | None, max_chars: int = 150) -> str | None:
+def chunk_context_summary(chunk: ChunkDraft | None, max_chars: int = 150) -> str | None:
     if chunk is None:
         return None
     for value in (chunk.summary, chunk.snippet, chunk.content):
@@ -658,7 +452,6 @@ def emit_model_audit_log(batch_id: str) -> None:
     embedding_provider = configured_embedding_provider()
     fallback_reason = embedding_fallback_reason()
     fallback_method = "deterministic_local_hash_embedding" if embedding_provider == "fake" else None
-    graph_provider = graph_extraction_provider()
     emit_ingestion_log(
         batch_id,
         "model_audit",
@@ -675,68 +468,92 @@ def emit_model_audit_log(batch_id: str) -> None:
         embedding_fallback_reason=fallback_reason,
         embedding_fallback_method=fallback_method,
         graph_embedding_external_called=False,
-        graph_extraction_provider=graph_provider,
-        graph_extraction_model=settings.chat_model if graph_provider == "openai_compatible_chat" else graph_provider,
+        graph_runtime="evidence_graph",
     )
 
 
-def get_course_paths(course_name: str) -> dict[str, Path]:
+def get_knowledge_base_paths(knowledge_base_name: str) -> dict[str, Path]:
     settings = get_settings()
-    return settings.course_paths_for_name(course_name)
+    return settings.knowledge_base_paths_for_name(knowledge_base_name)
 
 
-def ensure_course_directories(course_name: str) -> dict[str, Path]:
-    paths = get_course_paths(course_name)
-    for key in ("course_root", "storage_root", "ingestion_root"):
+def ensure_knowledge_base_directories(knowledge_base_name: str) -> dict[str, Path]:
+    paths = get_knowledge_base_paths(knowledge_base_name)
+    for key in ("knowledge_base_root", "storage_root", "ingestion_root"):
         paths[key].mkdir(parents=True, exist_ok=True)
     return paths
 
 
-def active_chunk_version_max(db: Session, course_id: str) -> int:
-    return db.scalar(select(func.max(Chunk.chunk_version)).where(Chunk.course_id == course_id, Chunk.is_active.is_(True))) or 0
+def active_chunk_version_max(db: Session, knowledge_base_id: str) -> int:
+    versions = [
+        int((chunk.metadata_json or {}).get("chunk_version") or 0)
+        for chunk in db.scalars(
+            select(ActiveChunk).where(ActiveChunk.knowledge_base_id == knowledge_base_id, ActiveChunk.state == "active")
+        ).all()
+    ]
+    return max(versions or [0])
 
 
-def active_chunk_count(db: Session, course_id: str) -> int:
-    return db.scalar(select(func.count(Chunk.id)).where(Chunk.course_id == course_id, Chunk.is_active.is_(True))) or 0
+def active_chunk_count(db: Session, knowledge_base_id: str) -> int:
+    return db.scalar(select(func.count(ActiveChunk.id)).where(ActiveChunk.knowledge_base_id == knowledge_base_id, ActiveChunk.state == "active")) or 0
 
 
-def sync_course_chunk_version_metadata(db: Session, course: Course) -> int:
-    max_version = active_chunk_version_max(db, course.id)
-    current = course.current_chunk_version or 0
+def active_chunks_for_document(db: Session, knowledge_base_id: str, document_id: str) -> list[ActiveChunk]:
+    return [
+        chunk
+        for chunk in db.scalars(
+            select(ActiveChunk).where(ActiveChunk.knowledge_base_id == knowledge_base_id, ActiveChunk.state == "active")
+        ).all()
+        if (chunk.metadata_json or {}).get("document_id") == document_id
+    ]
+
+
+def active_chunk_ids_for_document(db: Session, knowledge_base_id: str, document_id: str) -> list[str]:
+    return [chunk.id for chunk in active_chunks_for_document(db, knowledge_base_id, document_id)]
+
+
+def sync_knowledge_base_chunk_version_metadata(db: Session, KnowledgeBase: KnowledgeBase) -> int:
+    max_version = active_chunk_version_max(db, KnowledgeBase.id)
+    current = KnowledgeBase.current_chunk_version or 0
     if current < max_version:
-        course.current_chunk_version = max_version
+        KnowledgeBase.current_chunk_version = max_version
         db.flush()
         return max_version
     return current
 
 
-def recompute_course_chunk_version_metadata(db: Session, course: Course) -> int:
-    max_version = active_chunk_version_max(db, course.id)
-    if (course.current_chunk_version or 0) != max_version:
-        course.current_chunk_version = max_version
+def recompute_knowledge_base_chunk_version_metadata(db: Session, KnowledgeBase: KnowledgeBase) -> int:
+    max_version = active_chunk_version_max(db, KnowledgeBase.id)
+    if (KnowledgeBase.current_chunk_version or 0) != max_version:
+        KnowledgeBase.current_chunk_version = max_version
         db.flush()
     return max_version
 
 
-def summarize_course(db: Session, course: Course) -> dict:
+def summarize_knowledge_base(db: Session, KnowledgeBase: KnowledgeBase) -> dict:
     from app.services.strategy_profiles import get_active_profile_record
 
-    paths = get_course_paths(course.name)
+    paths = get_knowledge_base_paths(KnowledgeBase.name)
     storage_root = paths["storage_root"]
-    document_count = len(collect_source_documents(storage_root)) if storage_root.exists() else db.query(Document).filter(Document.course_id == course.id, Document.is_active.is_(True)).count()
-    concept_count = db.query(Concept).filter(Concept.course_id == course.id).count()
-    current_chunk_version = sync_course_chunk_version_metadata(db, course)
-    parsed_chunks = active_chunk_count(db, course.id)
-    profile = get_active_profile_record(db, course.id)
+    document_count = len(collect_source_documents(storage_root)) if storage_root.exists() else db.query(Document).filter(Document.knowledge_base_id == KnowledgeBase.id, Document.is_active.is_(True)).count()
+    evidence_atom_count = db.scalar(
+        select(func.count(EvidenceAtom.id)).where(
+            EvidenceAtom.knowledge_base_id == KnowledgeBase.id,
+            EvidenceAtom.state == "active",
+        )
+    ) or 0
+    current_chunk_version = sync_knowledge_base_chunk_version_metadata(db, KnowledgeBase)
+    parsed_chunks = active_chunk_count(db, KnowledgeBase.id)
+    profile = get_active_profile_record(db, KnowledgeBase.id)
     db.commit()
     return {
-        "id": course.id,
-        "name": course.name,
-        "description": course.description,
+        "id": KnowledgeBase.id,
+        "name": KnowledgeBase.name,
+        "description": KnowledgeBase.description,
         "source_root": str(storage_root),
         "storage_root": str(storage_root),
         "document_count": document_count,
-        "concept_count": concept_count,
+        "evidence_atom_count": evidence_atom_count,
         "current_chunk_version": current_chunk_version,
         "has_parsed_chunks": parsed_chunks > 0,
         "can_full_reparse": parsed_chunks > 0,
@@ -747,54 +564,54 @@ def summarize_course(db: Session, course: Course) -> dict:
     }
 
 
-def create_course_space(db: Session, name: str, description: str | None = None) -> Course:
+def create_knowledge_base_space(db: Session, name: str, description: str | None = None) -> KnowledgeBase:
     normalized_name = name.strip()
     if not normalized_name:
-        raise ValueError("Course name cannot be empty")
-    paths = ensure_course_directories(normalized_name)
+        raise ValueError("KnowledgeBase name cannot be empty")
+    paths = ensure_knowledge_base_directories(normalized_name)
     storage_root = paths["storage_root"]
-    course = db.scalar(select(Course).where(Course.name == normalized_name))
-    if course is None:
-        from app.services.strategy_profiles import ensure_builtin_course_profile
+    knowledge_base = db.scalar(select(KnowledgeBaseModel).where(KnowledgeBaseModel.name == normalized_name))
+    if knowledge_base is None:
+        from app.services.strategy_profiles import ensure_builtin_default_profile
 
-        profile = ensure_builtin_course_profile(db)
-        course = Course(name=normalized_name, description=description, source_root=str(storage_root), active_profile_id=profile.id)
-        db.add(course)
+        profile = ensure_builtin_default_profile(db)
+        knowledge_base = KnowledgeBaseModel(name=normalized_name, description=description, source_root=str(storage_root), active_profile_id=profile.id)
+        db.add(knowledge_base)
         db.commit()
-        db.refresh(course)
-        return course
+        db.refresh(knowledge_base)
+        return knowledge_base
     if description is not None:
-        course.description = description
-    course.source_root = str(storage_root)
+        knowledge_base.description = description
+    knowledge_base.source_root = str(storage_root)
     db.commit()
-    db.refresh(course)
-    return course
+    db.refresh(knowledge_base)
+    return knowledge_base
 
 
-def ensure_current_course(db: Session) -> Course:
+def ensure_current_knowledge_base(db: Session) -> KnowledgeBase:
     settings = get_settings()
-    return create_course_space(db, settings.course_name)
+    return create_knowledge_base_space(db, settings.knowledge_base_name)
 
 
-def resolve_course(db: Session, course_id: str | None = None) -> Course:
-    if course_id is None:
-        return ensure_current_course(db)
-    course = db.get(Course, course_id)
-    if course is None:
-        raise LookupError(f"Course not found: {course_id}")
-    paths = ensure_course_directories(course.name)
-    if course.source_root != str(paths["storage_root"]):
-        course.source_root = str(paths["storage_root"])
+def resolve_knowledge_base(db: Session, knowledge_base_id: str | None = None) -> KnowledgeBase:
+    if knowledge_base_id is None:
+        return ensure_current_knowledge_base(db)
+    knowledge_base = db.get(KnowledgeBaseModel, knowledge_base_id)
+    if knowledge_base is None:
+        raise LookupError(f"KnowledgeBase not found: {knowledge_base_id}")
+    paths = ensure_knowledge_base_directories(knowledge_base.name)
+    if knowledge_base.source_root != str(paths["storage_root"]):
+        knowledge_base.source_root = str(paths["storage_root"])
         db.commit()
-        db.refresh(course)
-    return course
+        db.refresh(knowledge_base)
+    return knowledge_base
 
 
-def list_course_summaries(db: Session) -> list[dict]:
-    courses = db.scalars(select(Course).order_by(Course.created_at.asc())).all()
-    if not courses:
-        courses = [ensure_current_course(db)]
-    return [summarize_course(db, course) for course in courses]
+def list_knowledge_base_summaries(db: Session) -> list[dict]:
+    knowledge_bases = db.scalars(select(KnowledgeBase).order_by(KnowledgeBase.created_at.asc())).all()
+    if not knowledge_bases:
+        knowledge_bases = [ensure_current_knowledge_base(db)]
+    return [summarize_knowledge_base(db, KnowledgeBase) for KnowledgeBase in knowledge_bases]
 
 
 def should_include_source(path: Path) -> bool:
@@ -813,14 +630,14 @@ def collect_source_documents(root: Path) -> list[Path]:
 
 def create_job(
     db: Session,
-    course_id: str,
+    knowledge_base_id: str,
     document_id: str | None,
     trigger_source: str,
     batch_id: str | None = None,
     source_path: str | None = None,
 ) -> IngestionJob:
     job = IngestionJob(
-        course_id=course_id,
+        knowledge_base_id=knowledge_base_id,
         document_id=document_id,
         batch_id=batch_id,
         source_path=source_path,
@@ -849,23 +666,23 @@ def set_job_state(db: Session, job: IngestionJob, state: str, *, error: str | No
         emit_ingestion_log(batch_id, "job_state", f"{Path(job.source_path or '').name or job.id}：{state_label(state)}", job_id=job.id, source_path=job.source_path, state=state)
 
 
-def create_sync_batch(db: Session, course_id: str, root: Path, trigger_source: str = "sync") -> IngestionBatch:
-    active = active_batch_for_course(db, course_id)
+def create_sync_batch(db: Session, knowledge_base_id: str, root: Path, trigger_source: str = "sync") -> IngestionBatch:
+    active = active_batch_for_knowledge_base(db, knowledge_base_id)
     if active is not None:
         return active
-    batch = IngestionBatch(course_id=course_id, source_root=str(root), trigger_source=trigger_source, status="queued")
+    batch = IngestionBatch(knowledge_base_id=knowledge_base_id, source_root=str(root), trigger_source=trigger_source, status="queued")
     db.add(batch)
     db.commit()
     db.refresh(batch)
     return batch
 
 
-def create_uploaded_files_batch(db: Session, course_id: str, files: list[Path], force: bool = False, rebuild_graph_mode: str = "none", full_reparse: bool = False) -> IngestionBatch:
-    active = active_batch_for_course(db, course_id)
+def create_uploaded_files_batch(db: Session, knowledge_base_id: str, files: list[Path], force: bool = False, full_reparse: bool = False) -> IngestionBatch:
+    active = active_batch_for_knowledge_base(db, knowledge_base_id)
     if active is not None:
         return active
     storage_batch_root = str(files[0].parent) if files else "storage files"
-    batch = IngestionBatch(course_id=course_id, source_root=storage_batch_root, trigger_source="upload", status="queued")
+    batch = IngestionBatch(knowledge_base_id=knowledge_base_id, source_root=storage_batch_root, trigger_source="upload", status="queued")
     batch.total_files = len(files)
     batch.stats = {
         "uploaded_files": [str(path) for path in files],
@@ -873,7 +690,7 @@ def create_uploaded_files_batch(db: Session, course_id: str, files: list[Path], 
         "errors": [],
         "force": force,
         "full_reparse": full_reparse,
-        "rebuild_graph_mode": rebuild_graph_mode,
+        "graph_runtime": "evidence_graph",
         "phase": "parsing",
         "parse_committed": False,
     }
@@ -882,15 +699,15 @@ def create_uploaded_files_batch(db: Session, course_id: str, files: list[Path], 
     if force:
         for path in files:
             path_string = str(path)
-            document = db.scalar(select(Document).where(Document.course_id == course_id, Document.source_path == path_string))
+            document = db.scalar(select(Document).where(Document.knowledge_base_id == knowledge_base_id, Document.source_path == path_string))
             job = db.scalar(
                 select(IngestionJob)
-                .where(IngestionJob.course_id == course_id, IngestionJob.source_path == path_string)
+                .where(IngestionJob.knowledge_base_id == knowledge_base_id, IngestionJob.source_path == path_string)
                 .order_by(IngestionJob.updated_at.desc())
             )
             if job is None:
                 job = IngestionJob(
-                    course_id=course_id,
+                    knowledge_base_id=knowledge_base_id,
                     document_id=document.id if document else None,
                     batch_id=batch.id,
                     source_path=path_string,
@@ -912,16 +729,16 @@ def create_uploaded_files_batch(db: Session, course_id: str, files: list[Path], 
     return batch
 
 
-def register_uploaded_file(db: Session, course: Course, source_path: Path) -> tuple[Document, IngestionJob]:
+def register_uploaded_file(db: Session, KnowledgeBase: KnowledgeBase, source_path: Path) -> tuple[Document, IngestionJob]:
     checksum = compute_checksum(source_path)
     document = db.scalar(
         select(Document)
-        .where(Document.course_id == course.id, Document.source_path == str(source_path))
+        .where(Document.knowledge_base_id == KnowledgeBase.id, Document.source_path == str(source_path))
         .with_for_update()
     )
     if document is None:
         document = Document(
-            course_id=course.id,
+            knowledge_base_id=KnowledgeBase.id,
             title=source_path.stem,
             source_path=str(source_path),
             source_type=source_type_from_path(source_path),
@@ -940,13 +757,13 @@ def register_uploaded_file(db: Session, course: Course, source_path: Path) -> tu
 
     job = db.scalar(
         select(IngestionJob)
-        .where(IngestionJob.course_id == course.id, IngestionJob.source_path == str(source_path))
+        .where(IngestionJob.knowledge_base_id == KnowledgeBase.id, IngestionJob.source_path == str(source_path))
         .order_by(IngestionJob.updated_at.desc())
         .with_for_update()
     )
     if job is None or job.status not in {"queued", "failed", "skipped"}:
         job = IngestionJob(
-            course_id=course.id,
+            knowledge_base_id=KnowledgeBase.id,
             document_id=document.id,
             source_path=str(source_path),
             trigger_source="upload",
@@ -969,7 +786,9 @@ def summarize_batch(batch: IngestionBatch) -> dict:
     graph_stats = {
         key: value
         for key, value in stats.items()
-        if key.startswith("graph_") or key in {"concepts", "relations"}
+        if key.startswith("graph_")
+        or key.startswith("signal_")
+        or key in {"evidence_atoms", "evidence_edges", "active_chunks", "chunk_candidates", "quality_decisions", "community_regions"}
     }
     return {
         "batch_id": batch.id,
@@ -1001,8 +820,8 @@ def get_batch_status(db: Session, batch_id: str) -> dict | None:
     return summarize_batch(batch)
 
 
-def remember_pre_batch_version(db: Session, job: IngestionJob, course_id: str, source_path: Path) -> None:
-    document = db.scalar(select(Document).where(Document.course_id == course_id, Document.source_path == str(source_path)))
+def remember_pre_batch_version(db: Session, job: IngestionJob, knowledge_base_id: str, source_path: Path) -> None:
+    document = db.scalar(select(Document).where(Document.knowledge_base_id == knowledge_base_id, Document.source_path == str(source_path)))
     active_version = None
     if document is not None:
         active_version = db.scalar(
@@ -1019,14 +838,12 @@ def remember_pre_batch_version(db: Session, job: IngestionJob, course_id: str, s
     db.commit()
 
 
-def request_batch_cancel(db: Session, batch_id: str, course_id: str) -> dict | None:
-    from app.models import GraphExtractionChunkTask, GraphExtractionRun
-
+def request_batch_cancel(db: Session, batch_id: str, knowledge_base_id: str) -> dict | None:
     batch = db.get(IngestionBatch, batch_id)
     if batch is None:
         return None
-    if not course_id or batch.course_id != course_id:
-        raise PermissionError("Batch does not belong to the requested course")
+    if not knowledge_base_id or batch.knowledge_base_id != knowledge_base_id:
+        raise PermissionError("Batch does not belong to the requested KnowledgeBase")
     if batch.status in TERMINAL_STATES:
         return summarize_batch(batch)
     batch.status = CANCEL_REQUESTED
@@ -1043,35 +860,15 @@ def request_batch_cancel(db: Session, batch_id: str, course_id: str) -> dict | N
     for job in jobs:
         job.status = CANCEL_REQUESTED
         job.error_message = batch.last_error
-    active_runs = db.scalars(
-        select(GraphExtractionRun).where(
-            GraphExtractionRun.batch_id == batch.id,
-            GraphExtractionRun.status.notin_(TERMINAL_STATES),
-        )
-    ).all()
-    for run in active_runs:
-        run.status = CANCELLED
-        run.error_message = batch.last_error
-        run.completed_at = datetime.utcnow()
-        run.stats_json = {
-            **(run.stats_json or {}),
-            "cancel_requested": True,
-            "cancelled": True,
-            "cancelled_at": datetime.utcnow().isoformat(),
-        }
-        db.query(GraphExtractionChunkTask).filter(
-            GraphExtractionChunkTask.run_id == run.id,
-            GraphExtractionChunkTask.status.notin_(TERMINAL_STATES),
-        ).update({"status": CANCELLED, "error_message": batch.last_error}, synchronize_session=False)
     db.commit()
     emit_ingestion_log(batch.id, "batch_cancel_requested", "已收到取消请求，正在停止后续步骤并清理本批次写入", state=CANCEL_REQUESTED)
     return summarize_batch(batch)
 
 
-async def request_batch_cancel_control(db: Session, batch_id: str, course_id: str) -> dict | None:
+async def request_batch_cancel_control(db: Session, batch_id: str, knowledge_base_id: str) -> dict | None:
     """Request cancellation and finish safe control-plane cancellations immediately."""
 
-    summary = request_batch_cancel(db, batch_id, course_id)
+    summary = request_batch_cancel(db, batch_id, knowledge_base_id)
     if summary is None:
         return None
     batch = db.get(IngestionBatch, batch_id)
@@ -1094,40 +891,23 @@ async def compensate_cancelled_batch(db: Session, batch_id: str, *, reason: str 
     batch = db.get(IngestionBatch, batch_id)
     if batch is None:
         return {"cancelled": False, "reason": "batch_missing"}
-    course = db.get(Course, batch.course_id)
-    if course is None:
+    KnowledgeBase = db.get(KnowledgeBaseModel, batch.knowledge_base_id)
+    if KnowledgeBase is None:
         batch.status = CANCELLED
         batch.completed_at = datetime.utcnow()
         batch.last_error = "用户取消；课程已不存在"
         db.commit()
-        return {"cancelled": True, "reason": "course_missing"}
+        return {"cancelled": True, "reason": "knowledge_base_missing"}
 
     stats = dict(batch.stats or {})
     batch.status = "compensating"
     batch.stats = {**stats, "cancel_requested": True, "cancellation_status": "compensating"}
     db.commit()
     stats = dict(batch.stats or {})
-    if stats.get("phase") == "graph" and stats.get("parse_committed"):
-        from app.models import GraphExtractionChunkTask, GraphExtractionRun
-        from app.services.concept_graph import _restore_course_graph_from_backup
-
-        graph_restored = False
-        try:
-            _restore_course_graph_from_backup(db, batch.course_id)
-            graph_restored = True
-        except Exception as exc:
-            db.rollback()
-            emit_ingestion_log(batch_id, "batch_cancel_compensation_warning", f"Graph restore after cancellation failed: {exc}", error=str(exc))
-        db.query(GraphExtractionRun).filter(GraphExtractionRun.batch_id == batch_id, GraphExtractionRun.status.notin_(TERMINAL_STATES)).update(
-            {"status": CANCELLED, "error_message": reason, "completed_at": datetime.utcnow()},
-            synchronize_session=False,
-        )
-        run_ids = [run_id for (run_id,) in db.query(GraphExtractionRun.id).filter(GraphExtractionRun.batch_id == batch_id).all()]
-        if run_ids:
-            db.query(GraphExtractionChunkTask).filter(
-                GraphExtractionChunkTask.run_id.in_(run_ids),
-                GraphExtractionChunkTask.status.notin_(TERMINAL_STATES),
-            ).update({"status": CANCELLED, "error_message": reason}, synchronize_session=False)
+    phase = str(stats.get("phase") or "")
+    parse_committed = bool(stats.get("parse_committed"))
+    derived_phases = {"graph", "evidence_graph", "global_graph", "chunk_quality", "vector_index", "embedding"}
+    if parse_committed and phase in derived_phases:
         batch.status = CANCELLED
         batch.completed_at = datetime.utcnow()
         batch.last_error = reason
@@ -1135,33 +915,34 @@ async def compensate_cancelled_batch(db: Session, batch_id: str, *, reason: str 
         batch.heartbeat_at = None
         compensation_stats = {
             "cancelled": True,
-            "phase": "graph",
+            "phase": phase,
             "parse_committed": True,
             "cancellation_status": "cancelled",
-            "graph_restored_from_backup": graph_restored,
+            "evidence_graph_retained": phase in {"graph", "evidence_graph", "global_graph", "chunk_quality"},
+            "vector_compensation_required": phase in {"vector_index", "embedding"},
             "parse_rollback_skipped": True,
         }
         batch.stats = {**stats, "cancel_requested": True, **compensation_stats}
         db.commit()
-        emit_ingestion_log(batch_id, "batch_cancelled", "Graph phase cancelled; parsing results were preserved and graph state was restored", state=CANCELLED, **compensation_stats)
+        emit_ingestion_log(batch_id, "batch_cancelled", "Derived ingestion phase cancelled; parsing results were preserved", state=CANCELLED, **compensation_stats)
         return compensation_stats
     restored_versions = 0
     deactivated_versions = 0
     deactivated_chunks = 0
     deleted_vectors = 0
     restored_vectors = 0
-    graph_relations_removed = 0
+    vector_records_removed = 0
+    evidence_atoms_removed = 0
+    evidence_graph_states_removed = 0
     started_at = batch.started_at or batch.created_at
-    vector_store = VectorStore(course_name=course.name)
+    vector_store = VectorStore(knowledge_base_name=KnowledgeBase.name)
     jobs = db.scalars(select(IngestionJob).where(IngestionJob.batch_id == batch_id)).all()
-
-    from app.models import ConceptRelation, EntityMention, GraphExtractionChunkTask, GraphExtractionRun, GraphRelationCandidate
 
     for job in jobs:
         job_stats = dict(job.stats or {})
         document = db.get(Document, job.document_id) if job.document_id else None
         if document is None and job.source_path:
-            document = db.scalar(select(Document).where(Document.course_id == batch.course_id, Document.source_path == job.source_path))
+            document = db.scalar(select(Document).where(Document.knowledge_base_id == batch.knowledge_base_id, Document.source_path == job.source_path))
         if document is None:
             job.status = CANCELLED
             job.error_message = reason
@@ -1176,41 +957,42 @@ async def compensate_cancelled_batch(db: Session, batch_id: str, *, reason: str 
             )
         ).all()
         new_version_ids = [version.id for version in new_versions]
-        # Collect new chunks by version OR by creation time (covers version-reuse scenario)
-        new_chunk_ids = list(
-            {
-                chunk_id
-                for (chunk_id,) in db.query(Chunk.id)
-                .filter(
-                    Chunk.document_id == document.id,
-                    Chunk.document_version_id.in_(new_version_ids),
+        new_chunk_ids = [
+            chunk.id
+            for chunk in db.scalars(
+                select(ActiveChunk).where(
+                    ActiveChunk.knowledge_base_id == batch.knowledge_base_id,
+                    ActiveChunk.created_at >= started_at,
                 )
-                .all()
-            }
-            | {
-                chunk_id
-                for (chunk_id,) in db.query(Chunk.id)
-                .filter(
-                    Chunk.document_id == document.id,
-                    Chunk.created_at >= started_at,
-                )
-                .all()
-            }
-        )
+            ).all()
+            if (chunk.metadata_json or {}).get("document_id") == document.id
+            or (chunk.metadata_json or {}).get("document_version_id") in new_version_ids
+        ]
 
         if new_chunk_ids:
-            graph_relations_removed += db.query(ConceptRelation).filter(ConceptRelation.evidence_chunk_id.in_(new_chunk_ids)).delete(synchronize_session=False)
-            db.query(EntityMention).filter(EntityMention.chunk_id.in_(new_chunk_ids)).delete(synchronize_session=False)
-            db.query(GraphRelationCandidate).filter(GraphRelationCandidate.evidence_chunk_id.in_(new_chunk_ids)).delete(synchronize_session=False)
-            db.query(GraphExtractionChunkTask).filter(GraphExtractionChunkTask.chunk_id.in_(new_chunk_ids)).update({"status": CANCELLED}, synchronize_session=False)
+            vector_records_removed += db.query(VectorRecord).filter(VectorRecord.active_chunk_id.in_(new_chunk_ids)).delete(synchronize_session=False)
             try:
                 await vector_store.async_delete(new_chunk_ids)
                 deleted_vectors += len(new_chunk_ids)
             except Exception as exc:
                 emit_ingestion_log(batch_id, "batch_cancel_compensation_warning", f"取消清理新向量失败：{exc}", error=str(exc))
-            deactivated_chunks += db.query(Chunk).filter(Chunk.id.in_(new_chunk_ids)).update({"is_active": False}, synchronize_session=False)
+            deactivated_chunks += db.query(ActiveChunk).filter(ActiveChunk.id.in_(new_chunk_ids)).update({"state": "inactive"}, synchronize_session=False)
 
         if new_version_ids:
+            new_version_id_set = set(new_version_ids)
+            graph_state_ids = [
+                state.id
+                for state in db.scalars(
+                    select(EvidenceGraphState).where(
+                        EvidenceGraphState.knowledge_base_id == batch.knowledge_base_id,
+                        EvidenceGraphState.created_at >= started_at,
+                    )
+                ).all()
+                if new_version_id_set.intersection(set(state.active_document_version_ids or []))
+            ]
+            if graph_state_ids:
+                evidence_graph_states_removed += db.query(EvidenceGraphState).filter(EvidenceGraphState.id.in_(graph_state_ids)).delete(synchronize_session=False)
+            evidence_atoms_removed += db.query(EvidenceAtom).filter(EvidenceAtom.document_version_id.in_(new_version_ids)).delete(synchronize_session=False)
             deactivated_versions += db.query(DocumentVersion).filter(DocumentVersion.id.in_(new_version_ids)).update({"is_active": False}, synchronize_session=False)
 
         if previous_version_id:
@@ -1219,16 +1001,17 @@ async def compensate_cancelled_batch(db: Session, batch_id: str, *, reason: str 
                 previous_version.is_active = True
                 restored_versions += 1
                 previous_chunk_ids = [
-                    chunk_id
-                    for (chunk_id,) in db.query(Chunk.id)
-                    .filter(
-                        Chunk.document_version_id == previous_version_id,
-                        Chunk.created_at < started_at,
-                    )
-                    .all()
+                    chunk.id
+                    for chunk in db.scalars(
+                        select(ActiveChunk).where(
+                            ActiveChunk.knowledge_base_id == batch.knowledge_base_id,
+                            ActiveChunk.created_at < started_at,
+                        )
+                    ).all()
+                    if (chunk.metadata_json or {}).get("document_version_id") == previous_version_id
                 ]
                 if previous_chunk_ids:
-                    db.query(Chunk).filter(Chunk.id.in_(previous_chunk_ids)).update({"is_active": True}, synchronize_session=False)
+                    db.query(ActiveChunk).filter(ActiveChunk.id.in_(previous_chunk_ids)).update({"state": "active"}, synchronize_session=False)
                     for log in db.scalars(
                         select(IngestionCompensationLog).where(
                             IngestionCompensationLog.job_id == job.id,
@@ -1256,16 +1039,12 @@ async def compensate_cancelled_batch(db: Session, batch_id: str, *, reason: str 
         job.error_message = reason
         job.stats = {**job_stats, "cancelled": True, "cancelled_at": datetime.utcnow().isoformat()}
 
-    db.query(GraphExtractionRun).filter(GraphExtractionRun.batch_id == batch_id, GraphExtractionRun.status.notin_(TERMINAL_STATES)).update(
-        {"status": CANCELLED, "error_message": reason, "completed_at": datetime.utcnow()},
-        synchronize_session=False,
-    )
     batch.status = CANCELLED
     batch.completed_at = datetime.utcnow()
     batch.last_error = reason
     batch.worker_id = None
     batch.heartbeat_at = None
-    recompute_course_chunk_version_metadata(db, course)
+    recompute_knowledge_base_chunk_version_metadata(db, KnowledgeBase)
     compensation_stats = {
         "cancelled": True,
         "cancellation_status": "cancelled",
@@ -1274,7 +1053,9 @@ async def compensate_cancelled_batch(db: Session, batch_id: str, *, reason: str 
         "deactivated_chunks": deactivated_chunks,
         "deleted_vectors": deleted_vectors,
         "restored_vectors": restored_vectors,
-        "removed_graph_relations": graph_relations_removed,
+        "removed_vector_records": vector_records_removed,
+        "removed_evidence_atoms": evidence_atoms_removed,
+        "removed_evidence_graph_states": evidence_graph_states_removed,
     }
     batch.stats = {**stats, "cancel_requested": True, **compensation_stats}
     db.commit()
@@ -1289,6 +1070,12 @@ def finalize_interrupted_batches() -> int:
     now = datetime.utcnow()
     with SessionLocal() as session:
         process_pending_vector_compensations(session)
+        try:
+            from app.services.maintenance import reconcile_vector_store_orphans
+
+            reconcile_stats = reconcile_vector_store_orphans(session)
+        except Exception as exc:
+            reconcile_stats = {"error": str(exc)}
         batches = session.scalars(select(IngestionBatch).where(IngestionBatch.status.notin_(TERMINAL_STATES))).all()
         for batch in batches:
             batch.status = "failed"
@@ -1313,29 +1100,31 @@ def finalize_interrupted_batches() -> int:
             "API 进程重启，批次尚未到达终态，已标记失败",
             state="failed",
         )
+    if reconcile_stats.get("deleted_orphan_points") or reconcile_stats.get("error"):
+        emit_ingestion_log(
+            None,
+            "startup_vector_reconcile",
+            "Startup vector reconciliation completed",
+            **reconcile_stats,
+        )
     return len(finalized)
 
 
-def remove_course_file(db: Session, course: Course, source_path: str) -> bool:
-    document = db.scalar(select(Document).where(Document.course_id == course.id, Document.source_path == source_path))
-    jobs = db.scalars(select(IngestionJob).where(IngestionJob.course_id == course.id, IngestionJob.source_path == source_path)).all()
+def remove_knowledge_base_file(db: Session, KnowledgeBase: KnowledgeBase, source_path: str) -> bool:
+    document = db.scalar(select(Document).where(Document.knowledge_base_id == KnowledgeBase.id, Document.source_path == source_path))
+    jobs = db.scalars(select(IngestionJob).where(IngestionJob.knowledge_base_id == KnowledgeBase.id, IngestionJob.source_path == source_path)).all()
     removed = False
     file_to_delete: Path | None = None
 
     if document is not None:
         document.is_active = False
-        # Collect chunk IDs for Qdrant vector cleanup (P1-11)
-        stale_chunk_ids = [
-            chunk_id
-            for (chunk_id,) in db.query(Chunk.id)
-            .filter(Chunk.document_id == document.id, Chunk.is_active.is_(True))
-            .all()
-        ]
+        stale_chunk_ids = active_chunk_ids_for_document(db, KnowledgeBase.id, document.id)
         db.query(DocumentVersion).filter(DocumentVersion.document_id == document.id).update({"is_active": False})
-        db.query(Chunk).filter(Chunk.document_id == document.id).update({"is_active": False})
+        if stale_chunk_ids:
+            db.query(ActiveChunk).filter(ActiveChunk.id.in_(stale_chunk_ids)).update({"state": "inactive"}, synchronize_session=False)
         from app.services.maintenance import delete_document_graph_incremental
 
-        delete_document_graph_incremental(db, course.id, document.id)
+        delete_document_graph_incremental(db, KnowledgeBase.id, document.id)
         removed = True
 
     for job in jobs:
@@ -1347,7 +1136,7 @@ def remove_course_file(db: Session, course: Course, source_path: str) -> bool:
 
     if not jobs:
         tombstone = IngestionJob(
-            course_id=course.id,
+            knowledge_base_id=KnowledgeBase.id,
             document_id=document.id if document else None,
             source_path=source_path,
             trigger_source="remove",
@@ -1358,8 +1147,8 @@ def remove_course_file(db: Session, course: Course, source_path: str) -> bool:
         db.add(tombstone)
         removed = True
 
-    course_paths = get_course_paths(course.name)
-    storage_root = course_paths["storage_root"].resolve()
+    knowledge_base_paths = get_knowledge_base_paths(KnowledgeBase.name)
+    storage_root = knowledge_base_paths["storage_root"].resolve()
     resolved_path = Path(source_path).resolve()
     if resolved_path.exists() and resolved_path.is_file() and (resolved_path == storage_root or storage_root in resolved_path.parents):
         file_to_delete = resolved_path
@@ -1371,10 +1160,10 @@ def remove_course_file(db: Session, course: Course, source_path: str) -> bool:
         if document is not None and stale_chunk_ids:
             delete_log = None
             try:
-                vector_store = VectorStore(course_name=course.name)
+                vector_store = VectorStore(knowledge_base_name=KnowledgeBase.name)
                 delete_log = create_vector_compensation_log(
                     db,
-                    course_id=course.id,
+                    knowledge_base_id=KnowledgeBase.id,
                     job_id=None,
                     operation="delete",
                     vector_ids=stale_chunk_ids,
@@ -1394,7 +1183,7 @@ def remove_course_file(db: Session, course: Course, source_path: str) -> bool:
 
 def create_or_update_document(
     db: Session,
-    course: Course,
+    KnowledgeBase: KnowledgeBase,
     source_path: Path,
     title: str,
     source_type: str,
@@ -1406,18 +1195,18 @@ def create_or_update_document(
 ) -> tuple[Document, int, list[str]]:
     """Create or update a document.
 
-    Chunk version is course-scoped. Only an empty library first parse or a full
+    Active chunk version is KnowledgeBase-scoped. Only an empty library first parse or a full
     reparse target creates a new version; selected parses align to the current
-    course version.
+    KnowledgeBase version.
     """
-    document = db.scalar(select(Document).where(Document.course_id == course.id, Document.source_path == str(source_path)))
+    document = db.scalar(select(Document).where(Document.knowledge_base_id == KnowledgeBase.id, Document.source_path == str(source_path)))
     stale_chunk_ids: list[str] = []
-    course_current_version = sync_course_chunk_version_metadata(db, course)
-    version_number = target_version if target_version is not None else (course_current_version if course_current_version > 0 else 1)
+    knowledge_base_current_version = sync_knowledge_base_chunk_version_metadata(db, KnowledgeBase)
+    version_number = target_version if target_version is not None else (knowledge_base_current_version if knowledge_base_current_version > 0 else 1)
 
     if document is None:
         document = Document(
-            course_id=course.id,
+            knowledge_base_id=KnowledgeBase.id,
             title=title,
             source_path=str(source_path),
             source_type=source_type,
@@ -1431,12 +1220,7 @@ def create_or_update_document(
         return document, version_number, stale_chunk_ids
 
     # Document exists
-    stale_chunk_ids = [
-        chunk_id
-        for (chunk_id,) in db.query(Chunk.id)
-        .filter(Chunk.document_id == document.id, Chunk.is_active.is_(True))
-        .all()
-    ]
+    stale_chunk_ids = active_chunk_ids_for_document(db, KnowledgeBase.id, document.id)
     document.is_active = True
     document.title = title
     document.source_type = source_type
@@ -1451,11 +1235,11 @@ def document_dedup_key(title: str, checksum: str) -> tuple[str, str]:
     return normalize_for_dedup(title), checksum
 
 
-def find_duplicate_document(db: Session, course_id: str, title: str, checksum: str, source_path: Path) -> Document | None:
+def find_duplicate_document(db: Session, knowledge_base_id: str, title: str, checksum: str, source_path: Path) -> Document | None:
     normalized_title, checksum_value = document_dedup_key(title, checksum)
     candidates = db.scalars(
         select(Document).where(
-            Document.course_id == course_id,
+            Document.knowledge_base_id == knowledge_base_id,
             Document.checksum == checksum_value,
             Document.is_active.is_(True),
         )
@@ -1471,7 +1255,7 @@ def find_duplicate_document(db: Session, course_id: str, title: str, checksum: s
 
 def deactivate_duplicate_documents(
     db: Session,
-    course_id: str,
+    knowledge_base_id: str,
     canonical_document_id: str,
     title: str,
     checksum: str,
@@ -1481,7 +1265,7 @@ def deactivate_duplicate_documents(
     source_path_string = str(source_path)
     candidates = db.scalars(
         select(Document).where(
-            Document.course_id == course_id,
+            Document.knowledge_base_id == knowledge_base_id,
             Document.id != canonical_document_id,
             Document.is_active.is_(True),
         )
@@ -1492,15 +1276,11 @@ def deactivate_duplicate_documents(
         same_content = document.checksum == checksum_value and normalize_for_dedup(document.title) == normalized_title
         if not same_file and not same_content:
             continue
-        stale_chunk_ids.extend(
-            chunk_id
-            for (chunk_id,) in db.query(Chunk.id)
-            .filter(Chunk.document_id == document.id, Chunk.is_active.is_(True))
-            .all()
-        )
+        stale_chunk_ids.extend(active_chunk_ids_for_document(db, knowledge_base_id, document.id))
         document.is_active = False
         db.query(DocumentVersion).filter(DocumentVersion.document_id == document.id).update({"is_active": False}, synchronize_session=False)
-        db.query(Chunk).filter(Chunk.document_id == document.id).update({"is_active": False}, synchronize_session=False)
+        if stale_chunk_ids:
+            db.query(ActiveChunk).filter(ActiveChunk.id.in_(stale_chunk_ids)).update({"state": "inactive"}, synchronize_session=False)
     db.flush()
     return stale_chunk_ids
 
@@ -1510,26 +1290,24 @@ def chunk_content_hash(content: str, is_parent: bool = False) -> str:
     return hashlib.sha256((prefix + normalize_for_dedup(content)).encode("utf-8", errors="ignore")).hexdigest()
 
 
-def active_chunk_hashes_for_course(
+def active_chunk_hashes_for_knowledge_base(
     db: Session,
-    course_id: str,
+    knowledge_base_id: str,
     excluded_document_id: str | None = None,
     minimum_chunk_version: int | None = None,
 ) -> set[str]:
-    query = select(Chunk.content, Chunk.metadata_json).where(Chunk.course_id == course_id, Chunk.is_active.is_(True))
-    if excluded_document_id:
-        query = query.where(Chunk.document_id != excluded_document_id)
-    if minimum_chunk_version is not None:
-        query = query.where(Chunk.chunk_version >= minimum_chunk_version)
+    chunks = db.scalars(select(ActiveChunk).where(ActiveChunk.knowledge_base_id == knowledge_base_id, ActiveChunk.state == "active")).all()
     return {
-        chunk_content_hash(content, bool(metadata.get("is_parent")))
-        for content, metadata in db.execute(query).all()
+        chunk_content_hash(chunk.text, bool((chunk.metadata_json or {}).get("is_parent")))
+        for chunk in chunks
+        if (not excluded_document_id or (chunk.metadata_json or {}).get("document_id") != excluded_document_id)
+        and (minimum_chunk_version is None or int((chunk.metadata_json or {}).get("chunk_version") or 0) >= minimum_chunk_version)
     }
 
 
 def deactivate_superseded_duplicate_documents_by_chunks(
     db: Session,
-    course_id: str,
+    knowledge_base_id: str,
     canonical_document_id: str,
     title: str,
     replacement_chunk_hashes: set[str],
@@ -1541,7 +1319,7 @@ def deactivate_superseded_duplicate_documents_by_chunks(
     normalized_title = normalize_for_dedup(title)
     candidates = db.scalars(
         select(Document).where(
-            Document.course_id == course_id,
+            Document.knowledge_base_id == knowledge_base_id,
             Document.id != canonical_document_id,
             Document.is_active.is_(True),
         )
@@ -1550,26 +1328,21 @@ def deactivate_superseded_duplicate_documents_by_chunks(
     for document in candidates:
         if normalize_for_dedup(document.title) != normalized_title:
             continue
-        active_chunks = db.execute(
-            select(Chunk.id, Chunk.content, Chunk.metadata_json, Chunk.chunk_version).where(
-                Chunk.document_id == document.id,
-                Chunk.is_active.is_(True),
-            )
-        ).all()
+        active_chunks = active_chunks_for_document(db, knowledge_base_id, document.id)
         if not active_chunks:
             continue
-        if any((chunk_version or 0) >= target_version for _chunk_id, _content, _metadata, chunk_version in active_chunks):
+        if any(int((chunk.metadata_json or {}).get("chunk_version") or 0) >= target_version for chunk in active_chunks):
             continue
         candidate_hashes = {
-            chunk_content_hash(content, bool((metadata or {}).get("is_parent")))
-            for _chunk_id, content, metadata, _chunk_version in active_chunks
+            chunk_content_hash(chunk.text, bool((chunk.metadata_json or {}).get("is_parent")))
+            for chunk in active_chunks
         }
         if not candidate_hashes.issubset(replacement_chunk_hashes):
             continue
-        stale_chunk_ids.extend(chunk_id for chunk_id, _content, _metadata, _chunk_version in active_chunks)
+        stale_chunk_ids.extend(chunk.id for chunk in active_chunks)
         document.is_active = False
         db.query(DocumentVersion).filter(DocumentVersion.document_id == document.id).update({"is_active": False}, synchronize_session=False)
-        db.query(Chunk).filter(Chunk.document_id == document.id).update({"is_active": False}, synchronize_session=False)
+        db.query(ActiveChunk).filter(ActiveChunk.id.in_([chunk.id for chunk in active_chunks])).update({"state": "inactive"}, synchronize_session=False)
     db.flush()
     return stale_chunk_ids
 
@@ -1580,11 +1353,12 @@ async def ingest_file(
     trigger_source: str = "upload",
     existing_job_id: str | None = None,
     batch_id: str | None = None,
-    course_id: str | None = None,
+    knowledge_base_id: str | None = None,
     rebuild_graph: bool = True,
     force: bool = False,
     target_version: int | None = None,
 ) -> dict:
+    refresh_runtime_settings_if_needed()
     async with source_path_lock(source_path):
         return await _ingest_file_locked(
             db=db,
@@ -1592,7 +1366,7 @@ async def ingest_file(
             trigger_source=trigger_source,
             existing_job_id=existing_job_id,
             batch_id=batch_id,
-            course_id=course_id,
+            knowledge_base_id=knowledge_base_id,
             rebuild_graph=rebuild_graph,
             force=force,
             target_version=target_version,
@@ -1605,19 +1379,19 @@ async def _ingest_file_locked(
     trigger_source: str = "upload",
     existing_job_id: str | None = None,
     batch_id: str | None = None,
-    course_id: str | None = None,
+    knowledge_base_id: str | None = None,
     rebuild_graph: bool = True,
     force: bool = False,
     target_version: int | None = None,
 ) -> dict:
     job = db.get(IngestionJob, existing_job_id) if existing_job_id else None
-    course = resolve_course(db, job.course_id if job is not None else course_id)
-    strategy_profile = get_active_profile_record(db, course.id)
-    course_paths = get_course_paths(course.name)
+    KnowledgeBase = resolve_knowledge_base(db, job.knowledge_base_id if job is not None else knowledge_base_id)
+    strategy_profile = get_active_profile_record(db, KnowledgeBase.id)
+    knowledge_base_paths = get_knowledge_base_paths(KnowledgeBase.name)
     checksum = compute_checksum(source_path)
     source_title = source_path.stem
-    duplicate_document = find_duplicate_document(db, course.id, source_title, checksum, source_path)
-    existing_document = db.scalar(select(Document).where(Document.course_id == course.id, Document.source_path == str(source_path)))
+    duplicate_document = find_duplicate_document(db, KnowledgeBase.id, source_title, checksum, source_path)
+    existing_document = db.scalar(select(Document).where(Document.knowledge_base_id == KnowledgeBase.id, Document.source_path == str(source_path)))
     if duplicate_document is not None and force and existing_document is None:
         duplicate_document.source_path = str(source_path)
         duplicate_document.title = source_title
@@ -1633,9 +1407,9 @@ async def _ingest_file_locked(
         )
 
     if job is None:
-        job = create_job(db, course.id, existing_document.id if existing_document else None, trigger_source, batch_id=batch_id, source_path=str(source_path))
+        job = create_job(db, KnowledgeBase.id, existing_document.id if existing_document else None, trigger_source, batch_id=batch_id, source_path=str(source_path))
     else:
-        job.course_id = course.id
+        job.knowledge_base_id = KnowledgeBase.id
         job.batch_id = batch_id
         job.source_path = str(source_path)
         job.trigger_source = trigger_source
@@ -1646,9 +1420,9 @@ async def _ingest_file_locked(
         job.status = "skipped"
         job.error_message = None
         job.stats = {
-            "chunks": 0,
-            "concepts": 0,
-            "relations": 0,
+            "active_chunks": 0,
+            "evidence_atoms": 0,
+            "evidence_edges": 0,
             "source_type": duplicate_document.source_type,
             "graph_rebuilt": False,
             "deduplicated_document": True,
@@ -1666,13 +1440,13 @@ async def _ingest_file_locked(
         }
 
     if active_version and active_version.checksum == checksum and not force:
-        chunk_count = db.query(Chunk).filter(Chunk.document_id == existing_document.id, Chunk.is_active.is_(True)).count() if existing_document else 0
+        chunk_count = len(active_chunk_ids_for_document(db, KnowledgeBase.id, existing_document.id)) if existing_document else 0
         job.document_id = existing_document.id if existing_document else None
         job.status = "skipped"
         job.stats = {
-            "chunks": chunk_count,
-            "concepts": 0,
-            "relations": 0,
+            "active_chunks": chunk_count,
+            "evidence_atoms": 0,
+            "evidence_edges": 0,
             "source_type": existing_document.source_type if existing_document else "unknown",
             "graph_rebuilt": False,
             **embedding_audit_payload(configured_embedding_provider(), False, "unchanged_checksum", 0),
@@ -1688,28 +1462,28 @@ async def _ingest_file_locked(
 
     set_job_state(db, job, "parsing", batch_id=batch_id)
     ensure_not_cancelled(db, batch_id)
-    storage_path = copy_source_file(source_path, course.name) if course_paths["storage_root"] not in source_path.parents else source_path
+    storage_path = copy_source_file(source_path, KnowledgeBase.name) if knowledge_base_paths["storage_root"] not in source_path.parents else source_path
     source_type, sections = parse_document(storage_path)
     ensure_not_cancelled(db, batch_id)
     if not sections:
         raise RuntimeError(f"No readable content extracted from {source_path.name}")
 
-    chapter = derive_chapter(source_path, course_name=course.name)
+    partition = derive_partition(source_path, knowledge_base_name=KnowledgeBase.name)
     document, version_number, stale_chunk_ids = create_or_update_document(
         db=db,
-        course=course,
+        KnowledgeBase=KnowledgeBase,
         source_path=source_path,
         title=source_path.stem,
         source_type=source_type,
         checksum=checksum,
-        tags=[chapter],
+        tags=[partition],
         force=force,
         target_version=target_version,
     )
     stale_chunk_ids.extend(
         deactivate_duplicate_documents(
             db=db,
-            course_id=course.id,
+            knowledge_base_id=KnowledgeBase.id,
             canonical_document_id=document.id,
             title=source_title,
             checksum=checksum,
@@ -1729,36 +1503,36 @@ async def _ingest_file_locked(
             version=version_number,
             checksum=checksum,
             storage_path=str(storage_path),
-            extracted_path=str(course_paths["ingestion_root"] / f"{document.id}-{version_number}.json"),
+            extracted_path=str(knowledge_base_paths["ingestion_root"] / f"{document.id}-{version_number}.json"),
             is_active=False,
         )
         db.add(version)
     else:
         version.checksum = checksum
         version.storage_path = str(storage_path)
-        version.extracted_path = str(course_paths["ingestion_root"] / f"{document.id}-{version_number}.json")
+        version.extracted_path = str(knowledge_base_paths["ingestion_root"] / f"{document.id}-{version_number}.json")
         version.is_active = False
     db.flush()
 
-    extracted_json = course_paths["ingestion_root"] / f"{document.id}-{version_number}.json"
+    extracted_json = knowledge_base_paths["ingestion_root"] / f"{document.id}-{version_number}.json"
     extracted_json.write_text(json.dumps(sections_to_json(sections), ensure_ascii=False, indent=2), encoding="utf-8")
 
     set_job_state(db, job, "chunking", batch_id=batch_id)
     ensure_not_cancelled(db, batch_id)
     with use_strategy_profile(strategy_profile.profile_json):
-        chunk_payloads, chunking_stats = await chunk_sections_hierarchical_async(sections, chapter=chapter, source_type=source_type, batch_id=batch_id)
+        chunk_payloads, chunking_stats = await chunk_sections_hierarchical_async(sections, partition=partition, source_type=source_type, batch_id=batch_id)
     ensure_not_cancelled(db, batch_id)
-    existing_hashes = active_chunk_hashes_for_course(
+    existing_hashes = active_chunk_hashes_for_knowledge_base(
         db,
-        course.id,
+        KnowledgeBase.id,
         excluded_document_id=document.id,
         minimum_chunk_version=version_number,
     )
     seen_parent_hashes = set(existing_hashes)
     seen_child_hashes = set(existing_hashes)
     deduplicated_chunks = 0
-    created_chunks: list[Chunk] = []
-    parent_chunks_map: dict[int, Chunk] = {}
+    created_chunks: list[ChunkDraft] = []
+    parent_chunks_map: dict[int, ChunkDraft] = {}
 
     # 第一遍：创建 parent chunks
     for payload in chunk_payloads:
@@ -1771,31 +1545,29 @@ async def _ingest_file_locked(
         seen_parent_hashes.add(content_hash)
         payload["metadata"]["content_hash"] = content_hash
         payload["metadata"]["chunk_version"] = version_number
-        chunk = Chunk(
-            course_id=course.id,
+        chunk = ChunkDraft(
+            id=generate_uuid(),
+            knowledge_base_id=KnowledgeBase.id,
             document_id=document.id,
             document_version_id=version.id,
             chunk_version=version_number,
             content=payload["content"],
             snippet=payload["snippet"],
-            chapter=payload["chapter"],
+            partition=payload["partition"],
             section=payload["section"],
             page_number=payload["page_number"],
             token_count=payload["token_count"],
             source_type=source_type,
             metadata_json=payload["metadata"],
-            embedding_status="pending",
             is_active=False,
             parent_chunk_id=None,
             summary=None,
             keywords=[],
             embedding_text_version=CURRENT_EMBEDDING_TEXT_VERSION,
+            created_at=datetime.utcnow(),
         )
-        db.add(chunk)
         created_chunks.append(chunk)
         parent_chunks_map[int(payload["parent_key"])] = chunk
-
-    db.flush()
 
     # 第二遍：创建 child chunks
     for payload in chunk_payloads:
@@ -1809,32 +1581,47 @@ async def _ingest_file_locked(
         payload["metadata"]["content_hash"] = content_hash
         payload["metadata"]["chunk_version"] = version_number
         parent_chunk = parent_chunks_map.get(int(payload["parent_key"]))
-        chunk = Chunk(
-            course_id=course.id,
+        chunk = ChunkDraft(
+            id=generate_uuid(),
+            knowledge_base_id=KnowledgeBase.id,
             document_id=document.id,
             document_version_id=version.id,
             chunk_version=version_number,
             content=payload["content"],
             snippet=payload["snippet"],
-            chapter=payload["chapter"],
+            partition=payload["partition"],
             section=payload["section"],
             page_number=payload["page_number"],
             token_count=payload["token_count"],
             source_type=source_type,
             metadata_json=payload["metadata"],
-            embedding_status="pending",
             is_active=False,
             parent_chunk_id=parent_chunk.id if parent_chunk else None,
             summary=None,
             keywords=[],
             embedding_text_version=CURRENT_EMBEDDING_TEXT_VERSION,
+            created_at=datetime.utcnow(),
         )
         if parent_chunk is not None:
             chunk.metadata_json["parent_chunk_id"] = parent_chunk.id
-        db.add(chunk)
         created_chunks.append(chunk)
 
-    db.flush()
+    refresh_runtime_settings_if_needed()
+    evidence_pipeline = apply_evidence_pipeline_for_chunks(
+        db,
+        knowledge_base_id=KnowledgeBase.id,
+        document=document,
+        version=version,
+        sections=sections,
+        created_chunks=created_chunks,
+        source_path=storage_path,
+        extracted_path=extracted_json,
+        checksum=checksum,
+        source_type=source_type,
+        ingestion_job_id=job.id,
+        batch_id=batch_id,
+        profile_objective_hash=strategy_profile.profile_hash,
+    )
 
     # Phase 6: 知识增强 — 为 parent chunks 生成摘要和关键词
     parent_chunks = [c for c in created_chunks if c.metadata_json.get("is_parent")]
@@ -1860,17 +1647,18 @@ async def _ingest_file_locked(
         job.status = "skipped"
         job.error_message = None
         job.stats = {
-            "chunks": 0,
-            "concepts": 0,
-            "relations": 0,
+            "active_chunks": 0,
+            "evidence_atoms": evidence_pipeline.stats.get("evidence_atoms", 0),
+            "evidence_edges": evidence_pipeline.stats.get("evidence_edges", 0),
             "source_type": source_type,
-            "chapter": chapter,
+            "partition": partition,
             "version": version.version,
             "graph_rebuilt": False,
             "chunks_before_filter": chunking_stats["chunks_before_filter"],
             "chunks_filtered": chunking_stats["chunks_filtered"],
             "chunks_deduplicated": deduplicated_chunks,
             "embedding_text_version": CURRENT_EMBEDDING_TEXT_VERSION,
+            **evidence_pipeline.stats,
             **embedding_audit_payload(configured_embedding_provider(), False, "no_effective_chunks", 0),
         }
         db.commit()
@@ -1884,23 +1672,56 @@ async def _ingest_file_locked(
 
     set_job_state(db, job, "embedding", batch_id=batch_id)
     ensure_not_cancelled(db, batch_id)
+    if batch_id:
+        batch = db.get(IngestionBatch, batch_id)
+        if batch is not None:
+            batch.stats = {**(batch.stats or {}), "phase": "embedding"}
+            db.flush()
     embedder = EmbeddingProvider()
+    embeddable_chunks = [chunk for chunk in created_chunks if chunk.id in evidence_pipeline.chunk_to_active]
+    if not embeddable_chunks:
+        job.document_id = document.id
+        job.status = "skipped"
+        job.error_message = "No chunk candidate passed the evidence quality gate"
+        job.stats = {
+            "active_chunks": 0,
+            "evidence_atoms": evidence_pipeline.stats.get("evidence_atoms", 0),
+            "evidence_edges": evidence_pipeline.stats.get("evidence_edges", 0),
+            "source_type": source_type,
+            "partition": partition,
+            "version": version.version,
+            "chunk_version": version_number,
+            "chunks_before_filter": chunking_stats["chunks_before_filter"],
+            "chunks_filtered": chunking_stats["chunks_filtered"],
+            "chunks_deduplicated": deduplicated_chunks,
+            "embedding_text_version": CURRENT_EMBEDDING_TEXT_VERSION,
+            **evidence_pipeline.stats,
+            **embedding_audit_payload(configured_embedding_provider(), False, "no_quality_gate_passed_chunks", 0),
+        }
+        db.commit()
+        return {
+            "job_id": job.id,
+            "document_id": document.id,
+            "status": "skipped",
+            "stats": job.stats,
+            "source_type": source_type,
+        }
 
     # 按 section 分组 child chunks，用于构建相邻上下文
-    section_children: dict[int, list[Chunk]] = {}
+    section_children: dict[int, list[ChunkDraft]] = {}
     for chunk in created_chunks:
         if not chunk.metadata_json.get("is_parent"):
             section_index = int((chunk.metadata_json or {}).get("section_index") or 0)
             section_children.setdefault(section_index, []).append(chunk)
 
     embedding_inputs = []
-    for chunk in created_chunks:
+    for chunk in embeddable_chunks:
         is_parent = chunk.metadata_json.get("is_parent", False)
         if is_parent:
             with use_strategy_profile(strategy_profile.profile_json):
                 embedding_input = contextual_embedding_text(
                     document_title=document.title,
-                    chapter=chunk.chapter,
+                    partition=chunk.partition,
                     section=chunk.section,
                     source_type=source_type,
                     content_kind=chunk.metadata_json.get("content_kind"),
@@ -1921,7 +1742,7 @@ async def _ingest_file_locked(
             with use_strategy_profile(strategy_profile.profile_json):
                 embedding_input = contextual_embedding_text(
                     document_title=document.title,
-                    chapter=chunk.chapter,
+                    partition=chunk.partition,
                     section=chunk.section,
                     source_type=source_type,
                     content_kind=chunk.metadata_json.get("content_kind"),
@@ -1950,33 +1771,46 @@ async def _ingest_file_locked(
         vector_count=len(embeddings),
     )
     vector_points = []
-    for chunk, vector in zip(created_chunks, embeddings):
+    for chunk, vector in zip(embeddable_chunks, embeddings):
         chunk.embedding_status = "ready"
+        active_chunk = evidence_pipeline.chunk_to_active.get(chunk.id)
+        if active_chunk is None:
+            continue
+        payload = {
+            "chunk_id": active_chunk.id,
+            "active_chunk_id": active_chunk.id,
+            "chunk_draft_id": chunk.id,
+            "knowledge_base_id": KnowledgeBase.id,
+            "document_id": document.id,
+            "document_title": document.title,
+            "source_path": document.source_path,
+            "partition": chunk.partition,
+            "section": chunk.section,
+            "page_number": chunk.page_number,
+            "snippet": chunk.snippet,
+            "source_type": source_type,
+            "version": version.version,
+            "chunk_version": chunk.chunk_version,
+            "tags": document.tags,
+            "difficulty": document.difficulty,
+            "content": chunk.content,
+            "content_kind": chunk.metadata_json.get("content_kind"),
+            "is_parent": chunk.metadata_json.get("is_parent", False),
+            "parent_chunk_id": str(chunk.parent_chunk_id) if chunk.parent_chunk_id else None,
+            "embedding_text_version": CURRENT_EMBEDDING_TEXT_VERSION,
+        }
         vector_points.append(
             {
-                "id": chunk.id,
+                "id": active_chunk.id,
                 "vector": vector,
-                "payload": {
-                    "chunk_id": chunk.id,
-                    "course_id": course.id,
-                    "document_id": document.id,
-                    "document_title": document.title,
-                    "source_path": document.source_path,
-                    "chapter": chunk.chapter,
-                    "section": chunk.section,
-                    "page_number": chunk.page_number,
-                    "snippet": chunk.snippet,
-                    "source_type": source_type,
-                    "version": version.version,
-                    "chunk_version": chunk.chunk_version,
-                    "tags": document.tags,
-                    "difficulty": document.difficulty,
-                    "content": chunk.content,
-                    "content_kind": chunk.metadata_json.get("content_kind"),
-                    "is_parent": chunk.metadata_json.get("is_parent", False),
-                    "parent_chunk_id": str(chunk.parent_chunk_id) if chunk.parent_chunk_id else None,
-                    "embedding_text_version": CURRENT_EMBEDDING_TEXT_VERSION,
-                },
+                "payload": enrich_vector_payload(
+                    payload=payload,
+                    chunk=chunk,
+                    active_chunk=active_chunk,
+                    graph_state=evidence_pipeline.graph_state,
+                    policy_state=evidence_pipeline.policy_state,
+                    community_state=evidence_pipeline.community_state,
+                ),
             }
         )
     # P0-7: Flush (not commit) before Qdrant upsert to keep DB in uncommitted state.
@@ -1984,7 +1818,7 @@ async def _ingest_file_locked(
     # will be marked as ready in the DB without corresponding vectors in Qdrant.
     db.flush()
 
-    new_chunk_ids = [chunk.id for chunk in created_chunks]
+    new_chunk_ids = [str(point["id"]) for point in vector_points]
     # P1-12: Distinguish empty-dimension vectors from zero vectors for clearer errors
     for point in vector_points:
         vec = point["vector"]
@@ -1994,13 +1828,18 @@ async def _ingest_file_locked(
             raise RuntimeError(f"Zero vector detected for chunk {point['id']} before upsert")
     upsert_log = create_vector_compensation_log(
         db,
-        course_id=course.id,
+        knowledge_base_id=KnowledgeBase.id,
         job_id=job.id,
         operation="upsert",
         vector_ids=new_chunk_ids,
     )
-    vector_store = VectorStore(course_name=course.name)
+    vector_store = VectorStore(knowledge_base_name=KnowledgeBase.name)
     ensure_not_cancelled(db, batch_id)
+    if batch_id:
+        batch = db.get(IngestionBatch, batch_id)
+        if batch is not None:
+            batch.stats = {**(batch.stats or {}), "phase": "vector_index"}
+            db.flush()
     try:
         await vector_store.async_upsert(vector_points)
     except Exception as exc:
@@ -2033,31 +1872,38 @@ async def _ingest_file_locked(
             DocumentVersion.document_id == document.id,
             DocumentVersion.id != version.id,
         ).update({"is_active": False}, synchronize_session=False)
-        db.query(Chunk).filter(
-            Chunk.document_id == document.id,
-            Chunk.id.notin_(new_chunk_ids),
-        ).update({"is_active": False}, synchronize_session=False)
+        if stale_chunk_ids:
+            db.query(ActiveChunk).filter(ActiveChunk.id.in_(stale_chunk_ids)).update({"state": "inactive"}, synchronize_session=False)
         version.is_active = True
-        for chunk in created_chunks:
+        for chunk in embeddable_chunks:
             chunk.is_active = True
         document.checksum = checksum
         document.is_active = True
         replacement_chunk_hashes = {
             chunk_content_hash(chunk.content, bool((chunk.metadata_json or {}).get("is_parent")))
-            for chunk in created_chunks
+            for chunk in embeddable_chunks
         }
         stale_chunk_ids.extend(
             deactivate_superseded_duplicate_documents_by_chunks(
                 db=db,
-                course_id=course.id,
+                knowledge_base_id=KnowledgeBase.id,
                 canonical_document_id=document.id,
                 title=document.title,
                 replacement_chunk_hashes=replacement_chunk_hashes,
                 target_version=version_number,
             )
         )
-        if (course.current_chunk_version or 0) < version_number:
-            course.current_chunk_version = version_number
+        if (KnowledgeBase.current_chunk_version or 0) < version_number:
+            KnowledgeBase.current_chunk_version = version_number
+        activate_evidence_chunks(db, evidence_pipeline.chunk_to_active)
+        record_vector_records(
+            db,
+            knowledge_base_id=KnowledgeBase.id,
+            chunks=embeddable_chunks,
+            vector_points=vector_points,
+            chunk_to_active=evidence_pipeline.chunk_to_active,
+            embedding_model=embedder.settings.embedding_model,
+        )
         db.commit()
     except Exception as exc:
         db.rollback()
@@ -2076,7 +1922,7 @@ async def _ingest_file_locked(
             stale_points = []
         delete_log = create_vector_compensation_log(
             db,
-            course_id=course.id,
+            knowledge_base_id=KnowledgeBase.id,
             job_id=job.id,
             operation="delete",
             vector_ids=stale_chunk_ids,
@@ -2088,35 +1934,34 @@ async def _ingest_file_locked(
         except Exception as exc:
             mark_vector_compensation_log(db, delete_log.id, "failed", str(exc))
 
-    set_job_state(db, job, "extracting_graph", batch_id=batch_id)
-    if rebuild_graph and document:
-        graph_stats = await incremental_update_course_graph(db, course.id, [document.id], batch_id)
-    elif rebuild_graph:
-        graph_stats = await rebuild_course_graph(db, course.id)
-    else:
-        graph_stats = {
-            "graph_rebuilt": False,
-            "concepts": 0,
-            "relations": 0,
-            "graph_nodes": 0,
-            "graph_edges": 0,
-            "graph_extraction_provider": graph_extraction_provider(),
-        }
+    graph_stats = {
+        "graph_rebuilt": True,
+        "graph_runtime": "evidence_graph",
+        "graph_nodes": evidence_pipeline.stats.get("evidence_atoms", 0) + evidence_pipeline.stats.get("active_chunks", 0),
+        "graph_edges": evidence_pipeline.stats.get("evidence_edges", 0),
+        "evidence_atoms": evidence_pipeline.stats.get("evidence_atoms", 0),
+        "evidence_edges": evidence_pipeline.stats.get("evidence_edges", 0),
+        "active_chunks": evidence_pipeline.stats.get("active_chunks", 0),
+        "signal_layer_complete": evidence_pipeline.stats.get("signal_layer_complete", False),
+        "signal_nodes": evidence_pipeline.stats.get("signal_nodes", 0),
+        "signal_edges": evidence_pipeline.stats.get("signal_edges", 0),
+    }
 
     job.status = "completed"
     job.error_message = None
     job.stats = {
-        "chunks": len(created_chunks),
-        "concepts": graph_stats["concepts"],
-        "relations": graph_stats["relations"],
+        "active_chunks": evidence_pipeline.stats.get("active_chunks", len(created_chunks)),
+        "evidence_atoms": evidence_pipeline.stats.get("evidence_atoms", 0),
+        "evidence_edges": evidence_pipeline.stats.get("evidence_edges", 0),
         "source_type": source_type,
-        "chapter": chapter,
+        "partition": partition,
         "version": version.version,
         "chunk_version": version_number,
         "chunks_before_filter": chunking_stats["chunks_before_filter"],
         "chunks_filtered": chunking_stats["chunks_filtered"],
         "chunks_deduplicated": deduplicated_chunks,
         "embedding_text_version": CURRENT_EMBEDDING_TEXT_VERSION,
+        **evidence_pipeline.stats,
         **graph_stats,
         **embedding_audit_payload(
             embedding_result.provider,
@@ -2133,14 +1978,14 @@ async def _ingest_file_locked(
         "status": job.status,
         "stats": job.stats,
         "source_type": source_type,
-        "concept_cards": get_concept_cards(db, course.id),
-        "graph": get_graph_payload(db, course.id, graph_type="semantic"),
+        "graph": get_graph_payload(db, KnowledgeBase.id, graph_type="evidence"),
     }
 
 
-async def run_batch_ingestion(batch_id: str, force: bool = False, rebuild_graph_mode: str = "incremental", full_reparse: bool = False) -> dict:
+async def run_batch_ingestion(batch_id: str, force: bool = False, full_reparse: bool = False) -> dict:
     from app.db import SessionLocal
 
+    refresh_runtime_settings_if_needed()
     session = SessionLocal()
     try:
         batch = session.get(IngestionBatch, batch_id)
@@ -2174,11 +2019,11 @@ async def run_batch_ingestion(batch_id: str, force: bool = False, rebuild_graph_
         errors: list[dict] = []
         session.commit()
 
-        course = resolve_course(session, batch.course_id)
+        KnowledgeBase = resolve_knowledge_base(session, batch.knowledge_base_id)
         target_version = None
-        current_chunk_version = sync_course_chunk_version_metadata(session, course)
+        current_chunk_version = sync_knowledge_base_chunk_version_metadata(session, KnowledgeBase)
         if full_reparse:
-            if active_chunk_count(session, course.id) <= 0:
+            if active_chunk_count(session, KnowledgeBase.id) <= 0:
                 raise RuntimeError("Full reparse is unavailable before the first successful parse")
             target_version = current_chunk_version + 1
             batch.stats = {**(batch.stats or {}), "target_version": target_version, "current_chunk_version_before": current_chunk_version, "full_reparse": True}
@@ -2189,6 +2034,7 @@ async def run_batch_ingestion(batch_id: str, force: bool = False, rebuild_graph_
             session.commit()
         emit_ingestion_log(batch_id, "batch_files", f"发现 {len(files)} 个待解析文件", total_files=len(files))
         for index, path in enumerate(files, start=1):
+            refresh_runtime_settings_if_needed()
             if is_cancel_requested(session, batch_id):
                 await compensate_cancelled_batch(session, batch_id)
                 return summarize_batch(session.get(IngestionBatch, batch_id))
@@ -2197,13 +2043,13 @@ async def run_batch_ingestion(batch_id: str, force: bool = False, rebuild_graph_
             emit_ingestion_log(batch_id, "file_started", f"[{index}/{len(files)}] 正在解析 {path.name}", source_path=str(path), processed_files=batch.processed_files, total_files=batch.total_files)
             job = create_job(
                 session,
-                course_id=course.id,
+                knowledge_base_id=KnowledgeBase.id,
                 document_id=None,
                 trigger_source=batch.trigger_source,
                 batch_id=batch.id,
                 source_path=str(path),
             )
-            remember_pre_batch_version(session, job, course.id, path)
+            remember_pre_batch_version(session, job, KnowledgeBase.id, path)
             try:
                 ensure_not_cancelled(session, batch_id)
                 result = await ingest_file(
@@ -2249,7 +2095,7 @@ async def run_batch_ingestion(batch_id: str, force: bool = False, rebuild_graph_
                     await compensate_cancelled_batch(session, batch_id)
                     return summarize_batch(session.get(IngestionBatch, batch_id))
                 batch.processed_files += 1
-                batch.stats = {**(batch.stats or {}), "coverage_by_source_type": dict(coverage), "errors": errors, "rebuild_graph_mode": rebuild_graph_mode, "phase": "parsing"}
+                batch.stats = {**(batch.stats or {}), "coverage_by_source_type": dict(coverage), "errors": errors, "graph_runtime": "evidence_graph", "phase": "parsing"}
                 emit_ingestion_log(
                     batch_id,
                     "batch_progress",
@@ -2269,76 +2115,49 @@ async def run_batch_ingestion(batch_id: str, force: bool = False, rebuild_graph_
             await compensate_cancelled_batch(session, batch_id)
             return summarize_batch(session.get(IngestionBatch, batch_id))
         if batch.success_count > 0:
-            course = resolve_course(session, batch.course_id)
-            sync_course_chunk_version_metadata(session, course)
+            KnowledgeBase = resolve_knowledge_base(session, batch.knowledge_base_id)
+            sync_knowledge_base_chunk_version_metadata(session, KnowledgeBase)
             batch.stats = {**(batch.stats or {}), "parse_committed": True}
             session.commit()
-        if batch.success_count > 0 and rebuild_graph_mode != "none":
-            settings = get_settings()
-            batch_course_id = batch.course_id
-            from app.services.concept_graph import _backup_course_graph_tables
-            _backup_course_graph_tables(session, batch_course_id)
-            graph_start_payload = {
-                "processed_files": batch.processed_files,
-                "total_files": batch.total_files,
-                "success_count": batch.success_count,
-                "failure_count": batch.failure_count,
-                "skipped_count": batch.skipped_count,
-                "graph_extraction_strategy": settings.graph_extraction_strategy,
-                "graph_extraction_soft_start_budget": settings.graph_extraction_soft_start_budget or 120,
-                "graph_extraction_concurrency": settings.graph_extraction_concurrency,
-                "graph_extraction_resume_batch_size": settings.graph_extraction_resume_batch_size,
-            }
-            batch.status = "extracting_graph"
-            batch.stats = {**(batch.stats or {}), "phase": "graph", "parse_committed": True}
-            mark_batch_worker_heartbeat(session, batch, phase="graph")
-            session.commit()
-            emit_ingestion_log(
-                batch_id,
-                "batch_graph_started",
-                "正在生成课程图谱",
-                **graph_start_payload,
-            )
+        refresh_runtime_settings_if_needed()
+        if batch.success_count > 0:
             try:
-                session.rollback()
-                ensure_not_cancelled(session, batch_id)
-                batch = session.get(IngestionBatch, batch_id)
-                if batch is not None:
-                    mark_batch_worker_heartbeat(session, batch, phase="graph")
-                    session.commit()
-                graph_stats = await rebuild_course_graph_for_batch(session, batch_course_id, batch_id) if rebuild_graph_mode == "full" else await incremental_update_course_graph(session, batch_course_id, [job.document_id for job in session.scalars(select(IngestionJob).where(IngestionJob.batch_id == batch_id)).all() if job.document_id], batch_id)
-                ensure_not_cancelled(session, batch_id)
+                KnowledgeBase = resolve_knowledge_base(session, batch.knowledge_base_id)
+                batch.stats = {**(batch.stats or {}), "phase": "global_graph", "parse_committed": True}
+                session.commit()
+                graph_result = publish_global_evidence_graph_state(session, knowledge_base_id=KnowledgeBase.id, batch_id=batch_id)
+                graph_stats = graph_result.stats
+                session.commit()
             except Exception as exc:
-                if isinstance(exc, IngestionCancelled):
-                    session.rollback()
-                    await compensate_cancelled_batch(session, batch_id)
-                    return summarize_batch(session.get(IngestionBatch, batch_id))
                 session.rollback()
-                recovery_stats = await recover_existing_graph_algorithm_metrics(session, batch_course_id)
-                return finalize_graph_generation_failure(
-                    session,
-                    batch_id,
-                    exc,
-                    {
-                        "coverage_by_source_type": dict(coverage),
-                        "errors": errors,
-                        "degraded_mode": is_degraded_mode(),
-                        **recovery_stats,
-                    },
-                )
+                batch = session.get(IngestionBatch, batch_id)
+                if batch is None:
+                    raise
+                error_message = exception_message(exc)
+                batch.last_error = error_message
+                batch.status = "partial_failed" if batch.success_count > 0 else "failed"
+                batch.completed_at = datetime.utcnow()
+                batch.worker_id = None
+                batch.heartbeat_at = None
+                batch.stats = {**(batch.stats or {}), "phase": "global_graph_failed", "graph_runtime": "evidence_graph", "global_graph_error": error_message}
+                session.commit()
+                emit_ingestion_log(batch_id, "global_graph_failed", f"Global evidence graph publish failed: {error_message}", error=error_message)
+                emit_ingestion_log(batch_id, "batch_partial_failed" if batch.success_count > 0 else "batch_failed", f"鎵规{batch.status}锛氬叏灞€鍥捐氨鍙戝竷澶辫触")
+                return summarize_batch(batch)
         else:
             graph_stats = {
                 "graph_rebuilt": False,
+                "graph_runtime": "evidence_graph",
                 "graph_nodes": 0,
                 "graph_edges": 0,
-                "concepts": 0,
-                "relations": 0,
-                "graph_extraction_provider": graph_extraction_provider(),
+                "evidence_atoms": 0,
+                "evidence_edges": 0,
+                "active_chunks": 0,
             }
         batch.stats = {
             "coverage_by_source_type": dict(coverage),
             "errors": errors,
-            "rebuild_graph_mode": rebuild_graph_mode,
+            "graph_runtime": "evidence_graph",
             "full_reparse": full_reparse,
             "phase": "completed",
             "parse_committed": batch.success_count > 0,
@@ -2351,10 +2170,6 @@ async def run_batch_ingestion(batch_id: str, force: bool = False, rebuild_graph_
         elif batch.failure_count == batch.total_files and batch.total_files > 0:
             batch.status = "failed"
             terminal_event = "batch_failed"
-        elif graph_stats.get("graph_llm_failed_chunks", 0) > 0:
-            batch.status = "partial_failed"
-            terminal_event = "batch_partial_failed"
-            batch.last_error = f"图谱抽取失败片段数：{graph_stats['graph_llm_failed_chunks']}"
         elif batch.failure_count > 0:
             batch.status = "partial_failed"
             terminal_event = "batch_partial_failed"
@@ -2365,16 +2180,17 @@ async def run_batch_ingestion(batch_id: str, force: bool = False, rebuild_graph_
         batch.worker_id = None
         batch.heartbeat_at = None
         session.commit()
-        emit_ingestion_log(batch_id, "graph_rebuilt", f"图谱已重建：{graph_stats.get('graph_nodes', 0)} 个节点，{graph_stats.get('graph_edges', 0)} 条边", **graph_stats)
+        emit_ingestion_log(batch_id, "graph_rebuilt", f"Evidence graph 已更新：{graph_stats.get('graph_nodes', 0)} 个节点，{graph_stats.get('graph_edges', 0)} 条边", **graph_stats)
         emit_ingestion_log(batch_id, terminal_event, f"批次{batch.status}：成功 {batch.success_count}，失败 {batch.failure_count}，跳过 {batch.skipped_count}")
         return summarize_batch(batch)
     finally:
         session.close()
 
 
-async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], force: bool = False, rebuild_graph_mode: str = "none", full_reparse: bool = False) -> dict:
+async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], force: bool = False, full_reparse: bool = False) -> dict:
     from app.db import SessionLocal
 
+    refresh_runtime_settings_if_needed()
     session = SessionLocal()
     try:
         batch = session.get(IngestionBatch, batch_id)
@@ -2397,22 +2213,23 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
         errors: list[dict] = []
         session.commit()
 
-        course = resolve_course(session, batch.course_id)
+        KnowledgeBase = resolve_knowledge_base(session, batch.knowledge_base_id)
         target_version = None
-        current_chunk_version = sync_course_chunk_version_metadata(session, course)
+        current_chunk_version = sync_knowledge_base_chunk_version_metadata(session, KnowledgeBase)
         if full_reparse:
-            if active_chunk_count(session, course.id) <= 0:
+            if active_chunk_count(session, KnowledgeBase.id) <= 0:
                 raise RuntimeError("Full reparse is unavailable before the first successful parse")
             target_version = current_chunk_version + 1
-            batch.stats = {**(batch.stats or {}), "target_version": target_version, "current_chunk_version_before": current_chunk_version, "rebuild_graph_mode": rebuild_graph_mode, "full_reparse": True}
+            batch.stats = {**(batch.stats or {}), "target_version": target_version, "current_chunk_version_before": current_chunk_version, "graph_runtime": "evidence_graph", "full_reparse": True}
             session.commit()
         elif current_chunk_version <= 0:
             target_version = 1
-            batch.stats = {**(batch.stats or {}), "target_version": target_version, "current_chunk_version_before": 0, "rebuild_graph_mode": rebuild_graph_mode, "full_reparse": False}
+            batch.stats = {**(batch.stats or {}), "target_version": target_version, "current_chunk_version_before": 0, "graph_runtime": "evidence_graph", "full_reparse": False}
             session.commit()
         emit_model_audit_log(batch_id)
-        emit_ingestion_log(batch_id, "batch_started", f"正在解析 {len(files)} 个文件" + ("，并强制重建已有内容" if force else ""), total_files=len(files), force=force, rebuild_graph_mode=rebuild_graph_mode)
+        emit_ingestion_log(batch_id, "batch_started", f"正在解析 {len(files)} 个文件" + ("，并强制重建已有内容" if force else ""), total_files=len(files), force=force, graph_runtime="evidence_graph")
         for index, path in enumerate(files, start=1):
+            refresh_runtime_settings_if_needed()
             if is_cancel_requested(session, batch_id):
                 await compensate_cancelled_batch(session, batch_id)
                 return summarize_batch(session.get(IngestionBatch, batch_id))
@@ -2421,14 +2238,14 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
             emit_ingestion_log(batch_id, "file_started", f"[{index}/{len(files)}] 正在解析 {path.name}", source_path=str(path), processed_files=batch.processed_files, total_files=batch.total_files)
             job = session.scalar(
                 select(IngestionJob)
-                .where(IngestionJob.course_id == course.id, IngestionJob.source_path == str(path))
+                .where(IngestionJob.knowledge_base_id == KnowledgeBase.id, IngestionJob.source_path == str(path))
                 .order_by(IngestionJob.updated_at.desc())
             )
             if job is None:
-                document = session.scalar(select(Document).where(Document.course_id == course.id, Document.source_path == str(path)))
+                document = session.scalar(select(Document).where(Document.knowledge_base_id == KnowledgeBase.id, Document.source_path == str(path)))
                 job = create_job(
                     session,
-                    course_id=course.id,
+                    knowledge_base_id=KnowledgeBase.id,
                     document_id=document.id if document else None,
                     trigger_source="upload",
                     batch_id=batch.id,
@@ -2440,7 +2257,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
                 job.status = "queued"
                 job.error_message = None
                 session.commit()
-            remember_pre_batch_version(session, job, course.id, path)
+            remember_pre_batch_version(session, job, KnowledgeBase.id, path)
             try:
                 ensure_not_cancelled(session, batch_id)
                 if not path.exists():
@@ -2451,7 +2268,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
                     trigger_source="upload",
                     existing_job_id=job.id,
                     batch_id=batch.id,
-                    course_id=course.id,
+                    knowledge_base_id=KnowledgeBase.id,
                     rebuild_graph=False,
                     force=force,
                     target_version=target_version,
@@ -2489,7 +2306,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
                     await compensate_cancelled_batch(session, batch_id)
                     return summarize_batch(session.get(IngestionBatch, batch_id))
                 batch.processed_files += 1
-                batch.stats = {**(batch.stats or {}), "uploaded_files": file_paths, "coverage_by_source_type": dict(coverage), "errors": errors, "force": force, "full_reparse": full_reparse, "rebuild_graph_mode": rebuild_graph_mode, "phase": "parsing"}
+                batch.stats = {**(batch.stats or {}), "uploaded_files": file_paths, "coverage_by_source_type": dict(coverage), "errors": errors, "force": force, "full_reparse": full_reparse, "graph_runtime": "evidence_graph", "phase": "parsing"}
                 emit_ingestion_log(
                     batch_id,
                     "batch_progress",
@@ -2509,74 +2326,44 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
             await compensate_cancelled_batch(session, batch_id)
             return summarize_batch(session.get(IngestionBatch, batch_id))
         if batch.success_count > 0:
-            course = resolve_course(session, batch.course_id)
-            sync_course_chunk_version_metadata(session, course)
+            KnowledgeBase = resolve_knowledge_base(session, batch.knowledge_base_id)
+            sync_knowledge_base_chunk_version_metadata(session, KnowledgeBase)
             batch.stats = {**(batch.stats or {}), "parse_committed": True}
             session.commit()
-        if batch.success_count > 0 and rebuild_graph_mode != "none":
-            settings = get_settings()
-            batch_course_id = batch.course_id
-            from app.services.concept_graph import _backup_course_graph_tables
-            _backup_course_graph_tables(session, batch_course_id)
-            graph_start_payload = {
-                "processed_files": batch.processed_files,
-                "total_files": batch.total_files,
-                "success_count": batch.success_count,
-                "failure_count": batch.failure_count,
-                "skipped_count": batch.skipped_count,
-                "graph_extraction_strategy": settings.graph_extraction_strategy,
-                "graph_extraction_soft_start_budget": settings.graph_extraction_soft_start_budget or 120,
-                "graph_extraction_concurrency": settings.graph_extraction_concurrency,
-                "graph_extraction_resume_batch_size": settings.graph_extraction_resume_batch_size,
-            }
-            batch.status = "extracting_graph"
-            batch.stats = {**(batch.stats or {}), "phase": "graph", "parse_committed": True}
-            mark_batch_worker_heartbeat(session, batch, phase="graph")
-            session.commit()
-            emit_ingestion_log(
-                batch_id,
-                "batch_graph_started",
-                "正在生成课程图谱",
-                **graph_start_payload,
-            )
+        refresh_runtime_settings_if_needed()
+        if batch.success_count > 0:
             try:
-                session.rollback()
-                ensure_not_cancelled(session, batch_id)
-                batch = session.get(IngestionBatch, batch_id)
-                if batch is not None:
-                    mark_batch_worker_heartbeat(session, batch, phase="graph")
-                    session.commit()
-                changed_document_ids = [job.document_id for job in session.scalars(select(IngestionJob).where(IngestionJob.batch_id == batch_id)).all() if job.document_id]
-                graph_stats = await rebuild_course_graph_for_batch(session, batch_course_id, batch_id) if rebuild_graph_mode == "full" else await incremental_update_course_graph(session, batch_course_id, changed_document_ids, batch_id)
-                ensure_not_cancelled(session, batch_id)
+                KnowledgeBase = resolve_knowledge_base(session, batch.knowledge_base_id)
+                batch.stats = {**(batch.stats or {}), "phase": "global_graph", "parse_committed": True}
+                session.commit()
+                graph_result = publish_global_evidence_graph_state(session, knowledge_base_id=KnowledgeBase.id, batch_id=batch_id)
+                graph_stats = graph_result.stats
+                session.commit()
             except Exception as exc:
-                if isinstance(exc, IngestionCancelled):
-                    session.rollback()
-                    await compensate_cancelled_batch(session, batch_id)
-                    return summarize_batch(session.get(IngestionBatch, batch_id))
                 session.rollback()
-                recovery_stats = await recover_existing_graph_algorithm_metrics(session, batch_course_id)
-                return finalize_graph_generation_failure(
-                    session,
-                    batch_id,
-                    exc,
-                    {
-                        "uploaded_files": file_paths,
-                        "coverage_by_source_type": dict(coverage),
-                        "errors": errors,
-                        "force": force,
-                        "degraded_mode": is_degraded_mode(),
-                        **recovery_stats,
-                    },
-                )
+                batch = session.get(IngestionBatch, batch_id)
+                if batch is None:
+                    raise
+                error_message = exception_message(exc)
+                batch.last_error = error_message
+                batch.status = "partial_failed" if batch.success_count > 0 else "failed"
+                batch.completed_at = datetime.utcnow()
+                batch.worker_id = None
+                batch.heartbeat_at = None
+                batch.stats = {**(batch.stats or {}), "phase": "global_graph_failed", "graph_runtime": "evidence_graph", "global_graph_error": error_message}
+                session.commit()
+                emit_ingestion_log(batch_id, "global_graph_failed", f"Global evidence graph publish failed: {error_message}", error=error_message)
+                emit_ingestion_log(batch_id, "batch_partial_failed" if batch.success_count > 0 else "batch_failed", f"鎵规{batch.status}锛氬叏灞€鍥捐氨鍙戝竷澶辫触")
+                return summarize_batch(batch)
         else:
             graph_stats = {
                 "graph_rebuilt": False,
+                "graph_runtime": "evidence_graph",
                 "graph_nodes": 0,
                 "graph_edges": 0,
-                "concepts": 0,
-                "relations": 0,
-                "graph_extraction_provider": graph_extraction_provider(),
+                "evidence_atoms": 0,
+                "evidence_edges": 0,
+                "active_chunks": 0,
             }
         batch.stats = {
             "uploaded_files": file_paths,
@@ -2584,7 +2371,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
             "errors": errors,
             "force": force,
             "full_reparse": full_reparse,
-            "rebuild_graph_mode": rebuild_graph_mode,
+            "graph_runtime": "evidence_graph",
             "phase": "completed",
             "parse_committed": batch.success_count > 0,
             "degraded_mode": is_degraded_mode(),
@@ -2596,10 +2383,6 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
         elif batch.failure_count == batch.total_files and batch.total_files > 0:
             batch.status = "failed"
             terminal_event = "batch_failed"
-        elif graph_stats.get("graph_llm_failed_chunks", 0) > 0:
-            batch.status = "partial_failed"
-            terminal_event = "batch_partial_failed"
-            batch.last_error = f"图谱抽取失败片段数：{graph_stats['graph_llm_failed_chunks']}"
         elif batch.failure_count > 0:
             batch.status = "partial_failed"
             terminal_event = "batch_partial_failed"
@@ -2610,7 +2393,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
         batch.worker_id = None
         batch.heartbeat_at = None
         session.commit()
-        emit_ingestion_log(batch_id, "graph_rebuilt", f"图谱已重建：{graph_stats.get('graph_nodes', 0)} 个节点，{graph_stats.get('graph_edges', 0)} 条边", **graph_stats)
+        emit_ingestion_log(batch_id, "graph_rebuilt", f"Evidence graph 已更新：{graph_stats.get('graph_nodes', 0)} 个节点，{graph_stats.get('graph_edges', 0)} 条边", **graph_stats)
         emit_ingestion_log(batch_id, terminal_event, f"批次{batch.status}：成功 {batch.success_count}，失败 {batch.failure_count}，跳过 {batch.skipped_count}")
         return summarize_batch(batch)
     finally:
@@ -2635,7 +2418,7 @@ async def run_ingestion_job(job_id: str, source_path: Path, trigger_source: str 
         session.close()
 
 
-async def _generate_chunk_knowledge(chunks: list[Chunk], chat: ChatProvider, *, batch_id: str | None = None) -> None:
+async def _generate_chunk_knowledge(chunks: list[ChunkDraft], chat: ChatProvider, *, batch_id: str | None = None) -> None:
     """为 parent chunks 批量生成摘要和关键词。直接修改 chunk 对象属性。
 
     使用 ChatProvider.classify_json 调用 LLM，批量处理（每批5个）以降低 API 调用成本。

@@ -1,10 +1,13 @@
 from collections.abc import Generator
 import contextvars
+import os
+import sys
 
 from pathlib import Path
 
-from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.sql.compiler import IdentifierPreparer
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import get_settings
@@ -20,8 +23,9 @@ settings = get_settings()
 def candidate_sqlite_paths() -> list[Path]:
     apps_root = Path(__file__).resolve().parents[2]
     candidates = [
-        apps_root / "course_kg.db",
+        apps_root / "symbograph.db",
         apps_root / "knowledge_base.db",
+        apps_root / "course_kg.db",
     ]
     seen: set[Path] = set()
     ordered: list[Path] = []
@@ -42,12 +46,12 @@ def try_connect(engine) -> bool:
         return False
 
 
-def has_materialized_course_data(engine) -> bool:
+def has_materialized_knowledge_base_data(engine) -> bool:
     try:
         with engine.connect() as connection:
             document_count = connection.execute(text("SELECT COUNT(*) FROM documents")).scalar() or 0
-            concept_count = connection.execute(text("SELECT COUNT(*) FROM concepts")).scalar() or 0
-        return bool(document_count or concept_count)
+            active_chunk_count = connection.execute(text("SELECT COUNT(*) FROM active_chunks")).scalar() or 0
+        return bool(document_count or active_chunk_count)
     except Exception:
         return False
 
@@ -62,11 +66,13 @@ def build_engine():
                 if not sqlite_path.exists():
                     continue
                 fallback = create_engine(f"sqlite:///{sqlite_path.as_posix()}", future=True, echo=False)
-                if try_connect(fallback) and has_materialized_course_data(fallback) and not has_materialized_course_data(primary):
+                if try_connect(fallback) and has_materialized_knowledge_base_data(fallback) and not has_materialized_knowledge_base_data(primary):
                     return fallback
         return primary
 
     if not settings.enable_database_fallback:
+        if os.getenv("PYTEST_CURRENT_TEST") or "pytest" in sys.modules or any("pytest" in Path(arg).name.lower() for arg in sys.argv):
+            return create_engine("sqlite:///:memory:", future=True, echo=False)
         raise RuntimeError("Primary database is unavailable and ENABLE_DATABASE_FALLBACK is false")
 
     for sqlite_path in candidate_sqlite_paths():
@@ -122,328 +128,35 @@ class ContextSessionLocalProxy:
 SessionLocal = ContextSessionLocalProxy(_original_SessionLocal)
 
 
-SCHEMA_PATCHES: dict[str, dict[str, str]] = {
-    "courses": {
-        "current_chunk_version": "INTEGER DEFAULT 0",
-        "active_profile_id": "VARCHAR(36)",
-    },
-    "strategy_profiles": {
-        "library_type": "VARCHAR(64) DEFAULT 'academic'",
-        "is_builtin": "BOOLEAN DEFAULT false",
-        "profile_json": "JSON DEFAULT '{}'",
-        "profile_hash": "VARCHAR(64)",
-        "is_active": "BOOLEAN DEFAULT true",
-        "updated_at": "DATETIME",
-    },
-    "course_graph_states": {
-        "strategy_profile_id": "VARCHAR(36)",
-        "strategy_profile_hash": "VARCHAR(64)",
-    },
-    "chunks": {
-        "chunk_version": "INTEGER DEFAULT 1",
-        "parent_chunk_id": "VARCHAR(36)",
-        "summary": "TEXT",
-        "keywords": "JSON DEFAULT '[]'",
-        "embedding_text_version": "VARCHAR(32) DEFAULT 'metadata_enriched_v1'",
-    },
-    "concepts": {
-        "normalized_name": "TEXT",
-        "concept_type": "VARCHAR(64) DEFAULT 'concept'",
-        "importance_score": "FLOAT DEFAULT 0",
-        "evidence_count": "INTEGER DEFAULT 0",
-        "community_louvain": "INTEGER",
-        "community_spectral": "INTEGER",
-        "component_id": "INTEGER",
-        "centrality_json": "JSON DEFAULT '{}'",
-        "graph_rank_score": "FLOAT DEFAULT 0",
-        "source_document_ids": "JSON DEFAULT '[]'",
-        "quality_json": "JSON DEFAULT '{}'",
-    },
-    "concept_relations": {
-        "confidence": "FLOAT DEFAULT 0.55",
-        "extraction_method": "VARCHAR(64) DEFAULT 'heuristic'",
-        "is_validated": "BOOLEAN DEFAULT false",
-        "weight": "FLOAT DEFAULT 0",
-        "semantic_similarity": "FLOAT DEFAULT 0",
-        "support_count": "INTEGER DEFAULT 1",
-        "relation_source": "VARCHAR(64) DEFAULT 'llm'",
-        "is_inferred": "BOOLEAN DEFAULT false",
-        "metadata_json": "JSON DEFAULT '{}'",
-        "source_document_ids": "JSON DEFAULT '[]'",
-    },
-    "ingestion_jobs": {
-        "batch_id": "VARCHAR(36)",
-        "source_path": "TEXT",
-    },
-    "ingestion_batches": {
-        "worker_id": "VARCHAR(128)",
-        "heartbeat_at": "TIMESTAMP",
-    },
-    "qa_sessions": {
-        "title": "VARCHAR(255)",
-        "last_question": "TEXT",
-        "last_answer": "TEXT",
-        "transcript": "JSON DEFAULT '[]'",
-    },
-    "agent_runs": {
-        "session_id": "VARCHAR(36)",
-        "route": "VARCHAR(64)",
-        "current_node": "VARCHAR(64)",
-        "retry_count": "INTEGER DEFAULT 0",
-        "final_answer": "TEXT",
-        "error_message": "TEXT",
-        "metadata_json": "JSON DEFAULT '{}'",
-        "started_at": "DATETIME",
-        "completed_at": "DATETIME",
-    },
-    "agent_trace_events": {
-        "document_ids": "JSON DEFAULT '[]'",
-        "scores": "JSON DEFAULT '{}'",
-        "duration_ms": "INTEGER DEFAULT 0",
-        "error_message": "TEXT",
-    },
-    "quality_profiles": {
-        "sample_chunk_ids": "JSON DEFAULT '[]'",
-        "is_active": "BOOLEAN DEFAULT true",
-    },
-    "graph_relation_candidates": {
-        "decision_json": "JSON DEFAULT '{}'",
-        "metadata_json": "JSON DEFAULT '{}'",
-        "source_document_ids": "JSON DEFAULT '[]'",
-    },
-    "graph_community_summaries": {
-        "key_concepts_json": "JSON DEFAULT '[]'",
-        "representative_chunk_ids": "JSON DEFAULT '[]'",
-        "source_document_ids": "JSON DEFAULT '[]'",
-        "quality_json": "JSON DEFAULT '{}'",
-        "is_active": "BOOLEAN DEFAULT true",
-    },
-    "graph_extraction_runs": {
-        "strategy_profile_id": "VARCHAR(36)",
-        "strategy_profile_hash": "VARCHAR(64)",
-        "coverage_json": "JSON DEFAULT '{}'",
-        "budget_json": "JSON DEFAULT '{}'",
-        "stats_json": "JSON DEFAULT '{}'",
-        "error_message": "TEXT",
-        "started_at": "DATETIME",
-        "completed_at": "DATETIME",
-    },
-    "graph_extraction_chunk_tasks": {
-        "selected_reason": "JSON DEFAULT '{}'",
-        "payload_json": "JSON",
-        "error_message": "TEXT",
-        "token_estimate": "INTEGER DEFAULT 0",
-    },
-    "course_model_hyperparameters": {
-        "llm_model_name": "VARCHAR(128) DEFAULT 'unknown'",
-        "embedding_model_name": "VARCHAR(128) DEFAULT 'unknown'",
-        "embedding_text_version": "VARCHAR(32) DEFAULT 'metadata_enriched_v1'",
-        "model_name": "VARCHAR(384)",
-        "graph_version": "VARCHAR(128) DEFAULT 'active'",
-        "min_relation_confidence": "FLOAT DEFAULT 0.72",
-        "min_accepted_relation_weight": "FLOAT DEFAULT 0.62",
-        "dijkstra_semantic_threshold": "FLOAT DEFAULT 0.78",
-        "w_degree": "FLOAT DEFAULT 0.25",
-        "w_weighted_degree": "FLOAT DEFAULT 0.25",
-        "w_pagerank": "FLOAT DEFAULT 0.20",
-        "w_betweenness": "FLOAT DEFAULT 0.20",
-        "w_closeness": "FLOAT DEFAULT 0.10",
-        "w_centrality": "FLOAT DEFAULT 0.50",
-        "w_llm_importance": "FLOAT DEFAULT 0.25",
-        "w_evidence": "FLOAT DEFAULT 0.25",
-        "hpo_status": "VARCHAR(32) DEFAULT 'pending'",
-        "last_optimized_at": "DATETIME",
-        "optuna_history": "JSON DEFAULT '{}'",
-    },
-    "graph_hpo_judge_samples": {
-        "reasons": "JSON DEFAULT '[]'",
-        "safety_flags": "JSON DEFAULT '[]'",
-        "raw_response": "JSON DEFAULT '{}'",
-    },
-    "graph_hpo_objective_models": {
-        "training_audit": "JSON DEFAULT '{}'",
-        "status": "VARCHAR(32) DEFAULT 'completed'",
-    },
-}
+def _running_under_pytest() -> bool:
+    return bool(os.getenv("PYTEST_CURRENT_TEST") or "pytest" in sys.modules or any("pytest" in Path(arg).name.lower() for arg in sys.argv))
 
 
-def _migrate_course_model_hyperparameters(connection) -> None:
-    if engine.dialect.name != "postgresql":
-        return
-    from app.services.chunking import CURRENT_EMBEDDING_TEXT_VERSION
+def _is_memory_sqlite() -> bool:
+    return engine.url.drivername.startswith("sqlite") and (engine.url.database in {None, "", ":memory:"})
 
-    default_llm = settings.chat_model
-    default_embedding = settings.embedding_model
-    default_text_version = CURRENT_EMBEDDING_TEXT_VERSION
-    connection.execute(
-        text(
-            """
-            UPDATE course_model_hyperparameters
-            SET llm_model_name = CASE
-                    WHEN model_name LIKE 'llm:%|embedding:%|text:%'
-                        THEN regexp_replace(split_part(model_name, '|', 1), '^llm:', '')
-                    ELSE COALESCE(NULLIF(model_name, ''), :default_llm)
-                END
-            WHERE llm_model_name IS NULL OR llm_model_name = '' OR llm_model_name = 'unknown'
-            """
-        ),
-        {"default_llm": default_llm},
-    )
-    connection.execute(
-        text(
-            """
-            UPDATE course_model_hyperparameters
-            SET embedding_model_name = CASE
-                    WHEN model_name LIKE 'llm:%|embedding:%|text:%'
-                        THEN regexp_replace(split_part(model_name, '|', 2), '^embedding:', '')
-                    ELSE :default_embedding
-                END
-            WHERE embedding_model_name IS NULL OR embedding_model_name = '' OR embedding_model_name = 'unknown'
-            """
-        ),
-        {"default_embedding": default_embedding},
-    )
-    connection.execute(
-        text(
-            """
-            UPDATE course_model_hyperparameters
-            SET embedding_text_version = CASE
-                    WHEN model_name LIKE 'llm:%|embedding:%|text:%'
-                        THEN regexp_replace(split_part(model_name, '|', 3), '^text:', '')
-                    ELSE :default_text_version
-                END
-            WHERE embedding_text_version IS NULL
-               OR embedding_text_version = ''
-               OR embedding_text_version = 'metadata_enriched_v1'
-            """
-        ),
-        {"default_text_version": default_text_version},
-    )
-    connection.execute(
-        text(
-            """
-            UPDATE course_model_hyperparameters
-            SET model_name = concat(
-                'llm:', llm_model_name,
-                '|embedding:', embedding_model_name,
-                '|text:', embedding_text_version
-            )
-            WHERE model_name IS NULL OR model_name = ''
-            """
-        )
-    )
-    connection.execute(
-        text(
-            """
-            DELETE FROM course_model_hyperparameters AS old
-            USING (
-                SELECT ctid,
-                       row_number() OVER (
-                           PARTITION BY course_id, llm_model_name, embedding_model_name, embedding_text_version
-                           ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, ctid DESC
-                       ) AS rn
-                FROM course_model_hyperparameters
-            ) AS ranked
-            WHERE old.ctid = ranked.ctid AND ranked.rn > 1
-            """
-        )
-    )
-    for column_name in ("llm_model_name", "embedding_model_name", "embedding_text_version"):
-        connection.execute(text(f"ALTER TABLE course_model_hyperparameters ALTER COLUMN {column_name} SET NOT NULL"))
-    pk_columns = [
-        row[0]
-        for row in connection.execute(
-            text(
-                """
-                SELECT a.attname
-                FROM pg_constraint c
-                JOIN pg_class t ON t.oid = c.conrelid
-                JOIN unnest(c.conkey) WITH ORDINALITY AS cols(attnum, ord) ON true
-                JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = cols.attnum
-                WHERE t.relname = 'course_model_hyperparameters' AND c.contype = 'p'
-                ORDER BY cols.ord
-                """
-            )
-        )
-    ]
-    target_columns = ["course_id", "llm_model_name", "embedding_model_name", "embedding_text_version"]
-    if pk_columns != target_columns:
-        pk_name = connection.execute(
-            text(
-                """
-                SELECT c.conname
-                FROM pg_constraint c
-                JOIN pg_class t ON t.oid = c.conrelid
-                WHERE t.relname = 'course_model_hyperparameters' AND c.contype = 'p'
-                """
-            )
-        ).scalar()
-        if pk_name:
-            connection.execute(text(f'ALTER TABLE course_model_hyperparameters DROP CONSTRAINT "{pk_name}"'))
-        connection.execute(
-            text(
-                """
-                ALTER TABLE course_model_hyperparameters
-                ADD CONSTRAINT course_model_hyperparameters_pkey
-                PRIMARY KEY (course_id, llm_model_name, embedding_model_name, embedding_text_version)
-                """
-            )
-        )
-    connection.execute(text("ALTER TABLE course_model_hyperparameters ALTER COLUMN model_name DROP NOT NULL"))
+
+def run_alembic_upgrade() -> None:
+    alembic_ini = Path(__file__).resolve().parents[1] / "alembic.ini"
+    if not alembic_ini.exists():
+        raise RuntimeError(f"Alembic configuration not found: {alembic_ini}")
+    config = Config(str(alembic_ini))
+    config.set_main_option("script_location", str(alembic_ini.parent / "migrations"))
+    config.set_main_option("sqlalchemy.url", engine.url.render_as_string(hide_password=False))
+    command.upgrade(config, "head")
 
 
 def ensure_schema() -> None:
-    Base.metadata.create_all(bind=engine)
-    inspector = inspect(engine)
-    preparer = IdentifierPreparer(engine.dialect)
-    with engine.begin() as connection:
-        for table_name, patch_columns in SCHEMA_PATCHES.items():
-            if table_name not in inspector.get_table_names():
-                continue
-            existing = {column["name"] for column in inspector.get_columns(table_name)}
-            for column_name, column_sql in patch_columns.items():
-                if column_name in existing:
-                    continue
-                table_sql = preparer.quote(table_name)
-                column_name_sql = preparer.quote(column_name)
-                connection.execute(text(" ".join(["ALTER TABLE", table_sql, "ADD COLUMN", column_name_sql, column_sql])))
-        if "course_model_hyperparameters" in inspector.get_table_names():
-            _migrate_course_model_hyperparameters(connection)
-        if {"courses", "documents", "document_versions", "chunks"}.issubset(set(inspector.get_table_names())):
-            connection.execute(
-                text(
-                    """
-                    UPDATE chunks AS c
-                    SET chunk_version = COALESCE(c.chunk_version, dv.version, 1)
-                    FROM document_versions AS dv
-                    WHERE c.document_version_id = dv.id
-                      AND (c.chunk_version IS NULL OR c.chunk_version <= 0)
-                    """
-                )
-            )
-            connection.execute(
-                text(
-                    """
-                    UPDATE courses AS course
-                    SET current_chunk_version = COALESCE(active.max_version, 0)
-                    FROM (
-                        SELECT c.course_id, MAX(c.chunk_version) AS max_version
-                        FROM chunks AS c
-                        WHERE c.is_active = true
-                        GROUP BY c.course_id
-                    ) AS active
-                    WHERE course.id = active.course_id
-                      AND COALESCE(course.current_chunk_version, 0) < COALESCE(active.max_version, 0)
-                    """
-                )
-            )
-            connection.execute(
-                text("UPDATE courses SET current_chunk_version = 0 WHERE current_chunk_version IS NULL")
-            )
-    from app.services.strategy_profiles import ensure_courses_have_profiles
+    import app.models  # noqa: F401
+
+    if _running_under_pytest() or _is_memory_sqlite():
+        Base.metadata.create_all(bind=engine)
+    else:
+        run_alembic_upgrade()
+    from app.services.strategy_profiles import ensure_knowledge_bases_have_profiles
 
     with SessionLocal() as session:
-        ensure_courses_have_profiles(session)
+        ensure_knowledge_bases_have_profiles(session)
         session.commit()
 
 

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -125,13 +125,13 @@ class FallbackVectorStore:
             current = self._read()
         return [item for item in current if item.get("id") in id_set]
 
-    def list_ids(self, course_id: str | None = None) -> list[str]:
+    def list_ids(self, knowledge_base_id: str | None = None) -> list[str]:
         with vector_process_lock(self.backing_file):
             current = self._read()
         ids = []
         for item in current:
             payload = item.get("payload", {})
-            if course_id and payload.get("course_id") != course_id:
+            if knowledge_base_id and payload.get("knowledge_base_id") != knowledge_base_id:
                 continue
             ids.append(item["id"])
         return ids
@@ -151,11 +151,11 @@ class FallbackVectorStore:
 
 
 class VectorStore:
-    def __init__(self, course_name: str | None = None) -> None:
+    def __init__(self, knowledge_base_name: str | None = None) -> None:
         self.settings = get_settings()
         self.collection = self.settings.qdrant_collection
-        course_paths = self.settings.course_paths_for_name(course_name or self.settings.course_name)
-        self.fallback = FallbackVectorStore(course_paths["ingestion_root"] / "vector_index.json")
+        knowledge_base_paths = self.settings.knowledge_base_paths_for_name(knowledge_base_name or self.settings.knowledge_base_name)
+        self.fallback = FallbackVectorStore(knowledge_base_paths["ingestion_root"] / "vector_index.json")
         self.client: QdrantClient | None = None
         try:
             self.client = QdrantClient(url=self.settings.qdrant_url, timeout=5.0)
@@ -238,12 +238,12 @@ class VectorStore:
             raise RuntimeError("Qdrant is unavailable and ENABLE_MODEL_FALLBACK is false")
         return self.fallback.get_points(ids)
 
-    def list_ids(self, course_id: str | None = None) -> list[str]:
+    def list_ids(self, knowledge_base_id: str | None = None) -> list[str]:
         if self.client:
             qdrant_filter = None
-            if course_id:
+            if knowledge_base_id:
                 qdrant_filter = rest.Filter(
-                    must=[rest.FieldCondition(key="course_id", match=rest.MatchValue(value=course_id))]
+                    must=[rest.FieldCondition(key="knowledge_base_id", match=rest.MatchValue(value=knowledge_base_id))]
                 )
             ids: list[str] = []
             offset = None
@@ -262,10 +262,10 @@ class VectorStore:
             return ids
         if not self.settings.enable_model_fallback:
             raise RuntimeError("Qdrant is unavailable and ENABLE_MODEL_FALLBACK is false")
-        return self.fallback.list_ids(course_id)
+        return self.fallback.list_ids(knowledge_base_id)
 
-    def health_check(self, course_id: str, active_chunk_ids: list[str]) -> dict:
-        vector_ids = set(self.list_ids(course_id))
+    def health_check(self, knowledge_base_id: str, active_chunk_ids: list[str]) -> dict:
+        vector_ids = set(self.list_ids(knowledge_base_id))
         active_ids = set(active_chunk_ids)
         missing = sorted(active_ids - vector_ids)
         stale = sorted(vector_ids - active_ids)

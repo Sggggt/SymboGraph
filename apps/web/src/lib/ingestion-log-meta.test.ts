@@ -1,43 +1,70 @@
 import { describe, expect, it } from "vitest";
 
-import { graphLogSummary, hpoLogSummary, logEventLabel, logVisualTone } from "./ingestion-log-meta";
+import { graphLogSummary, logEventLabel, logVisualTone } from "./ingestion-log-meta";
 
 describe("ingestion log metadata", () => {
-  it("labels and classifies judge-learned HPO events", () => {
-    expect(logEventLabel("hpo_judge_progress")).toBe("Judge HPO 进度");
-    expect(logVisualTone({ event: "hpo_judge_progress", stage: "judge" })).toBe("hpo");
-    expect(
-      hpoLogSummary({
-        timestamp: "2026-01-01T00:00:00",
-        event: "hpo_judge_progress",
-        message: "progress",
-        candidate_count: 4,
-        processed_pairs: 2,
-        pair_count: 3,
-        effective_labels: 2,
-        min_labels: 2,
-      }),
-    ).toContain("Judge 2/3");
-  });
-
   it("keeps unknown events readable and classifies graph/failure tones", () => {
     expect(logEventLabel("unknown_event")).toBe("unknown event");
     expect(logVisualTone({ event: "batch_graph_progress" })).toBe("graph");
-    expect(logVisualTone({ event: "hpo_failed" })).toBe("failure");
+    expect(logVisualTone({ event: "graph_failed" })).toBe("failure");
+    expect(logEventLabel("log_stream_warning")).toBe("Log stream warning");
+    expect(logVisualTone({ event: "log_stream_warning" })).toBe("warning");
   });
 
   it("summarizes graph phase logs", () => {
-    expect(logEventLabel("graph_upsert_started")).toBe("图谱写入开始");
+    expect(logEventLabel("batch_graph_progress")).toBe("Evidence graph progress");
+    expect(logEventLabel("global_graph_active")).toBe("Global evidence graph active");
+    expect(logVisualTone({ event: "global_graph_active" })).toBe("graph");
     expect(
       graphLogSummary({
         timestamp: "2026-01-01T00:00:00",
-        event: "graph_upsert_completed",
+        event: "graph_rebuilt",
         message: "done",
-        graph_llm_success_chunks: 12,
-        concepts: 4,
-        relations: 6,
-        graph_rejected_concepts: 2,
+        evidence_atoms: 12,
+        evidence_edges: 8,
+        active_chunks: 4,
       }),
-    ).toContain("relations 6");
+    ).toContain("active chunks 4");
+  });
+
+  it("summarizes global graph and signal candidate logs from the evidence pipeline", () => {
+    expect(
+      graphLogSummary({
+        timestamp: "2026-01-01T00:00:00",
+        event: "global_graph_scanning",
+        message: "started",
+        atom_count: 9,
+      }),
+    ).toBe("atoms 9");
+    expect(logEventLabel("signal_candidate_gate")).toBe("Signal candidate gate");
+    expect(
+      graphLogSummary({
+        timestamp: "2026-01-01T00:00:00",
+        event: "signal_candidate_gate",
+        message: "gate",
+        candidate_count: 7,
+      }),
+    ).toBe("signal candidates 7");
+    expect(logVisualTone({ event: "signal_schema_failed" })).toBe("failure");
+  });
+
+  it("summarizes signal layer logs outside the evidence graph tone", () => {
+    expect(logEventLabel("signal_layer_active")).toBe("Signal layer active");
+    expect(logVisualTone({ event: "signal_layer_active" })).toBe("default");
+    expect(
+      graphLogSummary({
+        timestamp: "2026-01-01T00:00:00",
+        event: "signal_layer_active",
+        message: "published",
+        signal_node_count: 5,
+        signal_edge_count: 4,
+      }),
+    ).toBe("signal nodes 5 / signal edges 4");
+  });
+
+  it("does not expose adaptive chunking wording", () => {
+    expect(logEventLabel("evidence_section_sizing")).toBe("Evidence section sizing");
+    expect(logEventLabel("chunk_adaptive")).toBe("Evidence section sizing");
+    expect(logVisualTone({ event: "chunk_adaptive" })).toBe("default");
   });
 });

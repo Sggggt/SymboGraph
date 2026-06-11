@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
-"""No-fallback quality gate for DB/Qdrant chunk-vector health.
+﻿#!/usr/bin/env python3
+"""No-fallback quality gate for evidence graph and vector health.
 
 Run inside the API container:
-    python /app/scripts/quality_gate.py --course-name "Course Name"
+    python /app/scripts/quality_gate.py --KnowledgeBase-name "KnowledgeBase Name"
 """
 
 from __future__ import annotations
@@ -14,57 +14,64 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "api"))
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.config import get_settings
 from app.db import SessionLocal, ensure_schema
-from app.models import Chunk, ConceptRelation, Course, GraphCommunitySummary, GraphExtractionChunkTask, GraphExtractionRun, GraphRelationCandidate, QualityProfile
-from app.services.strategy_profiles import get_active_profile_record
+from app.models import (
+    ActiveChunk,
+    ChunkCandidate,
+    ChunkDecision,
+    CommunityMembership,
+    CommunityState,
+    CommunitySummary,
+    EvidenceAtom,
+    EvidenceEdge,
+    EvidenceGraphState,
+    KnowledgeBase,
+    QualityDecision,
+    VectorRecord,
+)
 from app.services.vector_store import VectorStore
 
-LEGACY_ENTRYPOINT_SYMBOLS = (
-    "graph_enhanced_search",
-    "graph_enhanced_search_v2",
-    "layered_search_chunks",
-    "local_graph_search",
-    "community_search_chunks",
-    "RetrievalExecutor",
-    "GRAPH_EXTRACTION_CHUNK_LIMIT",
-    "GRAPH_EXTRACTION_CHUNKS_PER_DOCUMENT",
-    "graph_extraction_chunk_limit",
-    "graph_extraction_chunks_per_document",
+
+REMOVED_ACTIVE_ENTRYPOINTS = (
+    "/concepts",
+    "/search/semantic-graph",
+    "/maintenance/cleanup-stale-graph",
+    "rebuild_graph_mode",
+    "confirm_destructive_graph_rebuild",
+    "QuerySemanticGraphRequest",
+    "cleanupStaleGraph",
+    "fetchConcepts",
+    "rebuild_knowledge_base_graph_task",
 )
 
 
-def assert_legacy_entrypoints_removed(repo_root: Path) -> None:
-    """Fail if removed compatibility-only entrypoints return to source files."""
+def assert_removed_entrypoints_absent(repo_root: Path) -> None:
     scan_targets = [
-        repo_root / "README.md",
-        repo_root / "README.en.md",
-        repo_root / "todo.md",
-        repo_root / "apps" / "api" / "app",
-        repo_root / "apps" / "api" / "tests",
+        repo_root / "apps" / "api" / "app" / "api.py",
+        repo_root / "apps" / "api" / "app" / "schemas.py",
+        repo_root / "apps" / "api" / "app" / "services" / "ingestion.py",
+        repo_root / "apps" / "api" / "app" / "services" / "retrieval.py",
+        repo_root / "apps" / "api" / "app" / "services" / "agent_graph.py",
+        repo_root / "apps" / "api" / "app" / "services" / "runtime_settings.py",
         repo_root / "apps" / "web" / "src",
+        repo_root / "apps" / "worker" / "worker_app" / "tasks.py",
         repo_root / "packages" / "shared" / "src",
-        repo_root / "scripts",
     ]
-    current_file = Path(__file__).resolve()
     matches: list[str] = []
     for target in scan_targets:
         paths = [target] if target.is_file() else target.rglob("*") if target.exists() else []
         for path in paths:
-            if path == current_file or path.suffix.lower() not in {".py", ".ts", ".tsx", ".md", ".env", ".example"}:
+            if path.suffix.lower() not in {".py", ".ts", ".tsx"}:
                 continue
-            try:
-                text = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                text = path.read_text(encoding="utf-8", errors="ignore")
-            for symbol in LEGACY_ENTRYPOINT_SYMBOLS:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            for symbol in REMOVED_ACTIVE_ENTRYPOINTS:
                 if symbol in text:
                     matches.append(f"{path.relative_to(repo_root)}: {symbol}")
     if matches:
-        joined = "\n  ".join(matches)
-        raise SystemExit(f"Legacy fallback-only entrypoints remain in source:\n  {joined}")
+        raise SystemExit("Removed legacy active entrypoints remain:\n  " + "\n  ".join(matches))
 
 
 def vector_norm(vector: list[float]) -> float:
@@ -72,141 +79,111 @@ def vector_norm(vector: list[float]) -> float:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Check active chunk/vector health.")
-    parser.add_argument("--course-name", default=None)
-    parser.add_argument("--course-id", default=None)
+    parser = argparse.ArgumentParser(description="Check evidence graph and vector health.")
+    parser.add_argument("--KnowledgeBase-name", "--knowledge-base-name", dest="knowledge_base_name", default=None)
+    parser.add_argument("--KnowledgeBase-id", "--knowledge-base-id", dest="knowledge_base_id", default=None)
     parser.add_argument("--delete-orphan-zero-vectors", action="store_true")
-    parser.add_argument("--allow-flat-chunks", action="store_true", help="Do not fail on active chunks without parent/child metadata.")
     args = parser.parse_args()
 
     settings = get_settings()
     if settings.enable_model_fallback or settings.enable_database_fallback:
         raise SystemExit("Quality gate must run with ENABLE_MODEL_FALLBACK=false and ENABLE_DATABASE_FALLBACK=false.")
     repo_root = Path(__file__).resolve().parents[1]
-    assert_legacy_entrypoints_removed(repo_root)
+    assert_removed_entrypoints_absent(repo_root)
 
     ensure_schema()
     with SessionLocal() as db:
-        course_query = select(Course)
-        if args.course_id:
-            course_query = course_query.where(Course.id == args.course_id)
-        if args.course_name:
-            course_query = course_query.where(Course.name == args.course_name)
-        courses = db.scalars(course_query.order_by(Course.name.asc())).all()
-        if not courses:
-            raise SystemExit("No matching courses found.")
+        kb_query = select(KnowledgeBase)
+        if args.knowledge_base_id:
+            kb_query = kb_query.where(KnowledgeBase.id == args.knowledge_base_id)
+        if args.knowledge_base_name:
+            kb_query = kb_query.where(KnowledgeBase.name == args.knowledge_base_name)
+        knowledge_bases = db.scalars(kb_query.order_by(KnowledgeBase.name.asc())).all()
+        if not knowledge_bases:
+            raise SystemExit("No matching knowledge_bases found.")
 
         ok = True
-        for course in courses:
-            chunks = db.scalars(select(Chunk).where(Chunk.course_id == course.id, Chunk.is_active.is_(True))).all()
-            active_ids = {chunk.id for chunk in chunks}
-            parent_count = sum(1 for chunk in chunks if (chunk.metadata_json or {}).get("is_parent") is True)
-            explicit_child_count = sum(1 for chunk in chunks if (chunk.metadata_json or {}).get("is_parent") is False)
-            legacy_flat_count = len(chunks) - parent_count - explicit_child_count
-            child_without_parent = [
-                chunk.id
-                for chunk in chunks
-                if (chunk.metadata_json or {}).get("is_parent") is False and not chunk.parent_chunk_id
-            ]
-            quality_policy_counts: dict[str, int] = {}
-            chunk_action_counts: dict[str, int] = {}
-            chunk_retention_counts = {"retained": 0, "discarded": 0, "missing": 0}
-            route_counts = {"embed": 0, "retrieval": 0, "graph_extraction": 0, "summary": 0, "evidence_only": 0, "missing": 0}
-            for chunk in chunks:
-                metadata = chunk.metadata_json or {}
-                policy = str(metadata.get("quality_policy") or "missing")
-                quality_policy_counts[policy] = quality_policy_counts.get(policy, 0) + 1
-                action = str(metadata.get("quality_action") or "missing")
-                chunk_action_counts[action] = chunk_action_counts.get(action, 0) + 1
-                if "quality_retain" in metadata:
-                    if metadata.get("quality_retain") is False:
-                        chunk_retention_counts["discarded"] += 1
-                    else:
-                        chunk_retention_counts["retained"] += 1
-                else:
-                    chunk_retention_counts["missing"] += 1
-                routes = metadata.get("route_eligibility")
-                if isinstance(routes, dict):
-                    for route_name in ("embed", "retrieval", "graph_extraction", "summary", "evidence_only"):
-                        route_counts[route_name] += int(routes.get(route_name) is True)
-                else:
-                    route_counts["missing"] += 1
-            active_profile = db.scalar(
-                select(QualityProfile)
-                .where(QualityProfile.course_id == course.id, QualityProfile.is_active.is_(True))
-                .order_by(QualityProfile.created_at.desc())
-            )
-            strategy_profile = get_active_profile_record(db, course.id)
-            candidate_count = db.query(GraphRelationCandidate).filter(GraphRelationCandidate.course_id == course.id).count()
-            accepted_relation_count = db.query(ConceptRelation).filter(ConceptRelation.course_id == course.id).count()
-            forbidden_relation_count = (
-                db.query(ConceptRelation)
-                .filter(
-                    ConceptRelation.course_id == course.id,
-                    ConceptRelation.relation_source.in_(["semantic_sparse", "dijkstra_inferred"]),
-                )
-                .count()
-            )
-            candidate_only_in_relation_table = [
-                relation.id
-                for relation in db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course.id)).all()
-                if (relation.metadata_json or {}).get("candidate_only")
-            ]
-            relation_rows = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course.id)).all()
-            missing_evidence_relations = [
-                relation.id
-                for relation in relation_rows
-                if relation.relation_source not in {"prerequisite_chain"} and not relation.evidence_chunk_id
-            ]
-            active_by_id = {chunk.id: chunk for chunk in chunks}
-            relation_evidence_inactive = [
-                relation.id
-                for relation in relation_rows
-                if relation.evidence_chunk_id and relation.evidence_chunk_id not in active_ids
-            ]
-            relation_evidence_not_retrievable = [
-                relation.id
-                for relation in relation_rows
-                if relation.evidence_chunk_id
-                and relation.evidence_chunk_id in active_by_id
-                and isinstance((active_by_id[relation.evidence_chunk_id].metadata_json or {}).get("route_eligibility"), dict)
-                and not (active_by_id[relation.evidence_chunk_id].metadata_json or {}).get("route_eligibility", {}).get("retrieval")
-            ]
-            graph_chunks_not_retrievable = [
-                chunk.id
-                for chunk in chunks
-                if isinstance((chunk.metadata_json or {}).get("route_eligibility"), dict)
-                and (chunk.metadata_json or {}).get("route_eligibility", {}).get("graph_extraction")
-                and not (chunk.metadata_json or {}).get("route_eligibility", {}).get("retrieval")
-            ]
-            active_community_summaries = db.scalars(
-                select(GraphCommunitySummary).where(
-                    GraphCommunitySummary.course_id == course.id,
-                    GraphCommunitySummary.is_active.is_(True),
+        for knowledge_base in knowledge_bases:
+            active_chunks = db.scalars(
+                select(ActiveChunk).where(ActiveChunk.knowledge_base_id == knowledge_base.id, ActiveChunk.state == "active")
+            ).all()
+            active_chunk_ids = {chunk.id for chunk in active_chunks}
+            vector_records = db.scalars(
+                select(VectorRecord).where(
+                    VectorRecord.knowledge_base_id == knowledge_base.id,
+                    VectorRecord.vector_status == "ready",
                 )
             ).all()
-            community_versions = sorted({summary.version for summary in active_community_summaries})
-            latest_extraction_run = db.scalar(
-                select(GraphExtractionRun)
-                .where(GraphExtractionRun.course_id == course.id)
-                .order_by(GraphExtractionRun.created_at.desc())
-            )
-            extraction_task_counts: dict[str, int] = {}
-            if latest_extraction_run:
-                for status, count in db.query(GraphExtractionChunkTask.status, GraphExtractionChunkTask.id).filter(
-                    GraphExtractionChunkTask.run_id == latest_extraction_run.id
-                ).all():
-                    extraction_task_counts[str(status)] = extraction_task_counts.get(str(status), 0) + 1
+            expected_vector_ids = {
+                record.qdrant_point_id
+                for record in vector_records
+                if record.active_chunk_id in active_chunk_ids
+            }
+            broken_vector_records = [
+                record.id
+                for record in vector_records
+                if record.active_chunk_id not in active_chunk_ids
+            ]
 
-            vector_store = VectorStore(course_name=course.name)
-            vector_ids = set(vector_store.list_ids(course.id))
-            missing = sorted(active_ids - vector_ids)
-            orphan = sorted(vector_ids - active_ids)
+            active_atoms = db.scalars(
+                select(EvidenceAtom).where(EvidenceAtom.knowledge_base_id == knowledge_base.id, EvidenceAtom.state == "active")
+            ).all()
+            active_atom_ids = {atom.id for atom in active_atoms}
+            graph_states = db.scalars(
+                select(EvidenceGraphState).where(EvidenceGraphState.knowledge_base_id == knowledge_base.id, EvidenceGraphState.state == "active")
+            ).all()
+            graph_state_ids = {state.id for state in graph_states}
+            bad_graph_states = [
+                state.id
+                for state in graph_states
+                if not set(str(item) for item in (state.active_atom_ids or [])).issubset(active_atom_ids)
+            ]
+            edges = db.scalars(select(EvidenceEdge).where(EvidenceEdge.graph_state_id.in_(graph_state_ids or {"__none__"}))).all()
+            bad_edges = [
+                edge.id
+                for edge in edges
+                if edge.source_atom_id not in active_atom_ids or edge.target_atom_id not in active_atom_ids
+            ]
+            broken_active_chunks = [
+                chunk.id
+                for chunk in active_chunks
+                if not (chunk.atom_ids_json or [])
+                or not set(str(item) for item in (chunk.atom_ids_json or [])).issubset(active_atom_ids)
+                or not chunk.quality_decision_id
+                or not chunk.graph_state_hash
+            ]
+
+            candidate_count = db.scalar(
+                select(func.count(ChunkCandidate.id)).where(ChunkCandidate.graph_state_id.in_(graph_state_ids or {"__none__"}))
+            )
+            decision_count = db.scalar(
+                select(func.count(ChunkDecision.id)).where(ChunkDecision.knowledge_base_id == knowledge_base.id)
+            )
+            quality_count = db.scalar(
+                select(func.count(QualityDecision.id)).join(ChunkCandidate, QualityDecision.candidate_id == ChunkCandidate.id).where(
+                    ChunkCandidate.graph_state_id.in_(graph_state_ids or {"__none__"})
+                )
+            )
+            community_states = db.scalars(
+                select(CommunityState).where(CommunityState.knowledge_base_id == knowledge_base.id, CommunityState.state == "active")
+            ).all()
+            community_state_ids = {state.id for state in community_states}
+            community_memberships = db.scalar(
+                select(func.count(CommunityMembership.id)).where(CommunityMembership.community_state_id.in_(community_state_ids or {"__none__"}))
+            )
+            community_summaries = db.scalar(
+                select(func.count(CommunitySummary.id)).where(CommunitySummary.community_state_id.in_(community_state_ids or {"__none__"}))
+            )
+
+            vector_store = VectorStore(knowledge_base_name=knowledge_base.name)
+            qdrant_ids = set(vector_store.list_ids(knowledge_base.id))
+            missing = sorted(expected_vector_ids - qdrant_ids)
+            orphan = sorted(qdrant_ids - expected_vector_ids)
 
             zero_ids: list[str] = []
             checked = 0
-            for index in range(0, len(vector_ids), 100):
-                batch_ids = sorted(vector_ids)[index : index + 100]
+            for index in range(0, len(qdrant_ids), 100):
+                batch_ids = sorted(qdrant_ids)[index : index + 100]
                 points = vector_store.get_points(batch_ids)
                 checked += len(points)
                 for point in points:
@@ -219,51 +196,17 @@ def main() -> None:
                 orphan = sorted(set(orphan) - set(orphan_zero_ids))
                 zero_ids = sorted(set(zero_ids) - set(orphan_zero_ids))
 
-            print(f"\nCourse: {course.name}")
-            print(f"  active_chunks={len(chunks)} parent_chunks={parent_count} child_chunks={explicit_child_count} legacy_flat_chunks={legacy_flat_count}")
-            print(f"  qdrant_vectors={len(vector_ids)} checked_vectors={checked}")
+            print(f"\nKnowledgeBase: {knowledge_base.name}")
+            print(f"  active_chunks={len(active_chunks)} active_atoms={len(active_atoms)} evidence_edges={len(edges)}")
+            print(f"  graph_states={len(graph_states)} chunk_candidates={candidate_count or 0} chunk_decisions={decision_count or 0} quality_decisions={quality_count or 0}")
+            print(f"  vector_records={len(vector_records)} expected_vectors={len(expected_vector_ids)} qdrant_vectors={len(qdrant_ids)} checked_vectors={checked}")
             print(f"  missing_vectors={len(missing)} orphan_vectors={len(orphan)} zero_vectors={len(zero_ids)}")
-            print(f"  child_without_parent={len(child_without_parent)}")
-            print(
-                "  strategy_profile="
-                f"{strategy_profile.name} id={strategy_profile.id} hash={strategy_profile.profile_hash}"
-            )
-            print(f"  quality_profile={active_profile.version if active_profile else 'missing'}")
-            print(f"  quality_policy_counts={quality_policy_counts}")
-            print(f"  chunk_action_counts={chunk_action_counts}")
-            print(f"  chunk_retention_counts={chunk_retention_counts}")
-            print(f"  route_eligibility_counts={route_counts}")
-            print(f"  graph_relations={accepted_relation_count} graph_relation_candidates={candidate_count}")
-            print(f"  forbidden_candidate_relations={forbidden_relation_count} candidate_only_relation_rows={len(candidate_only_in_relation_table)}")
-            print(f"  relation_rows_missing_evidence={len(missing_evidence_relations)}")
-            print(f"  relation_evidence_inactive_chunks={len(relation_evidence_inactive)}")
-            print(f"  relation_evidence_not_retrievable={len(relation_evidence_not_retrievable)}")
-            print(f"  graph_chunks_not_retrievable={len(graph_chunks_not_retrievable)}")
-            print(f"  community_summaries={len(active_community_summaries)} community_versions={community_versions or ['missing']}")
-            print(
-                "  graph_extraction_run="
-                f"{latest_extraction_run.id if latest_extraction_run else 'missing'} "
-                f"status={latest_extraction_run.status if latest_extraction_run else 'missing'} "
-                f"strategy={latest_extraction_run.strategy if latest_extraction_run else 'missing'} "
-                f"profile_hash={latest_extraction_run.strategy_profile_hash if latest_extraction_run else 'missing'} "
-                f"tasks={extraction_task_counts}"
-            )
+            print(f"  communities={len(community_states)} memberships={community_memberships or 0} summaries={community_summaries or 0}")
+            print(f"  broken_active_chunks={len(broken_active_chunks)} broken_vector_records={len(broken_vector_records)} bad_graph_states={len(bad_graph_states)} bad_edges={len(bad_edges)}")
+
             if orphan_zero_ids:
                 print(f"  orphan_zero_vectors={', '.join(orphan_zero_ids)}")
-
-            if (
-                missing
-                or orphan
-                or zero_ids
-                or child_without_parent
-                or forbidden_relation_count
-                or candidate_only_in_relation_table
-                or missing_evidence_relations
-                or relation_evidence_inactive
-                or relation_evidence_not_retrievable
-                or graph_chunks_not_retrievable
-                or (legacy_flat_count and not args.allow_flat_chunks)
-            ):
+            if missing or orphan or zero_ids or broken_active_chunks or broken_vector_records or bad_graph_states or bad_edges:
                 ok = False
 
         if not ok:

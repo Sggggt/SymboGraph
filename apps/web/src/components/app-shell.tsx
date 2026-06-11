@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useState } from "react";
 import Image from "next/image";
@@ -9,11 +9,11 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { BookOpenText, BrainCircuit, FolderPlus, Home, RefreshCw, Search, Settings, Share2, Sparkles, TerminalSquare, Trash2, Upload } from "lucide-react";
 
 import { AmbientCanvas } from "@/components/ambient-canvas";
-import { useCourseContext } from "@/components/course-context";
+import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { deleteCourse, refreshCourse } from "@/lib/api";
+import { deleteKnowledgeBase, refreshKnowledgeBase } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const navigation = [
@@ -21,57 +21,52 @@ const navigation = [
   { href: "/upload", label: "导入", caption: "导入", icon: Upload },
   { href: "/search", label: "搜索", caption: "搜索", icon: Search },
   { href: "/qa", label: "问答", caption: "对话", icon: BrainCircuit },
-  { href: "/concepts", label: "概念", caption: "概念", icon: BookOpenText },
   { href: "/graph", label: "图谱", caption: "图谱", icon: Share2 },
   { href: "/settings", label: "设置", caption: "模型", icon: Settings },
 ];
 
-const CREATE_COURSE_TUTORIAL_STORAGE_KEY = "symbograph.hideCreateCourseTutorial";
+const CREATE_KB_TUTORIAL_STORAGE_KEY = "symbograph.hideCreateKnowledgeBaseTutorial";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const queryClient = useQueryClient();
-  const { courses, selectedCourse, selectedCourseId, setSelectedCourseId, createCourseSpace, isCreating } = useCourseContext();
+  const { knowledgeBases, selectedKnowledgeBase, selectedKnowledgeBaseId, setSelectedKnowledgeBaseId, createKnowledgeBaseSpace, isCreating } = useKnowledgeBaseContext();
   const [createOpen, setCreateOpen] = useState(false);
-  const [courseToDelete, setCourseToDelete] = useState<{ id: string; name: string } | null>(null);
-  const [deleteCourseResult, setDeleteCourseResult] = useState<string | null>(null);
-  const [nextCourseName, setNextCourseName] = useState("");
+  const [knowledgeBaseToDelete, setKnowledgeBaseToDelete] = useState<{ id: string; name: string } | null>(null);
+  const [deleteKnowledgeBaseResult, setDeleteKnowledgeBaseResult] = useState<string | null>(null);
+  const [nextKnowledgeBaseName, setNextKnowledgeBaseName] = useState("");
   const [refreshDone, setRefreshDone] = useState(false);
   const [createTutorialOpen, setCreateTutorialOpen] = useState(false);
   const [hideCreateTutorialDraft, setHideCreateTutorialDraft] = useState(false);
   const refreshMutation = useMutation({
-    mutationFn: () => refreshCourse(selectedCourseId),
+    mutationFn: () => refreshKnowledgeBase(selectedKnowledgeBaseId),
     onSuccess: async () => {
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["courses"] }),
-        queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] }),
-        queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] }),
-        queryClient.invalidateQueries({ queryKey: ["graph", selectedCourseId] }),
-        queryClient.invalidateQueries({ queryKey: ["chapter-graph"] }),
-        queryClient.invalidateQueries({ queryKey: ["graph-node"] }),
-        queryClient.invalidateQueries({ queryKey: ["concepts", selectedCourseId] }),
-        queryClient.invalidateQueries({ queryKey: ["sessions", selectedCourseId] }),
+        queryClient.invalidateQueries({ queryKey: ["knowledgeBases"] }),
+        queryClient.invalidateQueries({ queryKey: ["dashboard", selectedKnowledgeBaseId] }),
+        queryClient.invalidateQueries({ queryKey: ["knowledgeBase-files", selectedKnowledgeBaseId] }),
+        queryClient.invalidateQueries({ queryKey: ["graph", selectedKnowledgeBaseId] }),
+        queryClient.invalidateQueries({ queryKey: ["partition-graph"] }),
+        queryClient.invalidateQueries({ queryKey: ["sessions", selectedKnowledgeBaseId] }),
       ]);
       setRefreshDone(true);
       window.setTimeout(() => setRefreshDone(false), 1600);
     },
   });
-  const deleteCourseMutation = useMutation({
-    mutationFn: (courseId: string) => deleteCourse(courseId),
-    onSuccess: async (data, deletedCourseId) => {
-      setDeleteCourseResult(
-        `资料库数据已删除：向量 ${data.deleted_vectors} 条，文档 ${data.deleted_documents} 份，片段 ${data.deleted_chunks} 个，图谱关系 ${data.deleted_relations} 条。`,
+  const deleteKnowledgeBaseMutation = useMutation({
+    mutationFn: (knowledgeBaseId: string) => deleteKnowledgeBase(knowledgeBaseId),
+    onSuccess: async (data, deletedKnowledgeBaseId) => {
+      setDeleteKnowledgeBaseResult(
+        `资料库数据已删除：向量 ${data.deleted_vectors} 条，文档 ${data.deleted_documents} 份，片段 ${data.deleted_chunks} 个，evidence atoms ${data.deleted_evidence_atoms} 个，active chunks ${data.deleted_active_chunks} 个。`,
       );
-      const nextCourse = courses.find((course) => course.id !== deletedCourseId) ?? null;
-      setSelectedCourseId(nextCourse?.id ?? null);
+      const nextKnowledgeBase = knowledgeBases.find((knowledgeBase) => knowledgeBase.id !== deletedKnowledgeBaseId) ?? null;
+      setSelectedKnowledgeBaseId(nextKnowledgeBase?.id ?? null);
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["courses"] }),
+        queryClient.invalidateQueries({ queryKey: ["knowledgeBases"] }),
         queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
-        queryClient.invalidateQueries({ queryKey: ["course-files"] }),
+        queryClient.invalidateQueries({ queryKey: ["knowledgeBase-files"] }),
         queryClient.invalidateQueries({ queryKey: ["graph"] }),
-        queryClient.invalidateQueries({ queryKey: ["chapter-graph"] }),
-        queryClient.invalidateQueries({ queryKey: ["graph-node"] }),
-        queryClient.invalidateQueries({ queryKey: ["concepts"] }),
+        queryClient.invalidateQueries({ queryKey: ["partition-graph"] }),
         queryClient.invalidateQueries({ queryKey: ["sessions"] }),
       ]);
     },
@@ -136,7 +131,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <div className="min-w-0">
                 <p className="text-[10px] uppercase tracking-[0.34em] text-cyan-100/42">知 识 库</p>
                 <h1 className="mt-1 break-words text-lg font-semibold text-white lg:text-xl">本地资料智能检索台</h1>
-                <p className="mt-1 text-xs text-white/45">{selectedCourse?.name ?? "选择资料库空间"}</p>
+                <p className="mt-1 text-xs text-white/45">{selectedKnowledgeBase?.name ?? "选择资料库空间"}</p>
               </div>
             </div>
             <div className="flex flex-wrap items-center justify-end gap-2">
@@ -148,7 +143,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   className="rounded-full"
                   aria-label="刷新当前资料库"
                   onClick={() => refreshMutation.mutate()}
-                  disabled={!selectedCourseId || refreshMutation.isPending}
+                  disabled={!selectedKnowledgeBaseId || refreshMutation.isPending}
                 >
                   <RefreshCw className={cn("size-4", refreshMutation.isPending && "animate-spin")} />
                 </Button>
@@ -161,19 +156,19 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <div className="flex items-center gap-2 rounded-full border border-cyan-300/16 bg-cyan-300/[0.06] px-3 py-2 text-xs text-white/75 shadow-[0_0_24px_rgba(85,215,255,0.06)]">
                 <BookOpenText className="size-4 text-cyan-100/78" />
                 <select
-                  value={selectedCourseId ?? ""}
-                  onChange={(event) => setSelectedCourseId(event.target.value || null)}
-                  disabled={courses.length === 0}
+                  value={selectedKnowledgeBaseId ?? ""}
+                  onChange={(event) => setSelectedKnowledgeBaseId(event.target.value || null)}
+                  disabled={knowledgeBases.length === 0}
                   className="min-w-[11rem] bg-transparent text-sm text-white outline-none"
                 >
-                  {courses.length === 0 ? (
+                  {knowledgeBases.length === 0 ? (
                     <option value="" className="bg-[#081126] text-white">
                       暂无资料库
                     </option>
                   ) : null}
-                  {courses.map((course) => (
-                    <option key={course.id} value={course.id} className="bg-[#081126] text-white">
-                      {course.name}
+                  {knowledgeBases.map((knowledgeBase) => (
+                    <option key={knowledgeBase.id} value={knowledgeBase.id} className="bg-[#081126] text-white">
+                      {knowledgeBase.name}
                     </option>
                   ))}
                 </select>
@@ -182,14 +177,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   aria-label="删除当前资料库"
                   title="删除当前资料库"
                   onClick={() => {
-                    if (!selectedCourseId || !selectedCourse) {
+                    if (!selectedKnowledgeBaseId || !selectedKnowledgeBase) {
                       return;
                     }
-                    setDeleteCourseResult(null);
-                    deleteCourseMutation.reset();
-                    setCourseToDelete({ id: selectedCourseId, name: selectedCourse.name });
+                    setDeleteKnowledgeBaseResult(null);
+                    deleteKnowledgeBaseMutation.reset();
+                    setKnowledgeBaseToDelete({ id: selectedKnowledgeBaseId, name: selectedKnowledgeBase.name });
                   }}
-                  disabled={!selectedCourseId || deleteCourseMutation.isPending}
+                  disabled={!selectedKnowledgeBaseId || deleteKnowledgeBaseMutation.isPending}
                   className="grid size-8 place-items-center rounded-full border border-rose-200/20 text-rose-100/70 transition hover:border-rose-200/45 hover:bg-rose-300/10 hover:text-rose-50 disabled:pointer-events-none disabled:opacity-40"
                 >
                   <Trash2 className="size-4" />
@@ -226,14 +221,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             className="space-y-4 px-6 py-5"
             onSubmit={async (event) => {
               event.preventDefault();
-              const name = nextCourseName.trim();
+              const name = nextKnowledgeBaseName.trim();
               if (!name) {
                 return;
               }
-              await createCourseSpace({ name });
-              setNextCourseName("");
+              await createKnowledgeBaseSpace({ name });
+              setNextKnowledgeBaseName("");
               setCreateOpen(false);
-              if (window.localStorage.getItem(CREATE_COURSE_TUTORIAL_STORAGE_KEY) !== "true") {
+              if (window.localStorage.getItem(CREATE_KB_TUTORIAL_STORAGE_KEY) !== "true") {
                 setHideCreateTutorialDraft(false);
                 setCreateTutorialOpen(true);
               }
@@ -242,8 +237,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <label className="flex flex-col gap-2">
               <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">资料库名称</span>
               <Input
-                value={nextCourseName}
-                onChange={(event) => setNextCourseName(event.target.value)}
+                value={nextKnowledgeBaseName}
+                onChange={(event) => setNextKnowledgeBaseName(event.target.value)}
                 placeholder="线性代数"
                 className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white placeholder:text-white/28"
               />
@@ -252,7 +247,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <Button type="button" variant="outline" className="rounded-full" onClick={() => setCreateOpen(false)}>
                 取消
               </Button>
-              <Button type="submit" className="rounded-full" disabled={isCreating || !nextCourseName.trim()}>
+              <Button type="submit" className="rounded-full" disabled={isCreating || !nextKnowledgeBaseName.trim()}>
                 <FolderPlus data-icon="inline-start" />
                 {isCreating ? "创建中" : "创建"}
               </Button>
@@ -313,7 +308,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 type="button"
                 className="rounded-full"
                 onClick={() => {
-                  window.localStorage.setItem(CREATE_COURSE_TUTORIAL_STORAGE_KEY, hideCreateTutorialDraft ? "true" : "false");
+                  window.localStorage.setItem(CREATE_KB_TUTORIAL_STORAGE_KEY, hideCreateTutorialDraft ? "true" : "false");
                   setCreateTutorialOpen(false);
                 }}
               >
@@ -325,62 +320,62 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       </Dialog>
 
       <Dialog
-        open={Boolean(courseToDelete)}
+        open={Boolean(knowledgeBaseToDelete)}
         onOpenChange={(open) => {
-          if (!open && !deleteCourseMutation.isPending) {
-            setCourseToDelete(null);
-            setDeleteCourseResult(null);
+          if (!open && !deleteKnowledgeBaseMutation.isPending) {
+            setKnowledgeBaseToDelete(null);
+            setDeleteKnowledgeBaseResult(null);
           }
         }}
       >
-        <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.92)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl" showCloseButton={!deleteCourseMutation.isPending}>
+        <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.92)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl" showCloseButton={!deleteKnowledgeBaseMutation.isPending}>
           <DialogHeader className="border-b border-white/8 px-6 py-5">
             <DialogTitle>删除资料库</DialogTitle>
             <DialogDescription>
-              {courseToDelete ? `将从文件存储、PostgreSQL、Qdrant 和图谱表中删除“${courseToDelete.name}”。` : ""}
+              {knowledgeBaseToDelete ? `将从文件存储、PostgreSQL、Qdrant 和图谱表中删除“${knowledgeBaseToDelete.name}”。` : ""}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 px-6 py-5">
-            {deleteCourseMutation.isPending ? (
+            {deleteKnowledgeBaseMutation.isPending ? (
               <div>
                 <p className="text-sm text-white/72">正在删除资料库数据...</p>
                 <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/8">
                   <div className="h-full w-2/3 animate-pulse rounded-full bg-[linear-gradient(90deg,#fb7185,#fbbf24,#fb7185)]" />
                 </div>
               </div>
-            ) : deleteCourseResult ? (
-              <p className="rounded-2xl border border-emerald-200/16 bg-emerald-300/[0.055] px-4 py-3 text-sm leading-6 text-emerald-50/78">{deleteCourseResult}</p>
+            ) : deleteKnowledgeBaseResult ? (
+              <p className="rounded-2xl border border-emerald-200/16 bg-emerald-300/[0.055] px-4 py-3 text-sm leading-6 text-emerald-50/78">{deleteKnowledgeBaseResult}</p>
             ) : (
               <p className="rounded-2xl border border-rose-200/16 bg-rose-300/[0.055] px-4 py-3 text-sm leading-6 text-rose-50/78">
                 这是不可逆操作，界面内无法撤销。
               </p>
             )}
-            {deleteCourseMutation.error ? <p className="text-sm text-rose-100/78">{(deleteCourseMutation.error as Error).message}</p> : null}
+            {deleteKnowledgeBaseMutation.error ? <p className="text-sm text-rose-100/78">{(deleteKnowledgeBaseMutation.error as Error).message}</p> : null}
             <div className="flex justify-end gap-2">
               <Button
                 type="button"
                 variant="outline"
                 className="rounded-full"
-                disabled={deleteCourseMutation.isPending}
+                disabled={deleteKnowledgeBaseMutation.isPending}
                 onClick={() => {
-                  setCourseToDelete(null);
-                  setDeleteCourseResult(null);
+                  setKnowledgeBaseToDelete(null);
+                  setDeleteKnowledgeBaseResult(null);
                 }}
               >
-                {deleteCourseResult ? "关闭" : "取消"}
+                {deleteKnowledgeBaseResult ? "关闭" : "取消"}
               </Button>
-              {!deleteCourseResult ? (
+              {!deleteKnowledgeBaseResult ? (
                 <Button
                   type="button"
                   className="rounded-full"
-                  disabled={!courseToDelete || deleteCourseMutation.isPending}
+                  disabled={!knowledgeBaseToDelete || deleteKnowledgeBaseMutation.isPending}
                   onClick={() => {
-                    if (courseToDelete) {
-                      deleteCourseMutation.mutate(courseToDelete.id);
+                    if (knowledgeBaseToDelete) {
+                      deleteKnowledgeBaseMutation.mutate(knowledgeBaseToDelete.id);
                     }
                   }}
                 >
-                  {deleteCourseMutation.isPending ? "删除中..." : "删除"}
+                  {deleteKnowledgeBaseMutation.isPending ? "删除中..." : "删除"}
                 </Button>
               ) : null}
             </div>

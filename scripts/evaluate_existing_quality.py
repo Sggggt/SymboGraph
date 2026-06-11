@@ -79,37 +79,36 @@ async def check_endpoints():
         resp = await client.get(f"{API_BASE}/settings/runtime-check")
         resp.raise_for_status()
         
-        # /courses
-        resp = await client.get(f"{API_BASE}/courses")
+        # /knowledge_bases
+        resp = await client.get(f"{API_BASE}/knowledge_bases")
         resp.raise_for_status()
-        courses = resp.json()
+        knowledge_bases = resp.json()
         
-    return courses, model_settings
+    return knowledge_bases, model_settings
 
-def generate_samples(course_name: str, concepts: list) -> tuple[list[str], list[str]]:
-    # Generate 4 queries and 3 questions based on concept names
-    concept_names = [c["name"] for c in concepts[:10]]
-    if not concept_names:
-        concept_names = ["basic concept", "advanced theory", "application", "methodology"]
+def generate_samples(knowledge_base_name: str, evidence_terms: list[str]) -> tuple[list[str], list[str]]:
+    terms = [term.strip()[:90] for term in evidence_terms if str(term).strip()]
+    if not terms:
+        terms = [knowledge_base_name, "key evidence", "important source", "document context"]
         
     queries = [
-        f"Explain {concept_names[0]}",
-        f"What is the relationship between {concept_names[1]} and {concept_names[2]}?",
-        f"Details of {concept_names[3]}",
-        f"Summary of {concept_names[0]}"
+        f"Find evidence about {terms[0]}",
+        f"What source context connects {terms[1]} and {terms[2]}?",
+        f"Details of {terms[3]}",
+        f"Summary of {terms[0]}"
     ]
     
     questions = [
-        f"Can you explain the core idea behind {concept_names[0]} and how it is applied?",
-        f"How does {concept_names[1]} compare to {concept_names[2]} in this course?",
-        f"Summarize the key points about {concept_names[3]}."
+        f"Can you answer from cited evidence about {terms[0]}?",
+        f"How does the source context compare {terms[1]} and {terms[2]} in this KnowledgeBase?",
+        f"Summarize the key points about {terms[3]}."
     ]
     
     return queries, questions
 
-async def test_search(course_id: str, query: str, model_settings: dict, judge: Judge, results_report: list):
+async def test_search(knowledge_base_id: str, query: str, model_settings: dict, judge: Judge, results_report: list):
     async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
-        resp = await client.post(f"{API_BASE}/search", json={"course_id": course_id, "query": query, "top_k": 5})
+        resp = await client.post(f"{API_BASE}/search", json={"knowledge_base_id": knowledge_base_id, "query": query, "top_k": 5})
         resp.raise_for_status()
         data = resp.json()
         
@@ -148,7 +147,7 @@ async def test_search(course_id: str, query: str, model_settings: dict, judge: J
     
     return score, judge_res.get("failures", [])
 
-async def test_qa(course_id: str, question: str, judge: Judge, results_report: list, created_sessions: list):
+async def test_qa(knowledge_base_id: str, question: str, judge: Judge, results_report: list, created_sessions: list):
     import uuid
     session_id = str(uuid.uuid4())
     created_sessions.append(session_id)
@@ -161,7 +160,7 @@ async def test_qa(course_id: str, question: str, judge: Judge, results_report: l
     
     async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
         async with client.stream("POST", f"{API_BASE}/qa/stream", json={
-            "course_id": course_id,
+            "knowledge_base_id": knowledge_base_id,
             "question": question,
             "session_id": session_id,
             "history": []
@@ -228,42 +227,56 @@ async def cleanup_sessions(sessions: list):
                 print(f"Failed to delete session {sid}: {e}")
 
 async def main():
-    parser = argparse.ArgumentParser(description="Evaluate existing course search/QA quality with a real judge model.")
-    parser.add_argument("--course-name", action="append", default=[], help="Course name to evaluate. May be passed multiple times.")
-    parser.add_argument("--max-courses", type=int, default=2, help="Maximum courses to evaluate when --course-name is omitted.")
+    parser = argparse.ArgumentParser(description="Evaluate existing KnowledgeBase search/QA quality with a real judge model.")
+    parser.add_argument(
+        "--KnowledgeBase-name",
+        "--knowledge-base-name",
+        dest="knowledge_base_name",
+        action="append",
+        default=[],
+        help="KnowledgeBase name to evaluate. May be passed multiple times.",
+    )
+    parser.add_argument("--max-knowledge_bases", type=int, default=2, help="Maximum knowledge_bases to evaluate when --KnowledgeBase-name is omitted.")
     args = parser.parse_args()
 
     print("Starting evaluation...")
-    courses, model_settings = await check_endpoints()
-    if args.course_name:
-        target_names = set(args.course_name)
-        target_courses = [c for c in courses if c["name"] in target_names]
+    knowledge_bases, model_settings = await check_endpoints()
+    if args.knowledge_base_name:
+        target_names = set(args.knowledge_base_name)
+        target_courses = [c for c in knowledge_bases if c["name"] in target_names]
     else:
-        target_courses = courses[: args.max_courses]
+        target_courses = knowledge_bases[: args.max_courses]
     
     if not target_courses:
-        print("Target courses not found!")
+        print("Target knowledge_bases not found!")
         return
 
     judge = Judge()
     results_report = []
     created_sessions = []
     
-    for course in target_courses:
-        print(f"\nEvaluating course: {course['name']}")
+    for KnowledgeBase in target_courses:
+        print(f"\nEvaluating KnowledgeBase: {KnowledgeBase['name']}")
         
-        # Get concepts
+        # Get evidence graph terms without relying on removed graph APIs.
         async with httpx.AsyncClient(trust_env=False) as client:
-            resp = await client.get(f"{API_BASE}/concepts?course_id={course['id']}")
-            concepts = resp.json() if resp.status_code == 200 else []
+            resp = await client.get(
+                f"{API_BASE}/knowledge_bases/current/graph",
+                params={"knowledge_base_id": KnowledgeBase["id"], "graph_type": "evidence"},
+            )
+            graph = resp.json() if resp.status_code == 200 else {}
+            evidence_terms = [
+                str(node.get("snippet") or node.get("summary") or node.get("name") or "")
+                for node in (graph.get("nodes") or [])[:10]
+            ]
             
-        queries, questions = generate_samples(course['name'], concepts)
+        queries, questions = generate_samples(KnowledgeBase['name'], evidence_terms)
         
         search_scores = []
         for q in queries:
             print(f"  Search: {q}")
             try:
-                score, failures = await test_search(course['id'], q, model_settings, judge, results_report)
+                score, failures = await test_search(KnowledgeBase['id'], q, model_settings, judge, results_report)
                 search_scores.append(score)
             except Exception as e:
                 trace_str = traceback.format_exc()
@@ -274,7 +287,7 @@ async def main():
         for q in questions:
             print(f"  QA: {q}")
             try:
-                score, failures = await test_qa(course['id'], q, judge, results_report, created_sessions)
+                score, failures = await test_qa(KnowledgeBase['id'], q, judge, results_report, created_sessions)
                 qa_scores.append(score)
             except Exception as e:
                 trace_str = traceback.format_exc()

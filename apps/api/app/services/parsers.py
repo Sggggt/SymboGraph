@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import io
@@ -79,7 +79,14 @@ def _mojibake_score(text: str) -> float:
     markers = len(MOJIBAKE_MARKER_RE.findall(text))
     replacement = text.count("\ufffd")
     controls = len(CONTROL_CHAR_RE.findall(text))
-    return (markers * 2.0 + replacement * 3.0 + controls * 2.0) / max(len(text), 1)
+    lossy_latin_questions = len(re.findall(r"(?<=[A-Za-z])\?{2,}(?=\b|[\s.,;:])", text))
+    return (markers * 2.0 + replacement * 3.0 + controls * 2.0 + lossy_latin_questions * 2.5) / max(len(text), 1)
+
+
+def _repair_lossy_latin_question_marks(text: str) -> str:
+    # Some extractors replace non-ASCII Latin letters with repeated question
+    # marks. The original bytes are gone, so keep this limited to common words.
+    return re.sub(r"\b([Cc])af\?{2,}(?=\s|$|[.,;:])", lambda match: f"{match.group(1)}af\u00e9", text)
 
 
 def _repair_mojibake_candidate(text: str) -> tuple[str, bool]:
@@ -94,6 +101,7 @@ def _repair_mojibake_candidate(text: str) -> tuple[str, bool]:
             candidates.append(ftfy.fix_text(text, normalization="NFC"))
         except Exception:
             pass
+    candidates.append(_repair_lossy_latin_question_marks(text))
 
     # Typical PDF / web extraction failure: UTF-8 bytes were decoded as a
     # legacy code page, producing CJK-looking garbage such as "閺嶇绺?.
@@ -269,7 +277,7 @@ def parse_html(path: Path) -> list[ParsedSection]:
 
 def _detect_formula(text: str) -> bool:
     """Detect formula-heavy text without rewriting math symbols."""
-    formula_chars = set("∑∫∂√∞≈≠≤≥±×÷∈∉⊂⊆∪∩→←↔∀∃∇αβγδθηλμπρστυφχψωΓΔΘΛΠΣΦΨΩ")
+    formula_chars = set("∑∫?√∞≈≠≤≥±×÷∈???∪∩→←????αβγδθηλμπρστυφχψωΓΔΘΛΠΣΦΨΩ")
     if not text:
         return False
     ratio = sum(1 for c in text if c in formula_chars) / len(text)
@@ -561,7 +569,7 @@ def sections_to_json(sections: list[ParsedSection]) -> list[dict[str, Any]]:
     return [asdict(section) for section in sections]
 
 
-INVALID_CHAPTER_LABELS = {
+INVALID_PARTITION_LABELS = {
     "data",
     "storage",
     "reviewmarkdown",
@@ -576,30 +584,30 @@ def is_date_like_label(value: str) -> bool:
     return bool(re.fullmatch(r"(?:19|20)\d{6}", value.strip()))
 
 
-def is_invalid_chapter_label(value: str | None, course_name: str | None = None) -> bool:
+def is_invalid_partition_label(value: str | None, knowledge_base_name: str | None = None) -> bool:
     if not value:
         return True
     normalized = _normalize_label(value)
     if not normalized:
         return True
-    if normalized.replace(" ", "") in INVALID_CHAPTER_LABELS:
+    if normalized.replace(" ", "") in INVALID_PARTITION_LABELS:
         return True
     if is_date_like_label(normalized.replace(" ", "")):
         return True
-    if course_name and normalized == _normalize_label(course_name):
+    if knowledge_base_name and normalized == _normalize_label(knowledge_base_name):
         return True
     return False
 
 
-def canonical_chapter_label(value: str, course_name: str | None = None) -> str | None:
+def canonical_partition_label(value: str, knowledge_base_name: str | None = None) -> str | None:
     cleaned = re.sub(r"[_-]+", " ", value)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if not cleaned:
         return None
 
-    match = re.search(r"\b(?:chapter|chap)\s*\.?\s*(\d+[A-Za-z]?)\b", cleaned, flags=re.IGNORECASE)
+    match = re.search(r"\b(?:partition|chap)\s*\.?\s*(\d+[A-Za-z]?)\b", cleaned, flags=re.IGNORECASE)
     if match:
-        return f"Chapter {match.group(1)}"
+        return f"partition {match.group(1)}"
 
     match = re.search(r"\b(?:lecture|lec|l)\s*\.?\s*(\d+[A-Za-z]?)\b", cleaned, flags=re.IGNORECASE)
     if match:
@@ -620,8 +628,8 @@ def canonical_chapter_label(value: str, course_name: str | None = None) -> str |
             return "Lab Solutions"
         return "Lab"
 
-    if re.search(r"\bcourse\s*work\b|\bcoursework\b", cleaned, flags=re.IGNORECASE):
-        return "Coursework"
+    if re.search(r"\bwork\s*book\b|\bworkbook\b|\bwork\s*items?\b", cleaned, flags=re.IGNORECASE):
+        return "Workbook"
 
     if re.search(r"\bz\s*table\b|\breference\b|\bformula\b|\bsummary\b|\bvisuali[sz]er\b", cleaned, flags=re.IGNORECASE):
         return "Reference"
@@ -632,13 +640,13 @@ def canonical_chapter_label(value: str, course_name: str | None = None) -> str |
     cleaned = cleaned[:80].strip()
     if cleaned and not re.search(r"[A-Za-z0-9]", cleaned):
         return "Reference"
-    return None if is_invalid_chapter_label(cleaned, course_name=course_name) else cleaned
+    return None if is_invalid_partition_label(cleaned, knowledge_base_name=knowledge_base_name) else cleaned
 
 
-def derive_chapter(path: Path, course_name: str | None = None) -> str:
+def derive_partition(path: Path, knowledge_base_name: str | None = None) -> str:
     candidates = [path.stem, path.parent.name]
     for item in candidates:
-        label = canonical_chapter_label(item, course_name=course_name)
-        if label and not is_invalid_chapter_label(label, course_name=course_name):
+        label = canonical_partition_label(item, knowledge_base_name=knowledge_base_name)
+        if label and not is_invalid_partition_label(label, knowledge_base_name=knowledge_base_name):
             return label
     return path.stem[:80]

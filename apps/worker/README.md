@@ -1,62 +1,56 @@
-# SymboGraph Background Worker
+# Worker 使用指南
 
-An asynchronous task processor and filesystem watcher designed to offload long-running, CPU-intensive computations from the main FastAPI application thread and synchronize local source documents.
+`apps/worker` 提供 Celery worker 与文件 watcher。Worker 只负责执行长任务，不复制后端业务逻辑；解析、证据图、信号层、切块、质量、检索和问答逻辑都复用 `apps/api` 的 service layer。
 
----
+## 启动
 
-## 🛠️ Key Roles & Components
+推荐使用 Docker Compose：
 
-### 1. Asynchronous Ingestion (Celery Worker)
-To prevent blocking the core API event loop and maintain low latency for interactive client RAG requests, heavy computing loads are offloaded to **Celery**:
-- **Bulk Document Parsing**: Processing extensive PDF layouts, Jupyter notebook structures, and Office slides.
-- **High-volume Embedding Generation**: Performing batch vector embeddings across thousands of semantic text chunks.
-- **LLM Graph Extraction**: Managing long-running LLM extract-and-merge pipelines.
-- **Auto HPO Trials**: Running sequential Optuna TPE simulations over candidate parameters.
-- **Phase-aware cancellation**: Preserving committed parse results when cancellation happens during graph work, while rolling back parse-phase writes when cancellation happens before parse commit.
-- **Profile-aware execution**: Background ingestion and graph tasks reuse the API service layer and read the active knowledge-base Profile at task boundaries. Profile changes affect only tasks started after the change and do not rewrite already committed chunks, vectors, or graph objects.
-
-### 2. Filesystem Synchronization (Course Watcher)
-A lightweight monitoring service using `watchdog` to track file events within your course directories (`DATA_ROOT`):
-- Automatically triggers a sync ingestion batch when course files (`.pdf`, `.ipynb`, `.md`, etc.) are added, updated, or removed from local storage folders.
-- Uses file hashes (checksums) to dynamically deduplicate file writes and prevent redundant pipeline triggers.
-- Does not create, edit, or switch Profiles. New knowledge bases are still created with the built-in default Profile by the API layer.
-
----
-
-## 📂 Project Structure
-
-```
-apps/worker/
-├── worker_app/
-│   ├── celery_app.py   # Celery application registration and task broker configuration
-│   ├── tasks.py        # Shared background tasks (ingestion, graph rebuild)
-│   └── watcher.py       # Event-driven filesystem watchdog monitoring course storage
-├── pyproject.toml      # Modern uv package manager configuration
-└── README.md           # Worker documentation
+```powershell
+docker compose -f infra/docker-compose.yml up -d --build worker
 ```
 
----
+容器名：
 
-## 🚀 Running the Worker
-
-> [!NOTE]
-> The Celery worker is part of the standard `infra/docker-compose.yml` stack and consumes the `course-kg-main-ingestion` queue. The filesystem watcher remains optional and is not started by the default compose command.
-
-Ensure that PostgreSQL, Qdrant, and Redis are running and reachable before launching the worker services.
-
-### Starting the Celery Background Task Worker
-To run the background task handler:
-```bash
-# Sync local virtualenv using uv
-uv sync
-
-# Launch Celery worker
-uv run celery -A worker_app.celery_app worker --loglevel=info --queues=course-kg-main-ingestion --concurrency=${WORKER_CONCURRENCY:-2}
+```text
+course-kg-worker
 ```
 
-### Starting the Filesystem Directory Watcher
-To run the filesystem watchdog listener:
-```bash
-# Launch watcher module
-uv run python -m worker_app.watcher
+查看状态：
+
+```powershell
+docker ps --filter "name=course-kg-worker"
+docker logs --tail 100 course-kg-worker
+```
+
+## 职责
+
+```mermaid
+flowchart LR
+    API["API enqueue"] --> R["Redis broker"]
+    R --> W["Celery worker"]
+    W --> S["API service layer"]
+    S --> PG["PostgreSQL"]
+    S --> Q["Qdrant"]
+```
+
+Worker 处理：
+
+- 文件导入批次
+- 文件解析
+- evidence atoms / evidence graph 构建
+- signal layer 与 projection 派生
+- chunk candidates、quality decisions、active chunks
+- embedding 与 Qdrant upsert
+- 取消、补偿和重试
+
+## 运行时设置
+
+Worker 在任务开始前刷新共享 `.env` 与 Redis runtime settings version。长任务进入关键阶段前也应刷新设置，确保模型端点、embedding 维度、timeout、fallback、reranker、质量预算和策略参数可见。
+
+## 验证
+
+```powershell
+docker exec -w /app/apps/api course-kg-api python -m pytest tests/test_ingestion_batches.py tests/test_evidence_graph_pipeline.py -q
+python scripts\docker_smoke.py --base-url http://127.0.0.1:8000/api --worker-container course-kg-worker
 ```

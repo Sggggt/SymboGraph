@@ -1,53 +1,52 @@
 import type { IngestionLogEvent } from "@course-kg/shared";
 
-export type LogVisualTone = "adaptive" | "graph" | "hpo" | "warning" | "failure" | "default";
+export type LogVisualTone = "graph" | "warning" | "failure" | "default";
 
 export const logEventLabels: Record<string, string> = {
-  batch_started: "批次开始",
-  batch_files: "文件扫描",
-  file_started: "开始解析",
-  job_state: "任务状态",
-  file_skipped: "跳过文件",
-  file_completed: "文件完成",
-  file_failed: "文件失败",
-  batch_graph_started: "图谱生成",
-  batch_graph_selected: "图谱片段选择",
-  batch_graph_plan_created: "图谱计划",
-  batch_graph_probe_started: "图谱探针",
-  batch_graph_progress: "图谱抽取进度",
-  batch_graph_adaptive_round_started: "图谱抽取轮次",
-  batch_graph_coverage_updated: "图谱覆盖更新",
-  batch_graph_community_summary: "社区摘要进度",
-  graph_upsert_started: "图谱写入开始",
-  graph_upsert_completed: "图谱写入完成",
-  graph_enrichment_started: "拓扑刷新开始",
-  graph_enrichment_completed: "拓扑刷新完成",
-  graph_community_started: "社区摘要开始",
-  graph_community_completed: "社区摘要完成",
-  graph_rebuilt: "图谱完成",
-  graph_failed: "图谱失败",
-  batch_completed: "批次完成",
-  batch_partial_failed: "部分失败",
-  batch_failed: "批次失败",
-  batch_skipped: "批次跳过",
-  batch_missing: "批次丢失",
-  log_stream_retry: "日志重连",
-  chunk_adaptive: "分块自适应",
-  hpo_started: "自动调参开始",
-  hpo_objective_features_started: "HPO 特征开始",
-  hpo_objective_features_completed: "HPO 特征完成",
-  hpo_judge_started: "Judge HPO 开始",
-  hpo_judge_progress: "Judge HPO 进度",
-  hpo_judge_completed: "Judge HPO 完成",
-  hpo_judge_failed: "Judge HPO 失败",
-  hpo_objective_training_started: "目标函数训练开始",
-  hpo_objective_training_completed: "目标函数训练完成",
-  hpo_objective_training_failed: "目标函数训练失败",
-  hpo_tpe_started: "TPE 开始",
-  hpo_tpe_progress: "TPE 进度",
-  hpo_tpe_completed: "TPE 完成",
-  hpo_completed: "自动调参完成",
-  hpo_failed: "自动调参失败",
+  batch_started: "Batch started",
+  batch_files: "Files scanned",
+  file_started: "File parsing started",
+  job_state: "Job state",
+  file_skipped: "File skipped",
+  file_completed: "File completed",
+  file_failed: "File failed",
+  batch_graph_started: "Evidence graph build",
+  batch_graph_selected: "Evidence scope selected",
+  batch_graph_plan_created: "Evidence graph plan",
+  batch_graph_probe_started: "Evidence graph probe",
+  batch_graph_progress: "Evidence graph progress",
+  batch_graph_adaptive_round_started: "Evidence graph round",
+  batch_graph_coverage_updated: "Evidence coverage updated",
+  batch_graph_community_summary: "Community summary progress",
+  graph_upsert_started: "Evidence graph write started",
+  graph_upsert_completed: "Evidence graph write completed",
+  graph_enrichment_started: "Evidence topology refresh started",
+  graph_enrichment_completed: "Evidence topology refresh completed",
+  graph_community_started: "Community summary started",
+  graph_community_completed: "Community summary completed",
+  graph_rebuilt: "Evidence graph completed",
+  graph_failed: "Evidence graph failed",
+  global_graph_scanning: "Global evidence graph publish",
+  global_graph_active: "Global evidence graph active",
+  global_graph_failed: "Global evidence graph failed",
+  signal_candidate_scanning: "Signal candidate scan",
+  signal_candidate_gate: "Signal candidate gate",
+  signal_schema_failed: "Signal schema failed",
+  signal_layer_scanning: "Signal layer scanning",
+  signal_layer_normalizing: "Signal layer normalizing",
+  signal_layer_assembling: "Signal layer assembling",
+  signal_layer_validating: "Signal layer validating",
+  signal_layer_active: "Signal layer active",
+  signal_layer_failed: "Signal layer failed",
+  batch_completed: "Batch completed",
+  batch_partial_failed: "Partially failed",
+  batch_failed: "Batch failed",
+  batch_skipped: "Batch skipped",
+  batch_missing: "Batch missing",
+  log_stream_retry: "Log stream reconnect",
+  log_stream_warning: "Log stream warning",
+  evidence_section_sizing: "Evidence section sizing",
+  chunk_adaptive: "Evidence section sizing",
 };
 
 export function logEventLabel(event: string): string {
@@ -61,79 +60,46 @@ export function logVisualTone(item: Pick<IngestionLogEvent, "event" | "stage">):
   if (item.event === "log_stream_retry" || item.event.includes("warning")) {
     return "warning";
   }
-  if (item.event === "chunk_adaptive") {
-    return "adaptive";
-  }
-  if (item.event.startsWith("hpo_") || item.stage === "judge" || item.stage === "tpe" || item.stage === "objective_training") {
-    return "hpo";
-  }
-  if (item.event.startsWith("batch_graph_") || item.event.startsWith("graph_")) {
+  if (item.event.startsWith("batch_graph_") || item.event.startsWith("graph_") || item.event.startsWith("global_graph_")) {
     return "graph";
   }
   return "default";
 }
 
-function formatNumber(value: unknown, digits = 3): string | null {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return null;
-  }
-  return value.toFixed(digits).replace(/\.?0+$/, "");
-}
-
-export function hpoLogSummary(item: IngestionLogEvent): string | null {
-  if (!item.event.startsWith("hpo_")) {
-    return null;
-  }
-  const parts: string[] = [];
-  if (typeof item.candidate_count === "number") {
-    parts.push(`候选 ${item.candidate_count}`);
-  }
-  if (typeof item.processed_pairs === "number" || typeof item.pair_count === "number") {
-    parts.push(`Judge ${item.processed_pairs ?? 0}/${item.pair_count ?? "?"}`);
-  }
-  if (typeof item.effective_labels === "number" || typeof item.min_labels === "number") {
-    parts.push(`有效标签 ${item.effective_labels ?? 0}/${item.min_labels ?? "?"}`);
-  }
-  if (typeof item.trial_count === "number") {
-    parts.push(`TPE ${item.trial_count}`);
-  }
-  const bestValue = formatNumber(item.best_value);
-  if (bestValue !== null) {
-    parts.push(`best ${bestValue}`);
-  }
-  if (item.objective_model_id) {
-    parts.push(`目标 ${item.objective_model_id.slice(0, 8)}`);
-  }
-  return parts.length ? parts.join(" · ") : null;
-}
-
 export function graphLogSummary(item: IngestionLogEvent): string | null {
-  if (!(item.event.startsWith("batch_graph_") || item.event.startsWith("graph_"))) {
+  if (
+    !(
+      item.event.startsWith("batch_graph_") ||
+      item.event.startsWith("graph_") ||
+      item.event.startsWith("global_graph_") ||
+      item.event.startsWith("signal_candidate_") ||
+      item.event.startsWith("signal_schema_") ||
+      item.event.startsWith("signal_layer_")
+    )
+  ) {
     return null;
   }
   const parts: string[] = [];
-  if (typeof item.graph_extraction_completed_chunks === "number") {
-    parts.push(`chunks ${item.graph_extraction_completed_chunks}`);
-  } else if (typeof item.graph_llm_success_chunks === "number") {
-    parts.push(`chunks ${item.graph_llm_success_chunks}`);
+  const pushNumber = (label: string, value: number | undefined) => {
+    if (typeof value === "number") {
+      parts.push(`${label} ${value}`);
+    }
+  };
+  pushNumber("atoms", item.atom_count);
+  if (typeof item.evidence_atoms === "number") {
+    parts.push(`atoms ${item.evidence_atoms}`);
   }
-  if (typeof item.concepts === "number") {
-    parts.push(`concepts ${item.concepts}`);
-  }
-  if (typeof item.relations === "number") {
-    parts.push(`relations ${item.relations}`);
-  }
-  if (typeof item.graph_rejected_concepts === "number") {
-    parts.push(`rejected ${item.graph_rejected_concepts}`);
-  }
-  if (typeof item.graph_algorithm_nodes === "number") {
-    parts.push(`nodes ${item.graph_algorithm_nodes}`);
-  }
-  if (typeof item.graph_algorithm_edges === "number") {
-    parts.push(`edges ${item.graph_algorithm_edges}`);
-  }
-  if (typeof item.community_summary_count === "number") {
-    parts.push(`communities ${item.community_summary_count}`);
-  }
-  return parts.length ? parts.join(" · ") : null;
+  pushNumber("edges", item.evidence_edges);
+  pushNumber("active chunks", item.active_chunks);
+  pushNumber("chunk candidates", item.chunk_candidates);
+  pushNumber("communities", item.community_summary_count);
+  pushNumber("signal candidates", item.candidate_count);
+  pushNumber("signal candidates", item.signal_candidates);
+  pushNumber("signal candidates", item.signal_candidate_count);
+  pushNumber("accepted signals", item.accepted_signal_candidate_count);
+  pushNumber("rejected signals", item.rejected_signal_candidate_count);
+  pushNumber("signal nodes", item.signal_nodes ?? item.signal_node_count);
+  pushNumber("signal edges", item.signal_edges ?? item.signal_edge_count);
+  pushNumber("signal communities", item.signal_communities ?? item.signal_community_count);
+  return parts.length ? parts.join(" / ") : null;
 }

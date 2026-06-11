@@ -21,7 +21,8 @@ class CrossEncoderReranker:
         settings = get_settings()
         self.model_name = model_name or settings.reranker_model
         self.max_length = max_length or settings.reranker_max_length
-        self.model = CrossEncoder(self.model_name, max_length=self.max_length)
+        self.device = read_env_str("RERANKER_DEVICE", settings.reranker_device)
+        self.model = CrossEncoder(self.model_name, max_length=self.max_length, device=self.device)
 
     def rerank(self, query: str, candidates: list[dict], top_k: int) -> list[dict]:
         if not candidates:
@@ -83,7 +84,7 @@ def get_reranker() -> CrossEncoderReranker:
     except ImportError as exc:
         raise RerankerError(
             "sentence-transformers is required for Cross-Encoder reranking. "
-            "Install it with: pip install 'course-kg-api[rerank]'"
+            "Install it with: pip install 'KnowledgeBase-kg-api[rerank]'"
         ) from exc
 
 
@@ -91,10 +92,11 @@ def get_reranker_status() -> dict:
     """获取 CrossEncoder 的运行时状态（不重新加载模型，查缓存）。"""
     reranker_enabled = read_env_bool("RERANKER_ENABLED", False)
     reranker_model = read_env_str("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+    reranker_device = read_env_str("RERANKER_DEVICE", "cpu")
     if not reranker_enabled:
         return {
             "enabled": False,
-            "device": "cpu",
+            "device": reranker_device,
             "model": reranker_model,
             "url": "",
             "reachable": False,
@@ -116,15 +118,15 @@ def get_reranker_status() -> dict:
             "healthy": True,
             "reported_model": _reranker_instance.model_name,
             "reported_device": str(_reranker_instance.model.device),
-            "model_matches": True,
-            "device_matches": True,
+            "model_matches": _reranker_instance.model_name == reranker_model,
+            "device_matches": str(_reranker_instance.model.device) == reranker_device,
         }
 
     # 缓存了错误
     if _reranker_error is not None:
         return {
             "enabled": True,
-            "device": "cpu",
+            "device": reranker_device,
             "model": reranker_model,
             "url": "",
             "reachable": False,
@@ -147,13 +149,13 @@ def get_reranker_status() -> dict:
             "healthy": True,
             "reported_model": instance.model_name,
             "reported_device": str(instance.model.device),
-            "model_matches": True,
-            "device_matches": True,
+            "model_matches": instance.model_name == reranker_model,
+            "device_matches": str(instance.model.device) == reranker_device,
         }
     except Exception:
         return {
             "enabled": True,
-            "device": "cpu",
+            "device": reranker_device,
             "model": reranker_model,
             "url": "",
             "reachable": False,

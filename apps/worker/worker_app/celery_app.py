@@ -10,4 +10,14 @@ celery_app.conf.task_default_queue = settings.ingestion_task_queue
 celery_app.conf.task_serializer = "json"
 celery_app.conf.accept_content = ["json"]
 celery_app.conf.result_serializer = "json"
+celery_app.conf.beat_schedule = {
+    "reconcile-vector-store-every-30-minutes": {
+        "task": "reconcile_vector_store",
+        "schedule": 30 * 60,
+    },
+    "update-policy-backfill-every-5-minutes": {
+        "task": "update_policy_backfill",
+        "schedule": 5 * 60,
+    },
+}
 celery_app.autodiscover_tasks(["worker_app"])

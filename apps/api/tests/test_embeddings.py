@@ -215,8 +215,8 @@ async def test_answer_prompt_enforces_latex_markdown_format(no_fallback_env, mon
         "How is degree centrality defined?",
         [
             {
-                "document_title": "Centrality Notes",
-                "chapter": "L3",
+                "document_title": "Centrality sources",
+                "partition": "L3",
                 "content": "Degree centrality is ki over n minus 1.",
                 "snippet": "Degree centrality is ki over n minus 1.",
                 "citations": [],
@@ -255,7 +255,7 @@ async def test_answer_prompt_language_follows_english_question_with_chinese_cont
         [
             {
                 "document_title": "图论讲义",
-                "chapter": "第1章",
+                "partition": "第1章",
                 "content": "图由顶点集合和边集合组成。",
                 "snippet": "图由顶点集合和边集合组成。",
                 "citations": [],
@@ -290,8 +290,8 @@ async def test_answer_prompt_language_follows_chinese_question_with_english_cont
         "\u4ec0\u4e48\u662f\u56fe\uff0c\u56fe\u5982\u4f55\u8868\u793a\uff1f",
         [
             {
-                "document_title": "Graph Notes",
-                "chapter": "Chapter 1",
+                "document_title": "Graph sources",
+                "partition": "partition 1",
                 "content": "A graph consists of a vertex set and an edge set.",
                 "snippet": "A graph consists of a vertex set and an edge set.",
                 "citations": [],
@@ -313,7 +313,7 @@ def test_no_context_answer_follows_question_language(no_fallback_env):
     from app.services.embeddings import no_context_answer
 
     assert no_context_answer("What is a graph?").startswith("I could not find")
-    assert no_context_answer("\u4ec0\u4e48\u662f\u56fe\uff1f").startswith("\u8bfe\u7a0b\u6750\u6599")
+    assert no_context_answer("\u4ec0\u4e48\u662f\u56fe\uff1f").startswith("\u7d22\u5f15\u8d44\u6599")
 
 
 @pytest.mark.asyncio
@@ -327,35 +327,14 @@ async def test_chat_json_response_format_falls_back_to_prompt_only(no_fallback_e
         response_formats.append(payload.get("response_format"))
         if payload.get("response_format"):
             raise RuntimeError("InvalidParameter: response_format is not supported")
-        return {"choices": [{"message": {"content": '{"route":"retrieve_notes"}'}}]}
+        return {"choices": [{"message": {"content": '{"route":"retrieve_sources"}'}}]}
 
     monkeypatch.setattr(embeddings, "post_openai_compatible_json", fake_post_json)
 
     result = await ChatProvider().classify_json("Return JSON.", "Classify.", fallback={})
 
     assert response_formats == [{"type": "json_object"}, None]
-    assert result == {"route": "retrieve_notes"}
-
-
-@pytest.mark.asyncio
-async def test_graph_json_schema_falls_back_to_json_object_then_prompt_only(no_fallback_env, monkeypatch):
-    from app.services import embeddings
-    from app.services.embeddings import ChatProvider
-
-    response_formats: list[object] = []
-
-    async def fake_post_json(url, payload, headers, *, timeout, resolve_ip=None):
-        response_formats.append(payload.get("response_format"))
-        if payload.get("response_format"):
-            raise RuntimeError("InvalidParameter: response_format is not supported")
-        return {"choices": [{"message": {"content": '{"concepts":[],"relations":[]}'}}]}
-
-    monkeypatch.setattr(embeddings, "post_openai_compatible_json", fake_post_json)
-
-    result = await ChatProvider().extract_graph_payload("Graph material", "L1", "pdf")
-
-    assert [item.get("type") if isinstance(item, dict) else None for item in response_formats] == ["json_schema", "json_object", None]
-    assert result == {"concepts": [], "relations": []}
+    assert result == {"route": "retrieve_sources"}
 
 
 @pytest.mark.asyncio
@@ -384,7 +363,7 @@ async def test_chat_content_parts_are_normalized(no_fallback_env, monkeypatch):
         [
             {
                 "document_title": "Doc",
-                "chapter": "L1",
+                "partition": "L1",
                 "content": "Evidence",
                 "snippet": "Evidence",
                 "metadata": {},

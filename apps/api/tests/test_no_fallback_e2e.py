@@ -1,7 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
-import shutil
 import uuid
 from pathlib import Path
 
@@ -34,14 +33,15 @@ async def test_parse_search_and_qa_without_fallback(tmp_path, monkeypatch):
     from app.db import Base, SessionLocal, engine, ensure_schema
     from app.schemas import AgentRequest, SearchFilters
     from app.services.agent_graph import run_agent
-    from app.services.ingestion import create_course_space, ingest_file
+    from app.services.ingestion import create_knowledge_base_space, ingest_file
+    from app.services.maintenance import delete_knowledge_base_data
     from app.services.retrieval import search_chunks_with_audit
     from app.services.vector_store import VectorStore
 
     Base.metadata.create_all(bind=engine)
     ensure_schema()
 
-    course_name = f"No Fallback E2E {uuid.uuid4()}"
+    knowledge_base_name = f"No Fallback E2E {uuid.uuid4()}"
     source = tmp_path / "centrality.md"
     source.write_text(
         "# Centrality\n\nDegree centrality counts incident edges in a graph. "
@@ -50,37 +50,42 @@ async def test_parse_search_and_qa_without_fallback(tmp_path, monkeypatch):
     )
 
     db = SessionLocal()
-    course = None
-    chunk_ids: list[str] = []
-    course_root = settings.course_paths_for_name(course_name)["course_root"]
+    KnowledgeBase = None
     try:
         try:
             qdrant_response = httpx.get(f"{settings.qdrant_url.rstrip('/')}/collections", timeout=5.0, trust_env=False)
             qdrant_response.raise_for_status()
         except Exception as exc:
             pytest.fail(f"Qdrant is unavailable at {settings.qdrant_url}; no-fallback E2E cannot run: {exc}")
-        VectorStore(course_name=course_name)
-        course = create_course_space(db, course_name, "temporary no-fallback smoke test")
-        result = await ingest_file(db, source, trigger_source="test", course_id=course.id, rebuild_graph=False)
+        VectorStore(knowledge_base_name=knowledge_base_name)
+        KnowledgeBase = create_knowledge_base_space(db, knowledge_base_name, "temporary no-fallback smoke test")
+        result = await ingest_file(db, source, trigger_source="test", knowledge_base_id=KnowledgeBase.id, rebuild_graph=False)
         assert result["status"] == "completed"
         assert result["stats"]["embedding_provider"] == "openai_compatible"
         assert result["stats"]["embedding_external_called"] is True
         assert result["stats"]["embedding_fallback_reason"] is None
 
-        chunks = db.query(models.Chunk).filter(models.Chunk.course_id == course.id, models.Chunk.is_active.is_(True)).all()
+        chunks = db.query(models.ActiveChunk).filter(models.ActiveChunk.knowledge_base_id == KnowledgeBase.id, models.ActiveChunk.state == "active").all()
         chunk_ids = [chunk.id for chunk in chunks]
         assert chunk_ids
+        atoms = db.query(models.EvidenceAtom).filter(models.EvidenceAtom.knowledge_base_id == KnowledgeBase.id, models.EvidenceAtom.state == "active").all()
+        assert atoms
+        vector_records = db.query(models.VectorRecord).filter(models.VectorRecord.knowledge_base_id == KnowledgeBase.id).all()
+        assert {record.active_chunk_id for record in vector_records}.issubset(set(chunk_ids))
+        assert vector_records
 
-        search_results, search_audit = await search_chunks_with_audit(db, course.id, "degree centrality", SearchFilters(), 3)
+        search_results, search_audit = await search_chunks_with_audit(db, KnowledgeBase.id, "degree centrality", SearchFilters(), 3)
         assert search_results
         assert search_results[0]["citations"]
+        traces = db.query(models.RetrievalTrace).filter(models.RetrievalTrace.knowledge_base_id == KnowledgeBase.id).all()
+        assert traces
         assert search_audit["embedding_provider"] == "openai_compatible"
         assert search_audit["embedding_external_called"] is True
         assert search_audit["embedding_fallback_reason"] is None
 
         response = await run_agent(
             db,
-            AgentRequest(question="What is degree centrality?", course_id=course.id, top_k=3),
+            AgentRequest(question="What is degree centrality?", knowledge_base_id=KnowledgeBase.id, top_k=3),
         )
         assert response["answer"]
         assert response["citations"]
@@ -89,33 +94,10 @@ async def test_parse_search_and_qa_without_fallback(tmp_path, monkeypatch):
         assert "provider=openai_compatible_chat" in (answer_trace["output_summary"] or "")
         assert "fallback=None" in (answer_trace["output_summary"] or "")
 
-        vector_index = settings.course_paths_for_name(course.name)["ingestion_root"] / "vector_index.json"
+        vector_index = settings.knowledge_base_paths_for_name(KnowledgeBase.name)["ingestion_root"] / "vector_index.json"
         assert not vector_index.exists()
     finally:
-        if course is not None:
-            try:
-                VectorStore(course_name=course.name).delete(chunk_ids)
-            except Exception:
-                pass
-            db.query(models.AgentTraceEvent).filter(models.AgentTraceEvent.run_id.in_(
-                db.query(models.AgentRun.id).filter(models.AgentRun.course_id == course.id)
-            )).delete(synchronize_session=False)
-            db.query(models.AgentRun).filter(models.AgentRun.course_id == course.id).delete(synchronize_session=False)
-            db.query(models.QASession).filter(models.QASession.course_id == course.id).delete(synchronize_session=False)
-            db.query(models.ConceptRelation).filter(models.ConceptRelation.course_id == course.id).delete(synchronize_session=False)
-            concept_ids = [item.id for item in db.query(models.Concept).filter(models.Concept.course_id == course.id).all()]
-            if concept_ids:
-                db.query(models.ConceptAlias).filter(models.ConceptAlias.concept_id.in_(concept_ids)).delete(synchronize_session=False)
-            db.query(models.Concept).filter(models.Concept.course_id == course.id).delete(synchronize_session=False)
-            db.query(models.Chunk).filter(models.Chunk.course_id == course.id).delete(synchronize_session=False)
-            db.query(models.DocumentVersion).filter(models.DocumentVersion.document_id.in_(
-                db.query(models.Document.id).filter(models.Document.course_id == course.id)
-            )).delete(synchronize_session=False)
-            db.query(models.Document).filter(models.Document.course_id == course.id).delete(synchronize_session=False)
-            db.query(models.IngestionJob).filter(models.IngestionJob.course_id == course.id).delete(synchronize_session=False)
-            db.query(models.IngestionBatch).filter(models.IngestionBatch.course_id == course.id).delete(synchronize_session=False)
-            db.query(models.Course).filter(models.Course.id == course.id).delete(synchronize_session=False)
-            db.commit()
+        if KnowledgeBase is not None:
+            delete_knowledge_base_data(db, KnowledgeBase)
         db.close()
-        shutil.rmtree(course_root, ignore_errors=True)
         get_settings.cache_clear()

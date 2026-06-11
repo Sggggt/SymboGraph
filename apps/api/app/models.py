@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -18,8 +18,8 @@ class TimestampMixin:
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-class Course(TimestampMixin, Base):
-    __tablename__ = "courses"
+class KnowledgeBase(TimestampMixin, Base):
+    __tablename__ = "knowledge_bases"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
@@ -28,11 +28,41 @@ class Course(TimestampMixin, Base):
     current_chunk_version: Mapped[int] = mapped_column(Integer, default=0)
     active_profile_id: Mapped[str | None] = mapped_column(ForeignKey("strategy_profiles.id"), nullable=True, index=True)
 
-    documents: Mapped[list["Document"]] = relationship(back_populates="course")
-    concepts: Mapped[list["Concept"]] = relationship(back_populates="course")
-    batches: Mapped[list["IngestionBatch"]] = relationship(back_populates="course")
-    model_hyperparameters: Mapped[list["CourseModelHyperparameter"]] = relationship(back_populates="course")
+    documents: Mapped[list["Document"]] = relationship(back_populates="knowledge_base")
+    batches: Mapped[list["IngestionBatch"]] = relationship(back_populates="knowledge_base")
     active_profile: Mapped["StrategyProfile | None"] = relationship(foreign_keys=[active_profile_id])
+
+
+class SourceFile(TimestampMixin, Base):
+    __tablename__ = "source_files"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    document_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id", ondelete="SET NULL"), nullable=True, index=True)
+    source_path: Mapped[str] = mapped_column(Text, index=True)
+    checksum: Mapped[str] = mapped_column(String(64), index=True)
+    source_type: Mapped[str] = mapped_column(String(50), default="unknown", index=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    state: Mapped[str] = mapped_column(String(32), default="active", index=True)
+
+
+class ParseJob(TimestampMixin, Base):
+    __tablename__ = "parse_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    document_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id", ondelete="SET NULL"), nullable=True, index=True)
+    document_version_id: Mapped[str | None] = mapped_column(ForeignKey("document_versions.id", ondelete="SET NULL"), nullable=True, index=True)
+    ingestion_job_id: Mapped[str | None] = mapped_column(ForeignKey("ingestion_jobs.id", ondelete="SET NULL"), nullable=True, index=True)
+    source_file_id: Mapped[str | None] = mapped_column(ForeignKey("source_files.id", ondelete="SET NULL"), nullable=True, index=True)
+    parser_protocol_version: Mapped[str] = mapped_column(String(64), default="parser_v1")
+    status: Mapped[str] = mapped_column(String(32), default="completed", index=True)
+    stats_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class StrategyProfile(TimestampMixin, Base):
@@ -47,100 +77,11 @@ class StrategyProfile(TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
 
-class CourseGraphState(TimestampMixin, Base):
-    __tablename__ = "course_graph_states"
-
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), primary_key=True)
-    graph_build_id: Mapped[str] = mapped_column(String(36), default=generate_uuid, index=True)
-    build_mode: Mapped[str] = mapped_column(String(32), default="full")
-    embedding_text_version: Mapped[str] = mapped_column(String(32), index=True)
-    active_document_version_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    active_chunk_ids_hash: Mapped[str] = mapped_column(String(64), index=True)
-    graph_document_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    strategy_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    strategy_profile_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    active_chunk_count: Mapped[int] = mapped_column(Integer, default=0)
-    built_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-
-class CourseModelHyperparameter(TimestampMixin, Base):
-    __tablename__ = "course_model_hyperparameters"
-
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), primary_key=True)
-    llm_model_name: Mapped[str] = mapped_column(String(128), primary_key=True)
-    embedding_model_name: Mapped[str] = mapped_column(String(128), primary_key=True)
-    embedding_text_version: Mapped[str] = mapped_column(String(32), primary_key=True)
-    model_name: Mapped[str | None] = mapped_column(String(384), nullable=True)
-    graph_version: Mapped[str] = mapped_column(String(128), default="active")
-
-    min_relation_confidence: Mapped[float] = mapped_column(Float, default=0.72)
-    min_accepted_relation_weight: Mapped[float] = mapped_column(Float, default=0.62)
-    dijkstra_semantic_threshold: Mapped[float] = mapped_column(Float, default=0.78)
-
-    w_degree: Mapped[float] = mapped_column(Float, default=0.25)
-    w_weighted_degree: Mapped[float] = mapped_column(Float, default=0.25)
-    w_pagerank: Mapped[float] = mapped_column(Float, default=0.20)
-    w_betweenness: Mapped[float] = mapped_column(Float, default=0.20)
-    w_closeness: Mapped[float] = mapped_column(Float, default=0.10)
-
-    w_centrality: Mapped[float] = mapped_column(Float, default=0.50)
-    w_llm_importance: Mapped[float] = mapped_column(Float, default=0.25)
-    w_evidence: Mapped[float] = mapped_column(Float, default=0.25)
-
-    hpo_status: Mapped[str] = mapped_column(String(32), default="pending")
-    last_optimized_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    optuna_history: Mapped[dict] = mapped_column(JSON, default=dict)
-
-    course: Mapped["Course"] = relationship(back_populates="model_hyperparameters")
-
-
-class GraphHpoJudgeSample(TimestampMixin, Base):
-    __tablename__ = "graph_hpo_judge_samples"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), index=True)
-    llm_model_name: Mapped[str] = mapped_column(String(128), index=True)
-    embedding_model_name: Mapped[str] = mapped_column(String(128), index=True)
-    embedding_text_version: Mapped[str] = mapped_column(String(32), index=True)
-    model_key: Mapped[str] = mapped_column(String(384), index=True)
-    payload_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
-    prompt_version: Mapped[str] = mapped_column(String(128), index=True)
-    judge_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    candidate_a_params: Mapped[dict] = mapped_column(JSON, default=dict)
-    candidate_b_params: Mapped[dict] = mapped_column(JSON, default=dict)
-    candidate_a_features: Mapped[dict] = mapped_column(JSON, default=dict)
-    candidate_b_features: Mapped[dict] = mapped_column(JSON, default=dict)
-    winner: Mapped[str] = mapped_column(String(16), index=True)
-    confidence: Mapped[float] = mapped_column(Float, default=0.0)
-    reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
-    safety_flags: Mapped[list[str]] = mapped_column(JSON, default=list)
-    raw_response: Mapped[dict] = mapped_column(JSON, default=dict)
-
-
-class GraphHpoObjectiveModel(TimestampMixin, Base):
-    __tablename__ = "graph_hpo_objective_models"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id", ondelete="CASCADE"), index=True)
-    llm_model_name: Mapped[str] = mapped_column(String(128), index=True)
-    embedding_model_name: Mapped[str] = mapped_column(String(128), index=True)
-    embedding_text_version: Mapped[str] = mapped_column(String(32), index=True)
-    model_key: Mapped[str] = mapped_column(String(384), index=True)
-    objective_version: Mapped[str] = mapped_column(String(128), index=True)
-    payload_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
-    feature_names: Mapped[list[str]] = mapped_column(JSON, default=list)
-    weights_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    normalization_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    label_count: Mapped[int] = mapped_column(Integer, default=0)
-    training_audit: Mapped[dict] = mapped_column(JSON, default=dict)
-    status: Mapped[str] = mapped_column(String(32), default="completed", index=True)
-
-
 class Document(TimestampMixin, Base):
     __tablename__ = "documents"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
     title: Mapped[str] = mapped_column(String(255))
     source_path: Mapped[str] = mapped_column(Text, index=True)
     source_type: Mapped[str] = mapped_column(String(50), index=True)
@@ -151,9 +92,8 @@ class Document(TimestampMixin, Base):
     visibility: Mapped[str] = mapped_column(String(32), default="private")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
-    course: Mapped["Course"] = relationship(back_populates="documents")
+    knowledge_base: Mapped["KnowledgeBase"] = relationship(back_populates="documents")
     versions: Mapped[list["DocumentVersion"]] = relationship(back_populates="document")
-    chunks: Mapped[list["Chunk"]] = relationship(back_populates="document")
 
 
 class DocumentVersion(Base):
@@ -170,229 +110,459 @@ class DocumentVersion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     document: Mapped["Document"] = relationship(back_populates="versions")
-    chunks: Mapped[list["Chunk"]] = relationship(back_populates="document_version")
 
 
-class Chunk(Base):
-    __tablename__ = "chunks"
+class EvidenceAtom(Base):
+    __tablename__ = "evidence_atoms"
+    __table_args__ = (UniqueConstraint("document_version_id", "atom_index", name="uq_evidence_atom_version_index"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
-    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
-    document_version_id: Mapped[str] = mapped_column(ForeignKey("document_versions.id"), index=True)
-    chunk_version: Mapped[int] = mapped_column(Integer, default=1, index=True)
-    content: Mapped[str] = mapped_column(Text)
-    snippet: Mapped[str] = mapped_column(Text)
-    chapter: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
-    section: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    token_count: Mapped[int] = mapped_column(Integer, default=0)
-    source_type: Mapped[str] = mapped_column(String(50), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    document_version_id: Mapped[str] = mapped_column(ForeignKey("document_versions.id", ondelete="CASCADE"), index=True)
+    atom_index: Mapped[int] = mapped_column(Integer, index=True)
+    atom_type: Mapped[str] = mapped_column(String(64), default="paragraph", index=True)
+    text: Mapped[str] = mapped_column(Text)
+    text_hash: Mapped[str] = mapped_column(String(64), index=True)
+    source_span_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    layout_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    parser_confidence: Mapped[float] = mapped_column(Float, default=1.0)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    embedding_status: Mapped[str] = mapped_column(String(32), default="pending")
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    parent_chunk_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("chunks.id"), nullable=True, index=True)
-    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
-    keywords: Mapped[list[str]] = mapped_column(JSON, default=list)
-    embedding_text_version: Mapped[str] = mapped_column(String(32), default="metadata_enriched_v1")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-    document: Mapped["Document"] = relationship(back_populates="chunks")
-    document_version: Mapped["DocumentVersion"] = relationship(back_populates="chunks")
-
-
-class Concept(TimestampMixin, Base):
-    __tablename__ = "concepts"
-    __table_args__ = (UniqueConstraint("course_id", "normalized_name", name="uq_course_concept_normalized"),)
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
-    canonical_name: Mapped[str] = mapped_column(String(255), index=True)
-    normalized_name: Mapped[str] = mapped_column(String(255), index=True)
-    concept_type: Mapped[str] = mapped_column(String(64), default="concept")
-    summary: Mapped[str] = mapped_column(Text, default="")
-    chapter_refs: Mapped[list[str]] = mapped_column(JSON, default=list)
-    importance_score: Mapped[float] = mapped_column(Float, default=0.0)
-    evidence_count: Mapped[int] = mapped_column(Integer, default=0)
-    community_louvain: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    community_spectral: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    component_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    centrality_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    graph_rank_score: Mapped[float] = mapped_column(Float, default=0.0)
-    source_document_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    quality_json: Mapped[dict] = mapped_column(JSON, default=dict)
-
-    course: Mapped["Course"] = relationship(back_populates="concepts")
-    aliases: Mapped[list["ConceptAlias"]] = relationship(back_populates="concept")
-
-
-class ConceptAlias(Base):
-    __tablename__ = "concept_aliases"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    concept_id: Mapped[str] = mapped_column(ForeignKey("concepts.id"), index=True)
-    alias: Mapped[str] = mapped_column(String(255))
-    normalized_alias: Mapped[str] = mapped_column(String(255), index=True)
-
-    concept: Mapped["Concept"] = relationship(back_populates="aliases")
-
-
-class EntityMention(Base):
-    __tablename__ = "entity_mentions"
-    __table_args__ = (UniqueConstraint("course_id", "chunk_id", "surface", "entity_type", name="uq_entity_mention_surface_chunk_type"),)
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
-    chunk_id: Mapped[str] = mapped_column(ForeignKey("chunks.id"), index=True)
-    document_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id"), nullable=True, index=True)
-    concept_id: Mapped[str | None] = mapped_column(ForeignKey("concepts.id"), nullable=True, index=True)
-    surface: Mapped[str] = mapped_column(String(255))
-    canonical_name: Mapped[str] = mapped_column(String(255), index=True)
-    normalized_key: Mapped[str] = mapped_column(String(320), index=True)
-    entity_type: Mapped[str] = mapped_column(String(64), index=True)
-    confidence: Mapped[float] = mapped_column(Float, default=0.0)
-    evidence_spans: Mapped[list[str]] = mapped_column(JSON, default=list)
-    status: Mapped[str] = mapped_column(String(32), default="staged", index=True)
-    decision_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    state: Mapped[str] = mapped_column(String(32), default="active", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
-class EntityMergeCandidate(Base):
-    __tablename__ = "entity_merge_candidates"
-    __table_args__ = (UniqueConstraint("course_id", "left_key", "right_key", name="uq_entity_merge_candidate_pair"),)
+class EvidenceGraphState(Base):
+    __tablename__ = "evidence_graph_states"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
-    left_key: Mapped[str] = mapped_column(String(320), index=True)
-    right_key: Mapped[str] = mapped_column(String(320), index=True)
-    entity_type: Mapped[str] = mapped_column(String(64), index=True)
-    source: Mapped[str] = mapped_column(String(64), default="lexical")
-    score: Mapped[float] = mapped_column(Float, default=0.0)
-    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
-    verifier_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-
-class ConceptRelation(Base):
-    __tablename__ = "concept_relations"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
-    source_concept_id: Mapped[str] = mapped_column(ForeignKey("concepts.id"), index=True)
-    target_concept_id: Mapped[str | None] = mapped_column(ForeignKey("concepts.id"), nullable=True)
-    target_name: Mapped[str] = mapped_column(String(255))
-    relation_type: Mapped[str] = mapped_column(String(64), index=True)
-    evidence_chunk_id: Mapped[str | None] = mapped_column(ForeignKey("chunks.id"), nullable=True)
-    confidence: Mapped[float] = mapped_column(Float, default=0.55)
-    extraction_method: Mapped[str] = mapped_column(String(64), default="heuristic")
-    is_validated: Mapped[bool] = mapped_column(Boolean, default=False)
-    weight: Mapped[float] = mapped_column(Float, default=0.0)
-    semantic_similarity: Mapped[float] = mapped_column(Float, default=0.0)
-    support_count: Mapped[int] = mapped_column(Integer, default=1)
-    relation_source: Mapped[str] = mapped_column(String(64), default="llm")
-    is_inferred: Mapped[bool] = mapped_column(Boolean, default=False)
-    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    source_document_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-
-class QualityProfile(Base):
-    __tablename__ = "quality_profiles"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
-    version: Mapped[str] = mapped_column(String(128), index=True)
-    profile_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    sample_chunk_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-
-class GraphRelationCandidate(Base):
-    __tablename__ = "graph_relation_candidates"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
-    source_concept_id: Mapped[str] = mapped_column(ForeignKey("concepts.id"), index=True)
-    target_concept_id: Mapped[str | None] = mapped_column(ForeignKey("concepts.id"), nullable=True)
-    target_name: Mapped[str] = mapped_column(String(255))
-    relation_type: Mapped[str] = mapped_column(String(64), index=True)
-    relation_source: Mapped[str] = mapped_column(String(64), default="semantic_sparse", index=True)
-    evidence_chunk_id: Mapped[str | None] = mapped_column(ForeignKey("chunks.id"), nullable=True)
-    confidence: Mapped[float] = mapped_column(Float, default=0.0)
-    weight: Mapped[float] = mapped_column(Float, default=0.0)
-    semantic_similarity: Mapped[float] = mapped_column(Float, default=0.0)
-    support_count: Mapped[int] = mapped_column(Integer, default=1)
-    is_inferred: Mapped[bool] = mapped_column(Boolean, default=True)
-    decision_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    source_document_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-
-class GraphCommunitySummary(TimestampMixin, Base):
-    __tablename__ = "graph_community_summaries"
-    __table_args__ = (UniqueConstraint("course_id", "algorithm", "community_id", "version", name="uq_graph_community_summary_version"),)
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
-    algorithm: Mapped[str] = mapped_column(String(64), default="louvain", index=True)
-    community_id: Mapped[int] = mapped_column(Integer, index=True)
-    version: Mapped[str] = mapped_column(String(128), index=True)
-    summary: Mapped[str] = mapped_column(Text, default="")
-    key_concepts_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
-    representative_chunk_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    source_document_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    prompt_version: Mapped[str] = mapped_column(String(128), default="community_summary_v1")
-    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    quality_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
-
-
-class GraphExtractionRun(TimestampMixin, Base):
-    __tablename__ = "graph_extraction_runs"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
-    batch_id: Mapped[str | None] = mapped_column(ForeignKey("ingestion_batches.id"), nullable=True, index=True)
-    strategy: Mapped[str] = mapped_column(String(64), default="adaptive_best_first", index=True)
-    profile_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
-    strategy_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    strategy_profile_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    prompt_version: Mapped[str] = mapped_column(String(128), default="graph_extraction_v1")
-    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    status: Mapped[str] = mapped_column(String(32), default="planned", index=True)
-    coverage_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    budget_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    scope_type: Mapped[str] = mapped_column(String(32), default="document", index=True)
+    state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    atom_scope_hash: Mapped[str] = mapped_column(String(64), index=True)
+    edge_protocol_version: Mapped[str] = mapped_column(String(64), default="deterministic_edges_v1", index=True)
+    parser_protocol_version: Mapped[str] = mapped_column(String(64), default="parser_v1", index=True)
+    embedding_text_version: Mapped[str] = mapped_column(String(64), default="metadata_enriched_v1", index=True)
+    active_document_version_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    active_atom_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    community_state_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    policy_state_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    prompt_protocol_version: Mapped[str] = mapped_column(String(64), default="prompt_protocol_v1")
     stats_json: Mapped[dict] = mapped_column(JSON, default=dict)
-    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    state: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class EvidenceEdge(Base):
+    __tablename__ = "evidence_edges"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    graph_state_id: Mapped[str] = mapped_column(ForeignKey("evidence_graph_states.id", ondelete="CASCADE"), index=True)
+    source_atom_id: Mapped[str] = mapped_column(ForeignKey("evidence_atoms.id", ondelete="CASCADE"), index=True)
+    target_atom_id: Mapped[str] = mapped_column(ForeignKey("evidence_atoms.id", ondelete="CASCADE"), index=True)
+    edge_type: Mapped[str] = mapped_column(String(64), index=True)
+    weight: Mapped[float] = mapped_column(Float, default=1.0)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    features_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SignalSchemaState(Base):
+    __tablename__ = "signal_schema_states"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    evidence_graph_state_id: Mapped[str] = mapped_column(ForeignKey("evidence_graph_states.id", ondelete="CASCADE"), index=True)
+    evidence_community_state_id: Mapped[str | None] = mapped_column(ForeignKey("community_states.id", ondelete="SET NULL"), nullable=True, index=True)
+    schema_hash: Mapped[str] = mapped_column(String(64), index=True)
+    schema_protocol_version: Mapped[str] = mapped_column(String(64), default="signal_schema_induction_v1", index=True)
+    sample_pack_hash: Mapped[str] = mapped_column(String(64), index=True)
+    llm_model_audit_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    stats_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SignalTypeSpec(Base):
+    __tablename__ = "signal_type_specs"
+    __table_args__ = (UniqueConstraint("schema_state_id", "name", name="uq_signal_type_spec_schema_name"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    schema_state_id: Mapped[str] = mapped_column(ForeignKey("signal_schema_states.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(96), index=True)
+    description: Mapped[str] = mapped_column(Text)
+    evidence_patterns_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    applicable_atom_types_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    risk: Mapped[str] = mapped_column(String(32), default="medium", index=True)
+    retrieval_use_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    gate_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SignalRelationSpec(Base):
+    __tablename__ = "signal_relation_specs"
+    __table_args__ = (UniqueConstraint("schema_state_id", "name", name="uq_signal_relation_spec_schema_name"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    schema_state_id: Mapped[str] = mapped_column(ForeignKey("signal_schema_states.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(96), index=True)
+    source_signal_types_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    target_signal_types_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    required_evidence_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    risk: Mapped[str] = mapped_column(String(32), default="medium", index=True)
+    gate_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SignalState(Base):
+    __tablename__ = "signal_states"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    evidence_graph_state_id: Mapped[str] = mapped_column(ForeignKey("evidence_graph_states.id", ondelete="CASCADE"), index=True)
+    evidence_community_state_id: Mapped[str | None] = mapped_column(ForeignKey("community_states.id", ondelete="SET NULL"), nullable=True, index=True)
+    schema_state_id: Mapped[str | None] = mapped_column(ForeignKey("signal_schema_states.id", ondelete="SET NULL"), nullable=True, index=True)
+    signal_state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    schema_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    evidence_graph_state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    evidence_community_state_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    signal_community_state_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    active_signal_scope_hash: Mapped[str] = mapped_column(String(64), index=True)
+    signal_protocol_version: Mapped[str] = mapped_column(String(64), default="evidence_signal_layer_v1", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    eligible_atom_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    processed_atom_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    model_audit_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    stats_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
-class GraphExtractionChunkTask(TimestampMixin, Base):
-    __tablename__ = "graph_extraction_chunk_tasks"
-    __table_args__ = (UniqueConstraint("run_id", "chunk_id", name="uq_graph_extraction_run_chunk"),)
+class SignalCandidate(Base):
+    __tablename__ = "signal_candidates"
+    __table_args__ = (UniqueConstraint("signal_state_id", "normalized_key", "extractor_name", name="uq_signal_candidate_state_key_extractor"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    run_id: Mapped[str] = mapped_column(ForeignKey("graph_extraction_runs.id"), index=True)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
-    chunk_id: Mapped[str] = mapped_column(ForeignKey("chunks.id"), index=True)
-    chunk_hash: Mapped[str] = mapped_column(String(64), index=True)
-    priority: Mapped[float] = mapped_column(Float, default=0.0)
-    selected_reason: Mapped[dict] = mapped_column(JSON, default=dict)
+    signal_state_id: Mapped[str] = mapped_column(ForeignKey("signal_states.id", ondelete="CASCADE"), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    candidate_type: Mapped[str] = mapped_column(String(96), index=True)
+    surface: Mapped[str] = mapped_column(String(255), index=True)
+    normalized_key: Mapped[str] = mapped_column(String(320), index=True)
+    evidence_atom_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source_span_union_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    support_active_chunk_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    extractor_name: Mapped[str] = mapped_column(String(96), index=True)
+    extractor_version: Mapped[str] = mapped_column(String(64), index=True)
+    features_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
-    attempts: Mapped[int] = mapped_column(Integer, default=0)
-    payload_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    token_estimate: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SignalDecision(Base):
+    __tablename__ = "signal_decisions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    signal_state_id: Mapped[str] = mapped_column(ForeignKey("signal_states.id", ondelete="CASCADE"), index=True)
+    candidate_id: Mapped[str | None] = mapped_column(ForeignKey("signal_candidates.id", ondelete="CASCADE"), nullable=True, index=True)
+    decision_type: Mapped[str] = mapped_column(String(64), index=True)
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    reason_code: Mapped[str] = mapped_column(String(96), index=True)
+    support_evidence_atom_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source_span_union_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    algorithm_audit_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    llm_audit_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    quality_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SignalNode(Base):
+    __tablename__ = "signal_nodes"
+    __table_args__ = (
+        UniqueConstraint("signal_state_id", "normalized_key", name="uq_signal_node_state_key"),
+        CheckConstraint("support_atom_ids_json IS NOT NULL", name="ck_signal_node_support_atoms_present"),
+        CheckConstraint("source_span_union_json IS NOT NULL", name="ck_signal_node_source_span_present"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    signal_state_id: Mapped[str] = mapped_column(ForeignKey("signal_states.id", ondelete="CASCADE"), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    signal_type: Mapped[str] = mapped_column(String(96), index=True)
+    canonical_label: Mapped[str] = mapped_column(String(255), index=True)
+    normalized_key: Mapped[str] = mapped_column(String(320), index=True)
+    support_atom_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    support_active_chunk_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source_span_union_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    quality_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SignalEdge(Base):
+    __tablename__ = "signal_edges"
+    __table_args__ = (UniqueConstraint("signal_state_id", "source_signal_id", "target_signal_id", "edge_type", name="uq_signal_edge_state_pair_type"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    signal_state_id: Mapped[str] = mapped_column(ForeignKey("signal_states.id", ondelete="CASCADE"), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    edge_type: Mapped[str] = mapped_column(String(96), index=True)
+    source_signal_id: Mapped[str] = mapped_column(ForeignKey("signal_nodes.id", ondelete="CASCADE"), index=True)
+    target_signal_id: Mapped[str] = mapped_column(ForeignKey("signal_nodes.id", ondelete="CASCADE"), index=True)
+    support_atom_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    support_active_chunk_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source_span_union_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    relation_source: Mapped[str] = mapped_column(String(64), default="observed_signal_co_support", index=True)
+    decision_id: Mapped[str | None] = mapped_column(ForeignKey("signal_decisions.id", ondelete="SET NULL"), nullable=True, index=True)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SignalCommunity(Base):
+    __tablename__ = "signal_communities"
+    __table_args__ = (UniqueConstraint("signal_state_id", "community_id", name="uq_signal_community_state_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    signal_state_id: Mapped[str] = mapped_column(ForeignKey("signal_states.id", ondelete="CASCADE"), index=True)
+    community_id: Mapped[str] = mapped_column(String(64), index=True)
+    algorithm: Mapped[str] = mapped_column(String(64), default="support_overlap_components", index=True)
+    stats_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SignalCommunityMembership(Base):
+    __tablename__ = "signal_community_memberships"
+    __table_args__ = (UniqueConstraint("signal_community_id", "signal_node_id", name="uq_signal_community_membership_node"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    signal_community_id: Mapped[str] = mapped_column(ForeignKey("signal_communities.id", ondelete="CASCADE"), index=True)
+    signal_state_id: Mapped[str] = mapped_column(ForeignKey("signal_states.id", ondelete="CASCADE"), index=True)
+    signal_node_id: Mapped[str] = mapped_column(ForeignKey("signal_nodes.id", ondelete="CASCADE"), index=True)
+    community_id: Mapped[str] = mapped_column(String(64), index=True)
+    score: Mapped[float] = mapped_column(Float, default=1.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ProjectionState(Base):
+    __tablename__ = "projection_states"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    signal_state_id: Mapped[str] = mapped_column(ForeignKey("signal_states.id", ondelete="CASCADE"), index=True)
+    view: Mapped[str] = mapped_column(String(64), default="overview", index=True)
+    projection_hash: Mapped[str] = mapped_column(String(64), index=True)
+    projection_protocol_version: Mapped[str] = mapped_column(String(64), default="signal_projection_view_v1", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    stats_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ProjectionNode(Base):
+    __tablename__ = "projection_nodes"
+    __table_args__ = (UniqueConstraint("projection_state_id", "source_kind", "source_id", name="uq_projection_node_source"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    projection_state_id: Mapped[str] = mapped_column(ForeignKey("projection_states.id", ondelete="CASCADE"), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    source_kind: Mapped[str] = mapped_column(String(64), index=True)
+    source_id: Mapped[str] = mapped_column(String(36), index=True)
+    label: Mapped[str] = mapped_column(String(255), index=True)
+    category: Mapped[str] = mapped_column(String(96), index=True)
+    support_atom_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    support_active_chunk_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source_span_union_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ProjectionEdge(Base):
+    __tablename__ = "projection_edges"
+    __table_args__ = (UniqueConstraint("projection_state_id", "source_node_id", "target_node_id", "edge_type", name="uq_projection_edge_pair_type"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    projection_state_id: Mapped[str] = mapped_column(ForeignKey("projection_states.id", ondelete="CASCADE"), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    source_node_id: Mapped[str] = mapped_column(ForeignKey("projection_nodes.id", ondelete="CASCADE"), index=True)
+    target_node_id: Mapped[str] = mapped_column(ForeignKey("projection_nodes.id", ondelete="CASCADE"), index=True)
+    edge_type: Mapped[str] = mapped_column(String(96), index=True)
+    support_atom_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source_span_union_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ProjectionCommunity(Base):
+    __tablename__ = "projection_communities"
+    __table_args__ = (UniqueConstraint("projection_state_id", "community_id", name="uq_projection_community_state_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    projection_state_id: Mapped[str] = mapped_column(ForeignKey("projection_states.id", ondelete="CASCADE"), index=True)
+    community_id: Mapped[str] = mapped_column(String(64), index=True)
+    source_community_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    collapsed_node_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    stats_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PolicyState(Base):
+    __tablename__ = "policy_states"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    policy_family: Mapped[str] = mapped_column(String(64), default="constrained_linucb", index=True)
+    policy_version: Mapped[str] = mapped_column(String(64), default="bandit_policy_v1", index=True)
+    profile_objective_hash: Mapped[str] = mapped_column(String(64), index=True)
+    posterior_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    constraints_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    exploration_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    reward_summary_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    drift_status: Mapped[str] = mapped_column(String(32), default="fresh", index=True)
+    drift_detected_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ChunkCandidate(Base):
+    __tablename__ = "chunk_candidates"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    graph_state_id: Mapped[str] = mapped_column(ForeignKey("evidence_graph_states.id", ondelete="CASCADE"), index=True)
+    generator_name: Mapped[str] = mapped_column(String(128), index=True)
+    generator_version: Mapped[str] = mapped_column(String(64), index=True)
+    atom_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source_span_union_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    token_count: Mapped[int] = mapped_column(Integer, default=0)
+    graph_features_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    cost_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    feedback_driven: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class QualityDecision(Base):
+    __tablename__ = "quality_decisions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    candidate_id: Mapped[str] = mapped_column(ForeignKey("chunk_candidates.id", ondelete="CASCADE"), index=True)
+    policy_state_id: Mapped[str | None] = mapped_column(ForeignKey("policy_states.id", ondelete="SET NULL"), nullable=True, index=True)
+    decision_action: Mapped[str] = mapped_column(String(64), default="answer_candidate", index=True)
+    gate_passed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    risk_flags_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    reward_features_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    feedback_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ChunkDecision(Base):
+    __tablename__ = "chunk_decisions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    graph_state_id: Mapped[str] = mapped_column(ForeignKey("evidence_graph_states.id", ondelete="CASCADE"), index=True)
+    candidate_id: Mapped[str] = mapped_column(ForeignKey("chunk_candidates.id", ondelete="CASCADE"), index=True)
+    quality_decision_id: Mapped[str] = mapped_column(ForeignKey("quality_decisions.id", ondelete="CASCADE"), index=True)
+    policy_state_id: Mapped[str | None] = mapped_column(ForeignKey("policy_states.id", ondelete="SET NULL"), nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(64), default="activate", index=True)
+    decision_protocol_version: Mapped[str] = mapped_column(String(64), default="chunk_decision_v1", index=True)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ActiveChunk(Base):
+    __tablename__ = "active_chunks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    chunk_decision_id: Mapped[str] = mapped_column(ForeignKey("chunk_decisions.id", ondelete="CASCADE"), index=True)
+    document_version_scope_hash: Mapped[str] = mapped_column(String(64), index=True)
+    graph_state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    atom_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    text: Mapped[str] = mapped_column(Text)
+    source_span_union_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    boundary_policy_version: Mapped[str] = mapped_column(String(64), default="chunk_decision_v1")
+    quality_decision_id: Mapped[str] = mapped_column(String(36), index=True)
+    policy_state_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    community_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    state: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    @property
+    def content(self) -> str:
+        return self.text
+
+    @property
+    def snippet(self) -> str:
+        metadata = self.metadata_json or {}
+        return str(metadata.get("snippet") or self.text[:240])
+
+    @property
+    def document_id(self) -> str | None:
+        return (self.metadata_json or {}).get("document_id")
+
+    @property
+    def document_version_id(self) -> str | None:
+        return (self.metadata_json or {}).get("document_version_id")
+
+    @property
+    def partition(self) -> str | None:
+        return (self.metadata_json or {}).get("partition")
+
+    @property
+    def section(self) -> str | None:
+        return (self.metadata_json or {}).get("section")
+
+    @property
+    def source_type(self) -> str | None:
+        return (self.metadata_json or {}).get("source_type")
+
+    @property
+    def page_number(self) -> int | None:
+        return (self.metadata_json or {}).get("page_number")
+
+    @property
+    def parent_chunk_id(self) -> str | None:
+        return (self.metadata_json or {}).get("parent_chunk_id")
+
+    @property
+    def chunk_version(self) -> int:
+        try:
+            return int((self.metadata_json or {}).get("chunk_version") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+
+class VectorRecord(Base):
+    __tablename__ = "vector_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    active_chunk_id: Mapped[str | None] = mapped_column(ForeignKey("active_chunks.id", ondelete="SET NULL"), nullable=True, index=True)
+    qdrant_point_id: Mapped[str] = mapped_column(String(64), index=True)
+    embedding_model: Mapped[str] = mapped_column(String(128), index=True)
+    embedding_text_version: Mapped[str] = mapped_column(String(64), index=True)
+    payload_hash: Mapped[str] = mapped_column(String(64), index=True)
+    vector_status: Mapped[str] = mapped_column(String(32), default="ready", index=True)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class IngestionBatch(TimestampMixin, Base):
     __tablename__ = "ingestion_batches"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
     trigger_source: Mapped[str] = mapped_column(String(64), default="sync")
     source_root: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
@@ -408,7 +578,7 @@ class IngestionBatch(TimestampMixin, Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
-    course: Mapped["Course"] = relationship(back_populates="batches")
+    knowledge_base: Mapped["KnowledgeBase"] = relationship(back_populates="batches")
     jobs: Mapped[list["IngestionJob"]] = relationship(back_populates="batch")
 
 
@@ -416,7 +586,7 @@ class IngestionJob(TimestampMixin, Base):
     __tablename__ = "ingestion_jobs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
     batch_id: Mapped[str | None] = mapped_column(ForeignKey("ingestion_batches.id"), nullable=True, index=True)
     document_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id"), nullable=True, index=True)
     source_path: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -444,7 +614,7 @@ class IngestionCompensationLog(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     job_id: Mapped[str | None] = mapped_column(ForeignKey("ingestion_jobs.id"), nullable=True, index=True)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
     operation: Mapped[str] = mapped_column(String(32), index=True)
     vector_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -458,18 +628,175 @@ class QASession(TimestampMixin, Base):
     __tablename__ = "qa_sessions"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     last_question: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     transcript: Mapped[list[dict]] = mapped_column(JSON, default=list)
 
 
+class RetrievalTrace(Base):
+    __tablename__ = "retrieval_traces"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    query: Mapped[str] = mapped_column(Text)
+    filters_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    retrieval_mode: Mapped[str] = mapped_column(String(64), default="evidence_first", index=True)
+    active_chunk_scope_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    evidence_graph_state_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    community_state_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    policy_state_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    prompt_protocol_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    result_active_chunk_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    expansion_path_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    scores_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AnswerSession(Base):
+    __tablename__ = "answer_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    retrieval_trace_id: Mapped[str | None] = mapped_column(ForeignKey("retrieval_traces.id", ondelete="SET NULL"), nullable=True, index=True)
+    qa_session_id: Mapped[str | None] = mapped_column(ForeignKey("qa_sessions.id", ondelete="SET NULL"), nullable=True, index=True)
+    question: Mapped[str] = mapped_column(Text)
+    answer: Mapped[str] = mapped_column(Text, default="")
+    citation_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    active_chunk_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    prompt_protocol_version: Mapped[str] = mapped_column(String(64), default="answer_grounding_v1", index=True)
+    model_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class CitationVerification(Base):
+    __tablename__ = "citation_verifications"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    answer_session_id: Mapped[str | None] = mapped_column(ForeignKey("answer_sessions.id", ondelete="SET NULL"), nullable=True, index=True)
+    retrieval_trace_id: Mapped[str | None] = mapped_column(ForeignKey("retrieval_traces.id", ondelete="SET NULL"), nullable=True, index=True)
+    active_chunk_id: Mapped[str | None] = mapped_column(ForeignKey("active_chunks.id", ondelete="SET NULL"), nullable=True, index=True)
+    claim_text: Mapped[str] = mapped_column(Text, default="")
+    source_span_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    evidence_atom_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    verdict: Mapped[str] = mapped_column(String(32), default="supported", index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class QualityObservation(Base):
+    __tablename__ = "quality_observations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    quality_decision_id: Mapped[str | None] = mapped_column(ForeignKey("quality_decisions.id", ondelete="SET NULL"), nullable=True, index=True)
+    observation_type: Mapped[str] = mapped_column(String(64), index=True)
+    observation_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class CommunityState(Base):
+    __tablename__ = "community_states"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    graph_state_id: Mapped[str | None] = mapped_column(ForeignKey("evidence_graph_states.id", ondelete="SET NULL"), nullable=True, index=True)
+    community_protocol_version: Mapped[str] = mapped_column(String(64), default="local_community_v1", index=True)
+    state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    state: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class CommunityMembership(Base):
+    __tablename__ = "community_memberships"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    community_state_id: Mapped[str] = mapped_column(ForeignKey("community_states.id", ondelete="CASCADE"), index=True)
+    community_id: Mapped[str] = mapped_column(String(64), index=True)
+    atom_id: Mapped[str] = mapped_column(ForeignKey("evidence_atoms.id", ondelete="CASCADE"), index=True)
+    membership_score: Mapped[float] = mapped_column(Float, default=1.0)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class CommunitySummary(Base):
+    __tablename__ = "community_summaries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    community_state_id: Mapped[str] = mapped_column(ForeignKey("community_states.id", ondelete="CASCADE"), index=True)
+    community_id: Mapped[str] = mapped_column(String(64), index=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    citations_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    evidence_atom_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    quality_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PolicyObservation(Base):
+    __tablename__ = "policy_observations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    policy_state_id: Mapped[str | None] = mapped_column(ForeignKey("policy_states.id", ondelete="SET NULL"), nullable=True, index=True)
+    context_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    action_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    reward_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    propensity: Mapped[float] = mapped_column(Float, default=1.0)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class RewardEvent(Base):
+    __tablename__ = "reward_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    policy_state_id: Mapped[str | None] = mapped_column(ForeignKey("policy_states.id", ondelete="SET NULL"), nullable=True, index=True)
+    retrieval_trace_id: Mapped[str | None] = mapped_column(ForeignKey("retrieval_traces.id", ondelete="SET NULL"), nullable=True, index=True)
+    answer_session_id: Mapped[str | None] = mapped_column(ForeignKey("answer_sessions.id", ondelete="SET NULL"), nullable=True, index=True)
+    active_chunk_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    context_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    action_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    reward_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    propensity: Mapped[float] = mapped_column(Float, default=1.0)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PromptProtocolVersion(Base):
+    __tablename__ = "prompt_protocol_versions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    protocol_name: Mapped[str] = mapped_column(String(128), index=True)
+    protocol_version: Mapped[str] = mapped_column(String(64), index=True)
+    protocol_hash: Mapped[str] = mapped_column(String(64), index=True)
+    prompt_pack_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    state: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class RuntimeSettingsVersion(Base):
+    __tablename__ = "runtime_settings_versions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    version_hash: Mapped[str] = mapped_column(String(64), index=True)
+    settings_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    changed_keys_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source: Mapped[str] = mapped_column(String(64), default="api", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class AgentRun(Base):
     __tablename__ = "agent_runs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
-    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
     session_id: Mapped[str | None] = mapped_column(ForeignKey("qa_sessions.id"), nullable=True, index=True)
     question: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)

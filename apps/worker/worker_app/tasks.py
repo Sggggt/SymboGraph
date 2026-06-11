@@ -4,11 +4,17 @@ import asyncio
 from worker_app.bootstrap import API_ROOT  # noqa: F401
 from worker_app.celery_app import celery_app
 from app.db import SessionLocal
-from app.services.ingestion import ingest_file, run_batch_ingestion, run_graph_rebuild, run_uploaded_files_ingestion
+from app.models import KnowledgeBase
+from app.services.evidence_graph import update_policy_from_rewards
+from app.services.ingestion import ingest_file, run_batch_ingestion, run_uploaded_files_ingestion
+from app.services.maintenance import reconcile_policy_state, reconcile_vector_store_sync
+from app.services.runtime_settings import refresh_runtime_settings_if_needed
+from sqlalchemy import select
 
 
 @celery_app.task(name="ingest_path")
 def ingest_path(path: str, trigger_source: str = "watchdog", job_id: str | None = None) -> dict:
+    refresh_runtime_settings_if_needed(force=True)
     session = SessionLocal()
     try:
         return asyncio.run(ingest_file(session, Path(path), trigger_source=trigger_source, existing_job_id=job_id))
@@ -18,30 +24,38 @@ def ingest_path(path: str, trigger_source: str = "watchdog", job_id: str | None 
 
 @celery_app.task(name="ingest_batch")
 def ingest_batch(batch_id: str) -> dict:
+    refresh_runtime_settings_if_needed(force=True)
     return asyncio.run(run_batch_ingestion(batch_id))
 
 
 @celery_app.task(name="ingest_uploaded_batch")
-def ingest_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False, rebuild_graph_mode: str = "none", full_reparse: bool = False) -> dict:
-    return asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths, force=force, rebuild_graph_mode=rebuild_graph_mode, full_reparse=full_reparse))
+def ingest_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False, full_reparse: bool = False) -> dict:
+    refresh_runtime_settings_if_needed(force=True)
+    return asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths, force=force, full_reparse=full_reparse))
 
 
-@celery_app.task(name="rebuild_course_graph")
-def rebuild_course_graph_task(
-    batch_id: str,
-    course_id: str,
-    mode: str = "full",
-    run_llm_merge: bool | None = None,
-    run_hpo: bool | None = None,
-    run_community_summaries: bool | None = None,
-) -> dict:
-    return asyncio.run(
-        run_graph_rebuild(
-            batch_id,
-            course_id,
-            mode,
-            run_llm_merge=run_llm_merge,
-            run_hpo=run_hpo,
-            run_community_summaries=run_community_summaries,
-        )
-    )
+@celery_app.task(name="reconcile_vector_store")
+def reconcile_vector_store_task(knowledge_base_id: str | None = None) -> dict:
+    refresh_runtime_settings_if_needed(force=True)
+    session = SessionLocal()
+    try:
+        return reconcile_vector_store_sync(session, knowledge_base_id=knowledge_base_id)
+    finally:
+        session.close()
+
+
+@celery_app.task(name="update_policy_backfill")
+def update_policy_backfill_task(knowledge_base_id: str | None = None) -> dict:
+    refresh_runtime_settings_if_needed(force=True)
+    session = SessionLocal()
+    try:
+        knowledge_base_ids = [knowledge_base_id] if knowledge_base_id else list(session.scalars(select(KnowledgeBase.id)).all())
+        updated = 0
+        reconciled = 0
+        for kb_id in knowledge_base_ids:
+            updated += update_policy_from_rewards(session, knowledge_base_id=kb_id)
+            reconciled += reconcile_policy_state(session, knowledge_base_id=kb_id)
+        session.commit()
+        return {"updated_observations": updated, "reconciled_policy_states": reconciled, "knowledge_bases": len(knowledge_base_ids)}
+    finally:
+        session.close()

@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 import os
 import re
 from typing import Literal
@@ -8,7 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 APP_DIR = Path(__file__).resolve().parents[2]
 WORKSPACE_ROOT = APP_DIR.parents[1]
-INVALID_COURSE_DIR_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+INVALID_KNOWLEDGE_BASE_DIR_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 HOT_RELOAD_SETTINGS = {
     "openai_api_key",
     "chat_base_url",
@@ -22,19 +22,11 @@ HOT_RELOAD_SETTINGS = {
     "chat_model",
     "embedding_dimensions",
     "embedding_batch_size",
-    "graph_extraction_strategy",
-    "graph_extraction_soft_start_budget",
-    "graph_extraction_max_input_tokens_per_run",
-    "graph_extraction_max_model_calls_per_run",
-    "graph_extraction_min_marginal_gain",
-    "graph_extraction_stall_rounds",
-    "graph_extraction_concurrency",
     "worker_concurrency",
     "ingestion_file_concurrency",
     "model_request_concurrency",
     "model_request_timeout_seconds",
-    "hpo_concurrency",
-    "graph_extraction_resume_batch_size",
+    "chunk_token_budget",
     "enable_model_fallback",
     "retrieval_recall_k_default",
     "retrieval_recall_k_formula",
@@ -47,19 +39,19 @@ HOT_RELOAD_SETTINGS = {
     "reranker_enabled",
     "reranker_model",
     "reranker_max_length",
+    "reranker_device",
     "semantic_chunking_enabled",
     "semantic_chunking_min_length",
-    "enable_auto_hpo",
     "enable_graph_community_summaries",
-    "hpo_objective_mode",
-    "hpo_judge_max_candidates",
-    "hpo_judge_max_pairs",
-    "hpo_judge_min_labels",
-    "hpo_judge_max_tokens_per_pair",
-    "hpo_judge_concurrency",
+    "signal_extraction_max_model_batches",
+    "signal_extraction_max_candidates_per_batch",
+    "signal_extraction_max_tokens_per_batch",
+    "signal_candidate_keep_threshold",
+    "community_louvain_resolution",
+    "community_min_modularity_warn",
+    "graph_overview_max_nodes",
+    "graph_overview_max_edges",
 }
-
-
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=(WORKSPACE_ROOT / ".env", APP_DIR / ".env"),
@@ -67,11 +59,11 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    app_name: str = "Course Knowledge Base API"
+    app_name: str = "KnowledgeBase Knowledge Base API"
     app_env: str = "development"
     app_port: int = 8000
 
-    database_url: str = "sqlite:///./knowledge_base.db"
+    database_url: str = "sqlite:///./symbograph.db"
     qdrant_url: str = "http://localhost:6333"
     qdrant_collection: str = "knowledge_chunks"
     redis_url: str = "redis://localhost:6379/0"
@@ -81,7 +73,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
     api_keys: str = ""
 
-    course_name: str = "Sample Course"
+    knowledge_base_name: str = "Sample KnowledgeBase"
     data_root: Path = Field(default=WORKSPACE_ROOT / "data")
     storage_root: Path | None = None
     ingestion_root: Path | None = None
@@ -98,35 +90,29 @@ class Settings(BaseSettings):
     chat_model: str = "qwen-plus"
     embedding_dimensions: int = 1024
     embedding_batch_size: int = Field(default=10, ge=1, le=10)
-    graph_extraction_strategy: str = "adaptive_best_first"
-    graph_extraction_soft_start_budget: int | None = Field(default=24, ge=1)
-    graph_extraction_max_input_tokens_per_run: int | None = Field(default=None, ge=1)
-    graph_extraction_max_model_calls_per_run: int | None = Field(default=None, ge=1)
-    graph_extraction_min_marginal_gain: float = Field(default=0.03, ge=0.0, le=1.0)
-    graph_extraction_stall_rounds: int = Field(default=2, ge=1, le=20)
-    graph_extraction_concurrency: int = Field(default=2, ge=1, le=8)
     worker_concurrency: int = Field(default=3, ge=1, le=32)
     ingestion_file_concurrency: int = Field(default=3, ge=1, le=8)
     model_request_concurrency: int = Field(default=3, ge=1, le=16)
     model_request_timeout_seconds: int = Field(default=240, ge=5, le=600)
-    hpo_concurrency: int = Field(default=1, ge=1, le=8)
-    graph_extraction_resume_batch_size: int = Field(default=6, ge=1, le=100)
+    chunk_token_budget: int = Field(default=2400, ge=256, le=20000)
     enable_model_fallback: bool = False
     retrieval_recall_k_default: int = Field(default=64, ge=1, le=200)
     retrieval_recall_k_formula: int = Field(default=80, ge=1, le=200)
     reranker_enabled: bool = False
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     reranker_max_length: int = Field(default=512, ge=64, le=2048)
+    reranker_device: Literal["cpu", "cuda"] = "cpu"
     semantic_chunking_enabled: bool = False
     semantic_chunking_min_length: int = Field(default=2000, ge=500, le=5000)
-    enable_auto_hpo: bool = Field(default=False)
     enable_graph_community_summaries: bool = Field(default=True)
-    hpo_objective_mode: str = "judge_learned"
-    hpo_judge_max_candidates: int = Field(default=10, ge=2, le=50)
-    hpo_judge_max_pairs: int = Field(default=12, ge=1, le=100)
-    hpo_judge_min_labels: int = Field(default=6, ge=1, le=100)
-    hpo_judge_max_tokens_per_pair: int = Field(default=6000, ge=1000, le=50000)
-    hpo_judge_concurrency: int = Field(default=1, ge=1, le=4)
+    signal_extraction_max_model_batches: int = Field(default=4, ge=0, le=64)
+    signal_extraction_max_candidates_per_batch: int = Field(default=40, ge=1, le=500)
+    signal_extraction_max_tokens_per_batch: int = Field(default=6000, ge=500, le=50000)
+    signal_candidate_keep_threshold: float = Field(default=0.62, ge=0.0, le=1.0)
+    community_louvain_resolution: float = Field(default=1.0, ge=0.05, le=5.0)
+    community_min_modularity_warn: float = Field(default=0.18, ge=-1.0, le=1.0)
+    graph_overview_max_nodes: int = Field(default=260, ge=20, le=2000)
+    graph_overview_max_edges: int = Field(default=800, ge=20, le=5000)
     model_cache_root: Path = Field(default=WORKSPACE_ROOT / "models" / "huggingface")
 
     # Retrieval Layering & Agentic RAG
@@ -145,30 +131,30 @@ class Settings(BaseSettings):
     def api_key_list(self) -> list[str]:
         return [key.strip() for key in self.api_keys.split(",") if key.strip()]
 
-    def sanitize_course_dir_name(self, course_name: str) -> str:
-        value = INVALID_COURSE_DIR_CHARS.sub("-", course_name).strip()
+    def sanitize_knowledge_base_dir_name(self, knowledge_base_name: str) -> str:
+        value = INVALID_KNOWLEDGE_BASE_DIR_CHARS.sub("-", knowledge_base_name).strip()
         value = re.sub(r"\s+", " ", value).rstrip(".")
-        return value or "Course"
+        return value or "KnowledgeBase"
 
-    def course_paths_for_name(self, course_name: str) -> dict[str, Path]:
-        course_root = self.data_root / self.sanitize_course_dir_name(course_name)
+    def knowledge_base_paths_for_name(self, knowledge_base_name: str) -> dict[str, Path]:
+        knowledge_base_root = self.data_root / self.sanitize_knowledge_base_dir_name(knowledge_base_name)
         return {
-            "course_root": course_root,
-            "storage_root": course_root / "storage",
-            "ingestion_root": course_root / "ingestion",
+            "knowledge_base_root": knowledge_base_root,
+            "storage_root": knowledge_base_root / "storage",
+            "ingestion_root": knowledge_base_root / "ingestion",
         }
 
     @property
-    def course_data_root_path(self) -> Path:
-        return self.course_paths_for_name(self.course_name)["course_root"]
+    def knowledge_base_data_root_path(self) -> Path:
+        return self.knowledge_base_paths_for_name(self.knowledge_base_name)["knowledge_base_root"]
 
     @property
     def storage_root_path(self) -> Path:
-        return Path(self.storage_root) if self.storage_root else self.course_paths_for_name(self.course_name)["storage_root"]
+        return Path(self.storage_root) if self.storage_root else self.knowledge_base_paths_for_name(self.knowledge_base_name)["storage_root"]
 
     @property
     def ingestion_root_path(self) -> Path:
-        return Path(self.ingestion_root) if self.ingestion_root else self.course_paths_for_name(self.course_name)["ingestion_root"]
+        return Path(self.ingestion_root) if self.ingestion_root else self.knowledge_base_paths_for_name(self.knowledge_base_name)["ingestion_root"]
 
 
 _SETTINGS_CACHE: Settings | None = None
@@ -209,24 +195,17 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "retrieval_layer_enabled",
         "enable_agentic_reflection",
         "enable_post_generation_reflection",
-        "enable_auto_hpo",
         "enable_graph_community_summaries",
     }
     int_fields = {
         "model_bridge_port",
         "embedding_dimensions",
         "embedding_batch_size",
-        "graph_extraction_soft_start_budget",
-        "graph_extraction_max_input_tokens_per_run",
-        "graph_extraction_max_model_calls_per_run",
-        "graph_extraction_stall_rounds",
-        "graph_extraction_concurrency",
         "worker_concurrency",
         "ingestion_file_concurrency",
         "model_request_concurrency",
         "model_request_timeout_seconds",
-        "hpo_concurrency",
-        "graph_extraction_resume_batch_size",
+        "chunk_token_budget",
         "retrieval_recall_k_default",
         "retrieval_recall_k_formula",
         "retrieval_cache_ttl_seconds",
@@ -234,28 +213,35 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "reflection_max_retries",
         "reranker_max_length",
         "semantic_chunking_min_length",
-        "hpo_judge_max_candidates",
-        "hpo_judge_max_pairs",
-        "hpo_judge_min_labels",
-        "hpo_judge_max_tokens_per_pair",
-        "hpo_judge_concurrency",
+        "signal_extraction_max_model_batches",
+        "signal_extraction_max_candidates_per_batch",
+        "signal_extraction_max_tokens_per_batch",
+        "graph_overview_max_nodes",
+        "graph_overview_max_edges",
     }
-    float_fields = {"graph_extraction_min_marginal_gain"}
+    float_fields: set[str] = {
+        "signal_candidate_keep_threshold",
+        "community_louvain_resolution",
+        "community_min_modularity_warn",
+    }
     nullable_fields = {
         "chat_resolve_ip",
         "embedding_resolve_ip",
-        "graph_extraction_soft_start_budget",
-        "graph_extraction_max_input_tokens_per_run",
-        "graph_extraction_max_model_calls_per_run",
     }
     aliases = {
-        "GRAPH_EXTRACTION_CONCURRENCY": "graph_extraction_concurrency",
-        "HPO_CONCURRENCY": "hpo_concurrency",
-        "HPO_JUDGE_CONCURRENCY": "hpo_judge_concurrency",
         "INGESTION_FILE_CONCURRENCY": "ingestion_file_concurrency",
         "MODEL_REQUEST_CONCURRENCY": "model_request_concurrency",
         "MODEL_REQUEST_TIMEOUT_SECONDS": "model_request_timeout_seconds",
+        "CHUNK_TOKEN_BUDGET": "chunk_token_budget",
         "ENABLE_GRAPH_COMMUNITY_SUMMARIES": "enable_graph_community_summaries",
+        "SIGNAL_EXTRACTION_MAX_MODEL_BATCHES": "signal_extraction_max_model_batches",
+        "SIGNAL_EXTRACTION_MAX_CANDIDATES_PER_BATCH": "signal_extraction_max_candidates_per_batch",
+        "SIGNAL_EXTRACTION_MAX_TOKENS_PER_BATCH": "signal_extraction_max_tokens_per_batch",
+        "SIGNAL_CANDIDATE_KEEP_THRESHOLD": "signal_candidate_keep_threshold",
+        "COMMUNITY_LOUVAIN_RESOLUTION": "community_louvain_resolution",
+        "COMMUNITY_MIN_MODULARITY_WARN": "community_min_modularity_warn",
+        "GRAPH_OVERVIEW_MAX_NODES": "graph_overview_max_nodes",
+        "GRAPH_OVERVIEW_MAX_EDGES": "graph_overview_max_edges",
         "WORKER_CONCURRENCY": "worker_concurrency",
     }
     for env_key, value in env_entries.items():
@@ -271,8 +257,6 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
             elif attr in int_fields:
                 if value != "":
                     setattr(settings, attr, int(value))
-                    if attr == "hpo_concurrency":
-                        settings.hpo_judge_concurrency = int(value)
             elif attr in float_fields:
                 if value != "":
                     setattr(settings, attr, float(value))
@@ -350,36 +334,23 @@ def _build_settings() -> Settings:
     elif env_entries.get("EMBEDDING_API_KEY"):
         settings.embedding_api_key = env_entries["EMBEDDING_API_KEY"]
 
-    enable_auto_hpo = env_entries.get("ENABLE_AUTO_HPO") or os.getenv("ENABLE_AUTO_HPO")
-    if enable_auto_hpo is not None:
-        settings.enable_auto_hpo = str(enable_auto_hpo).lower() in {"true", "1", "yes", "on"}
-    hpo_objective_mode = env_entries.get("HPO_OBJECTIVE_MODE") or os.getenv("HPO_OBJECTIVE_MODE")
-    if hpo_objective_mode:
-        settings.hpo_objective_mode = hpo_objective_mode
     for env_key, attr in {
-        "HPO_JUDGE_MAX_CANDIDATES": "hpo_judge_max_candidates",
-        "HPO_JUDGE_MAX_PAIRS": "hpo_judge_max_pairs",
-        "HPO_JUDGE_MIN_LABELS": "hpo_judge_min_labels",
-        "HPO_JUDGE_MAX_TOKENS_PER_PAIR": "hpo_judge_max_tokens_per_pair",
-        "HPO_JUDGE_CONCURRENCY": "hpo_judge_concurrency",
-        "HPO_CONCURRENCY": "hpo_concurrency",
         "WORKER_CONCURRENCY": "worker_concurrency",
         "INGESTION_FILE_CONCURRENCY": "ingestion_file_concurrency",
         "MODEL_REQUEST_CONCURRENCY": "model_request_concurrency",
         "MODEL_REQUEST_TIMEOUT_SECONDS": "model_request_timeout_seconds",
+        "CHUNK_TOKEN_BUDGET": "chunk_token_budget",
     }.items():
         raw_value = env_entries.get(env_key) or os.getenv(env_key)
         if raw_value is None:
             continue
         try:
             setattr(settings, attr, int(raw_value))
-            if attr == "hpo_concurrency":
-                settings.hpo_judge_concurrency = int(raw_value)
         except ValueError:
             pass
 
     settings.data_root.mkdir(parents=True, exist_ok=True)
-    settings.course_data_root_path.mkdir(parents=True, exist_ok=True)
+    settings.knowledge_base_data_root_path.mkdir(parents=True, exist_ok=True)
     settings.storage_root_path.mkdir(parents=True, exist_ok=True)
     settings.ingestion_root_path.mkdir(parents=True, exist_ok=True)
     return settings

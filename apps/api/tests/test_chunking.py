@@ -39,18 +39,18 @@ def test_content_kind_and_chunk_metadata():
         ),
         ParsedSection(
             title="Text\x00",
-            text="Course\x00 note text about degree centrality and network representation.",
+            text="KnowledgeBase\x00 note text about degree centrality and network representation.",
             metadata={"content_kind": "markdown", "raw": "a\x00b"},
         ),
     ]
-    chunks = chunk_sections(sections, chapter="L1", source_type="notebook")
+    chunks = chunk_sections(sections, partition="L1", source_type="notebook")
 
     assert infer_content_kind("[Output]\n1") == "output"
     assert chunks[0]["metadata"]["content_kind"] == "code"
     assert chunks[1]["metadata"]["content_kind"] == "markdown"
     assert "\x00" not in chunks[1]["content"]
     assert chunks[1]["metadata"]["raw"] == "ab"
-    assert all(chunk["chapter"] == "L1" for chunk in chunks)
+    assert all(chunk["partition"] == "L1" for chunk in chunks)
     assert all(chunk["metadata"]["chunking_strategy"] == "chunk_800_metadata_enriched_v1" for chunk in chunks)
     assert "route_eligibility" in chunks[0]["metadata"]
     assert "retention_decision" in chunks[0]["metadata"]
@@ -74,13 +74,13 @@ def test_chunk_sections_routes_noise_and_keeps_relevant_code():
         ParsedSection(title="Good", text="This paragraph explains degree centrality in complex networks with enough detail.", metadata={"content_kind": "markdown"}),
     ]
 
-    chunks, stats = chunk_sections_with_stats(sections, chapter="L1", source_type="notebook")
+    chunks, stats = chunk_sections_with_stats(sections, partition="L1", source_type="notebook")
 
     assert stats["chunks_before_filter"] == 7
     assert stats["chunks_filtered"] == 1
     assert [chunk["section"] for chunk in chunks] == ["Output", "Short", "TOC", "Generic Code", "community detection", "Good"]
     assert chunks[0]["metadata"]["quality_action"] == "evidence_only"
-    assert chunks[0]["metadata"]["route_eligibility"]["graph_extraction"] is False
+    assert chunks[0]["metadata"]["route_eligibility"]["evidence_graph"] is False
     assert chunks[1]["metadata"]["quality_retain"] is True
     assert chunks[2]["metadata"]["quality_action"] == "summary_only"
     assert chunks[3]["metadata"]["quality_action"] == "embed_only"
@@ -90,7 +90,7 @@ def test_chunk_sections_routes_noise_and_keeps_relevant_code():
 def test_embedding_text_adds_metadata_without_changing_content():
     text = embedding_text(
         document_title="Centralities",
-        chapter="Lecture 3",
+        partition="Lecture 3",
         section="Degree",
         source_type="notebook",
         content_kind="markdown",
@@ -98,7 +98,7 @@ def test_embedding_text_adds_metadata_without_changing_content():
     )
 
     assert "Document: Centralities" in text
-    assert "Chapter: Lecture 3" in text
+    assert "partition: Lecture 3" in text
     assert "Content Kind: markdown" in text
     assert text.endswith("Degree centrality counts incident edges.")
     assert EMBEDDING_TEXT_VERSION == "metadata_enriched_v1"
@@ -112,12 +112,12 @@ def test_continuous_chunk_adaptation_does_not_emit_fixed_document_type():
         "The characteristic polynomial det(A - lambda I)=0 defines eigenvalues. "
     ) * 12
     prose_like = (
-        "This section explains how a course project should be planned. "
+        "This section explains how a KnowledgeBase project should be planned. "
         "It connects goals, milestones, evaluation criteria, and reflection in a coherent narrative. "
     ) * 12
 
     proof_profile = choose_chunking_profile(proof_like, title="Eigenvalues")
-    prose_profile = choose_chunking_profile(prose_like, title="Project Notes")
+    prose_profile = choose_chunking_profile(prose_like, title="Project sources")
 
     assert "document_type" not in proof_profile.metadata()
     assert "document_type" not in prose_profile.metadata()

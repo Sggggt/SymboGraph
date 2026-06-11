@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import Link from "next/link";
 import { useMemo } from "react";
@@ -9,7 +9,7 @@ import { ArrowRight, Orbit, Radar, Sparkles, Zap } from "lucide-react";
 import { fetchDashboard } from "@/lib/api";
 import { NetworkCanvas } from "@/components/network-canvas";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
-import { useCourseContext } from "@/components/course-context";
+import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
 
 const batchStateLabels: Record<string, string> = {
   queued: "排队中",
@@ -59,19 +59,19 @@ function GraphStaleBadge({ isStale }: { isStale?: boolean }) {
 }
 
 export function OverviewDashboard() {
-  const { selectedCourseId } = useCourseContext();
+  const { selectedKnowledgeBaseId } = useKnowledgeBaseContext();
   const { data, isLoading, error } = useQuery({
-    queryKey: ["dashboard", selectedCourseId],
-    queryFn: () => fetchDashboard(selectedCourseId),
-    enabled: Boolean(selectedCourseId),
+    queryKey: ["dashboard", selectedKnowledgeBaseId],
+    queryFn: () => fetchDashboard(selectedKnowledgeBaseId),
+    enabled: Boolean(selectedKnowledgeBaseId),
   });
 
   const stats = useMemo(() => {
     if (!data) return [];
     return [
       { label: "文档原件", value: data.ingested_document_count },
-      { label: "知识概念", value: data.course.concept_count },
-      { label: "图谱关系", value: data.graph_relation_count },
+      { label: "Active chunks", value: data.active_chunk_count },
+      { label: "Evidence edges", value: data.evidence_edge_count },
       { label: "目录分组", value: data.tree.length },
     ];
   }, [data]);
@@ -98,7 +98,7 @@ export function OverviewDashboard() {
             <div className="max-w-4xl space-y-4">
               <p className="section-kicker">本地资料 / 知识智能</p>
               <h2 className="glow-text text-3xl font-semibold leading-tight text-white lg:text-4xl">本地知识图谱、向量检索与 RAG 联动。</h2>
-              <p className="max-w-3xl text-sm leading-7 text-cyan-50/72">围绕本地原件、目录脉络、概念关系和证据片段展开。新资料导入后自动解析、切块、向量化并更新图谱。</p>
+              <p className="max-w-3xl text-sm leading-7 text-cyan-50/72">围绕本地原件、目录脉络、证据 atom 和 active chunk 展开。新资料导入后自动解析、构建 evidence graph、切块、质量门禁并向量化。</p>
             </div>
             <div className="flex flex-wrap gap-3">
               <Link href="/upload" className="rounded-full border border-cyan-300/40 bg-cyan-300/12 px-4 py-2.5 text-xs uppercase tracking-[0.24em] text-white">
@@ -124,7 +124,7 @@ export function OverviewDashboard() {
             <div>
               <p className="section-kicker">实时图谱</p>
               <div className="mt-1.5 flex flex-wrap items-center gap-2">
-                <h3 className="text-xl font-semibold text-white">概念关系热区</h3>
+                <h3 className="text-xl font-semibold text-white">证据图谱热区</h3>
                 <GraphStaleBadge isStale={data.graph.freshness?.is_stale} />
               </div>
             </div>
@@ -158,7 +158,7 @@ export function OverviewDashboard() {
             <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
               <p className="text-xs uppercase tracking-[0.28em] text-white/45">向量模型模式</p>
               <p className="mt-3 text-2xl font-semibold text-white">{data.degraded_mode ? "降级不可用" : "真实模型链路"}</p>
-              <p className="mt-2 text-sm text-white/55">{data.degraded_mode ? "当前未检测到真实模型链路" : "真实向量模型与外部图谱抽取已启用"}</p>
+              <p className="mt-2 text-sm text-white/55">{data.degraded_mode ? "当前未检测到真实模型链路" : "真实向量模型与 evidence graph 链路已启用"}</p>
             </div>
           </div>
           <div className="mt-6 space-y-3">
@@ -186,14 +186,14 @@ export function OverviewDashboard() {
               <Radar className="size-5 text-cyan-200" />
             </div>
             <div className="mt-6 space-y-4">
-              {data.tree.slice(0, 6).map((chapter) => (
-                <div key={chapter.id} className="rounded-[22px] border border-white/8 bg-white/[0.03] px-5 py-4">
+              {data.tree.slice(0, 6).map((partition) => (
+                <div key={partition.id} className="rounded-[22px] border border-white/8 bg-white/[0.03] px-5 py-4">
                   <div className="flex items-center justify-between gap-4">
-                    <p className="text-base font-medium text-white">{chapter.title}</p>
-                    <span className="text-xs uppercase tracking-[0.25em] text-white/45">{chapter.children?.length ?? 0} 个文档</span>
+                    <p className="text-base font-medium text-white">{partition.title}</p>
+                    <span className="text-xs uppercase tracking-[0.25em] text-white/45">{partition.children?.length ?? 0} 个文档</span>
                   </div>
                   <div className="mt-3 flex flex-wrap gap-2">
-                    {(chapter.children ?? []).slice(0, 4).map((child) => (
+                    {(partition.children ?? []).slice(0, 4).map((child) => (
                       <span key={child.id} className="rounded-full border border-white/10 px-3 py-1 text-xs text-cyan-50/74">
                         {child.title}
                       </span>
@@ -216,8 +216,7 @@ export function OverviewDashboard() {
               {[
                 { href: "/search", title: "搜索实验室", description: "带过滤条件的向量检索与目录联动视图。" },
                 { href: "/qa", title: "问答实验室", description: "流式回答、证据轨迹和命中片段并行展开。" },
-                { href: "/concepts", title: "概念浏览", description: "概念列表、关系摘要、目录引用统一浏览。" },
-                { href: "/graph", title: "图谱舞台", description: "全屏关系画布，按目录聚焦图谱热区。" },
+                { href: "/graph", title: "证据图谱", description: "查看 evidence atom、active chunk、文档版本和观测边。" },
               ].map((entry) => (
                 <Link
                   key={entry.href}

@@ -1,93 +1,165 @@
-# SymboGraph Backend API
+# API 使用指南
 
-A high-performance, asynchronous FastAPI backend service orchestrating the SymboGraph local course knowledge graph infrastructure. It manages data ingestion, semantic parsing, hybrid vector/lexical retrieval, graph extraction, and automated hyperparameter optimization (HPO).
+`apps/api` 是 SymboGraph 的 FastAPI 后端。它负责编排知识库、文件上传、解析、证据图、信号层、切块质量门禁、active chunks、向量索引、检索、问答、引用验证、运行时设置和维护接口。
 
----
+## 运行方式
 
-## 🛠️ Architecture & Services
+推荐通过 Docker Compose 运行完整栈：
 
-The backend enforces strict ACID constraints and coordinates three persistent stores:
-
-1. **PostgreSQL (v16)**: The single source of truth for structural course metadata, strategy profiles, ingestion batches, active document chunks, concept nodes, and relationship matrices. Enforces transaction atomicity and relational integrity.
-2. **Qdrant (v1.17)**: High-speed vector store storing dense contextualized embeddings (1024-dimension `text-embedding-v4`) for semantic hybrid search.
-3. **Redis (v7)**: Shared runtime cache, distributed locks (`_RedisDistributedLock`), and message broker facilitating high-throughput operations.
-
----
-
-## 🚀 Core Pipelines
-
-### 1. Ingestion, Parsing & Chunking
-- **Multiformat Parsers**: Custom parsers for `.pdf`, `.ipynb`, `.md`, `.docx`, `.pptx`, `.html`.
-- **Adaptive Semantic Chunking**: Preserves structural hierarchy, LaTeX formulas, and table coordinates. Dynamically balances chunk boundaries based on semantic coherence (F1 score).
-- **Contextualized Embeddings**: Enhances dense vectors by prefixing parent-chapter context to prevent loss of local semantics in downstream RAG.
-- **Chunk Version Control**: Tracks committed knowledge-base versions with `courses.current_chunk_version` and `chunks.chunk_version`; selected-file parses reuse the current version, while full reparse advances only after at least one file succeeds.
-- **Phase-aware Cancellation**: Parse-phase cancellation rolls back parse writes, while graph-phase cancellation restores the pre-graph snapshot without discarding committed parse results.
-
-### 2. Evidence-First Retrieval
-- **Hybrid Search**: Combines Qdrant dense vector cosine similarity with lexical full-text matching, resolved using Reciprocal Rank Fusion (RRF).
-- **Dijkstra Concept Pathing**: Traces semantic connection paths between multi-hop query concepts using graph algorithm weights.
-- **Citation Grounding**: Every answer is strictly back-referenced to source document slices to ensure evidence-first accuracy and zero hallucination.
-
-### 3. Adaptive Graph Extraction & Auto HPO
-- **Adaptive Extraction Plan**: Automatically budgets API token consumption by selecting critical chunks (`adaptive_best_first` strategy) for LLM relationship extraction.
-- **Bounded Model Calls**: Applies `GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN`, `MODEL_REQUEST_CONCURRENCY`, and `MODEL_REQUEST_TIMEOUT_SECONDS` to avoid unbounded graph extraction fan-out.
-- **Graph Enrichment**: Calculates PageRank, betweenness centrality, and Louvain community partitions to summarize corpus topology.
-- **TPE Auto HPO**: Runs an Optuna-powered Tree-structured Parzen Estimator (TPE) over a surrogate LLM-pairwise-judge learned objective to optimize Dijkstra distance cutoffs and relation confidence weights.
-
-### 4. Knowledge-Base Strategy Profiles
-- **Default Compatibility Layer**: New and legacy courses bind to the built-in course Profile by default, preserving existing RAG, graph extraction, retrieval, and agent behavior.
-- **Persistent Profiles**: Profiles are stored in PostgreSQL table `strategy_profiles` and linked from `courses.active_profile_id`; Profile state is not stored in `.env`.
-- **Profile-Aware Boundaries**: Prompt builders, entity/relation normalization, chunk labels, embedding metadata, query classification, agent routes, graph judge hints, and quality policy hints read the active Profile at pipeline boundaries.
-- **Non-Destructive Switching**: Profile changes only affect new tasks. Existing chunks, graph objects, vectors, and sessions remain untouched; graph extraction runs record `strategy_profile_id` and `strategy_profile_hash`.
-- **Deletion Semantics**: The built-in default Profile cannot be deleted. Deleting any custom Profile soft-deletes it and automatically rebinds any affected courses to the default Profile in one transaction.
-- **Profile Assistant**: `/settings/profile-assistant/stream` streams natural-language guidance plus a validated Profile JSON draft and caches assistant session state in Redis.
-
----
-
-## 📂 Codebase Directory Layout
-
-```
-apps/api/
-├── app/
-│   ├── core/           # App settings, DB connections, Redis distributed lock
-│   ├── models/         # SQLAlchemy ORM declarative database models
-│   ├── schemas/        # Strong contract validation using Pydantic v2
-│   ├── services/       # Core business logic: concept_graph, ingestion, strategy profiles, HPO engine
-│   ├── main.py         # FastAPI app registration and API router entry
-│   └── api.py          # Endpoints for ingestion, RAG chat, concept card catalog
-├── tests/              # Extensive pytest suite covering logic, DB integrations
-├── pyproject.toml      # Modern uv package manager configuration
-└── Dockerfile          # Production-grade Docker container configuration
+```powershell
+docker compose -f infra/docker-compose.yml up -d --build
 ```
 
----
+API 容器名：
 
-## 💻 Running & Testing
-
-### Running within Docker (Recommended)
-By default, all dependent services run via Docker Compose:
-```bash
-# Build and start the stack
-docker compose -f infra/docker-compose.yml up --build -d
-```
-The API is exposed at `http://127.0.0.1:8000/api`.
-
-### Running Integration & Unit Tests
-Integrations with PostgreSQL, Redis, and Qdrant must be validated inside the container environment to ensure correct schema and connection behaviors:
-```bash
-# Run the complete test suite inside the container
-docker exec course-kg-api python -m pytest tests
-
-# Run Profile-specific regression tests
-docker exec course-kg-api python -m pytest tests/test_strategy_profiles.py
+```text
+course-kg-api
 ```
 
-### Running Locally for Active Debugging
-Ensure your local PostgreSQL, Redis, and Qdrant instances are forwarded or running on `localhost`:
-```bash
-# Sync local virtualenv using uv
-uv sync
+健康检查：
 
-# Launch FastAPI reload server
-uv run uvicorn app.main:app --reload --port 8000
+```powershell
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health
 ```
+
+## 本地开发命令
+
+从 `apps/api` 执行：
+
+```powershell
+python -m pytest tests
+python -m pytest tests/test_evidence_graph_pipeline.py tests/test_evidence_first_retrieval.py -q
+```
+
+容器内执行：
+
+```powershell
+docker exec -w /app/apps/api course-kg-api python -m pytest tests/test_evidence_graph_pipeline.py tests/test_evidence_first_retrieval.py tests/test_quality_system.py -q
+```
+
+## 配置入口速查
+
+优先使用仓库根目录 `.env`。API 会读取：
+
+```text
+<repo>/.env
+apps/api/.env
+```
+
+常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `DATABASE_URL` | PostgreSQL 连接串 |
+| `QDRANT_URL` / `QDRANT_COLLECTION` | Qdrant 地址和集合名 |
+| `REDIS_URL` | Redis、Celery broker、缓存和运行时广播 |
+| `OPENAI_API_KEY` / `CHAT_BASE_URL` / `CHAT_MODEL` | Chat 模型配置 |
+| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | Embedding 配置 |
+| `WORKER_CONCURRENCY` / `INGESTION_FILE_CONCURRENCY` / `MODEL_REQUEST_CONCURRENCY` | 并发上限 |
+| `CHUNK_TOKEN_BUDGET` | active chunk 候选预算 |
+| `RERANKER_ENABLED` / `RERANKER_MODEL` / `RERANKER_DEVICE` | 可选 Cross-Encoder reranker |
+| `ENABLE_MODEL_FALLBACK` / `ENABLE_DATABASE_FALLBACK` | active path 应保持 `false` |
+
+详细环境参数和公式说明见仓库根目录 [README.md](../../README.md) 的“环境参数总表”。
+
+Cross-Encoder reranker 默认关闭。启用时：
+
+```env
+RERANKER_ENABLED=true
+RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+RERANKER_MAX_LENGTH=512
+RERANKER_DEVICE=cpu
+```
+
+如果 `HF_HUB_OFFLINE=1`，模型必须已经缓存或 `RERANKER_MODEL` 指向本地模型路径。
+
+## 主要模块
+
+| 路径 | 用途 |
+| --- | --- |
+| `app/api.py` | REST/SSE 路由入口 |
+| `app/models.py` | SQLAlchemy 数据模型 |
+| `app/schemas.py` | Pydantic API 契约 |
+| `app/services/evidence_graph.py` | evidence atoms、observed edges、chunk candidates、active chunks |
+| `app/services/evidence_signal_projection.py` | signal candidates、signal decisions、signal nodes、projection views |
+| `app/services/retrieval.py` | evidence-first search、signal expansion、trace audit |
+| `app/services/agent_graph.py` | QA agent、citation grounding、verification |
+| `app/services/quality/` | quality signals、policies、gate/reward/feedback |
+| `app/services/runtime_settings.py` | `.env` 写入、Redis 广播、热加载 |
+
+```mermaid
+flowchart LR
+    API["FastAPI routes"] --> SVC["Service layer"]
+    SVC --> PG["PostgreSQL"]
+    SVC --> Q["Qdrant"]
+    SVC --> R["Redis"]
+    SVC --> M["OpenAI-compatible models"]
+```
+
+## Agentic QA
+
+`app/services/agent_graph.py` 是问答 Agent 的编排入口。它不是单次 RAG prompt，而是一个 LangGraph 状态机：
+
+```mermaid
+flowchart LR
+    P["Perception"] --> RP["RetrievalPlanner"]
+    RP --> BR["BaseRetrieval"]
+    BR --> EA["EvidenceAnchorSelector"]
+    EA --> CP["EvidenceChainPlanner"]
+    CP --> GE["ControlledGraphEnhancer"]
+    GE --> AS["EvidenceAssembler"]
+    AS --> DG["DocumentGrader"]
+    DG --> EE["EvidenceEvaluator"]
+    EE -->|retry| RP
+    EE -->|pass| CS["ContextSynthesizer"]
+    CS --> AG["AnswerGenerator"]
+    AG --> CC["CitationChecker"]
+    CC --> CV["CitationVerifier"]
+    CV --> RF["Reflection"]
+    RF --> SC["SelfCheck"]
+```
+
+开发时重点检查：
+
+| 节点 | 关注点 |
+| --- | --- |
+| `Perception` | 只选择动作路径，不使用词表门禁，不写入事实 |
+| `BaseRetrieval` | 返回 active chunks，并记录 retrieval trace |
+| `EvidenceAnchorSelector` | 只选择可追溯到 active chunk 或 evidence atom 的锚点 |
+| `ControlledGraphEnhancer` | 只沿 signal layer 和观测边补上下文，不生成本体事实 |
+| `EvidenceEvaluator` | 输出证据是否充分、缺口类型和是否重试 |
+| `CitationVerifier` | 将答案引用核验回 source span、document version 和 active chunk |
+| `Reflection` | 只做定向修正，不能绕过证据新增事实 |
+
+相关配置：
+
+| 参数 | 默认值 |
+| --- | --- |
+| `RETRIEVAL_LAYER_ENABLED` | `true` |
+| `ENABLE_AGENTIC_REFLECTION` | `true` |
+| `ENABLE_POST_GENERATION_REFLECTION` | `false` |
+| `CITATION_VERIFICATION_SAMPLE_MAX` | `3` |
+| `REFLECTION_MAX_RETRIES` | `2` |
+| `RERANKER_ENABLED` | `false` |
+
+回归测试入口：
+
+```powershell
+python -m pytest tests/test_agent_graph.py tests/test_agent_api.py -q
+```
+
+## 开发约束
+
+- PostgreSQL 是生命周期状态事实源；Qdrant 和 Redis 是派生或运行态存储。
+- active path 禁止静默 fallback。
+- 新的图基座以 evidence graph 和 signal layer 为主，不把旧 Concept/Relation GraphRAG 当作默认产品链路。
+- 新增或修改 API contract 时，同步更新 Pydantic schema、前端 TypeScript 类型、测试和脚本输出。
+- 涉及导入、证据图、切块、质量、检索、问答、runtime settings 的改动必须补充测试，并优先在 Docker 栈内验证。
+
+## 常用验收
+
+```powershell
+python scripts\docker_smoke.py --base-url http://127.0.0.1:8000/api --worker-container course-kg-worker
+```
+
+smoke、benchmark 和临时报告写入仓库根目录 `output/`。

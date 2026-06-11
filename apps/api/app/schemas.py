@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field
 
 
 JobState = Literal[
@@ -20,99 +20,28 @@ JobState = Literal[
     "failed",
     "skipped",
 ]
-CourseFileStatus = Literal["pending", "parsing", "parsed", "failed", "skipped"]
+KnowledgeBaseFileStatus = Literal["pending", "parsing", "parsed", "failed", "skipped"]
 SourceType = Literal["pdf", "ppt", "pptx", "docx", "markdown", "text", "image", "notebook", "html", "unknown"]
-AgentRoute = Literal["direct_answer", "retrieve_notes", "retrieve_exercises", "retrieve_both", "clarify", "multi_hop_research"]
+AgentRoute = Literal["direct_answer", "retrieve_sources", "retrieve_tasks", "retrieve_both", "clarify", "multi_hop_research"]
 AgentRunState = Literal["queued", "running", "needs_clarification", "completed", "failed"]
-GraphRelationType = str
-GraphType = Literal["semantic", "structural", "evidence"]
-SemanticEntityType = str
-GraphNodeCategory = Literal["semantic_entity", "course", "document", "chapter", "section", "chunk", "evidence_chunk", "document_version"]
-
-SEMANTIC_ENTITY_TYPE_VALUES = {"concept", "method", "formula", "metric", "algorithm", "definition", "theorem", "problem_type"}
-GRAPH_RELATION_TYPE_VALUES = {
-    "is_a",
-    "part_of",
-    "prerequisite_of",
-    "used_for",
-    "causes",
-    "derives_from",
-    "compares_with",
-    "example_of",
-    "defined_by",
-    "formula_of",
-    "solves",
-    "implemented_by",
-    "related_to",
-}
-SEMANTIC_ENTITY_TYPE_ALIASES = {
-    "named_algorithm": "algorithm",
-    "algo": "algorithm",
-    "measure": "metric",
-    "definition_term": "definition",
-    "problem": "problem_type",
-    "problem type": "problem_type",
-    "application": "concept",
-}
-GRAPH_RELATION_TYPE_ALIASES = {
-    "defines": "defined_by",
-    "defined by": "defined_by",
-    "relates_to": "related_to",
-    "relates to": "related_to",
-    "mentions": "related_to",
-    "compares": "compares_with",
-    "compares with": "compares_with",
-    "extends": "derives_from",
-}
-
-
-def _normalize_semantic_entity_type(value: object) -> str:
-    from app.services.strategy_profiles import active_profile_json, profile_schema
-
-    if not isinstance(value, str):
-        value = ""
-    schema_pack = profile_schema(active_profile_json())
-    allowed = set(schema_pack.get("entity_types") or SEMANTIC_ENTITY_TYPE_VALUES)
-    default_type = str(schema_pack.get("default_entity_type") or "concept")
-    aliases = dict(schema_pack.get("entity_aliases") or SEMANTIC_ENTITY_TYPE_ALIASES)
-    entity_type = value.strip().lower().replace("-", "_").replace(" ", "_")
-    entity_type = aliases.get(value.strip().lower(), entity_type)
-    entity_type = aliases.get(entity_type, entity_type)
-    return entity_type if entity_type in allowed else default_type
-
-
-def _normalize_graph_relation_type(value: object) -> str:
-    from app.services.strategy_profiles import active_profile_json, profile_schema
-
-    if not isinstance(value, str):
-        value = ""
-    schema_pack = profile_schema(active_profile_json())
-    allowed = set(schema_pack.get("relation_types") or GRAPH_RELATION_TYPE_VALUES)
-    default_type = str(schema_pack.get("default_relation_type") or "related_to")
-    aliases = dict(schema_pack.get("relation_aliases") or GRAPH_RELATION_TYPE_ALIASES)
-    relation_type = value.strip().lower().replace("-", "_")
-    relation_type = aliases.get(value.strip().lower(), relation_type)
-    relation_type = aliases.get(relation_type, relation_type)
-    return relation_type if relation_type in allowed else default_type
-
-
-def _normalize_unit_interval_score(value: object) -> object:
-    if value is None or isinstance(value, bool):
-        return value
-    try:
-        score = float(value)
-    except (TypeError, ValueError):
-        return value
-    if 1.0 < score <= 10.0:
-        return score / 10.0
-    if score == 1.0:
-        if isinstance(value, int) or (isinstance(value, str) and value.strip() == "1"):
-            return 0.1
-    return value
+GraphType = Literal["evidence"]
+GraphNodeCategory = Literal[
+    "knowledge_base",
+    "evidence_graph_state",
+    "evidence_atom",
+    "active_chunk",
+    "community_region",
+    "signal_node",
+    "document",
+    "partition",
+    "section",
+    "evidence_chunk",
+    "document_version",
+]
 
 
 class SearchFilters(BaseModel):
-    chapter: str | None = None
+    partition: str | None = None
     tags: list[str] = Field(default_factory=list)
     difficulty: str | None = None
     source_type: SourceType | None = None
@@ -129,8 +58,6 @@ class ParseUploadedFilesRequest(BaseModel):
     file_paths: list[str] = Field(default_factory=list)
     force: bool = False
     full_reparse: bool = False
-    rebuild_graph_mode: Literal["none", "incremental", "full"] = "none"
-    confirm_destructive_graph_rebuild: bool = False
 
 
 class JobStatusResponse(BaseModel):
@@ -148,110 +75,33 @@ class Citation(BaseModel):
     document_id: str
     document_title: str
     source_path: str
-    chapter: str | None = None
+    partition: str | None = None
     section: str | None = None
     page_number: int | None = None
     snippet: str
-
-
-class GraphExtractionConcept(BaseModel):
-    name: str = Field(default="", max_length=255)
-    surface: str = Field(default="", max_length=255)
-    canonical_name: str = Field(default="", max_length=255)
-    aliases: list[str] = Field(default_factory=list)
-    summary: str = ""
-    definition: str = ""
-    concept_type: SemanticEntityType = "concept"
-    entity_type: SemanticEntityType | None = None
-    importance_score: float = Field(default=0.5, ge=0.0, le=1.0)
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-    evidence_spans: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_typed_payload(cls, value: object) -> object:
-        if not isinstance(value, dict):
-            return value
-        payload = dict(value)
-        canonical = str(payload.get("canonical_name") or payload.get("name") or payload.get("surface") or "").strip()
-        surface = str(payload.get("surface") or payload.get("name") or canonical).strip()
-        payload["name"] = canonical or surface
-        payload["canonical_name"] = canonical or surface
-        payload["surface"] = surface or canonical
-        if payload.get("entity_type") and not payload.get("concept_type"):
-            payload["concept_type"] = payload["entity_type"]
-        if payload.get("concept_type") and not payload.get("entity_type"):
-            payload["entity_type"] = payload["concept_type"]
-        payload["concept_type"] = _normalize_semantic_entity_type(payload.get("concept_type"))
-        payload["entity_type"] = _normalize_semantic_entity_type(payload.get("entity_type") or payload["concept_type"])
-        if payload.get("definition") and not payload.get("summary"):
-            payload["summary"] = payload["definition"]
-        return payload
-
-    @field_validator("name", "surface", "canonical_name", "summary", "definition")
-    @classmethod
-    def strip_text(cls, value: str) -> str:
-        return value.strip()
-
-    @field_validator("aliases", "evidence_spans")
-    @classmethod
-    def strip_aliases(cls, value: list[str]) -> list[str]:
-        return [item.strip() for item in value if item.strip()]
-
-    @field_validator("importance_score", "confidence", mode="before")
-    @classmethod
-    def normalize_scores(cls, value: object) -> object:
-        return _normalize_unit_interval_score(value)
-
-    @model_validator(mode="after")
-    def require_name(self) -> "GraphExtractionConcept":
-        if not self.name.strip():
-            raise ValueError("semantic entity name is required")
-        return self
-
-
-class GraphExtractionRelation(BaseModel):
-    source: str = Field(min_length=1, max_length=255)
-    target: str = Field(min_length=1, max_length=255)
-    relation_type: GraphRelationType
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-
-    @field_validator("relation_type", mode="before")
-    @classmethod
-    def normalize_relation_type(cls, value: object) -> str:
-        return _normalize_graph_relation_type(value)
-
-    @field_validator("confidence", mode="before")
-    @classmethod
-    def normalize_confidence(cls, value: object) -> object:
-        return _normalize_unit_interval_score(value)
-
-    @field_validator("source", "target")
-    @classmethod
-    def strip_endpoint(cls, value: str) -> str:
-        return value.strip()
-
-
-class GraphExtractionPayload(BaseModel):
-    concepts: list[GraphExtractionConcept] = Field(default_factory=list)
-    relations: list[GraphExtractionRelation] = Field(default_factory=list)
+    active_chunk_id: str | None = None
+    evidence_atom_ids: list[str] = Field(default_factory=list)
+    source_span: dict = Field(default_factory=dict)
+    retrieval_trace_id: str | None = None
+    citation_verification_id: str | None = None
 
 
 class SearchRequest(BaseModel):
     query: str
-    course_id: str | None = None
+    knowledge_base_id: str | None = None
     filters: SearchFilters = Field(default_factory=SearchFilters)
     top_k: int = Field(default=6, ge=1, le=50)
 
 
-class QuerySemanticGraphRequest(BaseModel):
-    course_id: str | None = None
+class QueryEvidenceGraphRequest(BaseModel):
+    knowledge_base_id: str | None = None
     query: str | None = None
     chunk_ids: list[str] = Field(default_factory=list, min_length=1, max_length=50)
 
 
 class SearchResult(BaseModel):
     chunk_id: str
+    active_chunk_id: str | None = None
     snippet: str
     score: float
     citations: list[Citation]
@@ -260,7 +110,7 @@ class SearchResult(BaseModel):
     child_content: str | None = None
     document_title: str | None = None
     source_path: str | None = None
-    chapter: str | None = None
+    partition: str | None = None
     source_type: str | None = None
 
 
@@ -274,6 +124,13 @@ class ModelAudit(BaseModel):
     fallback_enabled: bool = False
     degraded_mode: bool = False
     vector_index_warning: str | None = None
+    retrieval_pipeline: str | None = None
+    signal_state_hash: str | None = None
+    signal_node_ids: list[str] = Field(default_factory=list)
+    retrieval_cache_scope_hash: str | None = None
+    cached: bool = False
+    scope_hash: str | None = None
+    cache: dict = Field(default_factory=dict)
 
 
 class AnswerModelAudit(BaseModel):
@@ -282,6 +139,9 @@ class AnswerModelAudit(BaseModel):
     external_called: bool = False
     fallback_reason: str | None = None
     skipped_reason: str | None = None
+    signal_state_hash: str | None = None
+    signal_node_ids: list[str] = Field(default_factory=list)
+    signal_expansion_used: bool = False
 
 
 class SearchResponse(BaseModel):
@@ -299,7 +159,7 @@ class ChatMessage(BaseModel):
 class QARequest(BaseModel):
     question: str
     session_id: str | None = None
-    course_id: str | None = None
+    knowledge_base_id: str | None = None
     filters: SearchFilters = Field(default_factory=SearchFilters)
     top_k: int = Field(default=6, ge=1, le=50)
     history: list[ChatMessage] = Field(default_factory=list)
@@ -320,7 +180,7 @@ class QAResponse(BaseModel):
 class AgentRequest(BaseModel):
     question: str
     session_id: str | None = None
-    course_id: str | None = None
+    knowledge_base_id: str | None = None
     filters: SearchFilters = Field(default_factory=SearchFilters)
     top_k: int = Field(default=6, ge=1, le=50)
     history: list[ChatMessage] = Field(default_factory=list)
@@ -388,24 +248,22 @@ class CleanupStaleDataResponse(BaseModel):
     deleted_chunks: int = 0
     deleted_document_versions: int = 0
     deleted_documents: int = 0
-    removed_graph_relations: int = 0
-    removed_graph_concepts: int = 0
-
-
-class CleanupStaleGraphResponse(BaseModel):
-    removed_relations: int = 0
-    removed_aliases: int = 0
-    removed_concepts: int = 0
-    migrated_relations: int = 0
+    removed_vector_records: int = 0
+    removed_evidence_atoms: int = 0
+    removed_evidence_edges: int = 0
+    removed_evidence_graph_states: int = 0
+    removed_active_chunks: int = 0
+    removed_chunk_candidates: int = 0
+    removed_chunk_decisions: int = 0
+    removed_quality_decisions: int = 0
+    removed_community_states: int = 0
+    removed_community_memberships: int = 0
+    removed_community_summaries: int = 0
 
 
 class RebuildGraphRequest(BaseModel):
-    mode: str = "incremental"
-    confirm_destructive: bool = False
+    mode: Literal["evidence"] = "evidence"
     dry_run: bool = False
-    run_llm_merge: bool | None = None
-    run_hpo: bool | None = None
-    run_community_summaries: bool | None = None
 
 
 class StrategyProfileSummary(BaseModel):
@@ -415,7 +273,7 @@ class StrategyProfileSummary(BaseModel):
     is_builtin: bool = False
     is_active: bool = True
     profile_hash: str
-    course_ids: list[str] = Field(default_factory=list)
+    knowledge_base_ids: list[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime | None = None
 
@@ -441,7 +299,7 @@ class StrategyProfileCopyRequest(BaseModel):
 
 
 class StrategyProfileBindRequest(BaseModel):
-    course_id: str
+    knowledge_base_id: str
     profile_id: str
 
 
@@ -484,12 +342,13 @@ class StrategyProfileAssistantStateResponse(BaseModel):
 class RebuildGraphResponse(BaseModel):
     batch_id: str | None = None
     state: str
-    mode: str = "full"
+    mode: str = "evidence"
     affected_documents: int = 0
     previous_batch_id: str | None = None
     dry_run: bool = False
-    semantic_entities: int = 0
-    semantic_relations: int = 0
+    evidence_atoms: int = 0
+    evidence_edges: int = 0
+    active_chunks: int = 0
 
 
 class BatchLogTokenResponse(BaseModel):
@@ -497,38 +356,121 @@ class BatchLogTokenResponse(BaseModel):
     expires_at: datetime
 
 
-class DeleteCourseResponse(BaseModel):
+class DeleteKnowledgeBaseResponse(BaseModel):
     deleted: bool
     deleted_vectors: int = 0
+    deleted_vector_records: int = 0
+    deleted_active_chunks: int = 0
+    deleted_chunk_decisions: int = 0
+    deleted_quality_decisions: int = 0
+    deleted_chunk_candidates: int = 0
+    deleted_evidence_atoms: int = 0
+    deleted_evidence_edges: int = 0
+    deleted_evidence_graph_states: int = 0
+    deleted_community_states: int = 0
+    deleted_community_memberships: int = 0
+    deleted_community_summaries: int = 0
+    deleted_signal_schema_states: int = 0
+    deleted_signal_states: int = 0
+    deleted_signal_candidates: int = 0
+    deleted_signal_decisions: int = 0
+    deleted_signal_nodes: int = 0
+    deleted_signal_edges: int = 0
+    deleted_signal_communities: int = 0
+    deleted_signal_community_memberships: int = 0
+    deleted_projection_states: int = 0
+    deleted_projection_nodes: int = 0
+    deleted_projection_edges: int = 0
+    deleted_projection_communities: int = 0
+    deleted_policy_states: int = 0
+    deleted_policy_observations: int = 0
+    deleted_quality_observations: int = 0
+    deleted_retrieval_traces: int = 0
+    deleted_answer_sessions: int = 0
+    deleted_citation_verifications: int = 0
+    deleted_reward_events: int = 0
     deleted_trace_events: int = 0
     deleted_agent_runs: int = 0
     deleted_sessions: int = 0
     deleted_ingestion_logs: int = 0
     deleted_compensations: int = 0
     deleted_jobs: int = 0
-    deleted_graph_extraction_tasks: int = 0
-    deleted_graph_extraction_runs: int = 0
     deleted_batches: int = 0
-    deleted_hpo_judge_samples: int = 0
-    deleted_hpo_objective_models: int = 0
-    deleted_model_hyperparameters: int = 0
-    deleted_quality_profiles: int = 0
-    deleted_community_summaries: int = 0
-    deleted_relation_candidates: int = 0
-    deleted_mentions: int = 0
-    deleted_merge_candidates: int = 0
-    deleted_relations: int = 0
-    deleted_aliases: int = 0
-    deleted_concepts: int = 0
     deleted_chunks: int = 0
     deleted_document_versions: int = 0
     deleted_documents: int = 0
-    deleted_courses: int = 0
+    deleted_knowledge_bases: int = 0
     deleted_directory: int = 0
 
 
+class EvidenceAtomOut(BaseModel):
+    id: str
+    knowledge_base_id: str
+    document_id: str
+    document_version_id: str
+    atom_type: str
+    text: str
+    source_span_json: dict = Field(default_factory=dict)
+    state: str
+    created_at: datetime
+
+
+class SignalNodeOut(BaseModel):
+    id: str
+    knowledge_base_id: str
+    signal_state_id: str
+    canonical_label: str
+    signal_type: str
+    support_atom_ids: list[str] = Field(default_factory=list)
+    support_active_chunk_ids: list[str] = Field(default_factory=list)
+    source_span_union: dict = Field(default_factory=dict)
+    confidence: float
+    created_at: datetime
+
+
+class QualityDecisionOut(BaseModel):
+    id: str
+    candidate_id: str
+    policy_state_id: str | None = None
+    gate_passed: bool
+    decision_action: str
+    confidence: float
+    risk_flags_json: list[str] = Field(default_factory=list)
+    feedback_json: dict = Field(default_factory=dict)
+    diagnostics_json: dict = Field(default_factory=dict)
+    created_at: datetime
+
+
+class ChunkDecisionOut(BaseModel):
+    id: str
+    knowledge_base_id: str
+    graph_state_id: str
+    candidate_id: str
+    quality_decision_id: str
+    policy_state_id: str | None = None
+    action: str
+    decision_protocol_version: str
+    diagnostics_json: dict = Field(default_factory=dict)
+    created_at: datetime
+
+
+class PolicyStateOut(BaseModel):
+    id: str
+    knowledge_base_id: str
+    policy_family: str
+    policy_version: str
+    profile_objective_hash: str
+    constraints_json: dict = Field(default_factory=dict)
+    exploration_json: dict = Field(default_factory=dict)
+    reward_summary_json: dict = Field(default_factory=dict)
+    drift_status: str
+    drift_detected_at: datetime | None = None
+    state_hash: str
+    created_at: datetime
+
+
 class RefreshResponse(BaseModel):
-    course_id: str
+    knowledge_base_id: str
     refreshed_at: datetime
 
 
@@ -542,25 +484,17 @@ class ModelSettingsResponse(BaseModel):
     embedding_model: str
     chat_model: str
     embedding_dimensions: int
-    graph_extraction_strategy: str = "adaptive_best_first"
-    graph_extraction_soft_start_budget: int | None = None
-    graph_extraction_max_input_tokens_per_run: int | None = None
-    graph_extraction_max_model_calls_per_run: int | None = None
-    graph_extraction_min_marginal_gain: float = 0.03
-    graph_extraction_stall_rounds: int = 2
-    graph_extraction_concurrency: int = 2
     worker_concurrency: int = 2
     ingestion_file_concurrency: int = 2
     model_request_concurrency: int = 2
     model_request_timeout_seconds: int = 180
-    hpo_concurrency: int = 1
-    graph_extraction_resume_batch_size: int = 24
+    chunk_token_budget: int = 2400
     reranker_enabled: bool = False
     reranker_model: str = ""
     reranker_max_length: int = 512
-    reranker_device: str = "cpu"
+    reranker_device: Literal["cpu", "cuda"] = "cpu"
     reranker_url: str = ""
-    semantic_chunking_enabled: bool = True
+    semantic_chunking_enabled: bool = False
     semantic_chunking_min_length: int = 2000
     retrieval_layer_enabled: bool = True
     retrieval_cache_ttl_seconds: int = 300
@@ -568,13 +502,21 @@ class ModelSettingsResponse(BaseModel):
     enable_post_generation_reflection: bool = False
     citation_verification_sample_max: int = 3
     reflection_max_retries: int = 2
-    enable_auto_hpo: bool = False
     enable_graph_community_summaries: bool = True
+    signal_extraction_max_model_batches: int = 4
+    signal_extraction_max_candidates_per_batch: int = 40
+    signal_extraction_max_tokens_per_batch: int = 6000
+    signal_candidate_keep_threshold: float = 0.62
+    community_louvain_resolution: float = 1.0
+    community_min_modularity_warn: float = 0.18
+    graph_overview_max_nodes: int = 260
+    graph_overview_max_edges: int = 800
     enable_model_fallback: bool = False
     enable_database_fallback: bool = False
     has_api_key: bool
     has_embedding_api_key: bool
     degraded_mode: bool
+    runtime_settings_version: str | None = None
 
 
 class ModelSettingsUpdate(BaseModel):
@@ -588,23 +530,15 @@ class ModelSettingsUpdate(BaseModel):
     embedding_model: str | None = None
     chat_model: str | None = None
     embedding_dimensions: int | None = Field(default=None, ge=1, le=8192)
-    graph_extraction_strategy: str | None = None
-    graph_extraction_soft_start_budget: int | None = Field(default=None, ge=1)
-    graph_extraction_max_input_tokens_per_run: int | None = Field(default=None, ge=1)
-    graph_extraction_max_model_calls_per_run: int | None = Field(default=None, ge=1)
-    graph_extraction_min_marginal_gain: float | None = Field(default=None, ge=0.0, le=1.0)
-    graph_extraction_stall_rounds: int | None = Field(default=None, ge=1, le=20)
-    graph_extraction_concurrency: int | None = Field(default=None, ge=1, le=8)
     worker_concurrency: int | None = Field(default=None, ge=1, le=32)
     ingestion_file_concurrency: int | None = Field(default=None, ge=1, le=8)
     model_request_concurrency: int | None = Field(default=None, ge=1, le=16)
     model_request_timeout_seconds: int | None = Field(default=None, ge=5, le=600)
-    hpo_concurrency: int | None = Field(default=None, ge=1, le=8)
-    graph_extraction_resume_batch_size: int | None = Field(default=None, ge=1, le=100)
+    chunk_token_budget: int | None = Field(default=None, ge=256, le=20000)
     reranker_enabled: bool | None = None
     reranker_model: str | None = None
     reranker_max_length: int | None = Field(default=None, ge=64, le=2048)
-    reranker_device: str | None = None
+    reranker_device: Literal["cpu", "cuda"] | None = None
     semantic_chunking_enabled: bool | None = None
     semantic_chunking_min_length: int | None = Field(default=None, ge=500, le=5000)
     retrieval_layer_enabled: bool | None = None
@@ -613,8 +547,15 @@ class ModelSettingsUpdate(BaseModel):
     enable_post_generation_reflection: bool | None = None
     citation_verification_sample_max: int | None = Field(default=None, ge=0, le=20)
     reflection_max_retries: int | None = Field(default=None, ge=0, le=5)
-    enable_auto_hpo: bool | None = None
     enable_graph_community_summaries: bool | None = None
+    signal_extraction_max_model_batches: int | None = Field(default=None, ge=0, le=64)
+    signal_extraction_max_candidates_per_batch: int | None = Field(default=None, ge=1, le=500)
+    signal_extraction_max_tokens_per_batch: int | None = Field(default=None, ge=500, le=50000)
+    signal_candidate_keep_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    community_louvain_resolution: float | None = Field(default=None, ge=0.05, le=5.0)
+    community_min_modularity_warn: float | None = Field(default=None, ge=-1.0, le=1.0)
+    graph_overview_max_nodes: int | None = Field(default=None, ge=20, le=2000)
+    graph_overview_max_edges: int | None = Field(default=None, ge=20, le=5000)
     embedding_api_key: str | None = None
     clear_embedding_api_key: bool = False
 
@@ -630,6 +571,7 @@ class EnvSyncStatus(BaseModel):
     synced: bool
     missing_keys: list[str] = Field(default_factory=list)
     extra_keys: list[str] = Field(default_factory=list)
+    deprecated_keys: list[str] = Field(default_factory=list)
     bom_keys: list[str] = Field(default_factory=list)
 
 
@@ -656,41 +598,22 @@ class StructuredApiError(BaseModel):
     fix_commands: list[str] = Field(default_factory=list)
 
 
-class RelatedConcept(BaseModel):
-    concept_id: str
-    relation_type: str
-    target_name: str
-    confidence: float | None = None
-    weight: float | None = None
-    relation_source: str | None = None
-    is_inferred: bool = False
-
-
-class ConceptCard(BaseModel):
-    concept_id: str
-    name: str
-    aliases: list[str]
-    summary: str
-    chapter_refs: list[str]
-    concept_type: str = "concept"
-    importance_score: float = 0.0
-    related_concepts: list[RelatedConcept]
-
-
 class GraphNode(BaseModel):
     id: str
     name: str
     category: GraphNodeCategory | str
     value: int | float | None = None
-    chapter: str | None = None
+    partition: str | None = None
     importance_score: float | None = None
     source_type: str | None = None
-    entity_type: SemanticEntityType | str | None = None
+    entity_type: str | None = None
     aliases: list[str] = Field(default_factory=list)
     support_count: int | None = None
+    support_atom_ids: list[str] = Field(default_factory=list)
+    support_active_chunk_ids: list[str] = Field(default_factory=list)
+    source_span_union: dict | None = None
     confidence: float | None = None
     canonical_key: str | None = None
-    concept_id: str | None = None
     summary: str | None = None
     document_id: str | None = None
     document_version_id: str | None = None
@@ -714,6 +637,9 @@ class GraphEdge(BaseModel):
     weight: float | None = None
     semantic_similarity: float | None = None
     support_count: int | None = None
+    support_atom_ids: list[str] = Field(default_factory=list)
+    support_active_chunk_ids: list[str] = Field(default_factory=list)
+    source_span_union: dict | None = None
     relation_source: str | None = None
     is_inferred: bool = False
 
@@ -721,29 +647,35 @@ class GraphEdge(BaseModel):
 class GraphResponse(BaseModel):
     graph_type: GraphType
     schema_version: str = "typed_graph_v1"
+    view: str | None = None
     nodes: list[GraphNode]
     edges: list[GraphEdge]
     node_counts: dict[str, int] = Field(default_factory=dict)
     edge_counts: dict[str, int] = Field(default_factory=dict)
-    focus_chapter: str | None = None
+    focus_partition: str | None = None
     freshness: dict = Field(default_factory=dict)
+    signal_layer_status: str | None = None
+    signal_state_id: str | None = None
+    signal_state_hash: str | None = None
+    signal_layer_complete: bool = False
+    diagnostics: dict = Field(default_factory=dict)
 
 
-class CourseTreeNode(BaseModel):
+class KnowledgeBaseTreeNode(BaseModel):
     id: str
     title: str
-    type: Literal["course", "chapter", "document", "concept"]
-    children: list["CourseTreeNode"] = Field(default_factory=list)
+    type: Literal["knowledge_base", "partition", "document", "signal"]
+    children: list["KnowledgeBaseTreeNode"] = Field(default_factory=list)
 
 
-class CourseSummary(BaseModel):
+class KnowledgeBaseSummary(BaseModel):
     id: str
     name: str
     description: str | None = None
     source_root: str
     storage_root: str
     document_count: int
-    concept_count: int
+    evidence_atom_count: int
     current_chunk_version: int = 0
     has_parsed_chunks: bool = False
     can_full_reparse: bool = False
@@ -753,15 +685,17 @@ class CourseSummary(BaseModel):
     active_profile_hash: str | None = None
 
 
-class CourseCreateRequest(BaseModel):
+class KnowledgeBaseCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     description: str | None = None
 
 
 class IngestionStats(BaseModel):
-    chunks: int = 0
-    concepts: int = 0
-    relations: int = 0
+    active_chunks: int = 0
+    evidence_atoms: int = 0
+    evidence_edges: int = 0
+    signal_nodes: int = 0
+    signal_edges: int = 0
 
 
 class BatchError(BaseModel):
@@ -797,12 +731,16 @@ class BatchStartResponse(BaseModel):
 
 
 class DashboardSnapshot(BaseModel):
-    course: CourseSummary
-    tree: list[CourseTreeNode]
+    knowledge_base: KnowledgeBaseSummary
+    tree: list[KnowledgeBaseTreeNode]
     graph: GraphResponse
     batch_status: IngestionBatchSummary | None = None
     ingested_document_count: int = 0
     chunk_count: int = 0
+    evidence_atom_count: int = 0
+    active_chunk_count: int = 0
+    evidence_edge_count: int = 0
+    community_region_count: int = 0
     graph_eligible_chunk_count: int = 0
     graph_relation_count: int = 0
     coverage_by_source_type: dict[str, int] = Field(default_factory=dict)
@@ -815,7 +753,7 @@ class ChunkPayload(BaseModel):
     document_title: str
     source_path: str
     source_type: str
-    chapter: str | None = None
+    partition: str | None = None
     section: str | None = None
     page_number: int | None = None
     snippet: str
@@ -828,18 +766,18 @@ class DocumentSummary(BaseModel):
     title: str
     source_path: str
     source_type: str
-    chapter: str | None = None
+    partition: str | None = None
     updated_at: datetime
 
 
-class CourseFileSummary(BaseModel):
+class KnowledgeBaseFileSummary(BaseModel):
     id: str
     document_id: str | None = None
     title: str
     source_path: str
     source_type: str = "unknown"
-    chapter: str | None = None
-    status: CourseFileStatus
+    partition: str | None = None
+    status: KnowledgeBaseFileStatus
     job_state: JobState | None = None
     batch_id: str | None = None
     error: str | None = None
@@ -848,37 +786,5 @@ class CourseFileSummary(BaseModel):
     updated_at: datetime | None = None
 
 
-class GraphNodeRelation(BaseModel):
-    relation_id: str
-    relation_type: str
-    target_concept_id: str | None = None
-    target_name: str
-    confidence: float
-    weight: float | None = None
-    semantic_similarity: float | None = None
-    support_count: int | None = None
-    relation_source: str | None = None
-    is_inferred: bool = False
-    evidence: Citation | None = None
-
-
-class GraphNodeDetail(BaseModel):
-    concept_id: str
-    name: str
-    normalized_name: str
-    summary: str
-    aliases: list[str]
-    chapter_refs: list[str]
-    concept_type: str
-    importance_score: float
-    evidence_count: int = 0
-    community_louvain: int | None = None
-    community_spectral: int | None = None
-    component_id: int | None = None
-    centrality: dict = Field(default_factory=dict)
-    graph_rank_score: float = 0.0
-    relations: list[GraphNodeRelation]
-
-
-CourseTreeNode.model_rebuild()
+KnowledgeBaseTreeNode.model_rebuild()
 QAResponse.model_rebuild()

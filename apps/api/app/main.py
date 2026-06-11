@@ -8,6 +8,7 @@ from app.api import router
 from app.db import ensure_schema
 from app.core.config import get_settings
 from app.services.ingestion import finalize_interrupted_batches
+from app.services.runtime_settings import refresh_runtime_settings_if_needed
 
 
 @asynccontextmanager
@@ -27,7 +28,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Course Knowledge Base API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="KnowledgeBase Knowledge Base API", version="0.2.0", lifespan=lifespan)
 settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
@@ -41,6 +42,7 @@ app.include_router(router, prefix="/api")
 
 @app.middleware("http")
 async def api_key_auth(request: Request, call_next):
+    refresh_runtime_settings_if_needed()
     allowed_keys = get_settings().api_key_list
     if not allowed_keys:
         return await call_next(request)

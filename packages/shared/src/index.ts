@@ -1,4 +1,4 @@
-export type Visibility = "private";
+﻿export type Visibility = "private";
 
 export type SourceType =
   | "pdf"
@@ -28,12 +28,12 @@ export type JobState =
   | "failed"
   | "skipped";
 
-export type CourseFileStatus = "pending" | "parsing" | "parsed" | "failed" | "skipped";
+export type KnowledgeBaseFileStatus = "pending" | "parsing" | "parsed" | "failed" | "skipped";
 
 export type AgentRoute =
   | "direct_answer"
-  | "retrieve_notes"
-  | "retrieve_exercises"
+  | "retrieve_sources"
+  | "retrieve_tasks"
   | "retrieve_both"
   | "clarify"
   | "multi_hop_research";
@@ -41,7 +41,7 @@ export type AgentRoute =
 export type AgentRunState = "queued" | "running" | "needs_clarification" | "completed" | "failed";
 
 export interface SearchFilters {
-  chapter?: string;
+  partition?: string;
   tags?: string[];
   difficulty?: string;
   source_type?: SourceType;
@@ -66,13 +66,13 @@ export interface JobStatusResponse {
 
 export interface SearchRequest {
   query: string;
-  course_id?: string | null;
+  knowledge_base_id?: string | null;
   filters?: SearchFilters;
   top_k?: number;
 }
 
-export interface QuerySemanticGraphRequest {
-  course_id?: string | null;
+export interface QueryEvidenceGraphRequest {
+  knowledge_base_id?: string | null;
   query?: string | null;
   chunk_ids: string[];
 }
@@ -82,14 +82,20 @@ export interface Citation {
   document_id: string;
   document_title: string;
   source_path: string;
-  chapter?: string | null;
+  partition?: string | null;
   section?: string | null;
   page_number?: number | null;
   snippet: string;
+  active_chunk_id?: string | null;
+  evidence_atom_ids?: string[];
+  source_span?: Record<string, unknown>;
+  retrieval_trace_id?: string | null;
+  citation_verification_id?: string | null;
 }
 
 export interface SearchResult {
   chunk_id: string;
+  active_chunk_id?: string | null;
   snippet: string;
   score: number;
   citations: Citation[];
@@ -98,7 +104,7 @@ export interface SearchResult {
   child_content?: string | null;
   document_title?: string | null;
   source_path?: string | null;
-  chapter?: string | null;
+  partition?: string | null;
   source_type?: string | null;
 }
 
@@ -112,6 +118,13 @@ export interface ModelAudit {
   fallback_enabled: boolean;
   degraded_mode: boolean;
   vector_index_warning?: string | null;
+  retrieval_pipeline?: string | null;
+  signal_state_hash?: string | null;
+  signal_node_ids?: string[];
+  retrieval_cache_scope_hash?: string | null;
+  cached?: boolean;
+  scope_hash?: string | null;
+  cache?: Record<string, unknown>;
 }
 
 export interface AnswerModelAudit {
@@ -120,6 +133,9 @@ export interface AnswerModelAudit {
   external_called: boolean;
   fallback_reason?: string | null;
   skipped_reason?: string | null;
+  signal_state_hash?: string | null;
+  signal_node_ids?: string[];
+  signal_expansion_used?: boolean;
 }
 
 export interface SearchResponse {
@@ -137,7 +153,7 @@ export interface ChatMessage {
 export interface QARequest {
   question: string;
   session_id?: string | null;
-  course_id?: string | null;
+  knowledge_base_id?: string | null;
   filters?: SearchFilters;
   top_k?: number;
   history?: ChatMessage[];
@@ -158,7 +174,7 @@ export interface QAResponse {
 export interface AgentRequest {
   question: string;
   session_id?: string | null;
-  course_id?: string | null;
+  knowledge_base_id?: string | null;
   filters?: SearchFilters;
   top_k?: number;
   history?: ChatMessage[];
@@ -244,24 +260,22 @@ export interface CleanupStaleDataResponse {
   deleted_chunks: number;
   deleted_document_versions: number;
   deleted_documents: number;
-  removed_graph_relations: number;
-  removed_graph_concepts: number;
-}
-
-export interface CleanupStaleGraphResponse {
-  removed_relations: number;
-  removed_aliases: number;
-  removed_concepts: number;
-  migrated_relations: number;
+  removed_vector_records: number;
+  removed_evidence_atoms: number;
+  removed_evidence_edges: number;
+  removed_evidence_graph_states: number;
+  removed_active_chunks: number;
+  removed_chunk_candidates: number;
+  removed_chunk_decisions: number;
+  removed_quality_decisions: number;
+  removed_community_states: number;
+  removed_community_memberships: number;
+  removed_community_summaries: number;
 }
 
 export interface RebuildGraphRequest {
-  mode: "incremental" | "full";
-  confirm_destructive?: boolean;
+  mode: "evidence";
   dry_run?: boolean;
-  run_llm_merge?: boolean | null;
-  run_hpo?: boolean | null;
-  run_community_summaries?: boolean | null;
 }
 
 export interface RebuildGraphResponse {
@@ -271,8 +285,9 @@ export interface RebuildGraphResponse {
   affected_documents: number;
   previous_batch_id?: string | null;
   dry_run?: boolean;
-  semantic_entities?: number;
-  semantic_relations?: number;
+  evidence_atoms?: number;
+  evidence_edges?: number;
+  active_chunks?: number;
 }
 
 export interface BatchLogTokenResponse {
@@ -280,38 +295,55 @@ export interface BatchLogTokenResponse {
   expires_at: string;
 }
 
-export interface DeleteCourseResponse {
+export interface DeleteKnowledgeBaseResponse {
   deleted: boolean;
   deleted_vectors: number;
+  deleted_vector_records: number;
+  deleted_active_chunks: number;
+  deleted_chunk_decisions: number;
+  deleted_quality_decisions: number;
+  deleted_chunk_candidates: number;
+  deleted_evidence_atoms: number;
+  deleted_evidence_edges: number;
+  deleted_evidence_graph_states: number;
+  deleted_community_states: number;
+  deleted_community_memberships: number;
+  deleted_community_summaries: number;
+  deleted_signal_schema_states?: number;
+  deleted_signal_states?: number;
+  deleted_signal_candidates?: number;
+  deleted_signal_decisions?: number;
+  deleted_signal_nodes?: number;
+  deleted_signal_edges?: number;
+  deleted_signal_communities?: number;
+  deleted_signal_community_memberships?: number;
+  deleted_projection_states?: number;
+  deleted_projection_nodes?: number;
+  deleted_projection_edges?: number;
+  deleted_projection_communities?: number;
+  deleted_policy_states: number;
+  deleted_policy_observations: number;
+  deleted_quality_observations: number;
+  deleted_retrieval_traces: number;
+  deleted_answer_sessions: number;
+  deleted_citation_verifications: number;
+  deleted_reward_events: number;
   deleted_trace_events: number;
   deleted_agent_runs: number;
   deleted_sessions: number;
   deleted_ingestion_logs: number;
   deleted_compensations: number;
   deleted_jobs: number;
-  deleted_graph_extraction_tasks: number;
-  deleted_graph_extraction_runs: number;
   deleted_batches: number;
-  deleted_hpo_judge_samples: number;
-  deleted_hpo_objective_models: number;
-  deleted_model_hyperparameters: number;
-  deleted_quality_profiles: number;
-  deleted_community_summaries: number;
-  deleted_relation_candidates: number;
-  deleted_mentions: number;
-  deleted_merge_candidates: number;
-  deleted_relations: number;
-  deleted_aliases: number;
-  deleted_concepts: number;
   deleted_chunks: number;
   deleted_document_versions: number;
   deleted_documents: number;
-  deleted_courses: number;
+  deleted_knowledge_bases: number;
   deleted_directory: number;
 }
 
 export interface RefreshResponse {
-  course_id: string;
+  knowledge_base_id?: string;
   refreshed_at: string;
 }
 
@@ -324,19 +356,11 @@ export interface ModelSettingsResponse {
   embedding_model: string;
   chat_model: string;
   embedding_dimensions: number;
-  graph_extraction_strategy: string;
-  graph_extraction_soft_start_budget?: number | null;
-  graph_extraction_max_input_tokens_per_run?: number | null;
-  graph_extraction_max_model_calls_per_run?: number | null;
-  graph_extraction_min_marginal_gain: number;
-  graph_extraction_stall_rounds: number;
-  graph_extraction_concurrency: number;
   worker_concurrency: number;
   ingestion_file_concurrency: number;
   model_request_concurrency: number;
   model_request_timeout_seconds: number;
-  hpo_concurrency: number;
-  graph_extraction_resume_batch_size: number;
+  chunk_token_budget: number;
   reranker_enabled: boolean;
   reranker_model: string;
   reranker_max_length: number;
@@ -351,13 +375,21 @@ export interface ModelSettingsResponse {
   citation_verification_sample_max: number;
   reflection_max_retries: number;
   model_bridge_enabled: boolean;
-  enable_auto_hpo: boolean;
   enable_graph_community_summaries: boolean;
+  signal_extraction_max_model_batches: number;
+  signal_extraction_max_candidates_per_batch: number;
+  signal_extraction_max_tokens_per_batch: number;
+  signal_candidate_keep_threshold: number;
+  community_louvain_resolution: number;
+  community_min_modularity_warn: number;
+  graph_overview_max_nodes: number;
+  graph_overview_max_edges: number;
   enable_model_fallback: boolean;
   enable_database_fallback: boolean;
   has_api_key: boolean;
   has_embedding_api_key: boolean;
   degraded_mode: boolean;
+  runtime_settings_version?: string | null;
 }
 
 export interface ModelSettingsUpdate {
@@ -370,19 +402,11 @@ export interface ModelSettingsUpdate {
   embedding_model?: string | null;
   chat_model?: string | null;
   embedding_dimensions?: number | null;
-  graph_extraction_strategy?: string | null;
-  graph_extraction_soft_start_budget?: number | null;
-  graph_extraction_max_input_tokens_per_run?: number | null;
-  graph_extraction_max_model_calls_per_run?: number | null;
-  graph_extraction_min_marginal_gain?: number | null;
-  graph_extraction_stall_rounds?: number | null;
-  graph_extraction_concurrency?: number | null;
   worker_concurrency?: number | null;
   ingestion_file_concurrency?: number | null;
   model_request_concurrency?: number | null;
   model_request_timeout_seconds?: number | null;
-  hpo_concurrency?: number | null;
-  graph_extraction_resume_batch_size?: number | null;
+  chunk_token_budget?: number | null;
   reranker_enabled?: boolean | null;
   reranker_model?: string | null;
   reranker_max_length?: number | null;
@@ -396,8 +420,15 @@ export interface ModelSettingsUpdate {
   citation_verification_sample_max?: number | null;
   reflection_max_retries?: number | null;
   model_bridge_enabled?: boolean | null;
-  enable_auto_hpo?: boolean | null;
   enable_graph_community_summaries?: boolean | null;
+  signal_extraction_max_model_batches?: number | null;
+  signal_extraction_max_candidates_per_batch?: number | null;
+  signal_extraction_max_tokens_per_batch?: number | null;
+  signal_candidate_keep_threshold?: number | null;
+  community_louvain_resolution?: number | null;
+  community_min_modularity_warn?: number | null;
+  graph_overview_max_nodes?: number | null;
+  graph_overview_max_edges?: number | null;
   embedding_api_key?: string | null;
   clear_embedding_api_key?: boolean;
 }
@@ -427,27 +458,34 @@ export interface IngestionLogEvent {
   embedding_external_called?: boolean;
   embedding_fallback_reason?: string | null;
   embedding_fallback_method?: string | null;
-  graph_extraction_provider?: string;
-  graph_extraction_model?: string;
-  graph_extraction_completed_chunks?: number;
-  graph_llm_success_chunks?: number;
-  graph_algorithm_nodes?: number;
-  graph_algorithm_edges?: number;
-  graph_rejected_concepts?: number;
-  concepts?: number;
-  relations?: number;
+  graph_runtime?: string;
+  graph_state_id?: string | null;
+  graph_state_hash?: string | null;
+  community_state_id?: string | null;
+  community_state_hash?: string | null;
+  atom_count?: number;
+  evidence_atoms?: number;
+  evidence_edges?: number;
+  active_chunks?: number;
+  chunk_candidates?: number;
+  quality_decisions?: number;
   community_summary_count?: number;
+  candidate_count?: number;
+  signal_candidates?: number;
+  signal_candidate_count?: number;
+  accepted_signal_candidate_count?: number;
+  rejected_signal_candidate_count?: number;
+  signal_nodes?: number;
+  signal_edges?: number;
+  signal_node_count?: number;
+  signal_edge_count?: number;
+  signal_communities?: number;
+  signal_community_count?: number;
+  signal_state_id?: string | null;
+  signal_state_hash?: string | null;
+  signal_layer_status?: string;
   retry_count?: number;
   max_retries?: number;
-  candidate_count?: number;
-  pair_count?: number;
-  processed_pairs?: number;
-  effective_labels?: number;
-  min_labels?: number;
-  trial_count?: number;
-  best_value?: number;
-  objective_model_id?: string | null;
-  feature_summary?: Record<string, unknown>;
 }
 
 export interface RuntimeIssue {
@@ -461,12 +499,13 @@ export interface EnvSyncStatus {
   synced: boolean;
   missing_keys: string[];
   extra_keys: string[];
+  deprecated_keys: string[];
   bom_keys: string[];
 }
 
 export interface RerankerRuntimeStatus {
   enabled: boolean;
-  device: string;
+  device: "cpu" | "cuda" | string;
   model: string;
   url: string;
   reachable: boolean;
@@ -500,63 +539,40 @@ export interface StructuredApiErrorBody {
   fix_commands: string[];
 }
 
-export type CourseGraphRelationType =
-  | "is_a"
-  | "part_of"
-  | "prerequisite_of"
-  | "used_for"
-  | "causes"
-  | "derives_from"
-  | "compares_with"
-  | "example_of"
-  | "defined_by"
-  | "formula_of"
-  | "solves"
-  | "implemented_by"
-  | "related_to";
-
-export type GraphRelationType = CourseGraphRelationType | (string & {});
-
-export interface RelatedConcept {
-  concept_id: string;
-  relation_type: GraphRelationType;
-  target_name: string;
-  confidence?: number | null;
-  weight?: number | null;
-  relation_source?: string | null;
-  is_inferred?: boolean;
-}
-
-export interface ConceptCard {
-  concept_id: string;
-  name: string;
-  aliases: string[];
-  summary: string;
-  chapter_refs: string[];
-  concept_type: string;
-  importance_score: number;
-  related_concepts: RelatedConcept[];
-}
-
-export type GraphType = "semantic" | "structural" | "evidence";
-export type CourseSemanticEntityType = "concept" | "method" | "formula" | "metric" | "algorithm" | "definition" | "theorem" | "problem_type";
-export type SemanticEntityType = CourseSemanticEntityType | (string & {});
-export type GraphNodeCategory = "semantic_entity" | "course" | "document" | "chapter" | "section" | "chunk" | "evidence_chunk" | "document_version" | (string & {});
+export type GraphType = "evidence";
+export type EvidenceSignalType = "topic" | "method" | "formula" | "metric" | "algorithm" | "definition" | "theorem" | "observation" | "claim";
+export type SemanticEntityType = EvidenceSignalType | (string & {});
+export type GraphNodeCategory =
+  | "knowledge_base"
+  | "evidence_graph_state"
+  | "evidence_atom"
+  | "active_chunk"
+  | "signal_node"
+  | "community_region"
+  | "document"
+  | "partition"
+  | "section"
+  | "evidence_chunk"
+  | "document_version"
+  | (string & {});
 
 export interface GraphNode {
   id: string;
   name: string;
   category: GraphNodeCategory | string;
   value?: number;
-  chapter?: string | null;
+  partition?: string | null;
   importance_score?: number | null;
   source_type?: string | null;
   entity_type?: SemanticEntityType | string | null;
   aliases?: string[];
   support_count?: number | null;
+  support_atom_ids?: string[];
+  support_active_chunk_ids?: string[];
+  source_span_union?: Record<string, unknown> | null;
   confidence?: number | null;
   canonical_key?: string | null;
-  concept_id?: string | null;
+  signal_node_id?: string | null;
   summary?: string | null;
   document_id?: string | null;
   document_version_id?: string | null;
@@ -580,6 +596,9 @@ export interface GraphEdge {
   weight?: number | null;
   semantic_similarity?: number | null;
   support_count?: number | null;
+  support_atom_ids?: string[];
+  support_active_chunk_ids?: string[];
+  source_span_union?: Record<string, unknown> | null;
   relation_source?: string | null;
   is_inferred?: boolean;
 }
@@ -587,11 +606,17 @@ export interface GraphEdge {
 export interface GraphResponse {
   graph_type: GraphType;
   schema_version: string;
+  view?: "overview" | "detail" | "neighborhood" | null;
   nodes: GraphNode[];
   edges: GraphEdge[];
   node_counts: Record<string, number>;
   edge_counts: Record<string, number>;
-  focus_chapter?: string | null;
+  focus_partition?: string | null;
+  signal_layer_status?: string | null;
+  signal_state_id?: string | null;
+  signal_state_hash?: string | null;
+  signal_layer_complete?: boolean;
+  diagnostics?: Record<string, unknown>;
   freshness: {
     is_stale: boolean;
     reason?: string | null;
@@ -623,7 +648,7 @@ export interface StrategyProfileSummary {
   is_builtin: boolean;
   profile_hash: string;
   is_active: boolean;
-  course_ids: string[];
+  knowledge_base_ids: string[];
   created_at?: string | null;
   updated_at?: string | null;
 }
@@ -655,7 +680,7 @@ export interface StrategyProfileCopyRequest {
 }
 
 export interface StrategyProfileBindRequest {
-  course_id: string;
+  knowledge_base_id?: string;
   profile_id: string;
 }
 
@@ -690,21 +715,21 @@ export interface StrategyProfileAssistantStateResponse {
   updated_at?: string | null;
 }
 
-export interface CourseTreeNode {
+export interface KnowledgeBaseTreeNode {
   id: string;
   title: string;
-  type: "course" | "chapter" | "document" | "concept";
-  children?: CourseTreeNode[];
+  type: "knowledge_base" | "partition" | "document" | "signal";
+  children?: KnowledgeBaseTreeNode[];
 }
 
-export interface CourseSummary {
+export interface KnowledgeBaseSummary {
   id: string;
   name: string;
   description?: string | null;
   source_root: string;
   storage_root: string;
   document_count: number;
-  concept_count: number;
+  evidence_atom_count: number;
   current_chunk_version: number;
   has_parsed_chunks: boolean;
   can_full_reparse: boolean;
@@ -714,7 +739,7 @@ export interface CourseSummary {
   active_profile_hash?: string | null;
 }
 
-export interface CourseCreateRequest {
+export interface KnowledgeBaseCreateRequest {
   name: string;
   description?: string | null;
 }
@@ -755,65 +780,36 @@ export interface ParseUploadedFilesRequest {
   file_paths: string[];
   force?: boolean;
   full_reparse?: boolean;
-  rebuild_graph_mode?: "none" | "incremental" | "full";
-  confirm_destructive_graph_rebuild?: boolean;
 }
 
 export interface DashboardSnapshot {
-  course: CourseSummary;
-  tree: CourseTreeNode[];
+  knowledge_base: KnowledgeBaseSummary;
+  tree: KnowledgeBaseTreeNode[];
   graph: GraphResponse;
   batch_status?: IngestionBatchSummary | null;
   ingested_document_count: number;
+  chunk_count?: number;
+  evidence_atom_count?: number;
+  active_chunk_count?: number;
+  evidence_edge_count?: number;
+  community_region_count?: number;
   graph_relation_count: number;
   coverage_by_source_type: Record<string, number>;
   degraded_mode: boolean;
 }
 
-export interface CourseFileSummary {
+export interface KnowledgeBaseFileSummary {
   id: string;
   document_id?: string | null;
   title: string;
   source_path: string;
   source_type: string;
-  chapter?: string | null;
-  status: CourseFileStatus;
+  partition?: string | null;
+  status: KnowledgeBaseFileStatus;
   job_state?: JobState | null;
   batch_id?: string | null;
   error?: string | null;
   chunk_count: number;
   chunk_version?: number | null;
   updated_at?: string | null;
-}
-
-export interface GraphNodeRelation {
-  relation_id: string;
-  relation_type: GraphRelationType;
-  target_concept_id?: string | null;
-  target_name: string;
-  confidence: number;
-  weight?: number | null;
-  semantic_similarity?: number | null;
-  support_count?: number | null;
-  relation_source?: string | null;
-  is_inferred?: boolean;
-  evidence?: Citation | null;
-}
-
-export interface GraphNodeDetail {
-  concept_id: string;
-  name: string;
-  normalized_name: string;
-  summary: string;
-  aliases: string[];
-  chapter_refs: string[];
-  concept_type: string;
-  importance_score: number;
-  evidence_count: number;
-  community_louvain?: number | null;
-  community_spectral?: number | null;
-  component_id?: number | null;
-  centrality: Record<string, number>;
-  graph_rank_score: number;
-  relations: GraphNodeRelation[];
 }

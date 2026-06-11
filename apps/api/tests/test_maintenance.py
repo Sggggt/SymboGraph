@@ -3,15 +3,26 @@ from __future__ import annotations
 import pytest
 
 
-def add_document_graph(db_session, course_id: str, *, active: bool, title: str = "Doc"):
-    from app.models import Chunk, Document, DocumentVersion
+def add_active_document_graph(db_session, knowledge_base_id: str, *, active: bool, title: str = "Doc") -> dict:
+    from app.models import (
+        ActiveChunk,
+        ChunkCandidate,
+        ChunkDecision,
+        Document,
+        DocumentVersion,
+        EvidenceAtom,
+        EvidenceGraphState,
+        PolicyState,
+        QualityDecision,
+    )
 
+    slug = title.lower().replace(" ", "-")
     document = Document(
-        course_id=course_id,
+        knowledge_base_id=knowledge_base_id,
         title=title,
-        source_path=f"{title.lower()}.md",
+        source_path=f"{slug}.md",
         source_type="markdown",
-        checksum=f"{title}-checksum",
+        checksum=f"{slug}-checksum",
         is_active=active,
     )
     db_session.add(document)
@@ -25,377 +36,363 @@ def add_document_graph(db_session, course_id: str, *, active: bool, title: str =
     )
     db_session.add(version)
     db_session.flush()
-    chunk = Chunk(
-        course_id=course_id,
+    policy = PolicyState(
+        knowledge_base_id=knowledge_base_id,
+        profile_objective_hash=f"{slug}-objective",
+        posterior_json={},
+        constraints_json={},
+        exploration_json={},
+        reward_summary_json={},
+        state_hash=f"{slug}-policy",
+    )
+    db_session.add(policy)
+    db_session.flush()
+    text = f"{title} content about network centrality and graph evidence."
+    atom = EvidenceAtom(
+        knowledge_base_id=knowledge_base_id,
         document_id=document.id,
         document_version_id=version.id,
-        content=f"{title} content about network centrality and graph evidence.",
-        snippet=f"{title} content",
-        chapter="Unit",
-        section="Section",
-        source_type="markdown",
-        metadata_json={"content_kind": "markdown"},
-        embedding_status="ready",
-        is_active=active,
+        atom_index=0,
+        atom_type="paragraph",
+        text=text,
+        text_hash=f"{slug}-atom-hash",
+        source_span_json={"spans": [{"start": 0, "end": len(text), "section": "Section"}]},
+        metadata_json={"section": "Section"},
+        state="active" if active else "inactive",
     )
-    db_session.add(chunk)
+    db_session.add(atom)
     db_session.flush()
-    return document, version, chunk
-
-
-def add_concept(db_session, course_id: str, name: str):
-    from app.models import Concept, ConceptAlias
-
-    concept = Concept(
-        course_id=course_id,
-        canonical_name=name,
-        normalized_name=name.lower(),
-        summary=name,
-        importance_score=0.5,
+    graph_state = EvidenceGraphState(
+        knowledge_base_id=knowledge_base_id,
+        scope_type="document",
+        state_hash=f"{slug}-graph",
+        atom_scope_hash=f"{slug}-atom-scope",
+        active_document_version_ids=[version.id],
+        active_atom_ids=[atom.id],
+        policy_state_id=policy.id,
+        state="active" if active else "inactive",
     )
-    db_session.add(concept)
+    db_session.add(graph_state)
     db_session.flush()
-    db_session.add(ConceptAlias(concept_id=concept.id, alias=name, normalized_alias=name.lower()))
+    candidate = ChunkCandidate(
+        graph_state_id=graph_state.id,
+        generator_name="maintenance-test",
+        generator_version="v1",
+        atom_ids_json=[atom.id],
+        source_span_union_json={"spans": atom.source_span_json["spans"]},
+        token_count=12,
+        graph_features_json={"fixture": True},
+    )
+    db_session.add(candidate)
     db_session.flush()
-    return concept
+    quality = QualityDecision(
+        candidate_id=candidate.id,
+        policy_state_id=policy.id,
+        decision_action="answer_candidate",
+        gate_passed=True,
+    )
+    db_session.add(quality)
+    db_session.flush()
+    decision = ChunkDecision(
+        knowledge_base_id=knowledge_base_id,
+        graph_state_id=graph_state.id,
+        candidate_id=candidate.id,
+        quality_decision_id=quality.id,
+        policy_state_id=policy.id,
+        action="activate",
+    )
+    db_session.add(decision)
+    db_session.flush()
+    active_chunk = ActiveChunk(
+        knowledge_base_id=knowledge_base_id,
+        chunk_decision_id=decision.id,
+        document_version_scope_hash=f"{slug}-version-scope",
+        graph_state_hash=graph_state.state_hash,
+        atom_ids_json=[atom.id],
+        text=text,
+        source_span_union_json={"spans": atom.source_span_json["spans"]},
+        boundary_policy_version="maintenance-test-v1",
+        quality_decision_id=quality.id,
+        policy_state_id=policy.id,
+        metadata_json={
+            "document_id": document.id,
+            "document_version_id": version.id,
+            "chunk_version": 1,
+            "partition": "Unit",
+            "section": "Section",
+            "source_type": "markdown",
+            "content_kind": "markdown",
+            "snippet": f"{title} content",
+        },
+        state="active" if active else "inactive",
+    )
+    db_session.add(active_chunk)
+    db_session.flush()
+    return {
+        "document": document,
+        "version": version,
+        "policy": policy,
+        "atom": atom,
+        "graph_state": graph_state,
+        "candidate": candidate,
+        "quality": quality,
+        "decision": decision,
+        "chunk": active_chunk,
+    }
 
 
-def test_cleanup_stale_data_deletes_only_inactive_rows_and_stale_vectors(db_session, sample_course, monkeypatch):
-    from app.models import Chunk, Concept, ConceptAlias, ConceptRelation, Document, DocumentVersion, IngestionJob
+def test_cleanup_stale_data_deletes_only_inactive_rows_and_stale_vectors(db_session, sample_knowledge_base, monkeypatch):
+    from app.models import (
+        ActiveChunk,
+        ChunkCandidate,
+        ChunkDecision,
+        CommunityMembership,
+        CommunityState,
+        CommunitySummary,
+        Document,
+        DocumentVersion,
+        EvidenceAtom,
+        EvidenceEdge,
+        EvidenceGraphState,
+        IngestionJob,
+        QualityDecision,
+        VectorRecord,
+    )
     from app.services import maintenance
     from app.services.maintenance import cleanup_stale_data
 
-    active_document, active_version, active_chunk = add_document_graph(db_session, sample_course.id, active=True, title="Active")
-    inactive_document, inactive_version, inactive_chunk = add_document_graph(db_session, sample_course.id, active=False, title="Inactive")
-    stale_source = add_concept(db_session, sample_course.id, "Stale Source")
-    stale_target = add_concept(db_session, sample_course.id, "Stale Target")
-    active_source = add_concept(db_session, sample_course.id, "Active Source")
-    active_target = add_concept(db_session, sample_course.id, "Active Target")
-    stale_relation = ConceptRelation(
-        course_id=sample_course.id,
-        source_concept_id=stale_source.id,
-        target_concept_id=stale_target.id,
-        target_name=stale_target.canonical_name,
-        relation_type="related_to",
-        evidence_chunk_id=inactive_chunk.id,
+    active = add_active_document_graph(db_session, sample_knowledge_base.id, active=True, title="Active")
+    inactive = add_active_document_graph(db_session, sample_knowledge_base.id, active=False, title="Inactive")
+    stale_edge = EvidenceEdge(
+        graph_state_id=inactive["graph_state"].id,
+        source_atom_id=inactive["atom"].id,
+        target_atom_id=inactive["atom"].id,
+        edge_type="adjacent",
     )
-    active_relation = ConceptRelation(
-        course_id=sample_course.id,
-        source_concept_id=active_source.id,
-        target_concept_id=active_target.id,
-        target_name=active_target.canonical_name,
-        relation_type="related_to",
-        evidence_chunk_id=active_chunk.id,
+    stale_community_state = CommunityState(
+        knowledge_base_id=sample_knowledge_base.id,
+        graph_state_id=inactive["graph_state"].id,
+        state_hash="stale-community",
     )
     job = IngestionJob(
-        course_id=sample_course.id,
-        document_id=inactive_document.id,
-        source_path=inactive_document.source_path,
+        knowledge_base_id=sample_knowledge_base.id,
+        document_id=inactive["document"].id,
+        source_path=inactive["document"].source_path,
         trigger_source="remove",
         status="skipped",
     )
-    db_session.add_all([stale_relation, active_relation, job])
+    db_session.add_all([stale_edge, stale_community_state, job])
+    db_session.flush()
+    stale_membership = CommunityMembership(
+        community_state_id=stale_community_state.id,
+        community_id="community-1",
+        atom_id=inactive["atom"].id,
+    )
+    stale_summary = CommunitySummary(
+        community_state_id=stale_community_state.id,
+        community_id="community-1",
+        summary="stale summary",
+        evidence_atom_ids_json=[inactive["atom"].id],
+    )
+    stale_record = VectorRecord(
+        knowledge_base_id=sample_knowledge_base.id,
+        active_chunk_id=inactive["chunk"].id,
+        qdrant_point_id=inactive["chunk"].id,
+        embedding_model="test-embedding",
+        embedding_text_version="metadata_enriched_v1",
+        payload_hash="stale-payload",
+    )
+    db_session.add_all([stale_membership, stale_summary, stale_record])
     db_session.commit()
-    inactive_document_id = inactive_document.id
-    inactive_version_id = inactive_version.id
-    inactive_chunk_id = inactive_chunk.id
-    stale_relation_id = stale_relation.id
-    active_relation_id = active_relation.id
-    stale_source_id = stale_source.id
-    stale_source_alias_id = stale_source.aliases[0].id
+
+    active_document_id = active["document"].id
+    active_version_id = active["version"].id
+    active_chunk_id = active["chunk"].id
+    active_atom_id = active["atom"].id
+    active_graph_state_id = active["graph_state"].id
+    inactive_document_id = inactive["document"].id
+    inactive_version_id = inactive["version"].id
+    inactive_chunk_id = inactive["chunk"].id
+    inactive_atom_id = inactive["atom"].id
+    stale_graph_state_id = inactive["graph_state"].id
+    stale_record_id = stale_record.id
+    job_id = job.id
 
     deleted_vectors: list[str] = []
 
     class TrackingVectorStore:
-        def __init__(self, course_name=None):
-            self.course_name = course_name
+        def __init__(self, knowledge_base_name=None):
+            self.knowledge_base_name = knowledge_base_name
 
-        def list_ids(self, course_id=None):
-            return [active_chunk.id, inactive_chunk_id, "qdrant-only-stale"]
+        def list_ids(self, knowledge_base_id=None):
+            return [active_chunk_id, inactive_chunk_id, "qdrant-only-stale"]
 
         def delete(self, ids):
             deleted_vectors.extend(ids)
 
     monkeypatch.setattr(maintenance, "VectorStore", TrackingVectorStore)
 
-    stats = cleanup_stale_data(db_session, sample_course.id, sample_course.name)
+    stats = cleanup_stale_data(db_session, sample_knowledge_base.id, sample_knowledge_base.name)
 
     assert stats["deleted_vectors"] == 2
     assert set(deleted_vectors) == {inactive_chunk_id, "qdrant-only-stale"}
     assert stats["deleted_chunks"] == 1
     assert stats["deleted_document_versions"] == 1
     assert stats["deleted_documents"] == 1
-    assert stats["removed_graph_relations"] == 1
-    assert stats["removed_graph_concepts"] == 2
-    assert db_session.get(Document, active_document.id) is not None
-    assert db_session.get(DocumentVersion, active_version.id) is not None
-    assert db_session.get(Chunk, active_chunk.id) is not None
+    assert stats["removed_vector_records"] == 1
+    assert stats["removed_evidence_atoms"] == 1
+    assert stats["removed_evidence_edges"] == 1
+    assert stats["removed_evidence_graph_states"] == 1
+    assert stats["removed_active_chunks"] == 1
+    assert stats["removed_chunk_candidates"] == 1
+    assert stats["removed_chunk_decisions"] == 1
+    assert stats["removed_quality_decisions"] == 1
+    assert stats["removed_community_states"] == 1
+    assert stats["removed_community_memberships"] == 1
+    assert stats["removed_community_summaries"] == 1
+    assert db_session.get(Document, active_document_id) is not None
+    assert db_session.get(DocumentVersion, active_version_id) is not None
+    assert db_session.get(ActiveChunk, active_chunk_id) is not None
+    assert db_session.get(EvidenceAtom, active_atom_id) is not None
+    assert db_session.get(EvidenceGraphState, active_graph_state_id) is not None
     assert db_session.get(Document, inactive_document_id) is None
     assert db_session.get(DocumentVersion, inactive_version_id) is None
-    assert db_session.get(Chunk, inactive_chunk_id) is None
-    assert db_session.get(ConceptRelation, active_relation_id) is not None
-    assert db_session.get(ConceptRelation, stale_relation_id) is None
-    assert db_session.get(Concept, stale_source_id) is None
-    assert db_session.get(ConceptAlias, stale_source_alias_id) is None
-    refreshed_job = db_session.get(IngestionJob, job.id)
+    assert db_session.get(ActiveChunk, inactive_chunk_id) is None
+    assert db_session.get(EvidenceAtom, inactive_atom_id) is None
+    assert db_session.get(EvidenceGraphState, stale_graph_state_id) is None
+    assert db_session.get(VectorRecord, stale_record_id) is None
+    assert db_session.query(ChunkDecision).filter_by(id=inactive["decision"].id).count() == 0
+    assert db_session.query(ChunkCandidate).filter_by(id=inactive["candidate"].id).count() == 0
+    assert db_session.query(QualityDecision).filter_by(id=inactive["quality"].id).count() == 0
+    refreshed_job = db_session.get(IngestionJob, job_id)
     assert refreshed_job is not None
     assert refreshed_job.document_id is None
 
 
-def test_cleanup_stale_graph_removes_invalid_relations_and_orphans(db_session, sample_course):
-    from app.models import Concept, ConceptRelation
+def test_cleanup_stale_graph_is_evidence_only_noop(db_session, sample_knowledge_base):
     from app.services.maintenance import cleanup_stale_graph
 
-    active_document, _, active_chunk = add_document_graph(db_session, sample_course.id, active=True, title="GraphActive")
-    inactive_document, _, inactive_chunk = add_document_graph(db_session, sample_course.id, active=False, title="GraphInactive")
-    keep_source = add_concept(db_session, sample_course.id, "Keep Source")
-    keep_target = add_concept(db_session, sample_course.id, "Keep Target")
-    stale_source = add_concept(db_session, sample_course.id, "Dead Source")
-    stale_target = add_concept(db_session, sample_course.id, "Dead Target")
-    keep_relation = ConceptRelation(
-        course_id=sample_course.id,
-        source_concept_id=keep_source.id,
-        target_concept_id=keep_target.id,
-        target_name=keep_target.canonical_name,
-        relation_type="defines",
-        evidence_chunk_id=active_chunk.id,
-    )
-    stale_relation = ConceptRelation(
-        course_id=sample_course.id,
-        source_concept_id=stale_source.id,
-        target_concept_id=stale_target.id,
-        target_name=stale_target.canonical_name,
-        relation_type="supports",
-        evidence_chunk_id=inactive_chunk.id,
-    )
-    db_session.add_all([keep_relation, stale_relation])
+    add_active_document_graph(db_session, sample_knowledge_base.id, active=True, title="GraphActive")
     db_session.commit()
-    keep_relation_id = keep_relation.id
-    stale_relation_id = stale_relation.id
-    keep_source_id = keep_source.id
-    keep_target_id = keep_target.id
-    stale_source_id = stale_source.id
-    stale_target_id = stale_target.id
 
-    stats = cleanup_stale_graph(db_session, sample_course.id)
+    stats = cleanup_stale_graph(db_session, sample_knowledge_base.id)
 
-    assert stats == {"removed_relations": 1, "removed_aliases": 2, "removed_concepts": 2, "migrated_relations": 1}
-    assert db_session.get(ConceptRelation, keep_relation_id) is not None
-    assert db_session.get(ConceptRelation, keep_relation_id).relation_type == "defined_by"
-    assert db_session.get(ConceptRelation, stale_relation_id) is None
-    assert db_session.get(Concept, keep_source_id) is not None
-    assert db_session.get(Concept, keep_target_id) is not None
-    assert db_session.get(Concept, stale_source_id) is None
-    assert db_session.get(Concept, stale_target_id) is None
-    assert active_document.is_active is True
-    assert inactive_document.is_active is False
+    assert stats == {
+        "removed_evidence_edges": 0,
+        "removed_evidence_atoms": 0,
+        "removed_signal_nodes": 0,
+        "removed_signal_edges": 0,
+    }
 
 
-def test_delete_document_graph_incremental_gc_removes_only_orphan_facts(db_session, sample_course):
-    from app.models import Concept, ConceptRelation, EntityMention
+def test_reconcile_vector_store_orphans_deletes_qdrant_only_points(db_session, sample_knowledge_base, monkeypatch):
+    from app.models import ActiveChunk, VectorRecord
+    from app.services import maintenance
+    from app.services.maintenance import reconcile_vector_store_orphans
+
+    active = add_active_document_graph(db_session, sample_knowledge_base.id, active=True, title="VectorActive")
+    active_chunk_id = active["chunk"].id
+    orphan_id = "qdrant-only-orphan"
+    orphan_record = VectorRecord(
+        knowledge_base_id=sample_knowledge_base.id,
+        active_chunk_id=active_chunk_id,
+        qdrant_point_id=orphan_id,
+        embedding_model="unit-test",
+        embedding_text_version="unit-v1",
+        payload_hash="orphan",
+        vector_status="ready",
+    )
+    db_session.add(orphan_record)
+    db_session.commit()
+
+    deleted_vectors: list[str] = []
+
+    class TrackingVectorStore:
+        def __init__(self, knowledge_base_name=None):
+            self.knowledge_base_name = knowledge_base_name
+
+        def list_ids(self, knowledge_base_id=None):
+            return [active_chunk_id, orphan_id]
+
+        def delete(self, ids):
+            deleted_vectors.extend(ids)
+
+    monkeypatch.setattr(maintenance, "VectorStore", TrackingVectorStore)
+
+    stats = reconcile_vector_store_orphans(db_session, sample_knowledge_base.id)
+
+    assert stats["deleted_orphan_points"] == 1
+    assert stats["removed_orphan_vector_records"] == 1
+    assert stats["missing_points"] == 0
+    assert deleted_vectors == [orphan_id]
+    assert db_session.get(ActiveChunk, active_chunk_id) is not None
+    assert db_session.query(VectorRecord).filter(VectorRecord.id == orphan_record.id).count() == 0
+
+
+def test_delete_document_graph_incremental_removes_document_evidence_scope(db_session, sample_knowledge_base):
+    from app.models import ActiveChunk, Document, EvidenceAtom, EvidenceGraphState
     from app.services.maintenance import delete_document_graph_incremental
 
-    document_a, _, chunk_a = add_document_graph(db_session, sample_course.id, active=True, title="DocA")
-    document_b, _, chunk_b = add_document_graph(db_session, sample_course.id, active=True, title="DocB")
-    unique = add_concept(db_session, sample_course.id, "Unique Concept")
-    shared = add_concept(db_session, sample_course.id, "Shared Concept")
-    anchor = add_concept(db_session, sample_course.id, "Anchor Concept")
-    orphan = add_concept(db_session, sample_course.id, "Empty Source Orphan")
-    unique.source_document_ids = [document_a.id]
-    unique.evidence_count = 1
-    shared.source_document_ids = [document_a.id, document_b.id]
-    shared.evidence_count = 2
-    anchor.source_document_ids = [document_b.id]
-    anchor.evidence_count = 1
-    orphan.source_document_ids = []
-    orphan.evidence_count = 0
-    db_session.add(
-        ConceptRelation(
-            course_id=sample_course.id,
-            source_concept_id=unique.id,
-            target_concept_id=shared.id,
-            target_name=shared.canonical_name,
-            relation_type="related_to",
-            evidence_chunk_id=chunk_a.id,
-            source_document_ids=[document_a.id],
-        )
-    )
-    db_session.add(
-        ConceptRelation(
-            course_id=sample_course.id,
-            source_concept_id=shared.id,
-            target_concept_id=anchor.id,
-            target_name=anchor.canonical_name,
-            relation_type="related_to",
-            source_document_ids=[document_a.id, document_b.id],
-        )
-    )
-    db_session.add(
-        EntityMention(
-            course_id=sample_course.id,
-            chunk_id=chunk_a.id,
-            document_id=document_a.id,
-            concept_id=unique.id,
-            surface="Unique Concept",
-            canonical_name="Unique Concept",
-            normalized_key="unique concept::concept",
-            entity_type="concept",
-        )
-    )
-    for surface in ["Shared Concept", "shared concept"]:
-        db_session.add(
-            EntityMention(
-                course_id=sample_course.id,
-                chunk_id=chunk_b.id,
-                document_id=document_b.id,
-                concept_id=shared.id,
-                surface=surface,
-                canonical_name="Shared Concept",
-                normalized_key="shared concept::concept",
-                entity_type="concept",
-            )
-        )
+    keep = add_active_document_graph(db_session, sample_knowledge_base.id, active=True, title="KeepDoc")
+    delete = add_active_document_graph(db_session, sample_knowledge_base.id, active=True, title="DeleteDoc")
     db_session.commit()
-    unique_id = unique.id
-    shared_id = shared.id
-    orphan_id = orphan.id
 
-    stats = delete_document_graph_incremental(db_session, sample_course.id, document_a.id)
+    keep_chunk_id = keep["chunk"].id
+    keep_atom_id = keep["atom"].id
+    delete_document_id = delete["document"].id
+    delete_chunk_id = delete["chunk"].id
+    delete_atom_id = delete["atom"].id
+    delete_graph_state_id = delete["graph_state"].id
+
+    stats = delete_document_graph_incremental(db_session, sample_knowledge_base.id, delete_document_id)
     db_session.commit()
-    db_session.expire_all()
 
-    assert stats["graph_removed_concepts"] == 2
-    assert db_session.get(Concept, unique_id) is None
-    assert db_session.get(Concept, orphan_id) is None
-    refreshed_shared = db_session.get(Concept, shared_id)
-    assert refreshed_shared is not None
-    assert refreshed_shared.source_document_ids == [document_b.id]
-    assert refreshed_shared.evidence_count == 2
-    remaining_relations = db_session.query(ConceptRelation).filter_by(course_id=sample_course.id).all()
-    assert len(remaining_relations) == 1
-    assert remaining_relations[0].source_document_ids == [document_b.id]
-    assert db_session.query(EntityMention).filter_by(document_id=document_a.id).count() == 0
+    assert stats["removed_active_chunks"] == 1
+    assert stats["removed_evidence_atoms"] == 1
+    assert stats["removed_evidence_graph_states"] == 1
+    assert db_session.get(ActiveChunk, keep_chunk_id) is not None
+    assert db_session.get(EvidenceAtom, keep_atom_id) is not None
+    assert db_session.get(ActiveChunk, delete_chunk_id) is None
+    assert db_session.get(EvidenceAtom, delete_atom_id) is None
+    assert db_session.get(EvidenceGraphState, delete_graph_state_id) is None
+    assert db_session.get(Document, delete_document_id) is not None
 
 
-def test_delete_document_graph_incremental_recalculates_edge_support_from_remaining_mentions(db_session, sample_course):
-    from app.models import Chunk, ConceptRelation, EntityMention, GraphRelationCandidate
-    from app.services.maintenance import delete_document_graph_incremental
-
-    document_a, _, chunk_a = add_document_graph(db_session, sample_course.id, active=True, title="SupportA")
-    document_b, version_b, chunk_b1 = add_document_graph(db_session, sample_course.id, active=True, title="SupportB")
-    chunk_b2 = Chunk(
-        course_id=sample_course.id,
-        document_id=document_b.id,
-        document_version_id=version_b.id,
-        content="SupportB second chunk with shared relation evidence.",
-        snippet="SupportB second chunk",
-        chapter="Unit",
-        section="Section 2",
-        source_type="markdown",
-        metadata_json={"content_kind": "markdown"},
-        embedding_status="ready",
-        is_active=True,
-    )
-    db_session.add(chunk_b2)
-    db_session.flush()
-    source = add_concept(db_session, sample_course.id, "Shared Source")
-    target = add_concept(db_session, sample_course.id, "Shared Target")
-    relation = ConceptRelation(
-        course_id=sample_course.id,
-        source_concept_id=source.id,
-        target_concept_id=target.id,
-        target_name=target.canonical_name,
-        relation_type="related_to",
-        evidence_chunk_id=chunk_a.id,
-        source_document_ids=[document_a.id, document_b.id],
-        support_count=9,
-    )
-    candidate = GraphRelationCandidate(
-        course_id=sample_course.id,
-        source_concept_id=source.id,
-        target_concept_id=target.id,
-        target_name=target.canonical_name,
-        relation_type="related_to",
-        evidence_chunk_id=chunk_a.id,
-        source_document_ids=[document_a.id, document_b.id],
-        support_count=9,
-    )
-    db_session.add_all([relation, candidate])
-    for chunk in (chunk_b1, chunk_b2):
-        for concept, name in ((source, "Shared Source"), (target, "Shared Target")):
-            db_session.add(
-                EntityMention(
-                    course_id=sample_course.id,
-                    chunk_id=chunk.id,
-                    document_id=document_b.id,
-                    concept_id=concept.id,
-                    surface=name,
-                    canonical_name=name,
-                    normalized_key=f"{name.lower()}::concept",
-                    entity_type="concept",
-                )
-            )
-    db_session.commit()
-    relation_id = relation.id
-    candidate_id = candidate.id
-
-    delete_document_graph_incremental(db_session, sample_course.id, document_a.id)
-    db_session.commit()
-    db_session.expire_all()
-
-    refreshed_relation = db_session.get(ConceptRelation, relation_id)
-    refreshed_candidate = db_session.get(GraphRelationCandidate, candidate_id)
-    assert refreshed_relation.source_document_ids == [document_b.id]
-    assert refreshed_relation.evidence_chunk_id is None
-    assert refreshed_relation.support_count == 2
-    assert refreshed_candidate.source_document_ids == [document_b.id]
-    assert refreshed_candidate.evidence_chunk_id is None
-    assert refreshed_candidate.support_count == 2
-
-
-def test_cleanup_stale_data_rejects_active_batch(db_session, sample_course):
+def test_cleanup_stale_data_rejects_active_batch(db_session, sample_knowledge_base):
     from app.models import IngestionBatch
     from app.services.maintenance import MaintenanceConflict, cleanup_stale_data
 
-    db_session.add(IngestionBatch(course_id=sample_course.id, source_root="unit", trigger_source="upload", status="queued"))
+    db_session.add(IngestionBatch(knowledge_base_id=sample_knowledge_base.id, source_root="unit", trigger_source="upload", status="queued"))
     db_session.commit()
 
     with pytest.raises(MaintenanceConflict):
-        cleanup_stale_data(db_session, sample_course.id, sample_course.name)
+        cleanup_stale_data(db_session, sample_knowledge_base.id, sample_knowledge_base.name)
 
 
 @pytest.mark.asyncio
-async def test_rebuild_graph_endpoint_accepts_mode_parameter(db_session, sample_course, monkeypatch):
-    from fastapi import BackgroundTasks
-
+async def test_rebuild_graph_endpoint_reports_evidence_status(db_session, sample_knowledge_base, monkeypatch):
     from app.api import rebuild_graph_endpoint
-    from app.services.ingestion import run_graph_rebuild_background
     from app.core.config import get_settings
     from app.schemas import RebuildGraphRequest
 
     monkeypatch.setenv("ENABLE_MODEL_FALLBACK", "false")
     monkeypatch.setenv("INGESTION_EXECUTION_MODE", "inline")
     get_settings.cache_clear()
-    background_tasks = BackgroundTasks()
 
     response = await rebuild_graph_endpoint(
-        background_tasks,
-        request=RebuildGraphRequest(mode="incremental"),
-        course_id=sample_course.id,
+        request=RebuildGraphRequest(mode="evidence"),
+        knowledge_base_id=sample_knowledge_base.id,
         db=db_session,
     )
 
-    assert response["mode"] == "incremental"
-    assert response["batch_id"]
-    assert response["state"] == "extracting_graph"
-    assert background_tasks.tasks
-    assert background_tasks.tasks[0].func is run_graph_rebuild_background
+    assert response["mode"] == "evidence"
+    assert response["batch_id"] is None
+    assert response["state"] == "evidence_graph_active"
+    assert response["affected_documents"] >= 0
 
 
 @pytest.mark.asyncio
-async def test_rebuild_graph_endpoint_dry_run_has_no_batch(db_session, sample_course, monkeypatch):
-    from fastapi import BackgroundTasks
-
+async def test_rebuild_graph_endpoint_dry_run_has_no_batch(db_session, sample_knowledge_base, monkeypatch):
     from app.api import rebuild_graph_endpoint
     from app.core.config import get_settings
     from app.schemas import RebuildGraphRequest
@@ -404,156 +401,152 @@ async def test_rebuild_graph_endpoint_dry_run_has_no_batch(db_session, sample_co
     get_settings.cache_clear()
 
     response = await rebuild_graph_endpoint(
-        BackgroundTasks(),
-        request=RebuildGraphRequest(mode="full", dry_run=True),
-        course_id=sample_course.id,
+        request=RebuildGraphRequest(mode="evidence", dry_run=True),
+        knowledge_base_id=sample_knowledge_base.id,
         db=db_session,
     )
 
     assert response["batch_id"] is None
-    assert response["state"] == "dry_run"
-    assert response["mode"] == "full"
+    assert response["state"] == "evidence_graph_active"
+    assert response["mode"] == "evidence"
     assert response["dry_run"] is True
     assert response["affected_documents"] >= 0
 
 
-def test_delete_course_data_removes_database_vectors_and_directory(db_session, sample_course, monkeypatch):
+def test_delete_knowledge_base_data_removes_database_vectors_and_directory(db_session, sample_knowledge_base, monkeypatch):
     from app.core.config import get_settings
     from app.models import (
         AgentRun,
         AgentTraceEvent,
-        ConceptRelation,
-        CourseModelHyperparameter,
-        Course,
-        EntityMention,
-        EntityMergeCandidate,
-        GraphCommunitySummary,
-        GraphExtractionChunkTask,
-        GraphExtractionRun,
-        GraphHpoJudgeSample,
-        GraphHpoObjectiveModel,
-        GraphRelationCandidate,
+        AnswerSession,
+        CitationVerification,
         IngestionBatch,
         IngestionCompensationLog,
         IngestionJob,
         IngestionLog,
-        QualityProfile,
+        KnowledgeBase,
+        ParseJob,
+        PolicyObservation,
         QASession,
+        QualityObservation,
+        RetrievalTrace,
+        RewardEvent,
+        SourceFile,
+        VectorRecord,
     )
     from app.services import maintenance
-    from app.services.maintenance import delete_course_data
+    from app.services.maintenance import delete_knowledge_base_data
 
-    document, version, chunk = add_document_graph(db_session, sample_course.id, active=True, title="DeleteMe")
-    source = add_concept(db_session, sample_course.id, "Delete Source")
-    target = add_concept(db_session, sample_course.id, "Delete Target")
-    relation = ConceptRelation(
-        course_id=sample_course.id,
-        source_concept_id=source.id,
-        target_concept_id=target.id,
-        target_name=target.canonical_name,
-        relation_type="related_to",
-        evidence_chunk_id=chunk.id,
-    )
-    batch = IngestionBatch(course_id=sample_course.id, source_root="unit", trigger_source="upload", status="completed")
-    job = IngestionJob(course_id=sample_course.id, document_id=document.id, source_path=document.source_path, status="completed")
-    session = QASession(course_id=sample_course.id, title="chat", transcript=[])
-    run = AgentRun(course_id=sample_course.id, question="q", status="completed")
+    bundle = add_active_document_graph(db_session, sample_knowledge_base.id, active=True, title="DeleteMe")
+    batch = IngestionBatch(knowledge_base_id=sample_knowledge_base.id, source_root="unit", trigger_source="upload", status="completed")
     db_session.add(batch)
     db_session.flush()
-    graph_run = GraphExtractionRun(course_id=sample_course.id, batch_id=batch.id, strategy="adaptive_best_first", status="completed")
-    db_session.add_all([relation, job, session, run, graph_run])
+    job = IngestionJob(
+        knowledge_base_id=sample_knowledge_base.id,
+        batch_id=batch.id,
+        document_id=bundle["document"].id,
+        source_path=bundle["document"].source_path,
+        status="completed",
+    )
+    qa_session = QASession(knowledge_base_id=sample_knowledge_base.id, title="chat", transcript=[])
+    run = AgentRun(knowledge_base_id=sample_knowledge_base.id, question="q", status="completed")
+    retrieval_trace = RetrievalTrace(
+        knowledge_base_id=sample_knowledge_base.id,
+        query="q",
+        result_active_chunk_ids_json=[bundle["chunk"].id],
+    )
+    db_session.add_all([job, qa_session, run, retrieval_trace])
+    db_session.flush()
+    answer_session = AnswerSession(
+        knowledge_base_id=sample_knowledge_base.id,
+        retrieval_trace_id=retrieval_trace.id,
+        qa_session_id=qa_session.id,
+        question="q",
+        answer="a",
+        active_chunk_ids_json=[bundle["chunk"].id],
+    )
+    db_session.add(answer_session)
+    db_session.flush()
+    source_file = SourceFile(
+        knowledge_base_id=sample_knowledge_base.id,
+        document_id=bundle["document"].id,
+        source_path=bundle["document"].source_path,
+        checksum=bundle["document"].checksum,
+        source_type="markdown",
+    )
+    db_session.add(source_file)
     db_session.flush()
     db_session.add_all(
         [
             IngestionLog(batch_id=batch.id, event="done", message="done"),
-            IngestionCompensationLog(course_id=sample_course.id, job_id=job.id, operation="delete", vector_ids=[chunk.id], status="completed"),
-            AgentTraceEvent(run_id=run.id, node="n", status="completed", document_ids=[], scores={}),
-            GraphExtractionChunkTask(
-                run_id=graph_run.id,
-                course_id=sample_course.id,
-                chunk_id=chunk.id,
-                chunk_hash="hash",
+            IngestionCompensationLog(
+                knowledge_base_id=sample_knowledge_base.id,
+                job_id=job.id,
+                operation="delete",
+                vector_ids=[bundle["chunk"].id],
                 status="completed",
-                payload_json={"concepts": []},
             ),
-            CourseModelHyperparameter(
-                course_id=sample_course.id,
-                llm_model_name="judge-llm",
-                embedding_model_name="embedder",
+            ParseJob(
+                knowledge_base_id=sample_knowledge_base.id,
+                document_id=bundle["document"].id,
+                document_version_id=bundle["version"].id,
+                ingestion_job_id=job.id,
+                source_file_id=source_file.id,
+            ),
+            AgentTraceEvent(run_id=run.id, node="n", status="completed", document_ids=[], scores={}),
+            CitationVerification(
+                knowledge_base_id=sample_knowledge_base.id,
+                answer_session_id=answer_session.id,
+                retrieval_trace_id=retrieval_trace.id,
+                active_chunk_id=bundle["chunk"].id,
+                claim_text="claim",
+            ),
+            QualityObservation(
+                knowledge_base_id=sample_knowledge_base.id,
+                quality_decision_id=bundle["quality"].id,
+                observation_type="gate",
+                observation_json={"ok": True},
+            ),
+            PolicyObservation(
+                knowledge_base_id=sample_knowledge_base.id,
+                policy_state_id=bundle["policy"].id,
+                context_json={},
+                action_json={},
+                reward_json={"score": 1.0},
+            ),
+            RewardEvent(
+                knowledge_base_id=sample_knowledge_base.id,
+                policy_state_id=bundle["policy"].id,
+                retrieval_trace_id=retrieval_trace.id,
+                answer_session_id=answer_session.id,
+                active_chunk_ids_json=[bundle["chunk"].id],
+                reward_json={"score": 1.0},
+            ),
+            VectorRecord(
+                knowledge_base_id=sample_knowledge_base.id,
+                active_chunk_id=bundle["chunk"].id,
+                qdrant_point_id=bundle["chunk"].id,
+                embedding_model="test-embedding",
                 embedding_text_version="metadata_enriched_v1",
-                model_name="llm:judge-llm|embedding:embedder|text:metadata_enriched_v1",
-                hpo_status="completed",
-            ),
-            GraphHpoJudgeSample(
-                course_id=sample_course.id,
-                llm_model_name="judge-llm",
-                embedding_model_name="embedder",
-                embedding_text_version="metadata_enriched_v1",
-                model_key="llm:judge-llm|embedding:embedder|text:metadata_enriched_v1",
-                payload_fingerprint="fingerprint",
-                prompt_version="graph_hpo_judge_v1",
-                candidate_a_params={},
-                candidate_b_params={},
-                candidate_a_features={},
-                candidate_b_features={},
-                winner="a",
-                confidence=0.8,
-            ),
-            GraphHpoObjectiveModel(
-                course_id=sample_course.id,
-                llm_model_name="judge-llm",
-                embedding_model_name="embedder",
-                embedding_text_version="metadata_enriched_v1",
-                model_key="llm:judge-llm|embedding:embedder|text:metadata_enriched_v1",
-                objective_version="graph_hpo_judge_learned_v1",
-                payload_fingerprint="fingerprint",
-                feature_names=["edge_evidence_coverage"],
-                weights_json={"edge_evidence_coverage": 1.0},
-                normalization_json={},
-                label_count=6,
-            ),
-            QualityProfile(course_id=sample_course.id, version="v1", profile_json={}, sample_chunk_ids=[]),
-            GraphCommunitySummary(course_id=sample_course.id, algorithm="louvain", community_id=1, version="v1"),
-            GraphRelationCandidate(
-                course_id=sample_course.id,
-                source_concept_id=source.id,
-                target_concept_id=target.id,
-                target_name=target.canonical_name,
-                relation_type="related_to",
-                evidence_chunk_id=chunk.id,
-            ),
-            EntityMention(
-                course_id=sample_course.id,
-                chunk_id=chunk.id,
-                document_id=document.id,
-                concept_id=source.id,
-                surface="Delete Source",
-                canonical_name="Delete Source",
-                normalized_key="delete source::concept",
-                entity_type="concept",
-            ),
-            EntityMergeCandidate(
-                course_id=sample_course.id,
-                left_key="delete source::concept",
-                right_key="delete target::concept",
-                entity_type="concept",
+                payload_hash="payload",
             ),
         ]
     )
     db_session.commit()
 
-    course_root = get_settings().course_paths_for_name(sample_course.name)["course_root"]
-    (course_root / "storage").mkdir(parents=True, exist_ok=True)
-    (course_root / "storage" / "note.md").write_text("delete me", encoding="utf-8")
+    knowledge_base_root = get_settings().knowledge_base_paths_for_name(sample_knowledge_base.name)["knowledge_base_root"]
+    (knowledge_base_root / "storage").mkdir(parents=True, exist_ok=True)
+    (knowledge_base_root / "storage" / "note.md").write_text("delete me", encoding="utf-8")
     deleted_vectors: list[str] = []
     operations: list[str] = []
+    chunk_id = bundle["chunk"].id
 
     class TrackingVectorStore:
-        def __init__(self, course_name=None):
-            self.course_name = course_name
+        def __init__(self, knowledge_base_name=None):
+            self.knowledge_base_name = knowledge_base_name
 
-        def list_ids(self, course_id=None):
-            return [chunk.id, "orphan-vector"]
+        def list_ids(self, knowledge_base_id=None):
+            return [chunk_id, "orphan-vector"]
 
         def delete(self, ids):
             operations.append("qdrant_delete")
@@ -567,42 +560,50 @@ def test_delete_course_data_removes_database_vectors_and_directory(db_session, s
         original_commit()
 
     monkeypatch.setattr(db_session, "commit", tracking_commit)
-    course_id = sample_course.id
-    chunk_id = chunk.id
+    knowledge_base_id = sample_knowledge_base.id
 
-    stats = delete_course_data(db_session, sample_course)
+    stats = delete_knowledge_base_data(db_session, sample_knowledge_base)
 
     assert stats["deleted_vectors"] == 2
     assert set(deleted_vectors) == {chunk_id, "orphan-vector"}
-    assert stats["deleted_graph_extraction_tasks"] == 1
-    assert stats["deleted_graph_extraction_runs"] == 1
-    assert stats["deleted_hpo_judge_samples"] == 1
-    assert stats["deleted_hpo_objective_models"] == 1
-    assert stats["deleted_model_hyperparameters"] == 1
-    assert stats["deleted_quality_profiles"] == 1
-    assert stats["deleted_community_summaries"] == 1
-    assert stats["deleted_relation_candidates"] == 1
-    assert stats["deleted_mentions"] == 1
-    assert stats["deleted_merge_candidates"] == 1
-    assert stats["deleted_courses"] == 1
+    assert stats["deleted_vector_records"] == 1
+    assert stats["deleted_active_chunks"] == 1
+    assert stats["deleted_chunk_decisions"] == 1
+    assert stats["deleted_quality_decisions"] == 1
+    assert stats["deleted_chunk_candidates"] == 1
+    assert stats["deleted_evidence_atoms"] == 1
+    assert stats["deleted_evidence_graph_states"] == 1
+    assert stats["deleted_policy_states"] == 1
+    assert stats["deleted_retrieval_traces"] == 1
+    assert stats["deleted_answer_sessions"] == 1
+    assert stats["deleted_citation_verifications"] == 1
+    assert stats["deleted_reward_events"] == 1
+    assert stats["deleted_quality_observations"] == 1
+    assert stats["deleted_policy_observations"] == 1
+    assert stats["deleted_parse_jobs"] == 1
+    assert stats["deleted_source_files"] == 1
+    assert stats["deleted_ingestion_logs"] == 1
+    assert stats["deleted_compensations"] == 1
+    assert stats["deleted_jobs"] == 1
+    assert stats["deleted_batches"] == 1
+    assert stats["deleted_knowledge_bases"] == 1
     assert stats["deleted_directory"] == 1
     assert operations.index("db_commit") < operations.index("qdrant_delete")
-    assert not course_root.exists()
-    assert db_session.get(Course, course_id) is None
+    assert not knowledge_base_root.exists()
+    assert db_session.get(KnowledgeBase, knowledge_base_id) is None
 
 
-def test_cleanup_stale_data_commits_db_before_qdrant_delete(db_session, sample_course, monkeypatch):
-    """Regression: DB commit must happen before Qdrant vector deletion to maintain cross-store consistency."""
+def test_cleanup_stale_data_commits_db_before_qdrant_delete(db_session, sample_knowledge_base, monkeypatch):
     from app.services import maintenance
     from app.services.maintenance import cleanup_stale_data
 
     operations: list[str] = []
 
     class TrackingVectorStore:
-        def __init__(self, course_name=None):
-            self.course_name = course_name
+        def __init__(self, knowledge_base_name=None):
+            self.knowledge_base_name = knowledge_base_name
 
-        def list_ids(self, course_id=None):
+        def list_ids(self, knowledge_base_id=None):
             return ["stale-vector-1"]
 
         def delete(self, ids):
@@ -617,10 +618,10 @@ def test_cleanup_stale_data_commits_db_before_qdrant_delete(db_session, sample_c
     monkeypatch.setattr(maintenance, "VectorStore", TrackingVectorStore)
     monkeypatch.setattr(db_session, "commit", tracking_commit)
 
-    cleanup_stale_data(db_session, sample_course.id, sample_course.name)
+    cleanup_stale_data(db_session, sample_knowledge_base.id, sample_knowledge_base.name)
 
-    db_commit_indices = [i for i, op in enumerate(operations) if op == "db_commit"]
+    db_commit_indices = [index for index, op in enumerate(operations) if op == "db_commit"]
     qdrant_index = operations.index("qdrant_delete")
-    assert any(idx < qdrant_index for idx in db_commit_indices), (
+    assert any(index < qdrant_index for index in db_commit_indices), (
         f"DB commit must occur before Qdrant delete, but operations were: {operations}"
     )

@@ -1,9 +1,9 @@
-"use client";
+﻿"use client";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
 
-import { CourseProvider } from "@/components/course-context";
+import { KnowledgeBaseProvider } from "@/components/knowledge-base-context";
 
 export function Providers({ children }: { children: React.ReactNode }) {
   const [queryClient] = useState(
@@ -20,7 +20,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <CourseProvider>{children}</CourseProvider>
+      <KnowledgeBaseProvider>{children}</KnowledgeBaseProvider>
     </QueryClientProvider>
   );
 }

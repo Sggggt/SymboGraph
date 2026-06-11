@@ -33,21 +33,21 @@ class CacheManager:
     def _hash(self, text: str) -> str:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
-    def get_embedding(self, course_id: str, query: str, embedding_version: str) -> list[float] | None:
-        key = self._key("emb", course_id, self._hash(query), embedding_version)
+    def get_embedding(self, knowledge_base_id: str, query: str, embedding_version: str) -> list[float] | None:
+        key = self._key("emb", knowledge_base_id, self._hash(query), embedding_version)
         return self._get(key)
 
-    def set_embedding(self, course_id: str, query: str, embedding_version: str, vector: list[float], ttl: int = 600) -> None:
-        key = self._key("emb", course_id, self._hash(query), embedding_version)
+    def set_embedding(self, knowledge_base_id: str, query: str, embedding_version: str, vector: list[float], ttl: int = 600) -> None:
+        key = self._key("emb", knowledge_base_id, self._hash(query), embedding_version)
         self._set(key, vector, ttl)
 
-    def get_search_results(self, course_id: str, query: str, filters_hash: str, embedding_version: str) -> list[dict] | None:
-        key = self._key("search", course_id, self._hash(query), filters_hash, embedding_version)
+    def get_search_results(self, knowledge_base_id: str, query: str, scope_hash: str, embedding_version: str) -> dict | None:
+        key = self._key("search", knowledge_base_id, self._hash(query), scope_hash, embedding_version)
         return self._get(key)
 
-    def set_search_results(self, course_id: str, query: str, filters_hash: str, embedding_version: str, results: list[dict], ttl: int = 300) -> None:
-        key = self._key("search", course_id, self._hash(query), filters_hash, embedding_version)
-        self._set(key, results, ttl)
+    def set_search_results(self, knowledge_base_id: str, query: str, scope_hash: str, embedding_version: str, payload: dict, ttl: int = 300) -> None:
+        key = self._key("search", knowledge_base_id, self._hash(query), scope_hash, embedding_version)
+        self._set(key, payload, ttl)
 
     def get_quality_judgment(self, cache_key: str) -> dict | None:
         value = self._get(self._key("quality_judge", cache_key))
@@ -72,15 +72,15 @@ class CacheManager:
                 pass
         self._memory.pop(key, None)
 
-    def invalidate_course(self, course_id: str) -> None:
+    def invalidate_knowledge_base(self, knowledge_base_id: str) -> None:
         if self._redis:
             try:
-                for key in self._redis.scan_iter(match=f"kg:*:{course_id}:*"):
+                for key in self._redis.scan_iter(match=f"kg:*:{knowledge_base_id}:*"):
                     self._redis.delete(key)
             except Exception:
                 pass
-        # memory fallback: purge keys containing course_id
-        self._memory = {k: v for k, v in self._memory.items() if course_id not in k}
+        # memory fallback: purge keys containing knowledge_base_id
+        self._memory = {k: v for k, v in self._memory.items() if knowledge_base_id not in k}
 
     def _get(self, key: str) -> Any | None:
         if self._redis:

@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { AgentResponse, AgentTraceEventPayload, Citation, SessionSummary } from "@course-kg/shared";
@@ -21,7 +21,7 @@ import {
 } from "lucide-react";
 
 import { CitationCard } from "@/components/citation-card";
-import { useCourseContext } from "@/components/course-context";
+import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
@@ -66,14 +66,14 @@ function answerModelLabel(latestRun: AgentResponse | null): string {
   return "模型：未调用";
 }
 
-function buildCourseSuggestions(tree: Array<{ title: string; children?: Array<{ title: string }> }> | undefined): string[] {
-  const chapters = tree?.map((node) => node.title).filter(Boolean) ?? [];
+function buildKnowledgeBaseSuggestions(tree: Array<{ title: string; children?: Array<{ title: string }> }> | undefined): string[] {
+  const partitions = tree?.map((node) => node.title).filter(Boolean) ?? [];
   const documents = tree?.flatMap((node) => node.children?.map((child) => child.title) ?? []).filter(Boolean) ?? [];
   const suggestions = [
-    chapters[0] ? `总结 ${chapters[0]} 的核心内容` : "",
-    chapters[1] ? `比较 ${chapters[0]} 和 ${chapters[1]} 的联系` : "",
+    partitions[0] ? `总结 ${partitions[0]} 的核心内容` : "",
+    partitions[1] ? `比较 ${partitions[0]} 和 ${partitions[1]} 的联系` : "",
     documents[0] ? `根据 ${documents[0]} 生成整理提纲` : "",
-    chapters[0] ? `从本地资料中找出 ${chapters[0]} 的关键概念` : "",
+    partitions[0] ? `从本地资料中找出 ${partitions[0]} 的关键概念` : "",
   ].filter(Boolean);
   return suggestions.length ? suggestions.slice(0, 4) : fallbackSuggestions;
 }
@@ -91,11 +91,11 @@ function normalizeMessages(messages: Array<Record<string, unknown>>): ChatTurn[]
 
 function ChatHeader({
   grounded,
-  chapterList,
+  partitionList,
   latestRun,
 }: {
   grounded: boolean;
-  chapterList: string;
+  partitionList: string;
   latestRun: AgentResponse | null;
 }) {
   return (
@@ -109,7 +109,7 @@ function ChatHeader({
           <ShieldCheck data-icon="inline-start" />
           {grounded ? "已接入证据" : "降级模式"}
         </span>
-        <span className="kg-micro-chip max-w-full truncate rounded-full px-3 py-2 text-xs">目录：{chapterList || "等待中"}</span>
+        <span className="kg-micro-chip max-w-full truncate rounded-full px-3 py-2 text-xs">目录：{partitionList || "等待中"}</span>
         {latestRun?.route ? (
           <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
             <BrainCircuit data-icon="inline-start" />
@@ -579,18 +579,18 @@ function CitationsDrawer({
   );
 }
 
-function QAWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | null }) {
+function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBaseId: string | null }) {
   const queryClient = useQueryClient();
-  const storageScope = selectedCourseId ?? "unassigned";
+  const storageScope = selectedKnowledgeBaseId ?? "unassigned";
   const dashboardQuery = useQuery({
-    queryKey: ["dashboard", selectedCourseId],
-    queryFn: () => fetchDashboard(selectedCourseId),
-    enabled: Boolean(selectedCourseId),
+    queryKey: ["dashboard", selectedKnowledgeBaseId],
+    queryFn: () => fetchDashboard(selectedKnowledgeBaseId),
+    enabled: Boolean(selectedKnowledgeBaseId),
   });
   const sessionsQuery = useQuery({
-    queryKey: ["sessions", selectedCourseId],
-    queryFn: () => fetchSessions(selectedCourseId),
-    enabled: Boolean(selectedCourseId),
+    queryKey: ["sessions", selectedKnowledgeBaseId],
+    queryFn: () => fetchSessions(selectedKnowledgeBaseId),
+    enabled: Boolean(selectedKnowledgeBaseId),
   });
   const [question, setQuestion] = useLocalStorage(`qa.question.${storageScope}`, "");
   const [activeSessionId, setActiveSessionId] = useLocalStorage<string | null>(`qa.sessionId.${storageScope}`, null);
@@ -619,7 +619,7 @@ function QAWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | n
       setQuestion("");
       try {
         await streamAnswer(
-          { question: nextQuestion, session_id: activeSessionId, course_id: selectedCourseId, top_k: 6 },
+          { question: nextQuestion, session_id: activeSessionId, knowledge_base_id: selectedKnowledgeBaseId, top_k: 6 },
           {
             onTrace: (event) => {
               nextTraceEvents.push(event);
@@ -645,7 +645,7 @@ function QAWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | n
                   trace: finalTrace,
                 },
               ]);
-              void queryClient.invalidateQueries({ queryKey: ["sessions", selectedCourseId] });
+              void queryClient.invalidateQueries({ queryKey: ["sessions", selectedKnowledgeBaseId] });
               void queryClient.invalidateQueries({ queryKey: ["session-messages", response.session_id] });
             },
             onError: (message) => setStreamError(message),
@@ -669,12 +669,12 @@ function QAWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | n
         setLatestRun(null);
         setQuestion("");
       }
-      await queryClient.invalidateQueries({ queryKey: ["sessions", selectedCourseId] });
+      await queryClient.invalidateQueries({ queryKey: ["sessions", selectedKnowledgeBaseId] });
     },
   });
 
-  const chapterList = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title).join(" / ") ?? "", [dashboardQuery.data]);
-  const suggestions = useMemo(() => buildCourseSuggestions(dashboardQuery.data?.tree), [dashboardQuery.data?.tree]);
+  const partitionList = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title).join(" / ") ?? "", [dashboardQuery.data]);
+  const suggestions = useMemo(() => buildKnowledgeBaseSuggestions(dashboardQuery.data?.tree), [dashboardQuery.data?.tree]);
 
   if (dashboardQuery.isLoading) {
     return <LoadingBlock rows={4} />;
@@ -690,7 +690,7 @@ function QAWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | n
       <div className="relative z-10 flex flex-col gap-7">
         <ChatHeader
           grounded={!dashboardQuery.data?.degraded_mode}
-          chapterList={chapterList}
+          partitionList={partitionList}
           latestRun={latestRun}
         />
         <ChatActionRail
@@ -761,6 +761,6 @@ function QAWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | n
 }
 
 export function QAWorkspace() {
-  const { selectedCourseId } = useCourseContext();
-  return <QAWorkspaceContent key={selectedCourseId ?? "unassigned"} selectedCourseId={selectedCourseId} />;
+  const { selectedKnowledgeBaseId } = useKnowledgeBaseContext();
+  return <QAWorkspaceContent key={selectedKnowledgeBaseId ?? "unassigned"} selectedKnowledgeBaseId={selectedKnowledgeBaseId} />;
 }

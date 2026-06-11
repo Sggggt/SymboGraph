@@ -13,7 +13,7 @@ from app.services.ingestion import should_include_source
 from app.services.storage import compute_checksum
 
 
-class CourseEventHandler(FileSystemEventHandler):
+class KnowledgeBaseEventHandler(FileSystemEventHandler):
     def __init__(self) -> None:
         super().__init__()
         self.settings = get_settings()
@@ -45,7 +45,7 @@ def main() -> None:
     storage_root = settings.storage_root_path
     storage_root.mkdir(parents=True, exist_ok=True)
     observer = Observer()
-    handler = CourseEventHandler()
+    handler = KnowledgeBaseEventHandler()
     observer.schedule(handler, str(storage_root), recursive=True)
     observer.start()
     print(f"Watching {storage_root}")

@@ -1,62 +1,101 @@
-# Infrastructure
+# Infra 使用指南
 
-The local stack is Docker-first and split into reusable infrastructure plus small project images.
+`infra` 保存 SymboGraph 的默认 Docker Compose 运行环境。默认栈包括 API、worker、web、PostgreSQL、Redis 和 Qdrant。
 
-## Services
-
-- `api`: project FastAPI image, `course-kg-api:local`
-- `worker`: project Celery worker image, `course-kg-api:local`
-- `web`: project Next.js image, `course-kg-web:local`
-- `postgres`: reusable `postgres:16`
-- `redis`: reusable `redis:7`
-- `qdrant`: reusable `qdrant/qdrant:v1.17.1`
-
-PostgreSQL must stay on major version 16 because the existing data directory has `PG_VERSION=16`.
-Qdrant is pinned to 1.17.1 to match the API client's generated models.
-
-## Persistent Profile State
-
-Knowledge-base Profiles are persisted in PostgreSQL, not in `.env`. The relevant records are:
-
-- `strategy_profiles`: Profile name, library type, JSON strategy payload, hash, built-in flag, and active flag.
-- `courses.active_profile_id`: the active Profile binding for each knowledge base.
-- Graph extraction run metadata: records `strategy_profile_id` and `strategy_profile_hash` for freshness checks.
-
-Redis is used only for runtime/cache state such as Profile Assistant sessions. Deleting Redis data may clear assistant conversation state, but it does not delete saved Profiles. Deleting or recreating PostgreSQL volumes removes saved Profile definitions along with the rest of application metadata.
-
-## Validate Existing Images
-
-If these reusable images already exist on your machine, validate them and skip rebuilding:
+## 启动完整栈
 
 ```powershell
-docker run --rm postgres:16 postgres --version
-docker run --rm redis:7 redis-server --version
-docker image inspect qdrant/qdrant:v1.17.1
+docker compose -f infra/docker-compose.yml up -d --build
 ```
 
-## Build Missing Images
-
-Build only the images you do not already have:
+启动前建议从根模板创建配置：
 
 ```powershell
-docker build -f apps/api/Dockerfile -t course-kg-api:local .
-docker build -f apps/web/Dockerfile -t course-kg-web:local .
+Copy-Item .env.example .env
 ```
 
-## Run
+至少配置 chat 和 embedding 端点：
 
-From the repository root:
+```env
+OPENAI_API_KEY=...
+CHAT_BASE_URL=https://your-chat-endpoint/v1
+CHAT_MODEL=your-chat-model
+EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1
+EMBEDDING_MODEL=your-embedding-model
+EMBEDDING_DIMENSIONS=1024
+```
+
+## 默认服务
+
+| 服务 | 容器名 | 用途 |
+| --- | --- | --- |
+| `api` | `course-kg-api` | FastAPI 后端 |
+| `worker` | `course-kg-worker` | Celery 长任务 |
+| `web` | `course-kg-web` | Next.js 前端 |
+| `postgres` | `course-kg-postgres` | 元数据事实源 |
+| `redis` | `course-kg-redis` | Celery broker、缓存、运行时广播 |
+| `qdrant` | `course-kg-qdrant` | active chunk 向量索引 |
+
+```mermaid
+flowchart TB
+    WEB["course-kg-web"] --> API["course-kg-api"]
+    API --> PG["course-kg-postgres"]
+    API --> R["course-kg-redis"]
+    API --> Q["course-kg-qdrant"]
+    W["course-kg-worker"] --> PG
+    W --> R
+    W --> Q
+```
+
+## 常用命令
 
 ```powershell
-.\start-app.ps1
+docker compose -f infra/docker-compose.yml ps
+docker compose -f infra/docker-compose.yml logs -f api
+docker compose -f infra/docker-compose.yml restart api worker
+docker compose -f infra/docker-compose.yml down
 ```
 
-The API image includes the reranker Python extra in system Python. Enable it with `RERANKER_ENABLED=true`; no separate reranker container or virtual environment is used.
-
-Direct Compose examples:
+## 健康检查
 
 ```powershell
-docker compose -f infra/docker-compose.yml up -d postgres redis qdrant api worker web
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:3000
 ```
 
-The worker consumes `course-kg-main-ingestion` and uses `WORKER_CONCURRENCY` for Celery process concurrency. Keep this value aligned with API-side bounded concurrency settings such as `INGESTION_FILE_CONCURRENCY`, `MODEL_REQUEST_CONCURRENCY`, and `HPO_CONCURRENCY`.
+## 验收
+
+```powershell
+python scripts\docker_smoke.py --base-url http://127.0.0.1:8000/api --worker-container course-kg-worker
+```
+
+## Cross-Encoder reranker 可选配置
+
+默认关闭：
+
+```env
+RERANKER_ENABLED=false
+```
+
+启用 CPU rerank：
+
+```env
+RERANKER_ENABLED=true
+RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+RERANKER_MAX_LENGTH=512
+RERANKER_DEVICE=cpu
+```
+
+如需把默认模型预热进 API 镜像：
+
+```powershell
+docker build -f apps/api/Dockerfile -t course-kg-api:local --build-arg PRELOAD_RERANK_MODEL=true .
+```
+
+## 注意事项
+
+- 不要绕过 Docker 直接修改生产形态的 PostgreSQL、Redis 或 Qdrant 状态。
+- 服务名重命名属于基础设施变更，应单独处理。
+- `experiment` profile 不是默认运行路径。
+- 运行日志、smoke 输出和临时报告写入仓库根目录 `output/`。
+- 完整环境参数说明见根目录 [README.md](../README.md)。

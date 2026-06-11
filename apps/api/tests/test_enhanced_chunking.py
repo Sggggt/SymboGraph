@@ -60,7 +60,7 @@ def test_chunk_sections_hierarchical_creates_parents_and_children():
             metadata={},
         ),
     ]
-    chunks, stats = chunk_sections_hierarchical(sections, chapter="L1", source_type="pdf")
+    chunks, stats = chunk_sections_hierarchical(sections, partition="L1", source_type="pdf")
 
     assert stats["parents_created"] == 2
     assert stats["children_created"] >= 2
@@ -90,8 +90,8 @@ def test_chunk_sections_semantic_uses_different_strategies():
             metadata={},
         ),
     ]
-    chunks_md, _ = chunk_sections_semantic(sections, chapter="L1", source_type="md")
-    chunks_pdf, _ = chunk_sections_semantic(sections, chapter="L1", source_type="pdf")
+    chunks_md, _ = chunk_sections_semantic(sections, partition="L1", source_type="md")
+    chunks_pdf, _ = chunk_sections_semantic(sections, partition="L1", source_type="pdf")
 
     assert chunks_md[0]["metadata"]["chunking_strategy"] == "markdown_header_v2"
     assert chunks_pdf[0]["metadata"]["chunking_strategy"] == "sentence_aware_v2"
@@ -101,7 +101,7 @@ def test_contextual_embedding_text_includes_context():
     """上下文增强嵌入应包含 parent/prev/next 摘要。"""
     text = contextual_embedding_text(
         document_title="Networks",
-        chapter="L2",
+        partition="L2",
         section="Centrality",
         source_type="pdf",
         content_kind="text",
@@ -122,7 +122,7 @@ def test_embedding_text_enhanced_with_summary_keywords():
     """增强版 embedding_text 应包含 summary、keywords、table/formula 标记。"""
     text = embedding_text(
         document_title="Stats",
-        chapter="L3",
+        partition="L3",
         section="Bayes",
         source_type="pdf",
         content_kind="text",

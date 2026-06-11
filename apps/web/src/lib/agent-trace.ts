@@ -13,6 +13,9 @@ export const evidenceFirstTraceFallbackSteps: AgentTraceNode[] = [
   "context_synthesizer",
   "answer_generator",
   "citation_checker",
+  "citation_verifier",
+  "reflection",
+  "self_check",
 ];
 
 const traceNodeLabels: Record<AgentTraceNode, string> = {
@@ -21,10 +24,10 @@ const traceNodeLabels: Record<AgentTraceNode, string> = {
   base_retrieval: "基础召回",
   evidence_anchor_selector: "锚点选择",
   evidence_chain_planner: "证据链规划",
-  controlled_graph_enhancer: "受控图增强",
+  controlled_graph_enhancer: "受控信号投影",
   evidence_assembler: "证据装配",
   document_grader: "文档筛选",
-  evidence_evaluator: "证据校验",
+  evidence_evaluator: "证据充分性",
   context_synthesizer: "上下文合成",
   answer_generator: "答案生成",
   citation_checker: "引用检查",
@@ -64,8 +67,9 @@ export function traceAuditSummary(scores: Record<string, unknown> | undefined): 
     ["base_candidate_count", "base"],
     ["anchor_count", "anchors"],
     ["planned_paths", "paths"],
-    ["verified_edges", "verified"],
+    ["observed_edges", "observed"],
     ["graph_enhanced_chunks", "graph chunks"],
+    ["expanded_active_chunks", "expanded active"],
     ["path_evidence_chunks", "path chunks"],
     ["discarded_candidate_edges", "discarded"],
     ["community_summaries", "communities"],
@@ -73,7 +77,6 @@ export function traceAuditSummary(scores: Record<string, unknown> | undefined): 
     ["chunk_retained", "retained chunks"],
     ["chunk_discarded", "discarded chunks"],
     ["retrieval_eligible_chunks", "retrieval route"],
-    ["graph_extraction_eligible_chunks", "graph route"],
     ["evidence_only_chunks", "evidence only"],
   ];
   return entries

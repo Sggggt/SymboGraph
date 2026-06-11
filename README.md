@@ -1,1069 +1,218 @@
 [English](./README.en.md) | **中文**
 
 <p align="center">
-  <img src="./assets/diagraph-logo.svg" alt="SymboGraph 标志" width="132" height="132">
+  <img src="./assets/diagraph-logo.svg" alt="SymboGraph logo" width="132" height="132">
 </p>
 
 <h1 align="center">SymboGraph</h1>
 
-**SymboGraph 是面向严肃企业和学术场景开发的新一代 Neuro-Symbolic Agentic RAG（神经符号代理 RAG） 系统，该项目基于GraphRAG开发，但区别于传统 RAG 的“语义破碎”和笨重 GraphRAG 的“高成本与幻觉叠加”。**
+SymboGraph 是一个本地通用智能知识库系统。当前 active 链路以可追溯证据为事实源：文件先解析为 `EvidenceAtom`，再形成只表达观测关系的 `EvidenceGraph`，随后产生 graph-grounded chunk candidates、`QualityDecision`、`ActiveChunk`、检索轨迹、引用核验、问答会话与策略奖励。
 
-本系统把 PDF、幻灯片、文档、网页、Notebook、图片和 Markdown 解析为可检索文本块、Qdrant 稠密向量、PostgreSQL 稀疏知识图谱和带引用出处的问答结果。无论你的资料是中文还是英文，系统都能统一检索；所有数据留在本地，无需上传第三方。
+> **迁移说明**：产品代码与前端上下文已迁移到 `KnowledgeBase` / `partition` / evidence-first 语义。默认 PostgreSQL 数据库名已迁移为 `symbograph`。Docker Compose 服务名、容器名、镜像名、队列名仍保留 `course-kg-*` 等历史基础设施命名；这些名称会在独立基础设施变更中处理，不代表默认产品语义。
 
-作为通用 GraphRAG 平台，SymboGraph 的知识库概念并不限于某一类文档——你可以将其用于课程资料、研究文献、技术手册、法律合同或任何需要结构化解构与语义关联的文本集合。
+## 目录
+
+- [快速概览](#快速概览)
+- [技术栈](#技术栈)
+- [核心能力](#核心能力)
+- [主链路](#主链路)
+- [运行方式](#运行方式)
+- [环境参数](#环境参数)
+- [仓库结构](#仓库结构)
+- [测试与验收](#测试与验收)
+- [使用边界](#使用边界)
 
 ## 快速概览
 
-| 维度       | 实现                                                                                                          |
-| ---------- | ------------------------------------------------------------------------------------------------------------- |
-| 运行方式   | Docker Compose，全栈容器化                                                                                    |
-| 后端       | FastAPI、Pydantic、SQLAlchemy、NetworkX、LangGraph                                                            |
-| 前端       | Next.js 16.2.4、React 19、TypeScript、TanStack Query、ECharts                                                 |
-| 数据库     | PostgreSQL 16，保存知识库、文件版本、文本块、图谱、问答会话和运行轨迹                                         |
-| 向量库     | Qdrant 1.17.1，集合 `knowledge_chunks`                                                                        |
-| 缓存与协调 | Redis 7                                                                                                       |
-| 模型接口   | OpenAI 兼容 Embedding / Chat API，Embedding 与 Chat 端点独立配置                                              |
-| 检索       | Evidence-first 检索：dense + BM25 + rerank 基础召回，证据锚点选择，受控图导航增强，再装配 parent context      |
-| 图谱       | LLM 抽候选，chunk 向量建语义图，图算法做构图、消冗、社区、中心性和隐式关系；自适应最佳优先 chunk 选择；TPE 超参自动优化；支持增量更新与全量重建            |
-| 质量系统   | 信号-策略-画像-裁判四级质量架构：对 chunk、concept、relation 做自适应分级过滤与路由                           |
-| 问答       | Agentic RAG：Perception → Planning → Retrieval → EvidenceEvaluator → Generation，支持跨语言检索与前置证据评估 |
+| 维度 | 当前设计 |
+| --- | --- |
+| 系统定位 | 本地通用智能知识库，服务于证据检索、grounded QA、引用核验和策略闭环 |
+| 事实源 | PostgreSQL 中的 document versions、source spans、evidence atoms、active chunks、retrieval traces、answer sessions |
+| 图基座 | Evidence graph，只保存相邻、包含、布局连续、引用依赖、语义相似、模态连接、话题转折等观测边 |
+| 切块 | Evidence atoms 先进入图基座，再由图特征、社区边界、质量门禁与策略状态共同决定 active chunks |
+| 检索问答 | Dense/lexical evidence recall、community/graph expansion、rerank、context assembly、citation verification |
+| 策略 | `policy_states` 与 contextual bandit 管理 operating point；HPO 仅用于 experiment/offline replay 对照 |
+| 默认运行 | Docker Compose 启动 API、worker、web、PostgreSQL、Redis、Qdrant |
 
 ## 技术栈
 
-| 层         | 技术                                                               | 职责                                                            |
-| ---------- | ------------------------------------------------------------------ | --------------------------------------------------------------- |
-| 前端       | Next.js 16.2.4、React 19、TypeScript、TanStack Query、ECharts      | 知识库管理、上传解析、搜索、问答、图谱浏览、运行时配置          |
-| API        | FastAPI、Pydantic、SQLAlchemy、LangGraph                           | REST / SSE 接口、强类型校验、事务编排、导入任务、检索与问答编排 |
-| 图算法     | NetworkX、NumPy、SciPy                                             | 稀疏构图、连通分量、Louvain、谱聚类、中心性、Dijkstra 隐式关系  |
-| 超参优化   | Optuna TPE（Tree-structured Parzen Estimator）                      | 自动搜索图算法最优阈值与权重组合，持久化最优参数                  |
-| 质量系统   | 信号工程、规则策略、领域画像、LLM-as-judge                         | Chunk/Concept/Relation 分级过滤、自适应领域基线、缓存裁判       |
-| 数据库     | PostgreSQL 16                                                      | 知识库、文件版本、chunks、图谱、问答会话、运行轨迹和补偿记录    |
-| 向量检索   | Qdrant 1.17.1                                                      | parent / child chunk 向量、dense recall、向量健康检查           |
-| 词面检索   | PostgreSQL 文本数据、BM25                                          | child chunk 词面召回与混合检索融合                              |
-| 缓存与协调 | Redis 7                                                            | 运行态缓存、任务协调、服务依赖                                  |
-| 解析       | PyMuPDF、PPTX / DOCX / Markdown / HTML / Notebook 解析器、OCR 路径 | 把异构文档转成结构化章节与文本                                  |
-| 模型接口   | OpenAI 兼容 Embedding / Chat API                                   | 向量化、摘要、关键词、实体候选、关系候选、回答生成              |
-| 精排       | 轻量精排、可选 Cross-Encoder                                       | 对融合候选按相关性重排                                          |
-| 部署       | Docker Compose                                                     | 固定服务边界、依赖版本和本地持久化                              |
-| 测试       | pytest、Vitest、Next build、Docker smoke                           | 行为回归、前后端类型契约、无 fallback 质量门禁                  |
+| 层级 | 技术 | 职责 |
+| --- | --- | --- |
+| API | FastAPI、SQLAlchemy、Alembic、Pydantic | 导入编排、证据图、切块质量、检索问答、运行时设置 |
+| Worker | Celery、Redis broker | 文件解析、长任务、图构建、向量写入、可恢复批次 |
+| Web | Next.js 16.2.4、React 19、TypeScript、TanStack Query | 本地知识库 UI、导入、证据图、检索、问答、设置 |
+| Metadata | PostgreSQL | 生命周期状态、证据事实、策略状态、trace 与引用核验 |
+| Vector | Qdrant | active chunk 向量与派生检索索引 |
+| Runtime | Redis | 缓存、运行时设置广播、worker 协调 |
+| Models | OpenAI 兼容 chat / embedding endpoint | grounded answer generation、测量型 prompt、embedding |
 
 ## 核心能力
 
-| 能力           | 说明                                                                                |
-| -------------- | ----------------------------------------------------------------------------------- |
-| 多格式解析     | 支持 PDF、PPT/PPTX、DOCX、Markdown、TXT、Notebook、HTML 和图片资料                  |
-| 父子块切分     | parent chunk 保存完整上下文，child chunk 承担精确召回、精排和证据引用               |
-| 语义切分       | 对长文本按结构、语义边界、句子边界和长度上限切分，可用 embedding 相似度辅助边界判断 |
-| 上下文增强向量 | 向量输入包含文件元数据、章节、父块摘要、相邻子块摘要、关键词、表格和公式标记        |
-| 混合检索       | Qdrant child dense recall 与 child BM25 recall 融合，统一进入精排                   |
-| 跨语言检索     | LLM 翻译查询扩展至双语子查询，DocumentGrader 用 embedding similarity 跨越语言壁垒   |
-| 图谱增强       | 图谱关系必须回到证据 chunk，作为检索扩展信号而不是替代证据                          |
-| 图论构图       | 用稀疏图、社区、中心性、Dijkstra 和关系补全降低噪声、保留关键结构                   |
-| 自适应质量系统 | 基于领域画像的信号-策略分层过滤，对 chunk、concept、relation 做差异化路由           |
-| 可观测问答     | 保存检索审计、模型调用审计、agent trace、引用和失败原因                             |
-| 运行时检查     | 暴露健康检查、runtime-check、fallback 状态、Qdrant 状态和模型端点状态               |
-| 自动超参优化   | `ENABLE_AUTO_HPO=true` 时，图谱重建前自动运行 TPE 寻优最优阈值和权重组合            |
-| 增量图谱更新   | 仅对变更文档关联的图谱局部重算，避免无必要全量重建                                   |
-
-## 资料库 Profile
-
-SymboGraph 现在支持“资料库 Profile”体系，用来把课程、法律文件、企业资料、书籍、数据资料等不同资料库类型的 prompt、schema、解析策略、图谱策略、检索策略和质量准入策略从硬编码中解耦出来。
-
-- 每个资料库都会绑定一个 active Profile。新建资料库默认绑定内置“课程资料库默认 Profile”，因此默认 RAG、图谱、检索和 agent 行为保持兼容。
-- Profile 配置保存在 PostgreSQL 的 `strategy_profiles` 表中，不写入 `.env`；资料库通过 `courses.active_profile_id` 关联当前 Profile。
-- 默认内置 Profile 不能编辑或删除；需要修改时先复制为自定义 Profile。除默认 Profile 外，其他 Profile 都可以删除；若删除时仍有资料库绑定，后端会把这些资料库自动切回默认 Profile。
-- Profile 切换或修改只影响之后启动的新解析、图谱抽取、检索和问答任务，不会自动改写已有 chunks、图谱、向量或会话。图谱抽取运行会记录 Profile hash，用于前端提示旧数据可能需要重新解析或重建。
-- 设置页拆分为“模型与运行配置”和“Profile 设置”。Profile 设置页包含 Profile 选择/复制/新建/保存/绑定/删除、AI 设置助手、结构诊断和高级 JSON 编辑。
-- AI 设置助手使用当前 `chat_model` 生成自然语言说明和 Profile JSON 草案；结果只进入前端草稿，用户点击“自动填充”和“保存 Profile”后才落库。助手会话状态通过 Redis 记录。
-
-Profile JSON 的核心结构包括：
-
-| 字段 | 作用 |
+| 能力 | 说明 |
 | --- | --- |
-| `ui_labels` | 资料库、分区、实体、关系、路由等显示名 |
-| `prompt_pack` | 问答、图谱抽取、意图识别、引用验证、反思、社区摘要等 prompt |
-| `schema_pack` | 实体类型、关系类型、别名映射、禁用标签和默认类型 |
-| `parsing_strategy` | 章节/条款/分区识别、内容类型偏好、OCR/表格/代码处理提示 |
-| `graph_strategy` | 抽取预算、关系准入、合并规则、HPO/社区摘要偏好 |
-| `retrieval_strategy` | query 类型、路由词、dense/BM25/rerank 权重提示 |
-| `quality_policy` | 结构噪声词、通用词、实体/关系准入阈值 |
+| 证据级导入 | 保守解析 heading、paragraph、list item、table block、code block、formula、caption、page block 等 atoms |
+| 可审计图谱 | `EvidenceEdge` 只表达观测关系，不把 LLM durable ontology 当作事实源 |
+| 图基座切块 | `ChunkCandidate` 保存 atom ids、span union、graph features、cost estimate 和 generator version |
+| 质量决策 | `QualityDecision` 同时承担 gate、reward、feedback，并记录硬约束与诊断 |
+| Active chunks | 每个 active chunk 保存 source span union、graph state hash、quality decision、policy state 和 community ids |
+| 检索轨迹 | `RetrievalTrace` 记录候选、扩展、重排、缓存和风险审计信息 |
+| 引用核验 | 答案引用必须回到 `active_chunk_id`、`evidence_atom_id` 或 source span |
+| 策略闭环 | `RewardEvent` 回溯检索、问答、chunk 和 policy state，用于 contextual bandit 更新 |
+| 热加载设置 | `.env` 更新后通过 Redis runtime settings version 广播，API 与 worker 在任务边界刷新 |
 
-## 系统架构
-
-```mermaid
-flowchart TB
-    USER["用户浏览器"] --> WEB["Next.js Web<br/>course-kg-web"]
-    WEB -->|"HTTP / SSE"| API["FastAPI<br/>course-kg-api"]
-
-    subgraph APP["应用层"]
-        API --> INGEST["导入流水线<br/>解析 -> 父子切块 -> 质量路由 -> 知识增强 -> 向量写入"]
-        API --> RETRIEVAL["检索流水线<br/>dense/BM25 -> 融合 -> 精排 -> parent context"]
-        API --> GRAPH["图谱流水线<br/>LLM候选 -> 质量过滤 -> 向量相似图 -> 稀疏构图 -> 社区/中心性/推断"]
-        API --> QA["Agentic 问答<br/>Perception -> Planning -> Retrieval -> EvidenceEvaluator -> Generation"]
-        API -.-> QUALITY["质量系统<br/>被各流水线调用的内部库"]
-    end
-
-    subgraph STORE["存储与运行态"]
-        PG[("PostgreSQL<br/>元数据、文本块、稀疏图、审计记录、质量画像")]
-        QD[("Qdrant<br/>chunk 向量与相似召回")]
-        RD[("Redis<br/>运行态缓存、embedding / 检索结果缓存、裁判缓存、分布式锁、Celery broker")]
-        FS["data/<br/>知识库文件、解析产物、本地持久化"]
-    end
-
-    subgraph MODEL["模型接口"]
-        EMB["OpenAI 兼容 Embedding API<br/>独立端点配置"]
-        CHAT["OpenAI 兼容 Chat API<br/>独立端点配置"]
-        MB["Model Bridge<br/>宿主机模型桥接（可选）"]
-    end
-
-    API --> PG
-    API --> QD
-    API --> RD
-    API --> FS
-    API --> EMB
-    API --> CHAT
-    API --> MB
-```
-
-## 数据流
-
-```mermaid
-sequenceDiagram
-    participant 用户
-    participant Web
-    participant API
-    participant 文件 as File Storage
-    participant DB as PostgreSQL
-    participant Vector as Qdrant
-    participant Model as Model API
-
-    用户->>Web: 上传或选择知识库文件
-    Web->>API: 创建 ingestion batch
-    API->>DB: 创建 batch、job、document/version 状态
-    API->>文件: 保存原始文件与解析产物
-    API->>API: 解析章节、页面、表格、公式和 Notebook 单元
-    API->>API: 生成 parent/child chunks（内部含质量信号提取与 discard）
-    API->>API: 自适应切片：按 section 动态选择 chunk_size / overlap / strategy
-    API->>Model: 生成 parent chunk 摘要和关键词（ChatProvider）
-    API->>API: 生成上下文增强文本（contextual_embedding_text）
-    API->>Model: 生成所有 chunk 的 embeddings（EmbeddingProvider）
-    API->>Vector: 写入 active chunk 向量（含零向量校验与补偿）
-    API->>DB: 激活 document version 与 chunks
-    API->>Model: 抽取实体/关系候选（自适应最佳优先 chunk 子集）
-    API->>DB: 保存 concepts、relations、证据（内部含质量过滤）
-    API->>API: 自动超参优化（可选）：TPE 迭代寻优 Dijkstra 阈值、PageRank 权重等
-    alt 全量重建
-        API->>API: 运行稀疏图构建、社区、中心性和推断
-        API->>DB: 保存图算法字段（中心性、社区、排序）
-        API->>API: 生成社区摘要
-    else 增量更新
-        API->>DB: 仅变更文档关联的图谱局部重算
-    end
-    API-->>Web: SSE 推送日志、进度、retry 和失败状态
-```
-
-导入过程使用显式 batch / job 状态和文件级锁。同一知识库同一时间只保留一个非终态导入批次。PostgreSQL 是生命周期事实源；Qdrant 和 Redis 是派生或运行态存储，失败会记录补偿或错误上下文，不做静默降级。
-
-chunk 版本只记录在 `chunks.chunk_version` 上；`courses.current_chunk_version` 保存知识库已提交的最高 chunk 版本。空知识库首次成功解析创建 v1；一般选中文件解析会把成功文件同步到当前最高版本，不创建新版本。全量重新解析只在已有 active chunks 后可用，目标版本为 `current_chunk_version + 1`；如果整批没有任何成功文件，不推进课程版本。
-
-取消补偿按阶段隔离：解析阶段取消只回滚本次解析写入并恢复解析前 active chunks；进入图谱阶段后取消只恢复图谱阶段开始前的图状态，已经提交的解析结果保留。
-
-## 导入、切块与向量
-
-### 分层切块
-
-1. 解析器把源文件转成 `ParsedSection`，保留章节、页码、来源类型、表格、公式、Notebook cell 和图片 OCR 元数据。
-2. 每个结构段生成 parent chunk，保存完整章节、页面段落或自然语义段。
-3. parent chunk 内部继续生成 child chunks，用于精确召回、精排和证据定位。
-4. Markdown 和 Notebook 优先按标题与 cell 层级切分；普通长文本按语义边界、句子边界和安全长度切分。
-5. 当 `SEMANTIC_CHUNKING_ENABLED=true` 且文本长度达到 `SEMANTIC_CHUNKING_MIN_LENGTH` 时，系统可使用 embedding 相似度辅助切分边界。
-
-> **设计意图（为什么这么做）**：普通的固定长度切块会导致严重的内容割裂（断章取义）。采用父子分层与语义切分，使得模型在检索阶段能利用子块的高精确度，而在生成阶段又能获取父块的完整上下文，彻底解耦了"召回单元"与"生成单元"。
-
-### 自适应切片参数选择
-
-上述分层策略并非使用全局固定的 `chunk_size` 和 `chunk_overlap`。对于每个 `ParsedSection`，系统在切块前动态分析其内容特征，从候选配置空间中选择最优的切块参数组合。该过程通过 SSE 推送 `chunk_adaptive` 事件。
-
-**文档特征向量**：对每个 section 提取 12 维归一化特征：
-
-| 特征维度 | 计算方式 | 说明 |
-|---------|---------|------|
-| 文本长度 | $\min(1, L_{\text{tokens}} / 1800)$ | 归一化 token 数 |
-| 语义单元均长 | $\min(1, \bar{l}_{\text{unit}} / 80)$ | 语义单元平均 token 长度 |
-| 长度变异系数 | $\min(1, \sigma_l / \max(\bar{l}_{\text{unit}}, 1))$ | 语义单元长度离散程度 |
-| 定义密度 | 来自语义密度信号 | 定义性语句占比 |
-| 实体密度 | 来自语义密度信号 | 命名实体占比 |
-| 术语密度 | 来自语义密度信号 | 领域术语占比 |
-| 唯一 token 比例 | 来自语义密度信号 | 文本去重后的词汇丰富度 |
-| 公式信号 | $\min\bigl(1, \frac{12 N_{\text{formula}}}{L_{\text{tokens}}} + 0.35 \cdot \mathbf{1}_{\text{has formula}}\bigr)$ | 公式密集程度 |
-| 表格信号 | $\mathbf{1}_{\text{has table}}$ | 是否包含表格 |
-| 代码标记比例 | 代码行 / 总行数 | `def`/`class`/`import` 等标记占比 |
-| 符号比例 | $\min(1, \frac{4 N_{\text{symbol}}}{L_{\text{chars}}})$ | 非字母数字符号占比 |
-| 结构噪声 | $\max(S_{\text{structural}}, 20 R_{\text{mojibake}})$ | 结构异常与乱码风险 |
-
-**谱形状分析**：将 section 分割成语义单元，每个单元提取特征向量，构建协方差矩阵并计算特征值与特征向量：
-
-$$
-\lambda_1 \ge \lambda_2 \ge \lambda_3 \ge \lambda_4,\qquad
-\tilde{\lambda}_k = \frac{\lambda_k}{\sum_{j=1}^4 \lambda_j}
-$$
-
-谱间隙 $\rho = \tilde{\lambda}_1 - \tilde{\lambda}_2$ 衡量语义一致性；语义曲率 $\kappa$ 衡量相邻语义单元间的特征漂移幅度。
-
-**候选配置空间**（chunk_size, overlap, strategy）：
-
-| chunk_size | overlap | strategy |
-|-----------|---------|----------|
-| 512 | 64 | `sentence_aware` |
-| 640 | 96 | `sentence_aware` |
-| 800 | 120 | `semantic_or_sentence` |
-| 960 | 144 | `semantic_or_sentence` |
-| 700 | 160 | `recursive_structure_preserving` |
-
-**评分机制**：对每组候选参数计算综合得分。
-
-复杂度（内容结构混乱程度）：
-
-$$
-\gamma = \min\Bigl(1,\; 0.22 \cdot c_v + 0.18 \cdot f + 0.16 \cdot t + 0.18 \cdot r_{\text{code}} + 0.16 \cdot r_{\text{sym}} + 0.10 \cdot \kappa\Bigr)
-$$
-
-密度（知识含量）：
-
-$$
-\delta = \min\Bigl(1,\; 0.35 \cdot d_{\text{term}} + 0.30 \cdot d_{\text{entity}} + 0.20 \cdot d_{\text{def}} + 0.15 \cdot r_{\text{unique}}\Bigr)
-$$
-
-目标大小与重叠（由复杂度和密度驱动）：
-
-$$
-S^{\ast} = 920 - 380\,\gamma + 160\,\delta + 100\,\rho,\qquad
-O^{\ast} = 80 + 130\,\gamma + 40\,\kappa
-$$
-
-拟合度：
-
-$$
-\phi_{\text{size}} = 1 - \min\Bigl(1, \frac{|S - S^{\ast}|}{700}\Bigr),\qquad
-\phi_{\text{overlap}} = 1 - \min\Bigl(1, \frac{|O - O^{\ast}|}{220}\Bigr)
-$$
-
-策略奖励：
-
-$$
-\beta =
-\begin{cases}
-0.08 \cdot \max(\kappa, \delta) & \text{if strategy} = \text{`semantic or sentence'} \\
-0.10 \cdot r_{\text{code}} + 0.05 \cdot f & \text{if strategy} = \text{`recursive structure preserving'} \\
-0 & \text{otherwise}
-\end{cases}
-$$
-
-综合得分：
-
-$$
-\mathcal{F} = \max(0, \min(1,\; 0.54\,\phi_{\text{size}} + 0.26\,\phi_{\text{overlap}} + 0.14\,\delta - 0.10\,\nu + \beta))
-$$
-
-其中 $\nu$ 为结构噪声。得分最高者被选为当前 section 的切块参数，并持久化到 chunk metadata 中。
-
-> **设计意图（为什么这么做）**：不同类型的内容（如纯文本、复杂公式、代码、表格）对切块长度和重叠度的需求迥异。自适应切块通过对文本特征和谱形状的实时量化，让系统能动态“量体裁衣”选择切分参数与策略，既避免了对公式和代码块的野蛮截断，又在保障高语义段完整性的同时压制了结构噪声，实现了参数级别的自适应最优表征。
-
-### 上下文增强向量
-
-child 向量不只嵌入 child 原文，而是由 `contextual_embedding_text()` 生成上下文增强输入：
+## 主链路
 
 ```text
-文件元数据
-章节、页码和来源类型
-child chunk 正文
-parent summary 或 parent content
-相邻 child summaries
-关键词
-表格、公式和内容类型标记
+文件解析
+-> evidence atoms
+-> evidence graph
+-> graph-grounded chunk candidates
+-> quality gate
+-> active chunks
+-> retrieval / QA / citation verification
+-> reward events
+-> contextual bandit policy update
 ```
-
-parent chunk 保留原文、摘要和关键词。child chunk 继承 parent 语义摘要并补充邻近上下文，减少小块检索的断章取义。当前向量文本版本是 `contextual_enriched_v3`。
-
-> **设计意图（为什么这么做）**：子块由于文本较短，在独立转换为向量时极易产生语义歧义（例如单独的"该方法"、"这一步"）。在 Embedding 前强制注入父块摘要和相邻上下文，相当于在入库前对文本做了"环境灌注"（Contextual Retrieval），极大提升了 Dense Recall 阶段的召回准确率。
-
-### 去重与幂等
-
-导入按知识库、规范化标题和 checksum 判断重复文件。未变化文件会以 `unchanged_checksum` 跳过；同标题同 checksum 的重复副本会以 `duplicate_document` 跳过，避免重复写入 chunks 和向量。强制重新解析会重新生成 document version、chunks、Qdrant 向量和图谱候选。
-
-> **设计意图（为什么这么做）**：知识库的频繁导入与更新极易在数据库和向量库中堆积重复垃圾，导致检索Hubness问题和计算资源浪费。通过对文件名、标题规范化以及Checksum SHA256的多重幂等检测，确保只有真正发生变动的内容才触发解析与重算。这为工业级并发吞吐提供了强悍的安全护栏，实现数据级精确一致性与运行态的高效防重。
-
-## 质量系统
-
-SymboGraph 内置四级质量架构——信号（Signals）、策略（Policies）、画像（Profiles）、裁判（Judge）——对 chunk、concept 和 relation 做差异化分级过滤与自适应路由。质量系统不是简单的"合格/不合格"二元判断，而是为每个对象计算多维信号、输出结构化决策，并允许下游流水线根据决策采取不同行动。
 
 ```mermaid
 flowchart LR
-    RAW["原始对象<br/>chunk / concept / relation"] --> SIG["信号层<br/>TextQuality · StructuralRole · SemanticDensity · DomainSpecificity · EvidenceGrounding"]
-    SIG --> POL["策略层<br/>ChunkPolicy · ConceptPolicy · RelationPolicy"]
-    POL --> ROUTE["路由决策<br/>discard · summary_only · evidence_only · retrieval_candidate · graph_candidate · accept · candidate_only"]
-    PROF["画像层<br/>分层采样 · 正负样本 · 领域术语基线"] --> POL
-    JUD["裁判层<br/>LLM-as-judge · Redis缓存 · defer兜底"] --> POL
+    F["文件解析"] --> A["EvidenceAtom"]
+    A --> G["EvidenceGraph"]
+    G --> C["ChunkCandidate"]
+    C --> Q["QualityDecision"]
+    Q --> X["ActiveChunk"]
+    X --> R["RetrievalTrace"]
+    R --> S["AnswerSession / CitationVerification"]
+    S --> E["RewardEvent"]
+    E --> P["PolicyState"]
+    P --> C
 ```
 
-### 1. 信号层（Quality Signals）
+算法细节、约束公式、策略 operating point 和质量决策字段见 [docs/technical-spec.md](./docs/technical-spec.md)。README 只保留工程入口和运行边界。
 
-信号层从原始文本和元数据中提取可量化的质量指标：
+## 运行方式
 
-- **TextQuality**：长度、规范化长度、乱码比率（mojibake）、控制字符数、重复行比率、目录相似度
-- **StructuralRole**：结构标签（章节/页码/文件名）、容器暗示、目录页、Notebook output
-- **SemanticDensity**：唯一词比率、定义得分、实体密度、术语密度、公式/表格标记
-- **DomainSpecificity**：通用性得分（genericity）、特异性得分（specificity）、局部 IDF
-- **EvidenceGrounding**：文本片段、chunk 锚定、文档锚定、端点匹配、支持计数
+默认使用 Docker Compose：
 
-对于 concept，信号层还包含 **ModelJudgment**（LLM 裁判的 verdict、score、reasons）。
-
-> **设计意图（为什么这么做）**：垃圾进，垃圾出（Garbage in, garbage out）。如果不在源头对内容质量进行多维量化，下游的向量相似度检索和LLM图抽取将会饱受杂乱字符、目录页、无语义代码块的静默污染。通过在信号层对文本进行低阶与高阶联合量化，提取多维结构与特异性指标，下游的路由决策才拥有科学可审计的数据锚点。
-
-### 2. 策略层（Quality Policies）
-
-策略层将信号映射为离散的路由决策：
-
-**ChunkQualityPolicy** 决策空间：
-
-| 动作                  | 含义                         | 下游影响                                 |
-| --------------------- | ---------------------------- | ---------------------------------------- |
-| `discard`             | 机械噪声，直接丢弃           | 不嵌入、不检索、不参与图谱               |
-| `summary_only`        | 目录页或结构标签             | 仅用于摘要，不参与检索和图谱             |
-| `evidence_only`       | 太短或 Notebook output       | 可嵌入、可检索，但不生成摘要、不参与图谱 |
-| `retrieval_candidate` | 普通内容块                   | 嵌入、检索、生成摘要，不参与图谱         |
-| `graph_candidate`     | 高语义密度（定义/实体/术语） | 嵌入、检索、摘要、参与图谱抽取           |
-| `embed_only`          | 无领域上下文的代码块         | 仅嵌入，不参与检索和图谱                 |
-
-Chunk 质量得分公式：
-
-$$
-S_{\text{chunk}} = 0.30 \cdot \min\Bigl(1, \frac{L_{\text{norm}}}{600}\Bigr) + 0.25 \cdot D_{\text{term}} + 0.20 \cdot R_{\text{unique}} + 0.15 \cdot D_{\text{def}} + 0.05 \cdot \mathbf{1}_{\text{formula}} + 0.05 \cdot \mathbf{1}_{\text{table}} - 0.35 \cdot \mathbf{1}_{\text{toc}} - 0.40 \cdot \min\Bigl(1, 20 \cdot R_{\text{mojibake}}\Bigr)
-$$
-
-其中 $L_{\text{norm}}$ 为规范化长度，$D_{\text{term}}$ 为术语密度，$R_{\text{unique}}$ 为唯一词比率，$D_{\text{def}}$ 为定义得分，$R_{\text{mojibake}}$ 为乱码比率。
-
-**ConceptQualityPolicy** 决策空间为 `accept` / `reject`：
-
-$$
-S_{\text{concept}} = \max\Bigl(S_{\text{specificity}},\; 0.35 D_{\text{def}} + 0.25 D_{\text{term}} + 0.20 D_{\text{entity}}\Bigr) - 0.35 S_{\text{structural}} - 0.25 G_{\text{genericity}}
-$$
-
-准入条件：无硬拒绝理由（过短、乱码、路径名、结构容器、低特异性、证据不足），且得分 $S_{\text{concept}}$ ≥ 0.45。
-
-**RelationQualityPolicy** 决策空间为 `accept` / `candidate_only`：
-
-$$
-S_{\text{relation}} = 0.40 \cdot c + 0.25 \cdot \mathbf{1}_{\text{src}} + 0.25 \cdot \mathbf{1}_{\text{tgt}} + 0.10 \cdot \min\Bigl(1, \frac{n_{\text{support}}}{3}\Bigr)
-$$
-
-其中 *c* 为 LLM 置信度，$\mathbf{1}_{\text{src}}$ / $\mathbf{1}_{\text{tgt}}$ 为证据文本中是否出现源/目标概念。`inferred` 或 `related_to` 类型关系强制降级为 `candidate_only`。
-
-> **设计意图（为什么这么做）**：传统的 RAG/GraphRAG 系统往往在建图前只做粗粒度过滤，导致大量目录页、乱码、重复提取噪声进入向量库和知识图谱。SymboGraph 的分级质量路由让不同类型的内容去它该去的地方——噪声被丢弃、结构标签只做摘要、高语义密度块参与图谱、普通块负责检索——从数据源头上保证下游质量。
-
-### 3. 画像层（Domain Quality Profile）
-
-画像层为每个知识库构建自适应的质量基线：
-
-1. **分层采样**：按 `(content_kind, chapter)` 做分层，从每层抽取短/中/长样本，确保覆盖度
-2. **正样本**：高定义得分或高术语密度的 chunk，作为领域"好内容"示例
-3. **负样本**：目录页、乱码页、高结构分的 chunk，作为领域"噪声"示例
-4. **领域术语**：采样中出现频率最高的 40 个长词，用于后续概念特异性计算
-5. **关系 Schema 提示**：预定义 13 种允许的关系类型（`is_a`、`part_of`、`prerequisite_of`、`used_for`、`causes`、`derives_from`、`compares_with`、`example_of`、`defined_by`、`formula_of`、`solves`、`implemented_by`、`related_to`）
-
-画像数据保存在 `quality_profiles` 表，版本化并通过 SHA256 哈希校验完整性。画像在图谱构建和 LLM 裁判时被引用，使质量判断具备领域上下文。
-
-> **设计意图（为什么这么做）**：全局统一的硬阈值完全无法适配不同垂直学科（如医学文献 vs 软件代码）的特异性。画像层通过在导入之初进行自适应分层采样和正负样本提取，动态沉淀出当前知识库的“特有术语基线”和结构特征。这为后续的概念抽准率与关系过滤构筑了因地制宜的领域上下文，彻底摆脱了全局魔法数字的粗暴判断。
-
-### 4. 裁判层（Quality Judge）
-
-裁判层是可选的 LLM-as-judge 增强：
-
-- 接收策略层的候选对象 + 领域画像，让 LLM 输出 `accept` / `reject` / `candidate_only` / `defer`
-- 缓存 key 绑定 `(course_id, profile_version, target_type, model, candidate_hash)`，命中 Redis 时直接返回缓存结果
-- LLM 不可用时降级为 `defer`，完全回退到规则策略层，保证系统可用性
-
-> **设计意图（为什么这么做）**：规则策略层快且稳定，但面对复杂领域边界案例时不够灵活。LLM 裁判作为"慢思考"补充，只在规则层无法决断时介入；同时通过 Redis 缓存避免重复调用。这种"规则为主、LLM 为辅、缓存兜底"的三层架构兼顾了延迟、成本和准确性。
-
-## 图谱构建
-
-SymboGraph 的图谱生成不是单一的 KNN 或 LLM 抽取流程，而是一条 evidence-first 的多阶段构图流水线。LLM 负责发现候选实体和显式语义关系，质量门禁负责事实约束，向量相似图负责提供可控的语义候选，传统图算法负责结构分析，LLM 证据补全和 Dijkstra 推断只在受控边界内修补局部结构。PostgreSQL 是概念、关系和生命周期状态的事实源；Qdrant 只提供 chunk 向量与相似度信号，不能单独决定事实关系。
-
-本次更新引入了**自适应最佳优先 chunk 选择**、**TPE 自动超参优化**和**增量图谱更新**三大能力：
-- **自适应最佳优先**：根据文档覆盖、章节覆盖、段落覆盖、内容类型覆盖、embedding 簇代理覆盖和低频术语覆盖六维信号，动态选择最具信息增益的 chunks 进行 LLM 抽取，避免对所有 chunks 做无差别调用。
-- **TPE 超参优化**：重建前可选运行 Auto HPO，用 Optuna 的 `TPESampler` 在 30 轮 trial 中自动搜索最优的 Dijkstra 语义阈值、关系置信度阈值和图算法权重组合。
-- **增量更新**：仅对变更文档关联的图谱局部重算，保留未变更文档的概念和关系，大幅降低更新成本。
-
-> **设计意图（为什么这么做）**：传统 GraphRAG 极度依赖无约束的 LLM 全量实体/关系抽取，不仅带来了灾难性的 API 调用开销，还会引入海量的低频噪声和事实污染。本系统基于“证据优先（Evidence-First）”原则，将图谱完全定位为可审计文本块的关联骨架，拒绝生成缺少原文支持的虚空关系；同时运用严谨的图论清洗对冲模型幻觉，实现图级结构可控与成本精细化管理。
-
-```mermaid
-flowchart TB
-    CHUNK["Active child chunks<br/>通过 ChunkQualityPolicy"] --> VEC["Qdrant chunk vectors<br/>派生向量信号"]
-    CHUNK --> LLM["LLM 抽取<br/>候选实体 + 显式关系"]
-
-    LLM --> MERGE["Concept merge<br/>规范名、别名、去重、章节引用"]
-    MERGE --> CONCEPT_GATE["ConceptQualityPolicy<br/>实体质量过滤"]
-    CONCEPT_GATE --> UPSERT["Upsert graph candidates<br/>concepts、relations、evidence（含 hard gate）"]
-
-    VEC --> CENTROID["Concept vector centroid<br/>证据 chunk 向量质心 + L2 归一化"]
-    UPSERT --> CENTROID
-    CENTROID --> SPARSE["Semantic sparse candidates<br/>动态 KNN + 语义阈值 + 互近邻/反向入边配额"]
-    SPARSE --> CANDIDATE["GraphRelationCandidate<br/>candidate_only，不直接当事实边"]
-
-    UPSERT --> EXPLICIT["Verified explicit relations<br/>有证据支撑的事实边"]
-    CANDIDATE --> GRAPH["Verified graph + candidates<br/>中心性/社区分析输入"]
-    EXPLICIT --> GRAPH
-
-    UPSERT --> HPO["Auto HPO（可选）<br/>基于 probe chunks 的 TPE 优化"]
-    GRAPH --> ENRICH["enrich_course_graph<br/>build_sparse_edges → analyze → complete → dijkstra → final analyze"]
-    HPO --> ENRICH
-    ENRICH --> COMMUNITY["Community summaries<br/>rebuild_graph_community_summaries"]
-    ENRICH --> PG["PostgreSQL graph tables<br/>概念、验证关系、候选关系、指标"]
-
-    PG --> RETRIEVAL["Evidence-first retrieval<br/>只沿可审计证据扩展"]
-    PG --> UI["Community-aware graph UI"]
+```powershell
+docker compose -f infra/docker-compose.yml up --build
 ```
 
-### 0. 自适应最佳优先 Chunk 选择（Adaptive Best-First）
-
-在 LLM 抽取之前，系统不会盲目对所有 active chunks 调用模型，而是构建一个**自适应抽取计划**，按信息增益优先选择 chunks：
-
-$$
-\Delta_{\text{cov}}(c) = \sum_{d \in \text{new}(c)} w_d + \sum_{h \in \text{new}(c)} w_h + \sum_{s \in \text{new}(c)} w_s + \sum_{k \in \text{new}(c)} w_k + \sum_{e \in \text{new}(c)} w_e + \sum_{t \in \text{new}(c)} w_t
-$$
-
-其中 $\text{new}(c)$ 表示加入 chunk $c$ 后新覆盖的文档、章节、段落、内容类型、embedding 簇代理和低频术语。各维度权重为：
-
-| 维度 | 权重 | 说明 |
-|------|------|------|
-| 文档覆盖 | $0.18$ | 新文档首次被覆盖 |
-| 章节覆盖 | $0.16$ | 新章节首次被覆盖 |
-| 段落覆盖 | $0.10$ | 新段落首次被覆盖 |
-| 内容类型覆盖 | $0.08$ | 新内容类型首次被覆盖 |
-| Embedding 簇代理 | $0.12$ | 新簇首次被覆盖 |
-| 低频术语覆盖 | $\min(0.18, 0.015 \cdot n_{\text{rare}})$ | 新稀有术语数量加权 |
-| 图谱缺口填补 | $0.08$ | 当前图谱缺失该 chunk 关联概念时额外奖励 |
-
-选择采用**贪心最佳优先**策略，每次从未选 chunks 中挑选 $\Delta_{\text{cov}}$ 最大者，直到满足以下任一停止条件：
-- 累积覆盖率超过阈值（默认 $0.85$）
-- 边际增益 $\Delta_{\text{cov}} < 0.03$
-- 达到软启动预算（`GRAPH_EXTRACTION_SOFT_START_BUDGET`）或模型调用上限（`GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN`）
-- 所有 chunks 已选
-
-被选中的 chunks 进入 LLM 图谱抽取，其余 chunks 仍保留在向量库和检索系统中，但不消耗模型调用预算。
-
-> **设计意图（为什么这么做）**：在大规模文本上进行全量 LLM 抽取在商用场景中性价比极低。自适应最佳优先选择从信息增益的六个维度（文档、章节、段落、内容类型、语义簇、稀有术语）对 chunks 进行贪心覆盖排序。它只选择最具信息密度和图谱增益的“骨架块”进行昂贵的 LLM 抽取，在保留 85% 以上图谱宏观信息结构的同时，能暴降 60% 以上的模型调用预算。
-
-### 1. 实体与证据
-
-每个概念保留规范名、别名、章节引用、重要度、证据 chunk 数和质量审计信息。概念向量不是由概念名直接生成，而是由支撑该概念的证据 chunk 向量求质心，再做 L2 归一化：
-
-$$
-\bar{\mathbf{x}}_i = \frac{1}{|C_i|}\sum_{c \in C_i}\mathbf{z}_c,\qquad
-\mathbf{x}_i = \frac{\bar{\mathbf{x}}_i}{\lVert \bar{\mathbf{x}}_i\rVert_2}
-$$
-
-其中 $C_i$ 是支撑概念 *i* 的 active child chunks，$\mathbf{z}_c$ 是 chunk embedding。这样做的目标是让概念向量忠实于本地课程材料，而不是偏向 LLM 对概念名的通用预训练语义。
-
-> **设计意图（为什么这么做）**：由概念名直接生成的向量容易陷入通用的维基百科百科式定义，缺乏特定课程/领域上下文，甚至在检索时产生严重的概念漂移（Concept Drift）。采用实体支撑 chunks 的向量质心作为实体表示，能让概念的高维表征忠实地锚定在本地实际讲义语境中，使实体级别的相似性度量具备极高的垂直专业针对性。
-
-### 2. LLM 显式关系与质量门禁
-
-LLM 抽取出的关系不是直接入图。系统先检查关系类型 allowlist、端点是否存在、是否自环、置信度、support count、evidence chunk、端点名称是否能在证据文本中匹配，以及候选关系是否由允许的来源产生。只有通过质量门禁的关系才进入验证图，成为后续中心性、社区发现和检索路径规划的事实边。
-
-质量门禁的职责是约束事实性：LLM 负责“提出可能关系”，门禁负责“确认这条关系是否能被课程资料支持”。这也是图谱避免静默污染的关键边界。
-
-> **设计意图（为什么这么做）**：LLM 抽取的语义关系常常存在大量过度泛化（如无端声称 `A related_to B`）以及由于断章取义产生的虚假事实。通过强加类型白名单、自环阻断、实体/边在支撑原文中的严格字面重合检查以及置信度硬过滤，将幻觉关系在建图前直接阻击在门外，确保图的每一条显式事实边都具备物理级别的严格可审计性。
-
-### 3. 动态 KNN + 语义阈值 + 互近邻/反向入边配额稀疏构图
-
-这里不是标准 Radius-NN（按固定半径或距离阈值直接入选）的构图。当前实现先按动态 KNN 和语义相似度阈值生成候选，再保留互为近邻或通过反向入边配额的候选。该层的定位是“语义候选边筛选和规模控制”，不是最终事实关系判定。
-
-每个概念按证据量动态决定发出候选边数量：
-
-$$
-K_i = \mathrm{clamp}\bigl(4 + \lfloor \log_2(1 + m_i) \rfloor,\, 4,\, 12\bigr)
-$$
-
-每个概念按章节覆盖动态限制可接受的反向入边配额：
-
-$$
-B_i = \mathrm{clamp}\bigl(2 + \lfloor \log_2(1 + r_i) \rfloor,\, 2,\, 8\bigr)
-$$
-
-$m_i$ 是证据 chunk 数，$r_i$ 是章节引用数。系统保留互为近邻、通过反向入边配额 $B_i$ 的近邻，以及高置信 LLM 显式关系，从而让边数随节点数近线性增长。
-
-纯语义候选边会标记为 `relation_source="semantic_sparse"` 和 `candidate_only=true`。它们可以作为补边线索、审计对象或后续验证材料，但默认不会进入中心性和社区计算图，避免相似度噪声放大成事实结构。
-
-> **设计意图（为什么这么做）**：传统的 KNN 极易产生枢纽节点（Hubness Problem），即某些高频语义概念成为吞噬所有连边、破坏图局部特异性的“连接怪兽”。通过基于证据量和章节覆盖度动态分配出边配额 $K_i$ 与反向入边上限 $B_i$，并强制互近邻约束，使得节点间的语义相似度连边具备双向对等约束。这在确保图的边数随节点规模呈近线性增长的同时，彻底消除连边垄断，完美凸显局部小世界的知识社区微观结构。
-
-### 4. 边权、结构分析与剪枝
-
-边权由证据支持、关系置信度、语义相似度、共现强度和章节结构一致性组合：
-
-$$
-w_{ij}=
-0.30\,s_{ij}^{\mathrm{evidence}}
-+0.25\,c_{ij}^{\mathrm{relation}}
-+0.20\,s_{ij}^{\mathrm{sem}}
-+0.15\,s_{ij}^{\mathrm{cooccur}}
-+0.10\,s_{ij}^{\mathrm{structure}}
-$$
-
-最终 $w_{ij}$ 裁剪到 [0,1]。验证图上执行：
-
-- 连通分量分析：识别孤立结构、噪声节点和主要知识簇。
-- Louvain 社区发现：用于主社区标记和前端颜色分组。
-- 谱聚类：用于大连通分量和大社区的二级结构划分。
-- 中心性：计算 degree、weighted degree、PageRank、betweenness、closeness，并合成 `centrality_score`。
-- 图谱剪枝：优先保留高中心性节点、社区代表节点、跨社区桥接结构和高证据节点。
-
-中心性不是在纯语义候选图上计算，而是在经过证据门禁的验证图上计算；`graph_rank_score` 还会混合概念重要度和证据量，避免单一图拓扑支配排序。
-
-> **设计意图（为什么这么做）**：初始图往往存在大量的弱连接和无用连通分量，在可视化和导航中显得极其杂乱无序。通过融合支持度、置信度、相似度、共现率和结构特征五种信号来精细刻画边权，并结合 Louvain 社区分类与谱聚类降维剪枝，优先留存高中心度与跨界桥梁结构，将纷繁复杂的实体网络提炼成高可读、主干清晰且无冗余毛刺的结构化知识导引图。
-
-### 5. LLM 关系补全与 Dijkstra 隐式关系
-
-结构分析完成后，系统会挑选高 `graph_rank_score` 节点的局部邻域，收集相关 evidence snippets，让 LLM 只基于这些证据做关系补全。补全结果仍要回到同一套 `RelationQualityPolicy + hard gate`，不能绕过质量门禁直接入图。
-
-Dijkstra 在非负代价图上发现 2-3 跳隐式结构线索：
-
-$$
-\mathrm{cost}_{ij}=\frac{1}{0.05+w_{ij}}
-$$
-
-当端点语义相似度足够高且路径代价足够低时，系统可写入 `relation_source="dijkstra_inferred"` 的推断边。推断边用于导航、审计和候选补全，不应被视为无条件事实；回答仍必须回到原文 chunk 证据。
-
-> **设计意图（为什么这么做）**：知识图谱极易因一次性提取的局限而产生结构断层或孤岛。通过挑选高 Rank 节点的语义局部邻域触发定向 LLM 补全，并在非负代价图上利用 Dijkstra 算法在 2-3 跳内探测潜在的隐式关联（如前置知识推荐路径），让图谱具备在逻辑链条上的隐式推断与平滑导航能力，解决了局部图谱碎片化和“灯下黑”问题。
-
-### 6. TPE 自动超参优化（Auto HPO）
-
-当 `ENABLE_AUTO_HPO=true` 时，系统在**全量重建**前自动运行超参寻优。HPO 不直接在全量图谱上 trial（成本过高），而是基于少量 **probe chunks**（默认 5 个）的预抽取结果构建代理评估：
-
-**Phase 1 — 候选生成与特征提取**：
-从多组种子超参（保守型、激进型、均衡型及随机插值）中生成候选参数空间，对每组参数用预抽取的 probe payloads 构建 mock 图谱，提取以下特征：
-- 图规模特征：节点数、边数、连通分量数、平均度
-- 结构质量特征：社区模块化度、聚类系数、中心性分布熵
-- 语义特征：Dijkstra 推断边占比、LLM 显式关系占比、语义稀疏边占比
-- 硬约束检查：孤立节点过多、边数爆炸、社区退化等
-
-**Phase 2 — 成对裁判（Pairwise Judge）**：
-让 LLM 作为裁判对候选参数做成对比较（A vs B），输出 `winner`、`confidence` 和 `reasons`。系统收集至少 `HPO_JUDGE_MIN_LABELS`（默认 6）个有效标签后，训练一个**裁判学习代理目标函数**（judge-learned surrogate objective）：
-
-$$
-\mathcal{L}(\mathbf{f}, \mathbf{w}, b) = \sum_{(i,j) \in \mathcal{P}} \mathbb{1}[\hat{y}_{ij} = y_{ij}] \cdot \max(0, \; |s_i - s_j| - \epsilon)
-$$
-
-其中 $\mathcal{P}$ 是裁判标记的候选对集合，$\mathbf{f}$ 是特征向量，$\mathbf{w}$ 是学习权重，$s_i = \mathbf{w}^\top \mathbf{f}_i + b$ 是候选得分。代理目标函数把高维特征映射为标量质量分，使得后续 TPE 只需优化一个标量目标。
-
-**Phase 3 — TPE 迭代优化**：
-使用 Optuna 的 `TPESampler`（Tree-structured Parzen Estimator）在 30 轮 trial 中最大化代理目标函数：
-
-$$
-\theta^{\ast} = \arg\max_{\theta \in \Theta} \; g_{\text{surrogate}}(\theta; \mathcal{D}_{\text{probe}})
-$$
-
-其中 $\theta$ 是 11 维超参向量：
-
-| 超参 | 搜索范围 | 默认值 | 说明 |
-|------|----------|--------|------|
-| `min_relation_confidence` | $[0.50, 0.85]$ | $0.62$ | 关系最低置信度 |
-| `min_accepted_relation_weight` | $[0.45, 0.78]$ | $0.56$ | 关系最小接受权重 |
-| `dijkstra_semantic_threshold` | $[0.65, 0.88]$ | $0.74$ | Dijkstra 推断语义阈值 |
-| `w_pagerank` | $[0.05, 0.50]$ | $0.20$ | PageRank 权重 |
-| `w_betweenness` | $[0.05, 0.50]$ | $0.20$ | Betweenness 权重 |
-| `w_degree` | $[0.05, 0.50]$ | $0.25$ | Degree 权重 |
-| `w_weighted_degree` | $[0.05, 0.50]$ | $0.25$ | Weighted degree 权重 |
-| `w_closeness` | $[0.05, 0.30]$ | $0.10$ | Closeness 权重 |
-| `w_centrality` | $[0.10, 0.80]$ | $0.50$ | 综合中心性权重 |
-| `w_llm_importance` | $[0.05, 0.60]$ | $0.25$ | LLM 重要度权重 |
-| `w_evidence` | $[0.05, 0.60]$ | $0.25$ | 证据量权重 |
-
-最优参数持久化到 `course_model_hyperparameters` 表，并在全量重建时注入 `GraphHyperparameters`。如果 HPO 失败，系统回退到上次成功参数或默认值。
-
-> **设计意图（为什么这么做）**：图算法中的各种权重（如 PageRank 权重、Dijkstra 阈值）在不同垂直课程资料中有着极强的敏感性，人工调参（Grid Search）不仅成本极高且难得最优。Auto HPO 机制通过轻量级的 probe chunks 快速构建局部的代理模拟环境，让 LLM 裁判对不同超参构图结果进行成对博弈，利用代理目标函数拟合高维表现，最终通过 TPE 算法在 30 代内自适应进化出对当前知识库最契合的图超参组合，实现了算法级的自适应免人工调优。
-
-### 7. 增量图谱更新
-
-对于知识库的局部变更（如修改或删除少量文档），系统支持**增量图谱更新**，避免无必要全量重建：
-
-1. **变更检测**：对比变更文档的 chunks 与当前图谱证据，识别受影响的 concepts 和 relations。
-2. **局部清理**：调用 `delete_document_graph_incremental` 删除仅由变更文档支撑的概念、别名和关系；保留其他文档支撑的概念和关系不受影响。
-3. **局部重抽**：对变更文档的 active chunks 运行自适应最佳优先选择和 LLM 抽取。
-4. **局部重算**：运行图算法（社区、中心性）时仅重算受影响的子图，未受影响的节点和边保持原有指标。
-5. **事务一致性**：所有清理和重抽操作在显式事务中完成，失败时回滚，保证图谱不会处于半删除状态。
-
-增量更新的时间复杂度与变更文档数量成正比，而非与全库 chunks 数成正比。当变更文档过多或首次构建时，系统会自动回退到全量重建。
-
-> **设计意图（为什么这么做）**：在工业知识库中，用户会频繁地对少量文档进行增删改。如果每次变更都要求对成千上万个块运行全量图谱重建，计算代价和 LLM 吞吐将不可承受。增量更新通过精确计算受影响的 concepts 和 relations 进行局部级联清理，并在强数据库事务的保护下只对受影响的子图执行自适应抽取与重算，将更新时间复杂度从 $O(N)$ 降到 $O(M)$（$M \ll N$），极大地保证了系统的工业级可用性。
-
-### 8. 协作边界与注意事项
-
-这套架构的核心不是让某个算法单独决定图谱，而是让多种信号互相制衡：
-
-- LLM 负责发现候选语义，但必须接受 evidence-first 约束。
-- 质量门禁负责阻止幻觉、弱证据关系和不可信关系类型进入验证图。
-- 动态 KNN 稀疏构图负责控制语义候选规模，降低 hubness 和毛线球风险。
-- 图算法负责社区、中心性、桥接结构和剪枝，但不能替代证据。
-- LLM 补全和 Dijkstra 推断只做局部修补和导航线索，不能绕过验证流程。
-
-局限和课程资料约束也必须明确：
-
-- 图谱只表达本地课程资料中可被 evidence chunk 支撑的知识，不保证覆盖通用百科知识。
-- 课程资料如果章节混乱、OCR 错误、chunk 过短、重复文件过多或概念抽取质量差，图谱质量会随之下降。
-- 动态 KNN 仍偏向局部语义密集区域，跨章节桥接概念可能被漏召回，需要依赖 LLM 显式关系、证据补全和检索路径校正弥补。
-- 中心性会放大已进入验证图的错误边，因此关系门禁、候选边隔离和回归测试必须保持严格。
-- `semantic_sparse` 和 `dijkstra_inferred` 边不能直接作为答案依据；用户可见答案必须引用原文 chunk。
-- 换 embedding 模型、chunk 策略或关系抽取 prompt 后，需要重新校准相似度阈值、质量门禁和图谱质量指标。
-
-前端图展示按 Louvain 社区着色，节点大小反映中心性和图谱排序，虚线边表示 inferred 关系。用户可以筛选社区并快速打开关键实体详情，但图谱视图应被理解为“课程证据导航图”，不是不带证据的权威本体库。
-
-> **设计意图（为什么这么做）**：这套架构的核心不是让某个算法单独决定图谱，而是让多种信号互相制衡以达到最稳健的事实一致性。我们明确划定了人机协作与算法监督的清晰边界——模型负责“发现可能”，规则和事实约束负责“审查准入”；同时将语义相似度限制为线索边以控制 Hubness 毛线球效应，将中心度指标限制在经验验证的子图内以防噪声泛滥，多边制衡对冲单点不确定性，构筑高鲁棒的知识生产护城河。
-
-## 检索与问答
-
-SymboGraph 的问答链路采用 **Perception → Retrieval Planning → Base Retrieval → Evidence Navigation → EvidenceEvaluator → Generation** 的 evidence-first Agent 架构，以 LangGraph 编排。所有节点写入 `agent_trace_events`，前端通过 SSE 实时展示运行轨迹。
-
-> **设计意图（为什么这么做）**：传统的 QA 检索极度依赖单一的 Dense Similarity 相似度匹配，这在复杂多段推导和领域知识关联上极易导致“答非所问”。通过引入基于 LangGraph 编排的感知与规划双通道架构，先意图分类与图谱概念对齐，再根据问题意图自适应选择混合检索、图谱漫游或社区摘要路线，将 RAG 从机械的文本拼接升级为认知层面的智能体证据链组织，全面保障了回答的证据链饱满度和跨语种鲁棒性。
-
-```mermaid
-flowchart LR
-    Q["问题"] --> PER["Perception<br/>意图识别 · 实体抽取 · 图概念匹配"]
-    PER -->|"greeting / clarify"| AG["AnswerGenerator"]
-    PER -->|"需要检索"| PLAN["RetrievalPlanner<br/>evidence-first 参数 · 跨语言翻译 · 查询扩展"]
-    PLAN --> BASE["BaseRetrieval<br/>dense + BM25 + fusion + rerank"]
-    BASE --> ANCHOR["EvidenceAnchorSelector<br/>可靠 chunk / concept 锚点"]
-    ANCHOR --> PATH["EvidenceChainPlanner<br/>verified edges / community routing"]
-    PATH --> GRAPH["ControlledGraphEnhancer<br/>仅沿规划路径收集证据"]
-    GRAPH --> ASSEMBLE["EvidenceAssembler<br/>base + anchor + graph evidence"]
-    ASSEMBLE --> GRADE["DocumentGrader<br/>0.4·overlap + 0.6·embedding_sim"]
-    GRADE --> EVAL["EvidenceEvaluator<br/>前置证据充分性评估"]
-    EVAL -->|"不充分 + retry<2"| PLAN
-    EVAL -->|"充分 / 不充分+retry≥2"| CS["ContextSynthesizer"]
-    CS --> AG
-    AG --> CC["CitationChecker"]
-    CC --> CV["CitationVerifier"]
-    CV --> REFL["Reflection<br/>后生成反思（默认关闭）"]
-    REFL --> AC["AnswerCorrector"]
-    AC --> CS
-```
-
-### Perception（感知层）
-
-Perception 节点负责理解用户意图、抽取实体并在知识库图谱中匹配相关概念：
-
-1. **Fast-path**：问候语直接路由到 `direct_answer`；空查询或指代消解路由到 `clarify`。
-2. **LLM 感知**：调用 ChatProvider 分析意图（`definition` / `comparison` / `analysis` / `application` / `procedure` 等），抽取实体列表和子查询。
-3. **图概念匹配**：将抽取的实体与 `concepts` 表和 `concept_aliases` 表做规范化匹配，获取匹配概念的社区标签和一阶邻居关系。
-
-Perception 输出包含：
-
-- `intent`：问题类型
-- `entities` / `matched_concepts`：提取实体与图谱匹配结果
-- `perceived_communities`：相关社区 ID 集合
-- `suggested_strategy`：建议 evidence-first 路由（`base_retrieval`、`evidence_chain`、`community`）
-- `needs_graph`：是否需要图谱增强
-
-> **设计意图（为什么这么做）**：直接拿用户输入的问题进行检索是鲁莽的，因为用户的提问方式可能非常口语化、含糊不清或包含了复杂的交叉学科实体。Perception 节点在检索前充当智能体的“眼睛和耳朵”，剥离语义噪音，抽提实体并直接投射到已建立的知识图谱中，通过概念规范名和别名对齐获取实体所在的 Louvain 社区，为后续的检索路径选择与检索规划提供了最清晰的战场态势认知。
-
-### RetrievalPlanner（规划层）
-
-规划层根据 Perception 输出配置 evidence-first 检索参数，并执行跨语言查询翻译：
-
-**策略选择规则：**
-
-| 意图                               | 条件                   | evidence-first 参数                             |
-| ---------------------------------- | ---------------------- | ----------------------------------------------- |
-| `definition` / `formula`           | `needs_graph=false`    | 只走基础召回和证据评估                          |
-| `comparison` 或 `needs_graph=true` | —                      | 基础召回后启用 verified edge 路径规划           |
-| `application` / `procedure`        | 有匹配概念             | 允许最多 3 hop 的受控证据链规划                 |
-| `analysis`                         | 匹配社区或 broad query | 社区摘要只做 routing hint，答案仍引用原文 chunk |
-
-**跨语言翻译扩展**：
-
-系统检测查询语言（中/英），通过 LLM 翻译为对侧语言：
-
-$$
-Q_{\mathrm{bilingual}} = \{q_{\mathrm{original}},\; q_{\mathrm{translated}}\} \cup Q_{\mathrm{sub}}
-$$
-
-子查询去重后全部进入 BaseRetrieval。这让中文查询（如"最大流"）也能通过英文翻译（"max flow"）命中英文知识库材料中的 BM25 词面匹配。
-
-> **设计意图（为什么这么做）**：多语言 Embedding 模型在跨语言对齐上常常表现不佳。通过显式的查询翻译并入双语子查询，使得后续检索可以通过多种语言形态并行探测文档库，这是比单纯依赖 Embedding 模型底层对齐更鲁棒的工程解法。
-
-### Evidence-first 检索执行层
-
-执行层固定先召回文本证据，再用图谱做导航：
-
-| 阶段     | 后端/节点                                                  | 说明                                                     |
-| -------- | ---------------------------------------------------------- | -------------------------------------------------------- |
-| 基础召回 | `hybrid_search_chunks` / `hybrid_search_chunks_with_audit` | dense + BM25 混合召回、融合、精排                        |
-| 锚点选择 | `select_evidence_anchors`                                  | 从基础召回结果中选择可靠 anchor chunks / anchor concepts |
-| 路径规划 | `plan_evidence_chains`                                     | 只使用 verified graph edges；社区摘要仅用于 routing hint |
-| 受控增强 | `controlled_graph_enhancement`                             | 只沿规划路径收集 evidence chunks，不做全邻居扩展         |
-| 证据装配 | `assemble_evidence_documents`                              | 合并基础证据、锚点证据和图路径证据                       |
-
-所有策略都遵循 **Small-to-Big** 原则：召回最小粒度单元（child chunks，或没有 child 的 parent chunks 自身），避免 parent/child 在同一候选池竞争，最终通过 `parent_chunk_id` 装配 parent context。
-
-> **设计意图（为什么这么做）**：绝不为了迎合高大上的图概念而编造虚幻事实。系统强制遵循“召回文本在先，图谱增强在后”的硬性铁律。即使启用了图谱，图里的所有边和社区摘要也只用于在已验证事实内做导航和路径补全，坚决防止虚空的概念节点直接污染生成上下文。这在机制上确保了任何一句大模型回答都有确凿的 child chunk 物理引用出处。
-
-### DocumentGrader（文档评分层）
-
-对召回文档做准入评分，融合词面重叠与向量语义相似度：
-
-$$
-\mathrm{grade\_score} = 0.40 \cdot r_{\mathrm{overlap}} + 0.60 \cdot s_{\mathrm{embedding}}
-$$
-
-其中：
-
-- $r_{\text{overlap}}$ = |$T_q$ ∩ $T_d$| / |$T_q$|，$T_q$ 为查询词集合，$T_d$ 为文档标题+摘要+正文词集合
-- $s_{\text{embedding}}$ 为查询向量与文档向量的余弦相似度；当文档未携带原始向量时，回退到检索阶段记录的 dense score
-
-准入规则（满足任一即可通过）：
-
-$$
-\begin{cases}
-\mathrm{grade\_score} \ge 0.35 & \text{（主通道）} \\
-s_{\mathrm{embedding}} \ge 0.45 & \text{（跨语言桥接通道）} \\
-r_{\mathrm{overlap}} \ge 0.25 \;\land\; \mathrm{original\_score} \ge 0.3 & \text{（辅助通道）}
-\end{cases}
-$$
-
-跨语言桥接通道解决了一个关键问题：中文查询"最大流"与英文材料"max flow"在 `text-embedding-v4` 的向量空间中重叠较弱，但 LLM 翻译后的子查询通过 dense recall 能召回相关 chunk。此时 $r_{\text{overlap}}$ 可能接近 0，但 $s_{\text{embedding}}$ 仍然较高，桥接通道防止这类有效跨语言结果被词面匹配误杀。
-
-> **设计意图（为什么这么做）**：这是一个专为"跨语言墙"设计的破局漏斗。中文查询和英文材料往往字面毫无交集（overlap=0），但高维语义极高。通过设立基于 $s_{\text{embedding}}$ ≥ 0.45 的跨语言桥接豁免通道，巧妙修补了纯词面匹配（BM25）在面对翻译差异时的严重误杀问题。
-
-### EvidenceEvaluator（前置证据评估层）
-
-**在生成答案之前**评估已检索证据是否充分：
-
-对每份 graded document 提取 `grade_score`，计算：
-
-$$
-\bar{g} = \frac{1}{n}\sum_{i=1}^{n} g_i,\qquad g_{\max} = \max_i g_i
-$$
-
-按意图设定最低证据阈值：
-
-$$
-\begin{cases}
-(n_{\min}, \bar{g}_{\min}) = (1,\, 0.25) & \text{if intent} \in \{\text{definition},\, \text{procedure}\} \\
-(n_{\min}, \bar{g}_{\min}) = (2,\, 0.20) & \text{if intent} \in \{\text{comparison},\, \text{analysis}\} \\
-(n_{\min}, \bar{g}_{\min}) = (1,\, 0.20) & \text{otherwise}
-\end{cases}
-$$
-
-充分性判定：
-
-$$
-\mathrm{sufficient} \;\Leftrightarrow\; g_{\max} \ge 0.35 \;\land\; n \ge n_{\min} \;\land\; \bar{g} \ge \bar{g}_{\min}
-$$
-
-若仅有锚点但数量/分数边缘，则标记为 `marginal` 仍允许生成。若证据不充分且 `retry_count < 2`，路由回 `RetrievalPlanner`，`top_k` 翻倍后重新检索；若 `retry_count ≥ 2`，标记 `low_evidence=true` 并进入生成，生成器会在提示中注入免责声明，且不强制引用可能不相关的 chunk。
-
-> **设计意图（为什么这么做）**：这是打破传统 RAG"无论搜出什么垃圾都强行生成"的关键。作为防御性评估层，它赋予了系统"知道自己不知道"的能力。与其放任 LLM 胡编乱造，不如主动拦截低质检索并触发降级免责，这对于专业知识问答的可靠性至关重要。
-
-### 后生成闭环（默认关闭）
-
-`ENABLE_POST_GENERATION_REFLECTION=false`（默认）。后生成节点在启用时执行：
-
-- **CitationVerifier**：对答案中的高重要性陈述抽样做 NLI 验证。
-- **Reflection**：LLM 评估答案是否存在幻觉、覆盖不足或矛盾，返回 `has_issue` / `issue_type` / `suggestion`。
-- **AnswerCorrector**：根据反思结果调整策略（扩大 top_k、改写 query 或保留高置信文档重新生成）。
-
-这些节点在 trace 中可观测，但默认不参与主链路，避免增加延迟和模型调用成本。前置 `EvidenceEvaluator` 已覆盖大多数证据不足场景。
-
-> **设计意图（为什么这么做）**：生成后反思和 NLI 验证是保障学术和企业严肃问答质量的究极兜底手段。虽然它默认关闭以换取极致的极速延迟，但在高特异度和零容错场景中，它能对模型生成的回答进行严格的“反向引文指纹校验”与自我纠偏反思，形成自我闭环纠错，这是构建严肃工业级高可信 RAG 系统的关键工程拼图。
-
-### Evidence-first 图导航
-
-所有问题都先经过基础召回；只有比较、推导、过程或 broad analysis 类问题才在锚点证据之后启用图导航。`semantic_sparse`、`dijkstra_inferred`、`candidate_only` 和缺少 evidence chunk 的关系不会参与默认路径规划。
-
-可缓存的检索结果写入 Redis 时，key 必须绑定 course、query、filters、model、embedding text version 和相关配置；缓存命中仍携带审计信息。
-
-> **设计意图（为什么这么做）**：完全基于语义相似度的图导航会引入大量非事实的相似性干扰，导致图谱变成毛线球。我们严格限制图导航只能沿经过质量门禁审查的 explicit 显式事实边进行多跳探测，并将 semantic_sparse 和 dijkstra_inferred 标记为非事实关联。这在保障检索跳数可控的同时，让智能体在概念关联上的漫游推理具备极高的确定性与事实审计性。
-
-### Small-to-Big 检索
-
-主检索路径只让最小粒度单元进入召回和精排，最终再装配 parent context：
+默认服务：
+
+| 服务 | 默认地址 | 说明 |
+| --- | --- | --- |
+| Web | `http://127.0.0.1:3000` | Next.js UI |
+| API | `http://127.0.0.1:8000/api` | FastAPI |
+| PostgreSQL | `127.0.0.1:5432` | 元数据事实源 |
+| Redis | `127.0.0.1:6379` | 缓存、broker、广播 |
+| Qdrant | `http://127.0.0.1:6333` | active chunk 向量 |
+
+Compose 服务名目前仍是 `course-kg-api`、`course-kg-worker`、`course-kg-web`、`course-kg-postgres`、`course-kg-redis`、`course-kg-qdrant`。不要把这些历史基础设施名当作产品语义。
+
+## 环境参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `APP_NAME` | `KnowledgeBase Knowledge Base API` | API 应用显示名 |
+| `APP_ENV` | `development` | 运行环境标识 |
+| `APP_PORT` | `8000` | API 进程监听端口 |
+| `API_IMAGE` | `course-kg-api:local` | API/worker Docker 镜像名；历史基础设施名，不代表产品语义 |
+| `WEB_IMAGE` | `course-kg-web:local` | Web Docker 镜像名；历史基础设施名，不代表产品语义 |
+| `INGESTION_TASK_QUEUE` | `course-kg-main-ingestion` | Celery 导入队列名；历史基础设施名，不代表产品语义 |
+| `API_HOST_PORT` | `8000` | API 映射到宿主机的端口 |
+| `WEB_HOST_PORT` | `3000` | Web 映射到宿主机的端口 |
+| `DATABASE_URL` | `postgresql+psycopg://postgres:postgres@localhost:5432/symbograph` | PostgreSQL 连接串；默认数据库名为 `symbograph` |
+| `ENABLE_DATABASE_FALLBACK` | `false` | active path 禁用数据库 fallback |
+| `QDRANT_URL` | `http://localhost:6333` | Qdrant 地址 |
+| `QDRANT_COLLECTION` | `knowledge_chunks` | active chunk 向量集合名 |
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis 地址 |
+| `CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | API 允许的前端来源 |
+| `API_KEYS` | 空 | 可选 API key 列表，逗号分隔 |
+| `KNOWLEDGE_BASE_NAME` | `Sample KnowledgeBase` | 默认知识库名称 |
+| `DATA_ROOT` | `./data` | 本地数据根目录 |
+| `STORAGE_ROOT` | `./data/Sample KnowledgeBase/storage`（示例中注释） | 可选源文件存储目录覆盖值 |
+| `INGESTION_ROOT` | `./data/Sample KnowledgeBase/ingestion`（示例中注释） | 可选导入暂存目录覆盖值 |
+| `MODEL_BRIDGE_ENABLED` | `true` | 是否启用本地模型桥 |
+| `MODEL_BRIDGE_PORT` | `8765` | 本地模型桥端口 |
+| `OPENAI_API_KEY` | 空 | OpenAI 兼容接口密钥 |
+| `CHAT_BASE_URL` | 空 | OpenAI 兼容 chat endpoint |
+| `CHAT_RESOLVE_IP` | 空 | 可选 chat endpoint DNS 解析覆盖 IP |
+| `CHAT_MODEL` | `qwen-plus` | chat 模型名 |
+| `EMBEDDING_BASE_URL` | 空 | embedding endpoint；不会回退到 chat endpoint |
+| `EMBEDDING_RESOLVE_IP` | 空 | 可选 embedding endpoint DNS 解析覆盖 IP |
+| `EMBEDDING_API_KEY` | 空 | embedding endpoint 专用密钥 |
+| `EMBEDDING_MODEL` | `text-embedding-v4` | embedding 模型名 |
+| `EMBEDDING_BATCH_SIZE` | `10` | embedding 批大小 |
+| `EMBEDDING_DIMENSIONS` | `1024` | embedding 维度 |
+| `WORKER_CONCURRENCY` | `3` | worker 并发配置 |
+| `INGESTION_FILE_CONCURRENCY` | `3` | 文件导入并发上限 |
+| `MODEL_REQUEST_CONCURRENCY` | `3` | 模型请求并发上限 |
+| `MODEL_REQUEST_TIMEOUT_SECONDS` | `240` | 模型请求超时秒数 |
+| `CHUNK_TOKEN_BUDGET` | `2400` | active chunk token 预算 |
+| `ENABLE_GRAPH_COMMUNITY_SUMMARIES` | `true` | 是否生成社区摘要视图 |
+| `SIGNAL_EXTRACTION_MAX_MODEL_BATCHES` | `4` | signal extraction 模型批次数上限 |
+| `SIGNAL_EXTRACTION_MAX_CANDIDATES_PER_BATCH` | `40` | 单批 signal candidate 数量上限 |
+| `SIGNAL_EXTRACTION_MAX_TOKENS_PER_BATCH` | `6000` | 单批 signal measurement token 预算 |
+| `SIGNAL_CANDIDATE_KEEP_THRESHOLD` | `0.62` | signal candidate 保留阈值 |
+| `COMMUNITY_LOUVAIN_RESOLUTION` | `1.0` | Louvain 社区分辨率 |
+| `COMMUNITY_MIN_MODULARITY_WARN` | `0.18` | 模块度告警阈值 |
+| `GRAPH_OVERVIEW_MAX_NODES` | `260` | 图谱 overview 节点上限 |
+| `GRAPH_OVERVIEW_MAX_EDGES` | `800` | 图谱 overview 边上限 |
+| `ENABLE_MODEL_FALLBACK` | `false` | active path 禁用模型 fallback |
+| `RERANKER_ENABLED` | `false` | 是否启用 reranker |
+| `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | reranker 模型 |
+| `RERANKER_MAX_LENGTH` | `512` | reranker 输入最大长度 |
+| `RERANKER_DEVICE` | `cpu` | reranker 运行设备 |
+| `HF_HUB_OFFLINE` | `1` | HuggingFace Hub 离线模式 |
+| `SEMANTIC_CHUNKING_ENABLED` | `false` | 是否启用语义切块候选 |
+| `SEMANTIC_CHUNKING_MIN_LENGTH` | `2000` | 语义切块最小文本长度 |
+| `RETRIEVAL_LAYER_ENABLED` | `true` | 是否启用检索分层 |
+| `RETRIEVAL_CACHE_TTL_SECONDS` | `120` | 检索缓存 TTL 秒数 |
+| `ENABLE_AGENTIC_REFLECTION` | `true` | 是否启用 Agent 反思 |
+| `ENABLE_POST_GENERATION_REFLECTION` | `false` | 是否启用生成后反思 |
+| `CITATION_VERIFICATION_SAMPLE_MAX` | `3` | 引用核验采样上限 |
+| `REFLECTION_MAX_RETRIES` | `2` | 反思重试上限 |
+
+完整参数列表以根目录 `.env.example` 为准；`apps/api/.env.example` 是 API 本地运行子集。`.env` 应使用 `SIGNAL_EXTRACTION_*` 和 `SIGNAL_CANDIDATE_KEEP_THRESHOLD`。旧 `CONCEPT_PROJECTION_*` / `CONCEPT_KEEP_POSTERIOR_THRESHOLD` 参数名已经废弃，不再作为 active 配置入口。
+
+## 仓库结构
 
 ```text
-最小粒度单元 dense recall + 最小粒度单元 BM25 recall
--> weighted fusion
--> rerank
--> load parent_chunk_id（如有）
--> 最小粒度证据 + parent context（如有）+ citations
+apps/api        FastAPI、SQLAlchemy、Alembic、证据图、检索、问答、运行时设置
+apps/web        Next.js 16.2.4、React 19、本地知识库 UI
+apps/worker     Celery worker 与 watcher，复用 apps/api 服务逻辑
+packages/shared 前后端共享 TypeScript 类型
+infra           Docker Compose 默认运行栈
+scripts         smoke、质量门禁、重嵌入、重解析、策略评估和维护脚本
+docs            架构计划、技术规格、待办说明
+local_light_tests 被 .gitignore 忽略的轻量真实资料库验收脚本
+output          测试报告、截图、benchmark、smoke 输出
+data            本地运行数据，禁止提交
 ```
 
-检索结果携带 `retrieval_granularity=child_with_parent_context`、dense score、BM25 score、融合分数、精排分数、graph boost 和模型审计字段。
+`docs/todo.md` 用于记录后续工程任务；`local_light_tests/` 用于临时真实资料采样，不替代正式回归测试。
 
-> **设计意图（为什么这么做）**：大文本块虽然上下文完整但检索精度（Signal-to-Noise Ratio）极差，小文本块召回精度高却极易断章取义。Small-to-Big 检索通过在 dense + BM25 阶段使用极小的 child chunks 达成无可比拟的超精准捕获，再通过 `parent_chunk_id` 在内存中平滑组装 parent 宏观上下文，用两阶段解耦完美兼顾了检索极高召回率与生成极为饱满的语义上下文。
+## 测试与验收
 
-## 技术优势
-
-| 优势             | 体现                                                                                               |
-| ---------------- | -------------------------------------------------------------------------------------------------- |
-| 证据优先         | 答案、关系和图谱增强都回到真实文本块与 parent context                                              |
-| 上下文与精度兼顾 | child chunk 精确召回，parent chunk 提供完整解释上下文                                              |
-| 图谱结构可控     | 动态 KNN、语义阈值和反向入边配额限制边数，连通分量和社区算法降低噪声                               |
-| 自适应质量系统   | 信号-策略-画像-裁判四级架构，对 chunk/concept/relation 做差异化分级与路由                          |
-| 领域质量画像     | 自动构建知识库特异性基线，让质量判断自适应于不同领域                                               |
-| 文档资料友好     | 保留章节、页码、公式、表格、Notebook cell 和来源类型                                               |
-| 可审计           | 保存 batch/job/log、模型调用、检索分数、fallback 状态和引用                                        |
-| 可恢复           | PostgreSQL 保存生命周期状态，Qdrant / Redis 可从持久记录修复                                       |
-| 无静默降级       | 模型、数据库、Qdrant 不可用时快速失败并给出错误上下文                                              |
-| 可扩展           | 精排、语义切分、图谱增强、超参优化和模型端点通过配置与服务层隔离                                   |
-| Agent 架构清晰   | Perception-Planning-Retrieval-EvidenceEvaluator-Generation 五阶段分离，每层可独立观测与调优        |
-| 跨语言鲁棒       | LLM 翻译查询扩展 + embedding similarity 桥接 + 跨语言准入通道，缓解单语言 embedding 模型的对齐缺陷 |
-
-## 数据模型
-
-```mermaid
-erDiagram
-    Course ||--o{ Document : has
-    Document ||--o{ DocumentVersion : versions
-    DocumentVersion ||--o{ Chunk : chunks
-    Chunk ||--o{ Chunk : children
-    Course ||--o{ Concept : has
-    Concept ||--o{ ConceptAlias : aliases
-    Concept ||--o{ ConceptRelation : source
-    Concept ||--o{ ConceptRelation : target
-    Course ||--o{ IngestionBatch : batches
-    IngestionBatch ||--o{ IngestionJob : jobs
-    StrategyProfile ||--o{ Course : active_profile
-    Course ||--o{ QualityProfile : profiles
-    Course ||--o{ QASession : sessions
-    QASession ||--o{ AgentRun : runs
-    AgentRun ||--o{ AgentTraceEvent : traces
-    Course ||--o{ CourseModelHyperparameter : hyperparameters
-    Course ||--o{ GraphExtractionRun : extraction_runs
-    GraphExtractionRun ||--o{ GraphExtractionChunkTask : tasks
-    Course ||--o{ GraphHpoJudgeSample : hpo_judge_samples
-    Course ||--o{ GraphHpoObjectiveModel : hpo_objective_models
-    Concept ||--o{ EntityMention : mentions
-    Concept ||--o{ EntityMergeCandidate : merge_candidates
-    Concept ||--o{ GraphRelationCandidate : relation_candidates
-    Concept ||--o{ GraphCommunitySummary : community_summaries
-```
-
-| 表                                                  | 作用                                                             |
-| --------------------------------------------------- | ---------------------------------------------------------------- |
-| `courses`                                           | 知识库工作区、当前 chunk 版本和 active Profile 绑定              |
-| `documents` / `document_versions`                   | 文件元数据、版本和解析产物路径                                   |
-| `chunks`                                            | 父子文本块、摘要、关键词、embedding text version 和证据文本      |
-| `concepts`                                          | 概念、章节引用、证据数、社区、中心性和图谱排序                   |
-| `concept_aliases`                                   | 概念别名和规范化别名                                             |
-| `concept_relations`                                 | 稀疏边、关系类型、证据 chunk、权重、语义相似度、支持数和推断来源 |
-| `strategy_profiles`                                 | 资料库 Profile JSON、schema/prompt/策略包、hash、内置与启用状态 |
-| `quality_profiles`                                  | 领域质量画像（版本化、分层采样、正负样本、术语基线）             |
-| `ingestion_batches` / `ingestion_jobs`              | 批量导入与单文件任务                                             |
-| `ingestion_logs` / `ingestion_compensation_logs`    | 事件日志与跨存储补偿记录                                         |
-| `qa_sessions` / `agent_runs` / `agent_trace_events` | 问答会话、智能体运行和可观测轨迹                                 |
-| `course_model_hyperparameters`                      | 课程级 HPO 超参记录（版本化、可审计、可回退）                    |
-| `graph_extraction_runs` / `graph_extraction_chunk_tasks` | 自适应图谱抽取运行状态与 chunk 级任务跟踪                    |
-| `graph_hpo_judge_samples` / `graph_hpo_objective_models` | HPO 裁判样本与代理目标函数模型持久化                            |
-| `entity_mentions` / `entity_merge_candidates`         | 实体提及记录与 LLM 验证的合并候选                                 |
-| `graph_relation_candidates`                           | 语义稀疏图产生的候选关系（非事实边）                              |
-| `graph_community_summaries`                           | 社区摘要文本与社区级聚合指标                                      |
-
-## 配置
-
-复制配置模板：
+常用检查：
 
 ```powershell
-Copy-Item .env.example .env
-```
-
-常用配置：
-
-| 变量                                                                                                         | 说明                                                                        |
-| ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
-| `API_HOST_PORT` / `WEB_HOST_PORT`                                                                            | 宿主机访问端口                                                              |
-| `DATABASE_URL`                                                                                               | PostgreSQL 连接地址                                                         |
-| `ENABLE_DATABASE_FALLBACK`                                                                                   | 数据库降级开关，默认 `false`                                                |
-| `QDRANT_URL` / `QDRANT_COLLECTION`                                                                           | Qdrant 地址和集合名                                                         |
-| `REDIS_URL`                                                                                                  | Redis 地址                                                                  |
-| `COURSE_NAME`                                                                                                | 默认知识库名称                                                              |
-| `DATA_ROOT`                                                                                                  | 本地数据根目录                                                              |
-| `OPENAI_API_KEY` / `CHAT_BASE_URL`                                                                           | OpenAI 兼容 chat / 图谱抽取模型接口                                         |
-| `CHAT_RESOLVE_IP`                                                                                            | 需要固定解析 chat 模型域名时使用的目标 IP                                   |
-| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL`                                                                   | OpenAI 兼容 embedding 模型接口，独立于 chat endpoint                        |
-| `EMBEDDING_RESOLVE_IP`                                                                                       | 需要固定解析 embedding 模型域名时使用的目标 IP                              |
-| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` / `EMBEDDING_BATCH_SIZE`                                          | 向量模型、维度和批大小                                                      |
-| `CHAT_MODEL`                                                                                                 | 对话与图谱抽取模型                                                          |
-| `GRAPH_EXTRACTION_SOFT_START_BUDGET` / `GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN` / `GRAPH_EXTRACTION_CONCURRENCY` / `GRAPH_EXTRACTION_RESUME_BATCH_SIZE` | 自适应图谱抽取预算、模型调用硬上限、并发模型调用数和每批模型抽取 chunk 数 |
-| `WORKER_CONCURRENCY` / `INGESTION_FILE_CONCURRENCY` / `MODEL_REQUEST_CONCURRENCY` / `MODEL_REQUEST_TIMEOUT_SECONDS` / `HPO_CONCURRENCY` | worker、文件解析、模型请求和 HPO 的有界并发与超时控制                      |
-| `ENABLE_MODEL_FALLBACK`                                                                                      | 模型降级开关，默认 `false`                                                  |
-| `RERANKER_ENABLED` / `RERANKER_MODEL` / `RERANKER_MAX_LENGTH`                                                | Cross-Encoder 精排配置                                                      |
-| `SEMANTIC_CHUNKING_ENABLED` / `SEMANTIC_CHUNKING_MIN_LENGTH`                                                 | 语义切分开关和最小文本长度                                                  |
-| `RETRIEVAL_LAYER_ENABLED`                                                                                    | 检索分层开关，默认 `true`                                                   |
-| `RETRIEVAL_CACHE_TTL_SECONDS`                                                                                | Redis 检索缓存 TTL，模板默认 `120`                                          |
-| `ENABLE_AGENTIC_REFLECTION`                                                                                  | Agentic 反思与修正总开关，默认 `true`                                       |
-| `ENABLE_POST_GENERATION_REFLECTION`                                                                          | 后生成反思开关（CitationVerifier/Reflection/AnswerCorrector），默认 `false` |
-| `CITATION_VERIFICATION_SAMPLE_MAX`                                                                           | 每答案引用验证抽样数，默认 `3`                                              |
-| `REFLECTION_MAX_RETRIES`                                                                                     | 反思触发修正的最大重试次数，默认 `2`                                        |
-| `MODEL_BRIDGE_ENABLED` / `MODEL_BRIDGE_PORT`                                                                 | 宿主机模型桥接开关和端口；根配置模板默认开启                                |
-| `ENABLE_AUTO_HPO`                                                                                            | 图谱重建前自动运行 TPE 超参优化；根配置模板默认开启                         |
-| `ENABLE_GRAPH_COMMUNITY_SUMMARIES`                                                                           | 开启后在图谱重建/更新时生成社区摘要                                          |
-| `HPO_JUDGE_MAX_CANDIDATES` / `HPO_JUDGE_MAX_PAIRS` / `HPO_JUDGE_MIN_LABELS`                                  | HPO 裁判候选数、成对比较数、最小有效标签数                                   |
-| `HPO_JUDGE_MAX_TOKENS_PER_PAIR` / `HPO_JUDGE_CONCURRENCY`                                                    | 每对裁判最大 token 数和并发数                                               |
-
-Docker Compose 会在 API 容器内使用服务名覆盖基础设施地址：
-
-```text
-DATABASE_URL=postgresql+psycopg://postgres:postgres@postgres:5432/course_kg
-QDRANT_URL=http://qdrant:6333
-REDIS_URL=redis://redis:6379/0
-```
-
-Embedding 模型与 Chat 模型支持独立端点配置：
-
-```text
-CHAT_BASE_URL=https://api.openai.com/v1
-EMBEDDING_BASE_URL=https://api.openai.com/v1
-```
-
-如果你的 Embedding 提供商与 Chat 提供商不同（例如 embedding 用本地服务、chat 用云端 API），只需分别填写两个端点即可。系统不会将 Embedding 请求 fallback 到 Chat 端点。
-
-如果宿主机可以访问模型供应商，但容器内到模型端点的网络不稳定，可以启用模型桥接。模型桥接只转发真实 OpenAI 兼容接口，不生成假响应，也不是 fallback。
-
-## 运行
-
-1. 配置 `.env`，至少提供真实模型接口：
-
-```env
-OPENAI_API_KEY=...
-CHAT_BASE_URL=https://api.openai.com/v1
-EMBEDDING_BASE_URL=https://api.openai.com/v1
-EMBEDDING_MODEL=text-embedding-v4
-CHAT_MODEL=qwen-plus
-ENABLE_MODEL_FALLBACK=false
-ENABLE_DATABASE_FALLBACK=false
-```
-
-> **模型选择建议**：问答链路中的 Perception、Retrieval Planning、Reflection 等节点均依赖 LLM 输出高质量的结构化结果。建议使用 **强推理模型**（如 kimi-k2.6、o3、DeepSeek-R1 等）作为 `CHAT_MODEL`，其在意图理解、实体提取、自我检查和结构化输出上显著优于通用聊天模型，能大幅提升回答质量并降低整体延迟。
-
-2. 启动 Docker 栈：
-
-```powershell
-docker compose -f infra/docker-compose.yml up -d api worker web postgres redis qdrant
-```
-
-Windows 用户也可以直接双击 `start-app.bat` 一键启动后端、前端和基础设施容器；该脚本**不会**强制重建镜像，适合日常快速启动。
-
-如果应用代码或依赖发生变更，需要重新构建本地镜像，可运行：
-
-```powershell
-docker compose -f infra/docker-compose.yml build api worker web
-```
-
-或在 Windows 下直接运行 `rebuild-images.bat`；如需强制无缓存重建，可执行 `rebuild-images.bat -NoCache`。
-
-3. 打开 Web：
-
-```text
-http://127.0.0.1:3000
-```
-
-## 验证
-
-后端单元测试：
-
-```powershell
-docker exec course-kg-api python -m pytest tests
-```
-
-前端检查：
-
-```powershell
+python -m py_compile apps/api/app/core/config.py
+python -m pytest tests
 npm run typecheck --workspace web
 npm run lint --workspace web
 npm run test --workspace web
-```
-
-Docker smoke：
-
-```powershell
 python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
 ```
 
-知识库质量门禁：
+后端纯单元测试应从 `apps/api` 执行。涉及 PostgreSQL、Qdrant、Redis、模型接口、导入链路、检索或问答时，应在 Docker 栈内验收，并把报告写到 `output/`。
 
-```powershell
-docker exec course-kg-api python /app/scripts/quality_gate.py --course-name "知识库名称"
-```
+## 使用边界
 
-Evidence-first 检索对比评估：
-
-```powershell
-docker exec course-kg-api python /app/scripts/evaluate_evidence_first_retrieval.py --course-name "知识库名称"
-```
-
-质量决策评估：
-
-```powershell
-docker exec course-kg-api python /app/scripts/evaluate_quality_decisions.py --course-name "知识库名称"
-```
-
-重新解析单个知识库并清理过时派生数据：
-
-```powershell
-docker exec course-kg-api python /app/scripts/reingest_all_courses.py --course-name "知识库名称" --cleanup-stale
-```
-
-验收重点：
-
-| 检查项       | 期望                                                                                                                                 |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| 健康状态     | `/api/health` 返回可用服务状态                                                                                                       |
-| 运行时配置   | `/api/settings/runtime-check` 没有阻断项                                                                                             |
-| 模型降级     | `ENABLE_MODEL_FALLBACK=false`，模型不可用时快速失败                                                                                  |
-| 数据库降级   | `ENABLE_DATABASE_FALLBACK=false`，数据库不可用时快速失败                                                                             |
-| 向量健康     | Qdrant 向量数量与 active chunks 对齐，没有零向量                                                                                     |
-| 检索质量     | child recall、parent context、rerank 和 citations 字段完整                                                                           |
-| 图谱质量     | 节点数达到保留下限，边数近线性增长，社区字段、中心性和权重非空；增量更新后图谱结构稳定                                               |
-| 质量系统     | quality_profile 已生成，chunk/concept/relation 的策略决策记录可观测，无大量 discard 误杀                                             |
-| 检索分层     | 不同 query type 命中对应 layer，Redis 缓存命中/失效行为正确                                                                          |
-| Agentic 闭环 | Perception、RetrievalPlanner、EvidenceEvaluator 节点在 trace 中可观测；后生成 Reflection 默认关闭；无 fallback 时 LLM 错误不静默吞掉 |
-| 跨语言检索   | 中英混合查询能命中对侧语言材料，DocumentGrader 桥接通道生效                                                                          |
-| 日志可观测   | ingestion logs 暴露进度、retry、失败原因和 terminal event                                                                            |
-
-## 核心创新点
-
-SymboGraph 在通用 GraphRAG 方向上的核心创新可概括为以下七点：
-
-**1. 四级自适应质量架构**
-区别于传统系统的单一阈值过滤，SymboGraph 建立了信号-策略-画像-裁判四级质量体系。Chunk 不再只有"保留/丢弃"两种命运，而是被路由到 `discard`、`summary_only`、`evidence_only`、`retrieval_candidate`、`graph_candidate`、`embed_only` 六种下游路径；Concept 和 Relation 同样经过差异化策略过滤。领域质量画像让每个知识库拥有自适应的质量基线，而非依赖全局固定阈值。
-
-**2. 概念向量质心化与动态稀疏构图**
-概念向量由其证据 chunk 向量求质心生成，而非由 LLM 提取的概念名直接嵌入，从根本上消除了概念漂移。动态 KNN + 语义阈值 + 互近邻/反向入边配额稀疏构图算法基于证据量 $m_i$ 和章节覆盖 $r_i$ 做候选边收发限制，保证边数随节点数近线性增长，天然抑制 Hubness Problem。
-
-**3. Evidence-first Agentic RAG**
-问答链路不是简单的"检索→生成"，而是 Perception → RetrievalPlanner → BaseRetrieval → EvidenceAnchorSelector → EvidenceChainPlanner → ControlledGraphEnhancer → EvidenceAssembler → DocumentGrader → EvidenceEvaluator → Generation 的完整 Agent 工作流。前置 `EvidenceEvaluator` 赋予系统"知道自己不知道"的能力，在生成前拦截低质检索。
-
-**4. 跨语言鲁棒检索的三重机制**
-LLM 显式翻译扩展生成双语子查询、Embedding Similarity 桥接跨越语言壁垒、DocumentGrader 的 $s_{\text{embedding}}$ ≥ 0.45 跨语言桥接通道豁免词面误杀——三重机制共同构建了一个不依赖单一多语言 Embedding 模型对齐质量的鲁棒检索系统。
-
-**5. Small-to-Big 上下文装配与父子块解耦**
-检索阶段只让最小粒度单元（child chunks）进入 dense/BM25/recall/rerank，避免 parent 和 child 在候选池中竞争；生成阶段再通过 `parent_chunk_id` 装配完整 parent context。这彻底解耦了"召回单元"与"生成单元"，同时兼顾精度与上下文完整性。
-
-**6. 图论算法对冲 LLM 随机性**
-Louvain 社区发现、谱聚类、连通分量消融、多维中心性（degree / PageRank / betweenness / closeness）和 Dijkstra 隐式关系发现共同构成对传统 LLM 抽取噪声的系统性对冲。图谱不是 LLM 输出的被动容器，而是经过严格图论清洗后的稀疏知识骨架。
-
-**7. TPE 自动超参优化与增量更新**
-传统 GraphRAG 系统使用固定超参（阈值、权重）处理所有知识库，无法适应不同领域的语义密度和概念分布差异。SymboGraph 引入 Optuna TPE 自动寻优：基于 probe chunks 预抽取、LLM 成对裁判和代理目标函数，在 30 轮 trial 中自动搜索最优的 Dijkstra 阈值、关系置信度和图算法权重。最优参数版本化持久化，失败时自动回退。同时支持增量图谱更新，仅对变更文档局部重算，避免全量重建的冗余成本。
-
-## 版本库规则
-
-不进入版本库：
-
-- `.env`、本地密钥、Authorization header 或 provider 响应。
-- `data/`、`output/`、`models/`、`comparative_experiment/` 运行数据。
-- `node_modules/`、`.next/`、`dist/`、`build/`、coverage、Playwright 报告。
-- `.db`、`.sqlite*`、`__pycache__/`、`*.pyc`、`*.tsbuildinfo`、日志和临时文件。
-
-应进入版本库：
-
-- `apps/api`、`apps/web`、`packages/shared`、`scripts`、`infra`。
-- README、`.env.example`、Docker 配置、测试、schema 和类型契约。
+- SymboGraph 是通用本地知识库，不把课程、章节、作业、考试等领域语义写成系统真理。
+- Evidence-first 是最高优先级。检索、问答、质量判断、社区摘要和策略奖励必须能回到 document version、source span、evidence atom 或 active chunk。
+- LLM 是测量者和 grounded answer generator，不是默认本体构建器。
+- 社区摘要是派生视图，不能替代引用，也不能成为事实源。
+- 默认禁用 fallback。关键依赖不可用时应快速失败，并给出可行动错误上下文。
+- PostgreSQL 是持久事实源；Qdrant 与 Redis 是派生或运行态存储，必须能从持久记录修复。

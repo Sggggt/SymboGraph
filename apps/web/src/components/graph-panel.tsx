@@ -1,13 +1,13 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { GraphNodeDetail, GraphResponse, GraphType, SemanticEntityType } from "@course-kg/shared";
+import type { GraphResponse } from "@course-kg/shared";
 import { motion } from "framer-motion";
-import { Boxes, ChevronDown, Expand, Lock, Minimize2, RefreshCw, ScanSearch, Unlock } from "lucide-react";
+import { Boxes, ChevronDown, Expand, Lock, Minimize2, RefreshCw, Unlock } from "lucide-react";
 
-import { useCourseContext } from "@/components/course-context";
-import { fetchChapterGraph, fetchDashboard, fetchGraph, fetchGraphNode } from "@/lib/api";
+import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
+import { fetchPartitionGraph, fetchDashboard, fetchGraph } from "@/lib/api";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { NetworkCanvas, type NetworkCanvasHandle } from "@/components/network-canvas";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
@@ -15,12 +15,214 @@ import { useLocalStorage } from "@/hooks/use-local-storage";
 
 
 type SelectedNode = { id: string; category: string } | null;
-const graphTabs: Array<{ type: GraphType; label: string }> = [
-  { type: "semantic", label: "语义KG" },
-  { type: "structural", label: "结构图" },
-  { type: "evidence", label: "证据图" },
-];
-const entityTypes: SemanticEntityType[] = ["concept", "method", "formula", "metric", "algorithm", "definition", "theorem", "problem_type"];
+
+type EvidenceSnippet = {
+  id: string;
+  title: string;
+  text: string;
+  kind: string;
+  page?: number | null;
+  documentVersionId?: string | null;
+};
+
+function stripGraphPrefix(id: string) {
+  const separatorIndex = id.indexOf(":");
+  return separatorIndex >= 0 ? id.slice(separatorIndex + 1) : id;
+}
+
+function idSet(values?: string[]) {
+  return new Set((values ?? []).map((value) => stripGraphPrefix(String(value))));
+}
+
+function communityNumberFromGraphId(id: string) {
+  const tail = id.split(":").at(-1);
+  const parsed = Number(tail);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function dominantSupportCommunity(data: GraphResponse, node: GraphResponse["nodes"][number]) {
+  const supportIds = new Set([...idSet(node.support_atom_ids), ...idSet(node.support_active_chunk_ids)]);
+  if (!supportIds.size) {
+    return null;
+  }
+  const communityCounts = new Map<number, number>();
+  for (const edge of data.edges) {
+    const sourceId = stripGraphPrefix(String(edge.source));
+    const targetId = stripGraphPrefix(String(edge.target));
+    const source = String(edge.source);
+    const target = String(edge.target);
+    if (supportIds.has(sourceId) && target.startsWith("community:")) {
+      const community = communityNumberFromGraphId(target);
+      if (community !== null) {
+        communityCounts.set(community, (communityCounts.get(community) ?? 0) + 1);
+      }
+    }
+    if (supportIds.has(targetId) && source.startsWith("community:")) {
+      const community = communityNumberFromGraphId(source);
+      if (community !== null) {
+        communityCounts.set(community, (communityCounts.get(community) ?? 0) + 1);
+      }
+    }
+  }
+  for (const supportNode of data.nodes) {
+    if (typeof supportNode.community_louvain !== "number") {
+      continue;
+    }
+    if (!supportIds.has(stripGraphPrefix(supportNode.id))) {
+      continue;
+    }
+    communityCounts.set(supportNode.community_louvain, (communityCounts.get(supportNode.community_louvain) ?? 0) + 1);
+  }
+  let bestCommunity: number | null = null;
+  let bestCount = 0;
+  for (const [community, count] of communityCounts.entries()) {
+    if (count > bestCount) {
+      bestCommunity = community;
+      bestCount = count;
+    }
+  }
+  return bestCommunity;
+}
+
+function assignMissingSignalCommunities(nodes: GraphResponse["nodes"], edges: GraphResponse["edges"]) {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const adjacency = new Map<string, Set<string>>();
+  for (const node of nodes) {
+    adjacency.set(node.id, new Set());
+  }
+  for (const edge of edges) {
+    const source = String(edge.source);
+    const target = String(edge.target);
+    if (!byId.has(source) || !byId.has(target)) {
+      continue;
+    }
+    adjacency.get(source)?.add(target);
+    adjacency.get(target)?.add(source);
+  }
+
+  const visited = new Set<string>();
+  let fallbackCommunity = 1000;
+  for (const node of nodes) {
+    if (visited.has(node.id)) {
+      continue;
+    }
+    const component: GraphResponse["nodes"] = [];
+    const queue = [node.id];
+    visited.add(node.id);
+    for (let index = 0; index < queue.length; index += 1) {
+      const current = byId.get(queue[index]);
+      if (current) {
+        component.push(current);
+      }
+      for (const next of adjacency.get(queue[index]) ?? []) {
+        if (!visited.has(next)) {
+          visited.add(next);
+          queue.push(next);
+        }
+      }
+    }
+
+    const communityCounts = new Map<number, number>();
+    for (const item of component) {
+      if (typeof item.community_louvain === "number") {
+        communityCounts.set(item.community_louvain, (communityCounts.get(item.community_louvain) ?? 0) + 1);
+      }
+    }
+    let componentCommunity: number | null = null;
+    let bestCount = 0;
+    for (const [community, count] of communityCounts.entries()) {
+      if (count > bestCount) {
+        componentCommunity = community;
+        bestCount = count;
+      }
+    }
+    if (componentCommunity === null) {
+      componentCommunity = fallbackCommunity;
+      fallbackCommunity += 1;
+    }
+    for (const item of component) {
+      if (typeof item.community_louvain !== "number") {
+        item.community_louvain = componentCommunity;
+      }
+    }
+  }
+  return nodes;
+}
+
+function signalOnlyGraph(data: GraphResponse, signalLayerComplete: boolean): GraphResponse {
+  if (!signalLayerComplete) {
+    return {
+      ...data,
+      nodes: [],
+      edges: [],
+      node_counts: { signal_node: 0 },
+      edge_counts: { signal_projection: 0 },
+    };
+  }
+  const nodesWithSupportCommunity = data.nodes
+    .filter((node) => node.category === "signal_node")
+    .map((node) => ({
+      ...node,
+      community_louvain: typeof node.community_louvain === "number" ? node.community_louvain : dominantSupportCommunity(data, node),
+    }));
+  const keptNodeIds = new Set(nodesWithSupportCommunity.map((node) => node.id));
+  const edges = data.edges.filter((edge) => keptNodeIds.has(String(edge.source)) && keptNodeIds.has(String(edge.target)));
+  const nodes = assignMissingSignalCommunities(nodesWithSupportCommunity, edges);
+  return {
+    ...data,
+    nodes,
+    edges,
+    node_counts: { signal_node: nodes.length },
+    edge_counts: { signal_projection: edges.length },
+  };
+}
+
+function evidenceSnippetsForNode(data: GraphResponse | undefined, node: GraphResponse["nodes"][number] | null): EvidenceSnippet[] {
+  if (!data || !node) {
+    return [];
+  }
+  const supportAtomIds = idSet(node.support_atom_ids);
+  const supportChunkIds = idSet(node.support_active_chunk_ids);
+  const snippets: EvidenceSnippet[] = [];
+  const seen = new Set<string>();
+
+  const ownText = (node.snippet ?? "").trim();
+  if (ownText) {
+    seen.add(ownText);
+    snippets.push({
+      id: node.id,
+      title: node.name,
+      text: ownText,
+      kind: node.entity_type ?? node.category,
+      page: node.page_number,
+      documentVersionId: node.document_version_id,
+    });
+  }
+
+  for (const supportNode of data.nodes) {
+    const normalizedId = stripGraphPrefix(supportNode.id);
+    const isSupportAtom = supportNode.category === "evidence_atom" && supportAtomIds.has(normalizedId);
+    const isSupportChunk = supportNode.category === "active_chunk" && supportChunkIds.has(normalizedId);
+    if (!isSupportAtom && !isSupportChunk) {
+      continue;
+    }
+    const text = (supportNode.snippet ?? "").trim();
+    if (!text || seen.has(text)) {
+      continue;
+    }
+    seen.add(text);
+    snippets.push({
+      id: supportNode.id,
+      title: supportNode.name,
+      text,
+      kind: supportNode.entity_type ?? supportNode.category,
+      page: supportNode.page_number,
+      documentVersionId: supportNode.document_version_id,
+    });
+  }
+
+  return snippets.slice(0, 12);
+}
 
 function GraphStaleBadge({ isStale }: { isStale?: boolean }) {
   if (!isStale) {
@@ -33,58 +235,46 @@ function GraphStaleBadge({ isStale }: { isStale?: boolean }) {
   );
 }
 
-function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | null }) {
-  const storageScope = selectedCourseId ?? "unassigned";
+function GraphPanelContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBaseId: string | null }) {
+  const storageScope = selectedKnowledgeBaseId ?? "unassigned";
   const dashboardQuery = useQuery({
-    queryKey: ["dashboard", selectedCourseId],
-    queryFn: () => fetchDashboard(selectedCourseId),
-    enabled: Boolean(selectedCourseId),
+    queryKey: ["dashboard", selectedKnowledgeBaseId],
+    queryFn: () => fetchDashboard(selectedKnowledgeBaseId),
+    enabled: Boolean(selectedKnowledgeBaseId),
   });
-  const [selectedChapter, setSelectedChapter] = useLocalStorage(`graph.selectedChapter.${storageScope}`, "");
+  const [selectedPartition, setSelectedPartition] = useLocalStorage(`graph.selectedPartition.${storageScope}`, "");
   const [selectedNode, setSelectedNode] = useLocalStorage<SelectedNode>(`graph.selectedNode.${storageScope}`, null);
-  const [detailNodeId, setDetailNodeId] = useLocalStorage<string | null>(`graph.detailNodeId.${storageScope}`, null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isLocked, setIsLocked] = useState(false);
-  const [chapterMenuOpen, setChapterMenuOpen] = useState(false);
-  const [selectedCommunity, setSelectedCommunity] = useState<number | null>(null);
-  const [graphType, setGraphType] = useLocalStorage<GraphType>(`graph.type.${storageScope}`, "semantic");
-  const [selectedEntityType, setSelectedEntityType] = useLocalStorage<SemanticEntityType | "all">(`graph.entityType.${storageScope}`, "all");
+  const [partitionMenuOpen, setPartitionMenuOpen] = useState(false);
+  const graphView: GraphResponse["view"] = "overview";
   const canvasRef = useRef<NetworkCanvasHandle | null>(null);
   const fullscreenRef = useRef<HTMLDivElement | null>(null);
 
   const graphQuery = useQuery({
-    queryKey: ["graph", selectedCourseId, graphType, selectedChapter],
-    queryFn: () => (selectedChapter && graphType !== "structural" ? fetchChapterGraph(selectedChapter, selectedCourseId, graphType) : fetchGraph(selectedCourseId, graphType)),
-    enabled: Boolean(selectedCourseId),
+    queryKey: ["projection-graph", selectedKnowledgeBaseId, selectedPartition, graphView],
+    queryFn: () => (selectedPartition ? fetchPartitionGraph(selectedPartition, selectedKnowledgeBaseId, "evidence", graphView) : fetchGraph(selectedKnowledgeBaseId, "evidence", graphView)),
+    enabled: Boolean(selectedKnowledgeBaseId),
   });
-  const detailQuery = useQuery({
-    queryKey: ["graph-node", selectedCourseId, detailNodeId],
-    queryFn: () => fetchGraphNode(detailNodeId as string, selectedCourseId),
-    enabled: Boolean(selectedCourseId && detailNodeId),
-  });
-
-  const chapterOptions = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title) ?? [], [dashboardQuery.data]);
+  const signalLayerComplete = Boolean(graphQuery.data?.signal_layer_complete);
+  const partitionOptions = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title) ?? [], [dashboardQuery.data]);
   const visibleGraph = useMemo<GraphResponse | null>(() => {
     if (!graphQuery.data) {
       return null;
     }
-    const data = graphQuery.data;
-    const keptNodeIds = new Set(
-      data.nodes
-        .filter((node) => graphType !== "semantic" || selectedCommunity === null || node.category !== "semantic_entity" || node.community_louvain === selectedCommunity)
-        .filter((node) => graphType !== "semantic" || selectedEntityType === "all" || node.category !== "semantic_entity" || node.entity_type === selectedEntityType)
-        .map((node) => node.id),
-    );
-    return {
-      ...data,
-      nodes: data.nodes.filter((node) => keptNodeIds.has(node.id)),
-      edges: data.edges.filter((edge) => keptNodeIds.has(String(edge.source)) && keptNodeIds.has(String(edge.target))),
-    };
-  }, [graphQuery.data, graphType, selectedCommunity, selectedEntityType]);
+    return signalOnlyGraph(graphQuery.data, signalLayerComplete);
+  }, [signalLayerComplete, graphQuery.data]);
   const selectedGraphNode = useMemo(
     () => (selectedNode && visibleGraph ? visibleGraph.nodes.find((node) => node.id === selectedNode.id) ?? null : null),
     [selectedNode, visibleGraph],
   );
+  const selectedSnippets = useMemo(() => evidenceSnippetsForNode(graphQuery.data, selectedGraphNode), [graphQuery.data, selectedGraphNode]);
+
+  useEffect(() => {
+    if (selectedNode && visibleGraph && !visibleGraph.nodes.some((node) => node.id === selectedNode.id)) {
+      setSelectedNode(null);
+    }
+  }, [selectedNode, setSelectedNode, visibleGraph]);
 
   useEffect(() => {
     const handleChange = () => {
@@ -94,22 +284,15 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
     return () => document.removeEventListener("fullscreenchange", handleChange);
   }, []);
 
-  const handleChapterChange = (chapter: string) => {
-    setSelectedChapter(chapter);
+  const handlePartitionChange = (partition: string) => {
+    setSelectedPartition(partition);
     setSelectedNode(null);
-    setDetailNodeId(null);
     setIsLocked(false);
-    setSelectedCommunity(null);
-    setChapterMenuOpen(false);
+    setPartitionMenuOpen(false);
   };
 
   const openDetail = (nodeId: string, category: string) => {
     setSelectedNode({ id: nodeId, category });
-    if (graphType === "semantic" && category === "semantic_entity") {
-      setDetailNodeId(nodeId);
-      return;
-    }
-    setDetailNodeId(null);
   };
 
   const toggleFullscreen = async () => {
@@ -151,29 +334,29 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
           <div className="relative mt-5">
             <button
               type="button"
-              onClick={() => setChapterMenuOpen((open) => !open)}
+              onClick={() => setPartitionMenuOpen((open) => !open)}
               className="flex h-11 w-full items-center justify-between gap-3 rounded-full border border-white/10 bg-white/[0.05] px-4 text-left text-sm text-white outline-none transition hover:border-cyan-200/24"
             >
-              <span className="min-w-0 truncate">{selectedChapter || "全部目录"}</span>
-              <ChevronDown className={`size-4 shrink-0 text-cyan-100/60 transition ${chapterMenuOpen ? "rotate-180" : ""}`} />
+              <span className="min-w-0 truncate">{selectedPartition || "全部目录"}</span>
+              <ChevronDown className={`size-4 shrink-0 text-cyan-100/60 transition ${partitionMenuOpen ? "rotate-180" : ""}`} />
             </button>
-            {chapterMenuOpen ? (
+            {partitionMenuOpen ? (
               <div className="custom-scrollbar absolute left-0 right-0 top-[calc(100%+0.5rem)] z-[80] max-h-72 overflow-y-auto rounded-[1.25rem] border border-white/10 bg-[rgba(4,10,24,0.96)] p-2 shadow-[0_24px_70px_rgba(0,0,0,0.42)] backdrop-blur-2xl">
                 <button
                   type="button"
-                  onClick={() => handleChapterChange("")}
+                  onClick={() => handlePartitionChange("")}
                   className="w-full rounded-2xl px-3 py-2.5 text-left text-sm text-white/70 transition hover:bg-cyan-300/[0.08] hover:text-white"
                 >
                   全部目录
                 </button>
-                {chapterOptions.map((chapter) => (
+                {partitionOptions.map((partition) => (
                   <button
-                    key={chapter}
+                    key={partition}
                     type="button"
-                    onClick={() => handleChapterChange(chapter)}
+                    onClick={() => handlePartitionChange(partition)}
                     className="w-full rounded-2xl px-3 py-2.5 text-left text-sm text-white/70 transition hover:bg-cyan-300/[0.08] hover:text-white"
                   >
-                    {chapter}
+                    {partition}
                   </button>
                 ))}
               </div>
@@ -182,12 +365,12 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
 
           <div className="mt-6 space-y-4">
             {dashboardQuery.data.tree
-              .filter((chapter) => !selectedChapter || chapter.title === selectedChapter)
-              .map((chapter) => (
-                <div key={chapter.id} className="rounded-[22px] border border-white/8 bg-white/[0.03] px-4 py-4">
-                  <p className="break-words text-base font-medium text-white">{chapter.title}</p>
+              .filter((partition) => !selectedPartition || partition.title === selectedPartition)
+              .map((partition) => (
+                <div key={partition.id} className="rounded-[22px] border border-white/8 bg-white/[0.03] px-4 py-4">
+                  <p className="break-words text-base font-medium text-white">{partition.title}</p>
                   <div className="mt-3 space-y-2">
-                    {(chapter.children ?? []).map((document) => (
+                    {(partition.children ?? []).map((document) => (
                       <div key={document.id} className="rounded-[16px] border border-white/8 px-4 py-3 text-sm leading-6 text-white/62 break-words">
                         {document.title}
                       </div>
@@ -208,35 +391,30 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
           <div className="min-w-0">
             <p className="section-kicker">图谱画布</p>
             <div className="mt-2 flex flex-wrap items-center gap-3">
-              <h2 className="break-words text-3xl font-semibold text-white">{selectedChapter && graphType !== "structural" ? selectedChapter : "全库图谱"}</h2>
+              <h2 className="break-words text-3xl font-semibold text-white">{selectedPartition || "全库投影派生层"}</h2>
               <GraphStaleBadge isStale={graphQuery.data.freshness?.is_stale} />
             </div>
             <p className="mt-2 max-w-3xl break-words text-sm leading-7 text-white/50">
-              {graphType === "semantic" ? "单击节点只做高亮，双击语义实体打开知识详解。支持拖拽平移与滚轮缩放。" : graphType === "evidence" ? "语义实体、证据片段与文档版本分层展示，单击节点查看基础信息。" : "本地资料结构单独展示，不混入语义实体。"}
+              {signalLayerComplete
+                ? "画布只渲染完整发布后的投影派生层。证据图不在画布展开，仅用于右侧支撑片段、引用和诊断。"
+                : "投影派生层尚未 active；前端不会渲染 evidence atom、active chunk 或其他半成品节点。"}
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <div className="flex rounded-full border border-white/10 bg-white/[0.035] p-1">
-              {graphTabs.map((tab) => (
-                <button
-                  key={tab.type}
-                  type="button"
-                  onClick={() => {
-                    setSelectedNode(null);
-                    setDetailNodeId(null);
-                    setSelectedCommunity(null);
-                    if (tab.type !== "semantic") {
-                      setSelectedEntityType("all");
-                    }
-                    setGraphType(tab.type);
-                  }}
-                  className={`rounded-full px-3 py-1.5 text-xs transition ${graphType === tab.type ? "bg-cyan-300/12 text-cyan-50" : "text-white/58 hover:text-white"}`}
-                >
-                  {tab.label}
-                </button>
-              ))}
-            </div>
+            <span
+              className={`rounded-full border px-3 py-1.5 text-xs ${
+                signalLayerComplete
+                  ? "border-fuchsia-200/30 bg-fuchsia-300/[0.10] text-fuchsia-50"
+                  : "border-white/8 text-white/30"
+              }`}
+              title={signalLayerComplete ? "Signal layer is active" : `Signal layer ${graphQuery.data.signal_layer_status ?? "pending"}`}
+            >
+              Signal {signalLayerComplete ? "active" : graphQuery.data.signal_layer_status ?? "pending"}
+            </span>
+            <span className="rounded-full border border-white/8 px-3 py-1.5 text-xs text-white/45">
+              {graphQuery.data.view ?? "overview"}
+            </span>
             <motion.button
               whileHover={{ y: -1 }}
               whileTap={{ scale: 0.98 }}
@@ -268,32 +446,10 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
           </div>
         </div>
 
-        {graphType === "semantic" ? (
-          <div className="mb-4 flex flex-wrap items-center gap-2 px-2">
-            <button
-              type="button"
-              onClick={() => setSelectedEntityType("all")}
-              className={`rounded-full border px-3 py-1.5 text-xs transition ${selectedEntityType === "all" ? "border-cyan-200/30 bg-cyan-300/[0.08] text-cyan-50" : "border-white/10 text-white/58 hover:text-white"}`}
-            >
-              全部实体
-            </button>
-            {entityTypes.map((entityType) => (
-              <button
-                key={entityType}
-                type="button"
-                onClick={() => setSelectedEntityType(entityType)}
-                className={`rounded-full border px-3 py-1.5 text-xs transition ${selectedEntityType === entityType ? "border-cyan-200/30 bg-cyan-300/[0.08] text-cyan-50" : "border-white/10 text-white/58 hover:text-white"}`}
-              >
-                {entityType}
-              </button>
-            ))}
-          </div>
-        ) : null}
-
         <div className={`grid min-h-0 flex-1 gap-4 ${isFullscreen ? "grid-cols-[minmax(0,1fr)_380px]" : "grid-cols-1"}`}>
           <div className="min-w-0 rounded-[24px] border border-white/8 bg-[rgba(4,9,24,0.36)] p-2">
             <NetworkCanvas
-              key={`${graphType}:${selectedChapter || "all"}`}
+              key={`projection:${selectedPartition || "all"}`}
               ref={canvasRef}
               graph={visibleGraph}
               height={isFullscreen ? 900 : 760}
@@ -303,20 +459,9 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
             />
           </div>
 
-          {(detailNodeId || isFullscreen) && (
+          {isFullscreen && (
             <aside className={`glass-panel min-w-0 ${isFullscreen ? "kg-scroll-panel rounded-[24px]" : "hidden"} p-5`}>
-              {detailNodeId ? (
-                <NodeDetail
-                  detailQuery={{
-                    data: detailQuery.data,
-                    isLoading: detailQuery.isLoading,
-                    error: (detailQuery.error as Error | null) ?? null,
-                  }}
-                  onClose={() => setDetailNodeId(null)}
-                />
-              ) : (
-                <GraphNodeSummary node={selectedGraphNode} graphType={graphType} />
-              )}
+              <GraphNodeSummary node={selectedGraphNode} snippets={selectedSnippets} />
             </aside>
           )}
         </div>
@@ -324,15 +469,7 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
 
       {!isFullscreen ? (
         <motion.section initial={{ opacity: 0, x: 12 }} animate={{ opacity: 1, x: 0 }} className="glass-panel kg-scroll-panel min-w-0 rounded-[28px] p-5">
-          <NodeDetail
-            detailQuery={{
-              data: detailQuery.data,
-              isLoading: detailQuery.isLoading,
-              error: (detailQuery.error as Error | null) ?? null,
-            }}
-            onClose={() => setDetailNodeId(null)}
-          />
-          {!detailNodeId ? <GraphNodeSummary node={selectedGraphNode} graphType={graphType} /> : null}
+          <GraphNodeSummary node={selectedGraphNode} snippets={selectedSnippets} />
         </motion.section>
       ) : null}
     </div>
@@ -340,124 +477,11 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
 }
 
 export function GraphPanel() {
-  const { selectedCourseId } = useCourseContext();
-  return <GraphPanelContent key={selectedCourseId ?? "unassigned"} selectedCourseId={selectedCourseId} />;
+  const { selectedKnowledgeBaseId } = useKnowledgeBaseContext();
+  return <GraphPanelContent key={selectedKnowledgeBaseId ?? "unassigned"} selectedKnowledgeBaseId={selectedKnowledgeBaseId} />;
 }
 
-function NodeDetail({
-  detailQuery,
-  onClose,
-}: {
-  detailQuery: {
-    data?: GraphNodeDetail;
-    isLoading: boolean;
-    error: Error | null;
-  };
-  onClose: () => void;
-}) {
-  return (
-    <>
-      <div className="flex items-center justify-between gap-4">
-        <div className="min-w-0">
-          <p className="section-kicker">节点详情</p>
-          <h2 className="mt-2 break-words text-2xl font-semibold text-white">知识详解</h2>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <ScanSearch className="size-5 text-cyan-200" />
-          {detailQuery.data ? (
-            <motion.button whileHover={{ y: -1 }} whileTap={{ scale: 0.98 }} type="button" onClick={onClose} className="action-chip rounded-full px-3 py-2 text-xs uppercase tracking-[0.22em]">
-              关闭
-            </motion.button>
-          ) : null}
-        </div>
-      </div>
-
-      {detailQuery.isLoading ? (
-        <div className="mt-6">
-          <LoadingBlock rows={3} />
-        </div>
-      ) : detailQuery.error ? (
-        <div className="mt-6">
-          <ErrorBlock message={detailQuery.error.message} />
-        </div>
-      ) : detailQuery.data ? (
-        <div className="mt-6 space-y-5">
-          <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
-            <p className="break-words text-xs uppercase tracking-[0.26em] text-white/45">{detailQuery.data.concept_type}</p>
-            <p className="mt-3 break-words text-3xl font-semibold text-white">{detailQuery.data.name}</p>
-            <div className="mt-4 grid grid-cols-2 gap-3 text-xs text-white/58">
-              <span>Community {detailQuery.data.community_louvain ?? "n/a"}</span>
-              <span>Evidence {detailQuery.data.evidence_count}</span>
-              <span>Centrality {(detailQuery.data.centrality?.centrality_score ?? 0).toFixed(3)}</span>
-              <span>Rank {detailQuery.data.graph_rank_score.toFixed(3)}</span>
-            </div>
-            <p className="mt-3 break-words text-sm leading-8 text-white/68">
-              {detailQuery.data.summary || "当前节点缺少完整摘要，已展示最小可用信息。"}
-            </p>
-          </div>
-
-          <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
-            <p className="text-xs uppercase tracking-[0.26em] text-white/45">别名</p>
-            <div className="mt-4 flex flex-wrap gap-2">
-              {detailQuery.data.aliases.length > 0 ? (
-                detailQuery.data.aliases.map((alias) => (
-                  <span key={alias} className="max-w-full break-words rounded-full border border-white/10 px-3 py-1 text-sm text-cyan-50/76">
-                    {alias}
-                  </span>
-                ))
-              ) : (
-                <span className="text-sm text-white/58">暂无别名</span>
-              )}
-            </div>
-          </div>
-
-          <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
-            <p className="text-xs uppercase tracking-[0.26em] text-white/45">目录引用</p>
-            <div className="mt-4 flex flex-wrap gap-2">
-              {detailQuery.data.chapter_refs.length > 0 ? (
-                detailQuery.data.chapter_refs.map((chapter) => (
-                  <span key={chapter} className="max-w-full break-words rounded-full border border-white/10 px-3 py-1 text-sm text-cyan-50/76">
-                    {chapter}
-                  </span>
-                ))
-              ) : (
-                <span className="text-sm text-white/58">暂无目录引用</span>
-              )}
-            </div>
-          </div>
-
-          <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
-            <p className="text-xs uppercase tracking-[0.26em] text-white/45">相关关系与证据</p>
-            <div className="mt-4 space-y-3">
-              {detailQuery.data.relations.length > 0 ? (
-                detailQuery.data.relations.map((relation) => (
-                  <div key={relation.relation_id} className="rounded-[18px] border border-white/8 px-4 py-4">
-                    <div className="flex items-start justify-between gap-4">
-                      <p className="min-w-0 break-words text-sm font-medium leading-6 text-white">{relation.target_name}</p>
-                      <span className="shrink-0 text-xs text-white/42">{relation.confidence.toFixed(2)}</span>
-                    </div>
-                    <p className="mt-1 break-words text-xs uppercase tracking-[0.22em] text-white/45">
-                      {relation.relation_type} - w={(relation.weight ?? relation.confidence).toFixed(2)}{relation.is_inferred ? " - inferred" : ""}
-                    </p>
-                    {relation.evidence ? <MarkdownRenderer content={relation.evidence.snippet} compact className="mt-3 break-words text-white/58" /> : null}
-                  </div>
-                ))
-              ) : (
-                <p className="break-words text-sm text-white/58">当前节点暂无可展示的关系。</p>
-              )}
-            </div>
-          </div>
-        </div>
-      ) : (
-        <div className="mt-6 rounded-[22px] border border-white/8 bg-white/[0.03] px-5 py-6 text-sm leading-7 text-white/58 break-words">
-          双击图谱中的概念节点即可查看知识详解。单击只会高亮节点，不会打断浏览。
-        </div>
-      )}
-    </>
-  );
-}
-
-function GraphNodeSummary({ node, graphType }: { node: GraphResponse["nodes"][number] | null; graphType: GraphType }) {
+function GraphNodeSummary({ node, snippets }: { node: GraphResponse["nodes"][number] | null; snippets: EvidenceSnippet[] }) {
   if (!node) {
     return (
       <div className="mt-6 rounded-[24px] border border-white/8 bg-white/[0.03] p-5 text-sm leading-7 text-white/58">
@@ -467,15 +491,16 @@ function GraphNodeSummary({ node, graphType }: { node: GraphResponse["nodes"][nu
   }
   const rows = [
     ["类型", node.entity_type ?? node.category],
-    ["目录", node.chapter ?? "n/a"],
+    ["目录", node.partition ?? "n/a"],
     ["证据", node.evidence_count ?? node.support_count ?? "n/a"],
+    ["Support atoms", node.support_atom_ids?.length ?? "n/a"],
     ["页码", node.page_number ?? "n/a"],
     ["文档版本", node.document_version_id ?? "n/a"],
   ];
   return (
     <div className="mt-6 space-y-4">
       <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
-        <p className="break-words text-xs uppercase tracking-[0.26em] text-white/45">{graphType}</p>
+        <p className="break-words text-xs uppercase tracking-[0.26em] text-white/45">projection derived layer</p>
         <p className="mt-3 break-words text-2xl font-semibold text-white">{node.name}</p>
         <div className="mt-4 grid grid-cols-1 gap-2 text-sm text-white/62">
           {rows.map(([label, value]) => (
@@ -486,6 +511,31 @@ function GraphNodeSummary({ node, graphType }: { node: GraphResponse["nodes"][nu
           ))}
         </div>
         {node.snippet ? <p className="mt-4 break-words text-sm leading-7 text-white/68">{node.snippet}</p> : null}
+      </div>
+      <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-xs uppercase tracking-[0.26em] text-white/45">Related snippets</p>
+          <span className="rounded-full border border-white/8 px-2.5 py-1 text-[11px] text-white/45">{snippets.length}</span>
+        </div>
+        {snippets.length ? (
+          <div className="mt-4 space-y-3">
+            {snippets.map((snippet) => (
+              <article key={snippet.id} className="rounded-[18px] border border-white/8 bg-black/10 p-4">
+                <div className="mb-2 flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-white/38">
+                  <span>{snippet.kind}</span>
+                  {snippet.page ? <span>page {snippet.page}</span> : null}
+                  {snippet.documentVersionId ? <span className="normal-case tracking-normal">version {snippet.documentVersionId}</span> : null}
+                </div>
+                <p className="mb-2 break-words text-sm font-medium text-white/82">{snippet.title}</p>
+                <MarkdownRenderer content={snippet.text} compact className="break-words text-white/68" />
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="mt-4 break-words text-sm leading-7 text-white/52">
+            No support snippets were returned in the current overview payload. Support atoms: {node.support_atom_ids?.length ?? 0}; active chunks: {node.support_active_chunk_ids?.length ?? 0}.
+          </p>
+        )}
       </div>
     </div>
   );

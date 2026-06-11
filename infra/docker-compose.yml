@@ -9,7 +9,7 @@ services:
     env_file:
       - ../.env
     environment:
-      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/course_kg
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/symbograph
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379/0
       DATA_ROOT: /app/data
@@ -20,7 +20,7 @@ services:
       ENABLE_MODEL_FALLBACK: "false"
       ENABLE_DATABASE_FALLBACK: "false"
       INGESTION_EXECUTION_MODE: celery
-      INGESTION_TASK_QUEUE: course-kg-main-ingestion
+      INGESTION_TASK_QUEUE: ${INGESTION_TASK_QUEUE:-course-kg-main-ingestion}
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
       PYTHONPATH: /app/apps/worker:/app/apps/api
     ports:
@@ -58,7 +58,7 @@ services:
     env_file:
       - ../.env
     environment:
-      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/course_kg
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/symbograph
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379/0
       DATA_ROOT: /app/data
@@ -69,11 +69,11 @@ services:
       ENABLE_MODEL_FALLBACK: "false"
       ENABLE_DATABASE_FALLBACK: "false"
       INGESTION_EXECUTION_MODE: celery
-      INGESTION_TASK_QUEUE: course-kg-main-ingestion
+      INGESTION_TASK_QUEUE: ${INGESTION_TASK_QUEUE:-course-kg-main-ingestion}
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
       PYTHONPATH: /app/apps/worker:/app/apps/api
     working_dir: /app/apps/worker
-    command: ["python", "-m", "celery", "-A", "worker_app.celery_app", "worker", "--loglevel=info", "--queues=course-kg-main-ingestion", "--concurrency=${WORKER_CONCURRENCY:-2}"]
+    command: ["python", "-m", "celery", "-A", "worker_app.celery_app", "worker", "--loglevel=info", "--queues=${INGESTION_TASK_QUEUE:-course-kg-main-ingestion}", "--concurrency=${WORKER_CONCURRENCY:-2}"]
     volumes:
       - ../data:/app/data
       - ../.env:/app/.env
@@ -118,7 +118,7 @@ services:
     image: postgres:16
     container_name: course-kg-postgres
     environment:
-      POSTGRES_DB: course_kg
+      POSTGRES_DB: symbograph
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
@@ -126,7 +126,7 @@ services:
     volumes:
       - ../data/postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d course_kg"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d symbograph"]
       interval: 3s
       timeout: 5s
       retries: 10

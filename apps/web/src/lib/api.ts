@@ -1,18 +1,15 @@
-import type {
+﻿import type {
   AgentResponse,
   AgentTraceEventPayload,
   BatchLogTokenResponse,
   BatchStartResponse,
   CleanupStaleDataResponse,
-  CleanupStaleGraphResponse,
-  ConceptCard,
-  CourseFileSummary,
-  CourseCreateRequest,
-  CourseSummary,
+  KnowledgeBaseFileSummary,
+  KnowledgeBaseCreateRequest,
+  KnowledgeBaseSummary,
   DashboardSnapshot,
-  DeleteCourseResponse,
+  DeleteKnowledgeBaseResponse,
   DeleteResponse,
-  GraphNodeDetail,
   GraphResponse,
   GraphType,
   IngestionBatchSummary,
@@ -22,7 +19,7 @@ import type {
   ParseUploadedFilesRequest,
   QARequest,
   QAResponse,
-  QuerySemanticGraphRequest,
+  QueryEvidenceGraphRequest,
   RebuildGraphRequest,
   RebuildGraphResponse,
   RefreshResponse,
@@ -123,35 +120,35 @@ function extractApiErrorMessage(text: string, status: number): string {
   }
 }
 
-export async function fetchCourses(): Promise<CourseSummary[]> {
-  const response = await fetch(buildApiUrl("/courses"), { cache: "no-store", headers: authHeaders() });
-  return parseResponse<CourseSummary[]>(response);
+export async function fetchKnowledgeBases(): Promise<KnowledgeBaseSummary[]> {
+  const response = await fetch(buildApiUrl("/knowledge_bases"), { cache: "no-store", headers: authHeaders() });
+  return parseResponse<KnowledgeBaseSummary[]>(response);
 }
 
-export async function createCourse(payload: CourseCreateRequest): Promise<CourseSummary> {
-  const response = await fetch(buildApiUrl("/courses"), {
+export async function createKnowledgeBase(payload: KnowledgeBaseCreateRequest): Promise<KnowledgeBaseSummary> {
+  const response = await fetch(buildApiUrl("/knowledge_bases"), {
     method: "POST",
     headers: jsonHeaders(),
     body: JSON.stringify(payload),
   });
-  return parseResponse<CourseSummary>(response);
+  return parseResponse<KnowledgeBaseSummary>(response);
 }
 
-export async function deleteCourse(courseId: string): Promise<DeleteCourseResponse> {
-  const response = await fetch(buildApiUrl(`/courses/${encodeURIComponent(courseId)}`), {
+export async function deleteKnowledgeBase(knowledgeBaseId: string): Promise<DeleteKnowledgeBaseResponse> {
+  const response = await fetch(buildApiUrl(`/knowledge_bases/${encodeURIComponent(knowledgeBaseId)}`), {
     method: "DELETE",
     headers: authHeaders(),
   });
-  return parseResponse<DeleteCourseResponse>(response);
+  return parseResponse<DeleteKnowledgeBaseResponse>(response);
 }
 
-export async function fetchDashboard(courseId?: string | null): Promise<DashboardSnapshot> {
-  const response = await fetch(buildApiUrl("/courses/current/dashboard", { course_id: courseId }), { cache: "no-store", headers: authHeaders() });
+export async function fetchDashboard(knowledgeBaseId?: string | null): Promise<DashboardSnapshot> {
+  const response = await fetch(buildApiUrl("/knowledge_bases/current/dashboard", { knowledge_base_id: knowledgeBaseId }), { cache: "no-store", headers: authHeaders() });
   return parseResponse<DashboardSnapshot>(response);
 }
 
-export async function refreshCourse(courseId?: string | null): Promise<RefreshResponse> {
-  const response = await fetch(buildApiUrl("/courses/current/refresh", { course_id: courseId }), {
+export async function refreshKnowledgeBase(knowledgeBaseId?: string | null): Promise<RefreshResponse> {
+  const response = await fetch(buildApiUrl("/knowledge_bases/current/refresh", { knowledge_base_id: knowledgeBaseId }), {
     method: "POST",
     headers: authHeaders(),
   });
@@ -225,13 +222,13 @@ export async function deleteStrategyProfile(profileId: string): Promise<DeleteRe
   return parseResponse<DeleteResponse>(response);
 }
 
-export async function bindStrategyProfile(payload: StrategyProfileBindRequest): Promise<CourseSummary> {
+export async function bindStrategyProfile(payload: StrategyProfileBindRequest): Promise<KnowledgeBaseSummary> {
   const response = await fetch(buildApiUrl("/settings/profiles/bind"), {
     method: "POST",
     headers: jsonHeaders(),
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ knowledge_base_id: payload.knowledge_base_id, profile_id: payload.profile_id }),
   });
-  return parseResponse<CourseSummary>(response);
+  return parseResponse<KnowledgeBaseSummary>(response);
 }
 
 export async function draftStrategyProfile(payload: StrategyProfileDraftRequest): Promise<StrategyProfileDraftResponse> {
@@ -332,66 +329,53 @@ export async function streamProfileAssistant(
   }
 }
 
-export async function fetchCourseFiles(courseId?: string | null): Promise<CourseFileSummary[]> {
-  const response = await fetch(buildApiUrl("/course-files", { course_id: courseId }), { cache: "no-store", headers: authHeaders() });
-  return parseResponse<CourseFileSummary[]>(response);
+export async function fetchKnowledgeBaseFiles(knowledgeBaseId?: string | null): Promise<KnowledgeBaseFileSummary[]> {
+  const response = await fetch(buildApiUrl("/knowledge-base-files", { knowledge_base_id: knowledgeBaseId }), { cache: "no-store", headers: authHeaders() });
+  return parseResponse<KnowledgeBaseFileSummary[]>(response);
 }
 
-export async function removeCourseFile(sourcePath: string, courseId?: string | null): Promise<{ removed: boolean }> {
-  const response = await fetch(buildApiUrl("/course-files", { course_id: courseId, source_path: sourcePath }), {
+export async function removeKnowledgeBaseFile(sourcePath: string, knowledgeBaseId?: string | null): Promise<{ removed: boolean }> {
+  const response = await fetch(buildApiUrl("/knowledge-base-files", { knowledge_base_id: knowledgeBaseId, source_path: sourcePath }), {
     method: "DELETE",
     headers: authHeaders(),
   });
   return parseResponse<{ removed: boolean }>(response);
 }
 
-export async function cleanupStaleData(courseId?: string | null): Promise<CleanupStaleDataResponse> {
-  const response = await fetch(buildApiUrl("/maintenance/cleanup-stale-data", { course_id: courseId }), {
+export async function cleanupStaleData(knowledgeBaseId?: string | null): Promise<CleanupStaleDataResponse> {
+  const response = await fetch(buildApiUrl("/maintenance/cleanup-stale-data", { knowledge_base_id: knowledgeBaseId }), {
     method: "POST",
     headers: authHeaders(),
   });
   return parseResponse<CleanupStaleDataResponse>(response);
 }
 
-export async function cleanupStaleGraph(courseId?: string | null): Promise<CleanupStaleGraphResponse> {
-  const response = await fetch(buildApiUrl("/maintenance/cleanup-stale-graph", { course_id: courseId }), {
-    method: "POST",
-    headers: authHeaders(),
-  });
-  return parseResponse<CleanupStaleGraphResponse>(response);
-}
-
 export async function rebuildGraph(
-  courseId?: string | null,
-  mode: "incremental" | "full" = "incremental",
+  knowledgeBaseId?: string | null,
+  mode: "evidence" = "evidence",
   dryRun = false,
-  options: Pick<RebuildGraphRequest, "run_llm_merge" | "run_hpo" | "run_community_summaries"> = {},
+  options: Partial<RebuildGraphRequest> = {},
 ): Promise<RebuildGraphResponse> {
-  const response = await fetch(buildApiUrl("/maintenance/rebuild-graph", { course_id: courseId }), {
+  const response = await fetch(buildApiUrl("/maintenance/rebuild-graph", { knowledge_base_id: knowledgeBaseId }), {
     method: "POST",
     headers: jsonHeaders(),
-    body: JSON.stringify({ mode, confirm_destructive: mode === "full" && !dryRun, dry_run: dryRun, ...options } satisfies RebuildGraphRequest),
+    body: JSON.stringify({ mode, dry_run: dryRun, ...options } satisfies RebuildGraphRequest),
   });
   return parseResponse<RebuildGraphResponse>(response);
 }
 
-export async function fetchGraph(courseId: string | null | undefined, graphType: GraphType): Promise<GraphResponse> {
-  const response = await fetch(buildApiUrl("/courses/current/graph", { course_id: courseId, graph_type: graphType }), { cache: "no-store", headers: authHeaders() });
+export async function fetchGraph(knowledgeBaseId: string | null | undefined, graphType: GraphType, view: GraphResponse["view"] = "overview"): Promise<GraphResponse> {
+  const response = await fetch(buildApiUrl("/knowledge_bases/current/graph", { knowledge_base_id: knowledgeBaseId, graph_type: graphType, view }), { cache: "no-store", headers: authHeaders() });
   return parseResponse<GraphResponse>(response);
 }
 
-export async function fetchChapterGraph(chapter: string, courseId: string | null | undefined, graphType: GraphType): Promise<GraphResponse> {
-  const response = await fetch(buildApiUrl(`/graph/chapters/${encodeURIComponent(chapter)}`, { course_id: courseId, graph_type: graphType }), { cache: "no-store", headers: authHeaders() });
+export async function fetchPartitionGraph(partition: string, knowledgeBaseId: string | null | undefined, graphType: GraphType, view: GraphResponse["view"] = "detail"): Promise<GraphResponse> {
+  const response = await fetch(buildApiUrl(`/graph/partitions/${encodeURIComponent(partition)}`, { knowledge_base_id: knowledgeBaseId, graph_type: graphType, view }), { cache: "no-store", headers: authHeaders() });
   return parseResponse<GraphResponse>(response);
 }
 
-export async function fetchGraphNode(conceptId: string, courseId?: string | null): Promise<GraphNodeDetail> {
-  const response = await fetch(buildApiUrl(`/graph/nodes/${conceptId}`, { course_id: courseId }), { cache: "no-store", headers: authHeaders() });
-  return parseResponse<GraphNodeDetail>(response);
-}
-
-export async function fetchQuerySemanticGraph(payload: QuerySemanticGraphRequest): Promise<GraphResponse> {
-  const response = await fetch(`${API_BASE_URL}/search/semantic-graph`, {
+export async function fetchQueryEvidenceGraph(payload: QueryEvidenceGraphRequest): Promise<GraphResponse> {
+  const response = await fetch(buildApiUrl("/search/evidence-graph"), {
     method: "POST",
     headers: jsonHeaders(),
     body: JSON.stringify(payload),
@@ -399,13 +383,8 @@ export async function fetchQuerySemanticGraph(payload: QuerySemanticGraphRequest
   return parseResponse<GraphResponse>(response);
 }
 
-export async function fetchConcepts(courseId?: string | null): Promise<ConceptCard[]> {
-  const response = await fetch(buildApiUrl("/concepts", { course_id: courseId }), { cache: "no-store", headers: authHeaders() });
-  return parseResponse<ConceptCard[]>(response);
-}
-
 export async function searchKnowledge(payload: SearchRequest): Promise<SearchResponse> {
-  const response = await fetch(`${API_BASE_URL}/search`, {
+  const response = await fetch(buildApiUrl("/search"), {
     method: "POST",
     headers: jsonHeaders(),
     body: JSON.stringify(payload),
@@ -414,7 +393,7 @@ export async function searchKnowledge(payload: SearchRequest): Promise<SearchRes
 }
 
 export async function askQuestion(payload: QARequest): Promise<QAResponse> {
-  const response = await fetch(`${API_BASE_URL}/qa`, {
+  const response = await fetch(buildApiUrl("/qa"), {
     method: "POST",
     headers: jsonHeaders(),
     body: JSON.stringify(payload),
@@ -423,7 +402,7 @@ export async function askQuestion(payload: QARequest): Promise<QAResponse> {
 }
 
 export async function callAgent(payload: QARequest): Promise<AgentResponse> {
-  const response = await fetch(`${API_BASE_URL}/agent`, {
+  const response = await fetch(buildApiUrl("/agent"), {
     method: "POST",
     headers: jsonHeaders(),
     body: JSON.stringify(payload),
@@ -431,10 +410,10 @@ export async function callAgent(payload: QARequest): Promise<AgentResponse> {
   return parseResponse<AgentResponse>(response);
 }
 
-export async function uploadFile(file: File, courseId?: string | null, signal?: AbortSignal): Promise<UploadFileResponse> {
+export async function uploadFile(file: File, knowledgeBaseId?: string | null, signal?: AbortSignal): Promise<UploadFileResponse> {
   const formData = new FormData();
   formData.append("upload", file);
-  const response = await fetch(buildApiUrl("/files/upload", { course_id: courseId }), {
+  const response = await fetch(buildApiUrl("/files/upload", { knowledge_base_id: knowledgeBaseId }), {
     method: "POST",
     headers: authHeaders(),
     body: formData,
@@ -445,19 +424,16 @@ export async function uploadFile(file: File, courseId?: string | null, signal?: 
 
 export async function parseUploadedFiles(
   filePaths: string[],
-  courseId?: string | null,
+  knowledgeBaseId?: string | null,
   force = false,
-  rebuildGraphMode: ParseUploadedFilesRequest["rebuild_graph_mode"] = "none",
   fullReparse = false,
 ): Promise<BatchStartResponse> {
   const payload: ParseUploadedFilesRequest = {
     file_paths: filePaths,
     force,
     full_reparse: fullReparse,
-    rebuild_graph_mode: rebuildGraphMode,
-    confirm_destructive_graph_rebuild: rebuildGraphMode === "full",
   };
-  const response = await fetch(buildApiUrl("/ingestion/parse-uploaded-files", { course_id: courseId }), {
+  const response = await fetch(buildApiUrl("/ingestion/parse-uploaded-files", { knowledge_base_id: knowledgeBaseId }), {
     method: "POST",
     headers: jsonHeaders(),
     body: JSON.stringify(payload),
@@ -465,8 +441,8 @@ export async function parseUploadedFiles(
   return parseResponse<BatchStartResponse>(response);
 }
 
-export async function cancelBatch(batchId: string, courseId?: string | null): Promise<IngestionBatchSummary> {
-  const response = await fetch(buildApiUrl(`/ingestion/batches/${batchId}/cancel`, { course_id: courseId }), {
+export async function cancelBatch(batchId: string, knowledgeBaseId?: string | null): Promise<IngestionBatchSummary> {
+  const response = await fetch(buildApiUrl(`/ingestion/batches/${batchId}/cancel`, { knowledge_base_id: knowledgeBaseId }), {
     method: "POST",
     headers: authHeaders(),
   });
@@ -486,32 +462,32 @@ export function getBatchLogUrl(batchId: string, token: string): string {
 }
 
 export async function fetchJobStatus(jobId: string): Promise<JobStatusResponse> {
-  const response = await fetch(`${API_BASE_URL}/jobs/${jobId}`, { cache: "no-store", headers: authHeaders() });
+  const response = await fetch(buildApiUrl(`/jobs/${encodeURIComponent(jobId)}`), { cache: "no-store", headers: authHeaders() });
   return parseResponse<JobStatusResponse>(response);
 }
 
 export async function fetchBatchStatus(batchId: string): Promise<IngestionBatchSummary> {
-  const response = await fetch(`${API_BASE_URL}/ingestion/batches/${batchId}`, { cache: "no-store", headers: authHeaders() });
+  const response = await fetch(buildApiUrl(`/ingestion/batches/${encodeURIComponent(batchId)}`), { cache: "no-store", headers: authHeaders() });
   return parseResponse<IngestionBatchSummary>(response);
 }
 
 export async function fetchTaskStatus(runId: string): Promise<TaskStatusResponse> {
-  const response = await fetch(`${API_BASE_URL}/tasks/${runId}`, { cache: "no-store", headers: authHeaders() });
+  const response = await fetch(buildApiUrl(`/tasks/${encodeURIComponent(runId)}`), { cache: "no-store", headers: authHeaders() });
   return parseResponse<TaskStatusResponse>(response);
 }
 
-export async function fetchSessions(courseId?: string | null): Promise<SessionSummary[]> {
-  const response = await fetch(buildApiUrl("/sessions", { course_id: courseId }), { cache: "no-store", headers: authHeaders() });
+export async function fetchSessions(knowledgeBaseId?: string | null): Promise<SessionSummary[]> {
+  const response = await fetch(buildApiUrl("/sessions", { knowledge_base_id: knowledgeBaseId }), { cache: "no-store", headers: authHeaders() });
   return parseResponse<SessionSummary[]>(response);
 }
 
 export async function fetchSessionMessages(sessionId: string): Promise<SessionMessagesResponse> {
-  const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/messages`, { cache: "no-store", headers: authHeaders() });
+  const response = await fetch(buildApiUrl(`/sessions/${encodeURIComponent(sessionId)}/messages`), { cache: "no-store", headers: authHeaders() });
   return parseResponse<SessionMessagesResponse>(response);
 }
 
 export async function deleteSession(sessionId: string): Promise<DeleteResponse> {
-  const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}`, { method: "DELETE", headers: authHeaders() });
+  const response = await fetch(buildApiUrl(`/sessions/${encodeURIComponent(sessionId)}`), { method: "DELETE", headers: authHeaders() });
   return parseResponse<DeleteResponse>(response);
 }
 
@@ -526,7 +502,7 @@ export async function streamAnswer(
     onError?: (value: string) => void;
   },
 ): Promise<void> {
-  const response = await fetch(`${API_BASE_URL}/qa/stream`, {
+  const response = await fetch(buildApiUrl("/qa/stream"), {
     method: "POST",
     headers: jsonHeaders(),
     body: JSON.stringify(payload),
@@ -591,12 +567,13 @@ export async function streamAnswer(
         handlers.onCitations(parsed.citations);
       }
       if (parsed.type === "final" && parsed.response) {
+        const response = parsed.response;
         handlers.onFinal?.(parsed.response);
         handlers.onMeta?.({
-          degraded_mode: parsed.response.degraded_mode,
-          run_id: parsed.response.run_id,
-          session_id: parsed.response.session_id,
-          route: parsed.response.route,
+          degraded_mode: response.degraded_mode,
+          run_id: response.run_id,
+          session_id: response.session_id,
+          route: response.route,
         });
       }
       if (typeof parsed.degraded_mode === "boolean") {

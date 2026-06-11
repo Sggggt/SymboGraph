@@ -6,13 +6,13 @@ from pathlib import Path
 import pytest
 
 from app.services import parsers
-from app.services.parsers import clean_extracted_text, decode_text_bytes, derive_chapter, parse_document
+from app.services.parsers import clean_extracted_text, decode_text_bytes, derive_partition, parse_document
 
 
 def test_parse_markdown_html_notebook(tmp_path, no_fallback_env):
-    markdown = tmp_path / "notes.md"
+    markdown = tmp_path / "sources.md"
     markdown.write_text("# Centrality\nDegree centrality counts edges.", encoding="utf-8")
-    html = tmp_path / "notes.html"
+    html = tmp_path / "sources.html"
     html.write_text("<html><title>Networks</title><body><h1>Graphs</h1><p>Nodes and edges.</p></body></html>", encoding="utf-8")
     notebook = tmp_path / "lab.ipynb"
     notebook.write_text(
@@ -47,7 +47,7 @@ def test_decode_text_bytes_handles_common_encodings():
 
 
 def test_clean_extracted_text_repairs_mojibake_and_preserves_math():
-    cleaned, metadata = clean_extracted_text("cafÃ© posterior\x00\n\n\\(\\alpha + \\beta \\le \\gamma\\)\nE = mc^2")
+    cleaned, metadata = clean_extracted_text("caf?? posterior\x00\n\n\\(\\alpha + \\beta \\le \\gamma\\)\nE = mc^2")
 
     assert "café posterior" in cleaned
     assert "\\alpha" in cleaned
@@ -70,9 +70,9 @@ def test_parse_docx_pptx_pdf(tmp_path, no_fallback_env):
     pptx = pytest.importorskip("pptx")
     fitz = pytest.importorskip("fitz")
 
-    doc_path = tmp_path / "chapter.docx"
+    doc_path = tmp_path / "partition.docx"
     document = docx.Document()
-    document.add_heading("Chapter", level=1)
+    document.add_heading("partition", level=1)
     document.add_paragraph("Document text for parsing.")
     document.save(doc_path)
 
@@ -198,15 +198,15 @@ def test_unsupported_type_requires_explicit_fallback(tmp_path, no_fallback_env, 
         parse_document(unknown)
 
 
-def test_derive_chapter_uses_filename_before_date_or_course_folder():
-    assert derive_chapter(Path("fixtures/course-a/storage/20260425/Chapter 1.pdf"), "Course A") == "Chapter 1"
-    assert derive_chapter(Path("fixtures/course-b/storage/20260425/Lecture 5 - Slides.pdf"), "Course B") == "Lecture 5"
-    assert derive_chapter(Path("fixtures/course-b/storage/20260425/Lecture 9 - Sildes.pdf"), "Course B") == "Lecture 9"
-    assert derive_chapter(Path("fixtures/course-a/storage/20260425/Week 2 - Solutions.pdf"), "Course A") == "Week 2"
-    assert derive_chapter(Path("fixtures/course-b/storage/20260425/Lab Questions.pdf"), "Course B") == "Lab Questions"
-    assert derive_chapter(Path("fixtures/course-a/storage/20260425/Labs solutions.pdf"), "Course A") == "Lab Solutions"
-    assert derive_chapter(Path("fixtures/course-b/storage/20260425/Written Coursework.pdf"), "Course B") == "Coursework"
-    assert derive_chapter(Path("fixtures/course-b/storage/20260425/Z-Table.pdf"), "Course B") == "Reference"
-    assert derive_chapter(Path("fixtures/course-a/storage/20260425/graph_algorithms_visualizer.html"), "Course A") == "Reference"
-    assert derive_chapter(Path("fixtures/course-a/storage/20260425/参考资料.pdf"), "Course A") == "Reference"
-    assert derive_chapter(Path("fixtures/course-b/storage/20260425/topic-notes.md"), "Course B") == "topic notes"
+def test_derive_partition_uses_filename_before_date_or_parent_folder():
+    assert derive_partition(Path("fixtures/KnowledgeBase-a/storage/20260425/partition 1.pdf"), "KnowledgeBase A") == "partition 1"
+    assert derive_partition(Path("fixtures/KnowledgeBase-b/storage/20260425/Lecture 5 - Slides.pdf"), "KnowledgeBase B") == "Lecture 5"
+    assert derive_partition(Path("fixtures/KnowledgeBase-b/storage/20260425/Lecture 9 - Sildes.pdf"), "KnowledgeBase B") == "Lecture 9"
+    assert derive_partition(Path("fixtures/KnowledgeBase-a/storage/20260425/Week 2 - Solutions.pdf"), "KnowledgeBase A") == "Week 2"
+    assert derive_partition(Path("fixtures/KnowledgeBase-b/storage/20260425/Lab Questions.pdf"), "KnowledgeBase B") == "Lab Questions"
+    assert derive_partition(Path("fixtures/KnowledgeBase-a/storage/20260425/Labs solutions.pdf"), "KnowledgeBase A") == "Lab Solutions"
+    assert derive_partition(Path("fixtures/KnowledgeBase-b/storage/20260425/Research Workbook.pdf"), "KnowledgeBase B") == "Workbook"
+    assert derive_partition(Path("fixtures/KnowledgeBase-b/storage/20260425/Z-Table.pdf"), "KnowledgeBase B") == "Reference"
+    assert derive_partition(Path("fixtures/KnowledgeBase-a/storage/20260425/graph_algorithms_visualizer.html"), "KnowledgeBase A") == "Reference"
+    assert derive_partition(Path("fixtures/KnowledgeBase-a/storage/20260425/参考资料.pdf"), "KnowledgeBase A") == "Reference"
+    assert derive_partition(Path("fixtures/KnowledgeBase-b/storage/20260425/topic-sources.md"), "KnowledgeBase B") == "topic sources"

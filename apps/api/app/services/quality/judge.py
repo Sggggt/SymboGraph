@@ -11,21 +11,21 @@ from app.services.embeddings import ChatProvider
 QUALITY_JUDGE_PROMPT_VERSION = "quality_judge_v1"
 
 
-def quality_judge_cache_key(*, course_id: str, profile_version: str | None, target_type: str, candidate: dict[str, Any], model: str) -> str:
+def quality_judge_cache_key(*, knowledge_base_id: str, profile_version: str | None, target_type: str, candidate: dict[str, Any], model: str) -> str:
     payload = json.dumps(candidate, ensure_ascii=False, sort_keys=True, default=str)
     digest = hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()[:24]
-    return ":".join([course_id, profile_version or "no-profile", target_type, model, QUALITY_JUDGE_PROMPT_VERSION, digest])
+    return ":".join([knowledge_base_id, profile_version or "no-profile", target_type, model, QUALITY_JUDGE_PROMPT_VERSION, digest])
 
 
 class QualityJudge:
     def __init__(self, provider: ChatProvider | None = None) -> None:
         self.provider = provider or ChatProvider()
 
-    async def judge(self, *, course_id: str, profile: dict[str, Any] | None, target_type: str, candidate: dict[str, Any]) -> dict[str, Any]:
+    async def judge(self, *, knowledge_base_id: str, profile: dict[str, Any] | None, target_type: str, candidate: dict[str, Any]) -> dict[str, Any]:
         cache = get_cache_manager()
         profile_version = (profile or {}).get("schema_version") or (profile or {}).get("version")
         cache_key = quality_judge_cache_key(
-            course_id=course_id,
+            knowledge_base_id=knowledge_base_id,
             profile_version=profile_version,
             target_type=target_type,
             candidate=candidate,
@@ -35,7 +35,7 @@ class QualityJudge:
         if isinstance(cached, dict):
             return {**cached, "cache_key": cache_key, "cached": True}
 
-        system_prompt = "You are a strict structured quality judge for a course knowledge graph pipeline. Return JSON only."
+        system_prompt = "You are a strict structured quality judge for a KnowledgeBase knowledge graph pipeline. Return JSON only."
         user_prompt = (
             "Judge whether the candidate should be accepted, rejected, or kept as candidate_only. "
             "Return keys: action, score, reasons. Use action accept/reject/candidate_only/defer.\n\n"
