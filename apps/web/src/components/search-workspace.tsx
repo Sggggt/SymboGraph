@@ -25,20 +25,20 @@ import { NetworkCanvas } from "@/components/network-canvas";
 import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { fetchDashboard, fetchQueryEvidenceGraph, searchKnowledge } from "@/lib/api";
+import { fetchDashboard, fetchGraph, searchKnowledge } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 
 const sourceOptions: SourceType[] = ["pdf", "notebook", "markdown", "text", "image", "docx", "pptx"];
 const emptySearchResults: SearchResult[] = [];
 
-export function toQueryEvidenceGraph(graph: GraphResponse | undefined): GraphResponse | undefined {
+export function toLayeredContextGraph(graph: GraphResponse | undefined): GraphResponse | undefined {
   if (!graph) {
     return undefined;
   }
   return {
     ...graph,
-    graph_type: "evidence",
+    graph_type: "chunk-relation",
   };
 }
 
@@ -58,17 +58,44 @@ function scoreValue(result: SearchResult, key: string) {
 }
 
 function scoreKeys(result: SearchResult) {
-  return result.metadata.scores ? ["dense", "lexical", "fused", "rerank"] : [];
+  return result.metadata.scores ? ["dense", "bm25", "fine_cluster", "rq_fine", "mid_concept", "coarse_concept", "graph_path", "bridge_bonus", "structure"] : [];
 }
 
 function scoreLabel(key: string) {
   const labels: Record<string, string> = {
     dense: "向量",
-    lexical: "词面",
-    fused: "融合",
-    rerank: "重排",
+    bm25: "BM25",
+    fine_cluster: "细聚类",
+    rq_fine: "RQ",
+    mid_concept: "中概念",
+    coarse_concept: "粗概念",
+    graph_path: "图路径",
+    bridge_bonus: "桥边",
+    structure: "结构",
   };
   return labels[key] ?? key;
+}
+
+function resultRq(result: SearchResult): Record<string, unknown> | null {
+  const rq = result.metadata.rq;
+  return rq && typeof rq === "object" && !Array.isArray(rq) ? (rq as Record<string, unknown>) : null;
+}
+
+function rqPath(value: unknown): string {
+  return Array.isArray(value) && value.length ? value.join("/") : "无";
+}
+
+function sourceTypeLabel(value: string | undefined) {
+  const labels: Record<string, string> = {
+    pdf: "PDF",
+    notebook: "笔记本",
+    markdown: "Markdown 文档",
+    text: "文本",
+    image: "图片",
+    docx: "Word 文档",
+    pptx: "演示文稿",
+  };
+  return value ? labels[value] ?? value : "未知";
 }
 
 function resultPartition(result: SearchResult | undefined) {
@@ -78,10 +105,10 @@ function resultPartition(result: SearchResult | undefined) {
 
 function resultSourceType(result: SearchResult | undefined) {
   if (!result) return "未知";
-  return result.source_type ?? (result.metadata.source_type as string | undefined) ?? "未知";
+  return sourceTypeLabel(result.source_type ?? (result.metadata.source_type as string | undefined));
 }
 
-function resultEvidenceSnippet(result: SearchResult) {
+function resultContextSnippet(result: SearchResult) {
   return result.citations[0]?.snippet || result.snippet || result.content || "";
 }
 
@@ -112,9 +139,9 @@ function SearchHero({
           混合检索链路
         </div>
         <div className="space-y-3">
-          <h2 className="glow-text text-4xl font-semibold text-white lg:text-6xl">检索本地知识信号</h2>
+          <h2 className="glow-text text-4xl font-semibold text-white lg:text-6xl">检索本地上下文图谱</h2>
           <p className="mx-auto max-w-2xl text-sm leading-7 text-cyan-50/58 lg:text-base">
-            Dense 向量召回、BM25 词面召回、WSF 融合排序与图谱上下文会在这里汇总。
+            稠密向量、BM25、细聚类、RQ-KMeans、中粗概念路由与结构恢复会在这里汇总。
           </p>
         </div>
 
@@ -135,7 +162,7 @@ function SearchHero({
                 }
               }}
               className="h-12 min-w-0 flex-1 bg-transparent text-lg text-white outline-none placeholder:text-white/28"
-              placeholder="输入要从本地资料中检索的问题或证据线索..."
+              placeholder="输入要从本地资料中检索的问题或引用线索..."
             />
             <div className="hidden items-center gap-2 md:flex">
               <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{hitCount} 条结果</span>
@@ -200,13 +227,13 @@ function SearchFilterBar({
           {partition ? <X /> : null}
         </button>
         <button type="button" onClick={onClearSource} className="kg-micro-chip rounded-full px-3 py-2 text-xs">
-          来源：{sourceType || "全部"}
+          来源：{sourceType ? sourceTypeLabel(sourceType) : "全部"}
           {sourceType ? <X /> : null}
         </button>
       </div>
       <div className="kg-micro-chip rounded-full px-3 py-2 text-xs">
         <Activity data-icon="inline-start" />
-        {degradedMode ? "仅词面检索" : "Dense + BM25 + WSF"}
+        {degradedMode ? "依赖链路不完整" : "向量 + BM25 + 图谱"}
       </div>
     </div>
   );
@@ -239,6 +266,7 @@ function ResultRow({
   onHover: (result: SearchResult | null, anchor?: HTMLButtonElement | null) => void;
   onSelect: (result: SearchResult) => void;
 }) {
+  const rq = resultRq(result);
   return (
     <motion.button
       type="button"
@@ -278,6 +306,13 @@ function ResultRow({
             {scoreLabel(key)} {scoreValue(result, key)}
           </span>
         ))}
+        {rq ? (
+          <>
+            <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">RQ 路径 {rqPath(rq.candidate_rq_path)}</span>
+            <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">公共前缀 {String(rq.lcp_depth ?? "无")}</span>
+            <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">残差 {String(rq.residual_distance ?? "无")}</span>
+          </>
+        ) : null}
       </div>
     </motion.button>
   );
@@ -285,13 +320,13 @@ function ResultRow({
 
 function ResultStream({
   results,
-  activeChunkId,
+  selectedChunkId,
   isLoading,
   onHover,
   onSelect,
 }: {
   results: SearchResult[];
-  activeChunkId: string | null;
+  selectedChunkId: string | null;
   isLoading: boolean;
   onHover: (result: SearchResult | null, anchor?: HTMLButtonElement | null) => void;
   onSelect: (result: SearchResult) => void;
@@ -325,7 +360,7 @@ function ResultStream({
                 key={result.chunk_id}
                 result={result}
                 index={index}
-                active={activeChunkId === result.chunk_id}
+                active={selectedChunkId === result.chunk_id}
                 onHover={onHover}
                 onSelect={onSelect}
               />
@@ -397,18 +432,18 @@ function GraphCanvasPanel({
       <div className="relative z-10 flex items-center justify-between gap-3 px-5 py-4">
         <div>
           <p className="section-kicker">知识画布</p>
-          <h3 className="mt-1 text-xl font-semibold text-white">{selectedLabel ?? "查询证据子图"}</h3>
-          <p className="mt-1 text-sm text-white/42">{selectedPartition || "当前检索结果的语义邻域"}</p>
+          <h3 className="mt-1 text-xl font-semibold text-white">{selectedLabel ?? "检索上下文图谱"}</h3>
+          <p className="mt-1 text-sm text-white/42">{selectedPartition || "当前检索结果的片段关系邻域"}</p>
         </div>
         <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
           <GitBranch data-icon="inline-start" />
-          证据子图
+          四层图谱
         </span>
       </div>
       <div className="relative z-10 flex min-h-0 flex-1 px-2 pb-2">
         {isLoading ? (
           <div className="kg-shimmer mx-3 grid h-full min-h-0 w-full flex-1 place-items-center rounded-[1.5rem] border border-white/7 bg-white/[0.025] text-sm text-white/54">
-            正在生成图谱信号...
+            正在加载关系图谱...
           </div>
         ) : error ? (
           <div className="mx-3 flex min-h-0 w-full flex-1 items-stretch">
@@ -420,7 +455,7 @@ function GraphCanvasPanel({
           </div>
         ) : (
           <div className="mx-3 grid h-full min-h-0 w-full flex-1 place-items-center rounded-[1.5rem] border border-white/7 bg-white/[0.025] px-6 text-center text-sm leading-7 text-white/54">
-            {hasResults ? "当前检索结果没有匹配到可审计的证据子图。" : "发起检索后，这里展示命中片段相关的 evidence graph 子图。"}
+            {hasResults ? "当前检索结果暂未返回可展示的关系图谱。" : "发起检索后，这里展示片段关系图谱和命中片段上下文。"}
           </div>
         )}
       </div>
@@ -429,6 +464,7 @@ function GraphCanvasPanel({
 }
 
 function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | null; open: boolean; onOpenChange: (open: boolean) => void }) {
+  const rq = result ? resultRq(result) : null;
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="w-full border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-xl">
@@ -451,9 +487,9 @@ function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | n
             <div className="kg-flow-line my-6" />
             <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-5">
               <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">命中证据</p>
-              <MarkdownRenderer content={resultEvidenceSnippet(result)} className="mt-4 text-white/70" />
+              <MarkdownRenderer content={resultContextSnippet(result)} className="mt-4 text-white/70" />
             </div>
-            {result.content && result.content !== resultEvidenceSnippet(result) ? (
+            {result.content && result.content !== resultContextSnippet(result) ? (
               <div className="mt-5 rounded-2xl border border-white/8 bg-white/[0.03] p-5">
                 <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">完整片段</p>
                 <MarkdownRenderer content={result.content} className="mt-4 text-white/70" />
@@ -467,6 +503,19 @@ function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | n
                 </div>
               ))}
             </div>
+            {rq ? (
+              <div className="mt-5 rounded-2xl border border-white/8 bg-white/[0.03] p-5">
+                <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">RQ-KMeans 残差路由</p>
+                <div className="mt-4 grid gap-2 text-sm text-white/62">
+                  <p>查询路径：{rqPath(rq.query_rq_path)}</p>
+                  <p>候选路径：{rqPath(rq.candidate_rq_path)}</p>
+                  <p>公共前缀深度：{String(rq.lcp_depth ?? "无")}</p>
+                  <p>残差距离：{String(rq.residual_distance ?? "无")}</p>
+                  <p>RQ 分数：{String(rq.rq_score ?? "无")}</p>
+                  <p>漂移惩罚：{String(rq.rq_drift_penalty ?? "无")}</p>
+                </div>
+              </div>
+            ) : null}
           </div>
         ) : null}
       </SheetContent>
@@ -516,7 +565,7 @@ function AdvancedFilterDrawer({
               <option value="">全部来源</option>
               {sourceOptions.map((option) => (
                 <option key={option} value={option}>
-                  {option}
+                  {sourceTypeLabel(option)}
                 </option>
               ))}
             </select>
@@ -535,7 +584,7 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
   const storageScope = selectedKnowledgeBaseId ?? "unassigned";
   const dashboardQuery = useQuery({
     queryKey: ["dashboard", selectedKnowledgeBaseId],
-    queryFn: () => fetchDashboard(selectedKnowledgeBaseId),
+    queryFn: () => fetchDashboard(selectedKnowledgeBaseId, { includeGraph: false }),
     enabled: Boolean(selectedKnowledgeBaseId),
   });
   const [query, setQuery] = useLocalStorage(`search.query.${storageScope}`, "");
@@ -543,7 +592,7 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
   const [partition, setPartition] = useLocalStorage(`search.partition.${storageScope}`, "");
   const [sourceType, setSourceType] = useLocalStorage(`search.sourceType.${storageScope}`, "");
   const [selectedPartition, setSelectedPartition] = useLocalStorage(`search.selectedPartition.${storageScope}`, "");
-  const [activeChunkId, setActiveChunkId] = useLocalStorage<string | null>(`search.activeChunkId.${storageScope}`, null);
+  const [selectedChunkId, setSelectedChunkId] = useLocalStorage<string | null>(`search.selectedChunkId.${storageScope}`, null);
   const [searchResults, setSearchResults] = useLocalStorage<{ results: SearchResult[]; degraded_mode: boolean } | null>(`search.results.${storageScope}`, null);
   const [hoverPreview, setHoverPreview] = useState<HoverPreviewState | null>(null);
   const [detailResult, setDetailResult] = useState<SearchResult | null>(null);
@@ -567,24 +616,24 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
       const firstResult = data.results[0];
       const nextPartition = partition || (firstResult ? resultPartition(firstResult) : undefined) || (dashboardQuery.data?.tree[0]?.title ?? "");
       setSelectedPartition(nextPartition);
-      setActiveChunkId(firstResult?.chunk_id ?? null);
+      setSelectedChunkId(firstResult?.chunk_id ?? null);
     },
     onError: () => {
       setSearchResults({ results: [], degraded_mode: false });
-      setActiveChunkId(null);
+      setSelectedChunkId(null);
     },
   });
 
-  const partitionOptions = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title) ?? [], [dashboardQuery.data]);
+  const partitionOptions = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title).filter((title): title is string => Boolean(title)) ?? [], [dashboardQuery.data]);
   const results = searchResults?.results ?? emptySearchResults;
   const resultChunkIds = useMemo(() => results.map((result) => result.chunk_id), [results]);
-  const queryEvidenceGraphQuery = useQuery({
-    queryKey: ["search-evidence-graph", selectedKnowledgeBaseId, query, resultChunkIds],
-    queryFn: () => fetchQueryEvidenceGraph({ knowledge_base_id: selectedKnowledgeBaseId, query, chunk_ids: resultChunkIds }),
+  const queryContextGraphQuery = useQuery({
+    queryKey: ["search-context-graph", selectedKnowledgeBaseId, resultChunkIds],
+    queryFn: () => fetchGraph(selectedKnowledgeBaseId, "chunk-relation", "overview"),
     enabled: resultChunkIds.length > 0,
   });
-  const queryEvidenceGraph = useMemo(() => toQueryEvidenceGraph(queryEvidenceGraphQuery.data), [queryEvidenceGraphQuery.data]);
-  const selectedResult = results.find((result) => result.chunk_id === activeChunkId) ?? null;
+  const queryContextGraph = useMemo(() => toLayeredContextGraph(queryContextGraphQuery.data), [queryContextGraphQuery.data]);
+  const selectedResult = results.find((result) => result.chunk_id === selectedChunkId) ?? null;
   const focusPartition = selectedResult ? resultPartition(selectedResult) : selectedPartition;
   const selectedLabel = selectedResult?.document_title ?? selectedResult?.citations[0]?.document_title ?? null;
 
@@ -686,7 +735,7 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
       <section className="grid min-h-0 items-stretch gap-6 xl:grid-cols-[minmax(360px,0.78fr)_minmax(520px,1.22fr)]">
         <ResultStream
           results={results}
-          activeChunkId={activeChunkId}
+          selectedChunkId={selectedChunkId}
           isLoading={searchMutation.isPending}
           onHover={handleHoverPreview}
           onSelect={(result) => {
@@ -695,7 +744,7 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
               hoverPreviewTimerRef.current = null;
             }
             setHoverPreview(null);
-            setActiveChunkId(result.chunk_id);
+            setSelectedChunkId(result.chunk_id);
             setSelectedPartition(resultPartition(result));
             setDetailResult(result);
           }}
@@ -704,10 +753,10 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
           selectedLabel={selectedLabel}
           selectedPartition={focusPartition}
           selectedNodeId={null}
-          graph={queryEvidenceGraph}
+          graph={queryContextGraph}
           hasResults={results.length > 0}
-          isLoading={queryEvidenceGraphQuery.isLoading || searchMutation.isPending}
-          error={(queryEvidenceGraphQuery.error as Error | null) ?? null}
+          isLoading={queryContextGraphQuery.isLoading || searchMutation.isPending}
+          error={(queryContextGraphQuery.error as Error | null) ?? null}
         />
       </section>
 

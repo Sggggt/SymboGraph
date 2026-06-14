@@ -5,77 +5,27 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.db import get_db
-from app.models import ActiveChunk, AgentRun, AgentTraceEvent, Document, EvidenceAtom, EvidenceEdge, EvidenceGraphState, IngestionBatch, IngestionJob, QASession
 from app.core.config import get_settings
-from app.schemas import (
-    AgentRequest,
-    AgentResponse,
-    BatchLogTokenResponse,
-    BatchStartResponse,
-    CleanupStaleDataResponse,
-    KnowledgeBaseFileSummary,
-    KnowledgeBaseCreateRequest,
-    KnowledgeBaseSummary,
-    DashboardSnapshot,
-    DeleteKnowledgeBaseResponse,
-    DeleteResponse,
-    RebuildGraphResponse,
-    GraphResponse,
-    IngestionBatchSummary,
-    JobStatusResponse,
-    ModelSettingsResponse,
-    ModelSettingsUpdate,
-    ParseUploadedFilesRequest,
-    QARequest,
-    QAResponse,
-    QueryEvidenceGraphRequest,
-    RebuildGraphRequest,
-    RefreshResponse,
-    RuntimeCheckResponse,
-    SearchRequest,
-    SearchResponse,
-    SessionMessagesResponse,
-    SessionSummary,
-    StrategyProfileBindRequest,
-    StrategyProfileAssistantRequest,
-    StrategyProfileAssistantStateResponse,
-    StrategyProfileCopyRequest,
-    StrategyProfileCreateRequest,
-    StrategyProfileDetail,
-    StrategyProfileDraftRequest,
-    StrategyProfileDraftResponse,
-    StrategyProfileMutationResponse,
-    StrategyProfileSummary,
-    StrategyProfileUpdateRequest,
-    TaskStatusResponse,
-    UploadFileResponse,
-)
-from app.services.evidence_graph_payload import get_graph_payload, get_query_evidence_graph_payload
-from app.services.evidence_graph import publish_global_evidence_graph_state
-from app.services.embeddings import is_degraded_mode
-from app.services.agent_graph import run_agent, run_to_task_status, stream_agent_events
+from app.db import get_db
+from app.models import Chunk, IngestionBatch, IngestionJob
+from app.schemas import BatchLogTokenResponse, BatchStartResponse, IngestionBatchSummary, JobStatusResponse, ParseUploadedFilesRequest, UploadFileResponse
 from app.services.ingestion import (
-    create_knowledge_base_space,
     collect_source_documents,
-    create_uploaded_files_batch,
-    create_job,
     create_sync_batch,
+    create_uploaded_files_batch,
     get_batch_status,
-    list_knowledge_base_summaries,
-    request_batch_cancel_control,
+    get_job_status,
     register_uploaded_file,
+    request_batch_cancel_control,
     resolve_knowledge_base,
     run_batch_ingestion,
     run_ingestion_job,
     run_uploaded_files_ingestion,
-    remove_knowledge_base_file,
-    summarize_knowledge_base,
 )
 from app.services.ingestion_logs import (
     TERMINAL_LOG_EVENTS,
@@ -85,30 +35,10 @@ from app.services.ingestion_logs import (
     unsubscribe_ingestion_logs,
     validate_log_stream_token,
 )
-from app.services.maintenance import MaintenanceConflict, cleanup_stale_data, delete_knowledge_base_data
-from app.services.retrieval import (
-    evidence_first_search_chunks_with_audit,
-    get_dashboard_snapshot,
-    get_job_status,
-    list_knowledge_base_files,
-    search_chunks_with_audit,
-)
-from app.services.runtime_settings import model_settings_payload, runtime_check_payload, update_model_settings
 from app.services.storage import save_upload
-from app.services.strategy_profiles import (
-    bind_profile_to_knowledge_base,
-    copy_profile,
-    create_profile,
-    delete_profile,
-    generate_profile_draft,
-    get_profile_or_raise,
-    list_profiles,
-    profile_to_payload,
-    update_profile,
-)
-from app.services.profile_assistant import get_profile_assistant_state, stream_profile_assistant_events
 
 router = APIRouter()
+
 
 def get_requested_knowledge_base(db: Session, knowledge_base_id: str | None = None):
     try:
@@ -116,6 +46,9 @@ def get_requested_knowledge_base(db: Session, knowledge_base_id: str | None = No
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+
+def enqueue_error_message(exc: Exception) -> str:
+    return f"Failed to enqueue ingestion task in celery mode: {type(exc).__name__}: {exc}"
 
 
 async def enqueue_ingestion(job_id: str, source_path: str, trigger_source: str) -> None:
@@ -150,7 +83,7 @@ async def enqueue_batch(batch_id: str) -> None:
 async def enqueue_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False, full_reparse: bool = False) -> None:
     settings = get_settings()
     if settings.ingestion_execution_mode == "inline":
-        await run_uploaded_files_ingestion(batch_id, file_paths, force=force, full_reparse=full_reparse)
+        await run_uploaded_files_ingestion(batch_id, file_paths, force=force, full_reparse=full_reparse, execution_mode="inline")
         return
     try:
         from worker_app.tasks import ingest_uploaded_batch
@@ -162,15 +95,10 @@ async def enqueue_uploaded_batch(batch_id: str, file_paths: list[str], force: bo
         raise
 
 
-def enqueue_error_message(exc: Exception) -> str:
-    return f"Failed to enqueue ingestion task in celery mode: {type(exc).__name__}: {exc}"
-
-
 def mark_batch_enqueued(batch_id: str, task_name: str, task_id: str | None) -> None:
     from app.db import SessionLocal
 
-    session = SessionLocal()
-    try:
+    with SessionLocal() as session:
         batch = session.get(IngestionBatch, batch_id)
         if batch is None:
             return
@@ -179,10 +107,10 @@ def mark_batch_enqueued(batch_id: str, task_name: str, task_id: str | None) -> N
         stats["celery_task_name"] = task_name
         if task_id:
             stats["celery_task_id"] = task_id
+            stats["batch_task_ids"] = sorted({*stats.get("batch_task_ids", []), str(task_id)})
+            stats["task_last_seen_at"] = datetime.utcnow().isoformat()
         batch.stats = stats
         session.commit()
-    finally:
-        session.close()
 
 
 def mark_batch_enqueue_failed(batch_id: str, exc: Exception) -> None:
@@ -190,8 +118,7 @@ def mark_batch_enqueue_failed(batch_id: str, exc: Exception) -> None:
     from app.services.ingestion_logs import emit_ingestion_log
 
     message = enqueue_error_message(exc)
-    session = SessionLocal()
-    try:
+    with SessionLocal() as session:
         batch = session.get(IngestionBatch, batch_id)
         if batch is None:
             return
@@ -201,16 +128,13 @@ def mark_batch_enqueue_failed(batch_id: str, exc: Exception) -> None:
         batch.stats = {**(batch.stats or {}), "ingestion_execution_mode": "celery", "enqueue_error": message}
         session.commit()
         emit_ingestion_log(batch_id, "batch_failed", message, error=message, ingestion_execution_mode="celery")
-    finally:
-        session.close()
 
 
 def mark_job_enqueue_failed(job_id: str, exc: Exception) -> None:
     from app.db import SessionLocal
 
     message = enqueue_error_message(exc)
-    session = SessionLocal()
-    try:
+    with SessionLocal() as session:
         job = session.get(IngestionJob, job_id)
         if job is None:
             return
@@ -218,8 +142,6 @@ def mark_job_enqueue_failed(job_id: str, exc: Exception) -> None:
         job.error_message = message
         job.stats = {**(job.stats or {}), "ingestion_execution_mode": "celery", "enqueue_error": message}
         session.commit()
-    finally:
-        session.close()
 
 
 def enqueue_batch_background(batch_id: str) -> None:
@@ -236,10 +158,10 @@ async def upload_file(
     upload: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> dict:
-    KnowledgeBase = get_requested_knowledge_base(db, knowledge_base_id)
-    stored_path = await save_upload(upload, KnowledgeBase.name)
+    knowledge_base = get_requested_knowledge_base(db, knowledge_base_id)
+    stored_path = await save_upload(upload, knowledge_base.name)
     try:
-        document, job = register_uploaded_file(db, KnowledgeBase, stored_path)
+        document, job = register_uploaded_file(db, knowledge_base, stored_path)
     except Exception:
         stored_path.unlink(missing_ok=True)
         raise
@@ -253,58 +175,51 @@ async def parse_uploaded_files(
     knowledge_base_id: str | None = None,
     db: Session = Depends(get_db),
 ) -> dict:
-    KnowledgeBase = get_requested_knowledge_base(db, knowledge_base_id)
-    storage_root = Path(get_settings().knowledge_base_paths_for_name(KnowledgeBase.name)["storage_root"]).resolve()
+    knowledge_base = get_requested_knowledge_base(db, knowledge_base_id)
+    storage_root = Path(get_settings().knowledge_base_paths_for_name(knowledge_base.name)["storage_root"]).resolve()
     requested_paths = request.file_paths or [str(path) for path in collect_source_documents(storage_root)]
     if not requested_paths:
-        raise HTTPException(status_code=400, detail="No files found in KnowledgeBase storage")
-    file_paths = []
+        raise HTTPException(status_code=400, detail="No files found in knowledge base storage")
+    file_paths: list[Path] = []
     seen_paths: set[Path] = set()
     for raw_path in requested_paths:
         path = Path(raw_path).resolve()
         if not path.exists() or not path.is_file():
             raise HTTPException(status_code=404, detail=f"File not found: {path}")
-        if storage_root not in path.parents and path != storage_root:
-            raise HTTPException(status_code=400, detail=f"File is outside KnowledgeBase storage: {path}")
+        if path != storage_root and storage_root not in path.parents:
+            raise HTTPException(status_code=400, detail=f"File is outside knowledge base storage: {path}")
         if path in seen_paths:
             continue
         seen_paths.add(path)
         file_paths.append(path)
     if request.full_reparse:
-        active_chunks = db.scalar(select(func.count(ActiveChunk.id)).where(ActiveChunk.knowledge_base_id == KnowledgeBase.id, ActiveChunk.state == "active")) or 0
+        active_chunks = db.scalar(select(func.count(Chunk.id)).where(Chunk.knowledge_base_id == knowledge_base.id, Chunk.state == "active")) or 0
         if active_chunks <= 0:
             raise HTTPException(status_code=409, detail="Full reparse is unavailable before the first successful parse")
-    batch = create_uploaded_files_batch(db, KnowledgeBase.id, file_paths, force=request.force, full_reparse=request.full_reparse)
+    batch = create_uploaded_files_batch(db, knowledge_base.id, file_paths, force=request.force, full_reparse=request.full_reparse)
     serialized_paths = [str(path) for path in file_paths]
     if get_settings().ingestion_execution_mode == "celery":
         try:
             await enqueue_uploaded_batch(batch.id, serialized_paths, request.force, request.full_reparse)
         except Exception as exc:
-            raise HTTPException(
-                status_code=503,
-                detail={"code": "ingestion_enqueue_failed", "message": enqueue_error_message(exc)},
-            ) from exc
+            raise HTTPException(status_code=503, detail={"code": "ingestion_enqueue_failed", "message": enqueue_error_message(exc)}) from exc
     else:
         background_tasks.add_task(enqueue_uploaded_batch_background, batch.id, serialized_paths, request.force, request.full_reparse)
     return {"batch_id": batch.id, "state": "queued"}
 
 
 @router.post("/ingestion/parse-storage", response_model=BatchStartResponse)
-@router.post("/ingestion/sync-source", response_model=BatchStartResponse, include_in_schema=False)
 async def parse_storage_directory(background_tasks: BackgroundTasks, knowledge_base_id: str | None = None, db: Session = Depends(get_db)) -> dict:
-    KnowledgeBase = get_requested_knowledge_base(db, knowledge_base_id)
-    root = Path(get_settings().knowledge_base_paths_for_name(KnowledgeBase.name)["storage_root"])
+    knowledge_base = get_requested_knowledge_base(db, knowledge_base_id)
+    root = Path(get_settings().knowledge_base_paths_for_name(knowledge_base.name)["storage_root"])
     if not root.exists():
         raise HTTPException(status_code=404, detail=f"Storage root not found: {root}")
-    batch = create_sync_batch(db, KnowledgeBase.id, root, trigger_source="storage")
+    batch = create_sync_batch(db, knowledge_base.id, root, trigger_source="storage")
     if get_settings().ingestion_execution_mode == "celery":
         try:
             await enqueue_batch(batch.id)
         except Exception as exc:
-            raise HTTPException(
-                status_code=503,
-                detail={"code": "ingestion_enqueue_failed", "message": enqueue_error_message(exc)},
-            ) from exc
+            raise HTTPException(status_code=503, detail={"code": "ingestion_enqueue_failed", "message": enqueue_error_message(exc)}) from exc
     else:
         background_tasks.add_task(enqueue_batch_background, batch.id)
     return {"batch_id": batch.id, "state": "queued"}
@@ -320,9 +235,9 @@ def batch_status(batch_id: str, db: Session = Depends(get_db)) -> dict:
 
 @router.post("/ingestion/batches/{batch_id}/cancel", response_model=IngestionBatchSummary)
 async def cancel_batch(batch_id: str, knowledge_base_id: str | None = None, db: Session = Depends(get_db)) -> dict:
-    KnowledgeBase = get_requested_knowledge_base(db, knowledge_base_id)
+    knowledge_base = get_requested_knowledge_base(db, knowledge_base_id)
     try:
-        batch = await request_batch_cancel_control(db, batch_id, KnowledgeBase.id)
+        batch = request_batch_cancel_control(db, batch_id, knowledge_base.id)
     except PermissionError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if batch is None:
@@ -339,8 +254,6 @@ def batch_log_token(batch_id: str, db: Session = Depends(get_db)) -> dict:
 
 @router.get("/ingestion/batches/{batch_id}/logs")
 async def batch_logs(batch_id: str, token: str | None = None, x_api_key: str | None = Header(default=None)):
-    from app.db import SessionLocal
-
     allowed_keys = get_settings().api_key_list
     header_authorized = bool(x_api_key and x_api_key in allowed_keys)
     if allowed_keys and not header_authorized:
@@ -354,12 +267,13 @@ async def batch_logs(batch_id: str, token: str | None = None, x_api_key: str | N
         except ValueError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
 
+    from app.db import SessionLocal
+
     with SessionLocal() as session:
         batch_exists = get_batch_status(session, batch_id) is not None
-
     if not batch_exists:
         async def missing_stream():
-            yield f"data: {json.dumps({'timestamp': datetime.utcnow().isoformat(), 'event': 'batch_missing', 'message': 'Batch no longer exists. The local UI state can be cleared.', 'state': 'missing'}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'timestamp': datetime.utcnow().isoformat(), 'event': 'batch_missing', 'message': 'Batch no longer exists.', 'state': 'missing'}, ensure_ascii=False)}\n\n"
 
         return StreamingResponse(missing_stream(), media_type="text/event-stream")
 
@@ -374,11 +288,9 @@ async def batch_logs(batch_id: str, token: str | None = None, x_api_key: str | N
             if key in emitted:
                 return None
             emitted.add(key)
-            return f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+            return f"data: {json.dumps(item, ensure_ascii=False, default=str)}\n\n"
 
         def batch_snapshot_event() -> dict | None:
-            from app.db import SessionLocal
-
             with SessionLocal() as session:
                 snapshot = get_batch_status(session, batch_id)
             if snapshot is None:
@@ -389,12 +301,12 @@ async def batch_logs(batch_id: str, token: str | None = None, x_api_key: str | N
                 "failed": "batch_failed",
                 "partial_failed": "batch_partial_failed",
                 "skipped": "batch_skipped",
+                "cancelled": "batch_cancelled",
             }
-            event = terminal_events.get(state, "batch_status")
             return {
                 "synthetic_key": f"snapshot:{state}:{snapshot['processed_files']}:{snapshot['success_count']}:{snapshot['failure_count']}:{snapshot['skipped_count']}",
                 "timestamp": datetime.utcnow().isoformat(),
-                "event": event,
+                "event": terminal_events.get(state, "batch_status"),
                 "message": f"Batch {state}: {snapshot['processed_files']}/{snapshot['total_files']} processed",
                 "state": state,
                 "processed_files": snapshot["processed_files"],
@@ -413,8 +325,7 @@ async def batch_logs(batch_id: str, token: str | None = None, x_api_key: str | N
                 if item.get("event") in TERMINAL_LOG_EVENTS:
                     return
             while True:
-                latest = list_ingestion_logs(batch_id)
-                for item in latest:
+                for item in list_ingestion_logs(batch_id):
                     chunk = format_new(item)
                     if chunk:
                         yield chunk

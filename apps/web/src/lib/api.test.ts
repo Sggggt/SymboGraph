@@ -14,7 +14,7 @@ describe("api client", () => {
     vi.stubEnv("NEXT_PUBLIC_API_KEY", "test-key");
   });
 
-  it("starts parse batches with built-in evidence graph and cancels batches", async () => {
+  it("starts parse batches with built-in context graph and cancels batches", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse({ batch_id: "batch-1", state: "queued" }))
@@ -72,47 +72,57 @@ describe("api client", () => {
 
     await updateModelSettings({
       worker_concurrency: 3,
-      ingestion_file_concurrency: 3,
       model_request_concurrency: 3,
       model_request_timeout_seconds: 240,
-      chunk_token_budget: 2400,
-      retrieval_layer_enabled: true,
-      retrieval_cache_ttl_seconds: 120,
-      enable_agentic_reflection: true,
-      enable_post_generation_reflection: false,
-      citation_verification_sample_max: 3,
-      reflection_max_retries: 2,
-      enable_graph_community_summaries: true,
-      semantic_chunking_enabled: false,
+      embedding_batch_size: 10,
+      fixed_chunk_size_tokens: 512,
+      fixed_chunk_overlap_tokens: 80,
+      context_package_token_budget: 2400,
       reranker_enabled: true,
       reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2",
       reranker_max_length: 512,
       reranker_device: "cpu",
+      agent_coarse_activation_budget: 8,
+      agent_coarse_jump_budget: 2,
+      agent_mid_activation_budget: 16,
+      agent_mid_expansion_radius_cap: 2,
+      agent_fine_cluster_budget: 16,
+      agent_chunk_candidate_budget: 80,
+      agent_structure_restore_budget: 16,
+      agent_planning_round_budget: 2,
+      agent_max_typed_actions_per_round: 8,
+      agent_repair_round_budget: 2,
+      agent_verification_budget: 8,
     });
 
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
       worker_concurrency: 3,
-      ingestion_file_concurrency: 3,
       model_request_concurrency: 3,
       model_request_timeout_seconds: 240,
-      chunk_token_budget: 2400,
-      retrieval_layer_enabled: true,
-      retrieval_cache_ttl_seconds: 120,
-      enable_agentic_reflection: true,
-      enable_post_generation_reflection: false,
-      citation_verification_sample_max: 3,
-      reflection_max_retries: 2,
-      enable_graph_community_summaries: true,
-      semantic_chunking_enabled: false,
+      embedding_batch_size: 10,
+      fixed_chunk_size_tokens: 512,
+      fixed_chunk_overlap_tokens: 80,
+      context_package_token_budget: 2400,
       reranker_enabled: true,
       reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2",
       reranker_max_length: 512,
       reranker_device: "cpu",
+      agent_coarse_activation_budget: 8,
+      agent_coarse_jump_budget: 2,
+      agent_mid_activation_budget: 16,
+      agent_mid_expansion_radius_cap: 2,
+      agent_fine_cluster_budget: 16,
+      agent_chunk_candidate_budget: 80,
+      agent_structure_restore_budget: 16,
+      agent_planning_round_budget: 2,
+      agent_max_typed_actions_per_round: 8,
+      agent_repair_round_budget: 2,
+      agent_verification_budget: 8,
     });
   });
 
-  it("requests evidence graph status refresh", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ batch_id: null, state: "evidence_graph_active", mode: "evidence", affected_documents: 1 }));
+  it("requests context graph status refresh", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ batch_id: null, state: "context_graph_active", mode: "four_layer_context_graph", affected_documents: 1 }));
     vi.stubGlobal("fetch", fetchMock);
     const { rebuildGraph } = await import("./api");
 
@@ -123,7 +133,6 @@ describe("api client", () => {
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({
-          mode: "evidence",
           dry_run: false,
         }),
       }),
@@ -187,21 +196,11 @@ describe("api client", () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse({
-        deleted_vectors: 1,
-        deleted_chunks: 2,
-        deleted_document_versions: 3,
-        deleted_documents: 4,
-        removed_vector_records: 5,
-        removed_evidence_atoms: 6,
-        removed_evidence_edges: 7,
-        removed_evidence_graph_states: 8,
-        removed_active_chunks: 9,
-        removed_chunk_candidates: 10,
-        removed_chunk_decisions: 11,
-        removed_quality_decisions: 12,
-        removed_community_states: 13,
-        removed_community_memberships: 14,
-        removed_community_summaries: 15,
+        inactive_chunks: 2,
+        stale_vector_records: 5,
+        stale_qdrant_points: 5,
+        collections: ["knowledge_chunks"],
+        applied: false,
       }));
     vi.stubGlobal("fetch", fetchMock);
     const { cleanupStaleData } = await import("./api");
@@ -217,37 +216,30 @@ describe("api client", () => {
   it("requires graph_type on graph requests and confirms destructive rebuilds", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse({ graph_type: "evidence", schema_version: "typed_graph_v1", nodes: [], edges: [], node_counts: {}, edge_counts: {}, freshness: { is_stale: false } }))
-      .mockResolvedValueOnce(jsonResponse({ graph_type: "evidence", schema_version: "typed_graph_v1", nodes: [], edges: [], node_counts: {}, edge_counts: {}, freshness: { is_stale: false } }))
-      .mockResolvedValueOnce(jsonResponse({ batch_id: null, state: "evidence_graph_active", mode: "evidence" }))
-      .mockResolvedValueOnce(jsonResponse({ batch_id: null, state: "evidence_graph_active", mode: "evidence", dry_run: true, affected_documents: 3 }));
+      .mockResolvedValueOnce(jsonResponse({ graph_type: "chunk-relation", schema_version: "context_graph_v1", nodes: [], edges: [], counts: {}, sampled_counts: {}, node_counts: {}, edge_counts: {}, freshness: { is_stale: false } }))
+      .mockResolvedValueOnce(jsonResponse({ batch_id: null, state: "context_graph_active", mode: "four_layer_context_graph" }))
+      .mockResolvedValueOnce(jsonResponse({ batch_id: null, state: "context_graph_active", mode: "four_layer_context_graph", dry_run: true, affected_documents: 3 }));
     vi.stubGlobal("fetch", fetchMock);
-    const { fetchGraph, fetchPartitionGraph, rebuildGraph } = await import("./api");
+    const { fetchGraph, rebuildGraph } = await import("./api");
 
-    await fetchGraph("knowledge-base-1", "evidence");
-    await fetchPartitionGraph("Lecture 1", "knowledge-base-1", "evidence");
+    await fetchGraph("knowledge-base-1", "chunk-relation");
     await rebuildGraph("knowledge-base-1");
-    await rebuildGraph("knowledge-base-1", "evidence", true);
+    await rebuildGraph("knowledge-base-1", true);
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      "http://api.test/api/knowledge_bases/current/graph?knowledge_base_id=knowledge-base-1&graph_type=evidence&view=overview",
+      "http://api.test/api/knowledge_bases/current/graph?knowledge_base_id=knowledge-base-1&graph_type=chunk-relation&view=overview",
       expect.objectContaining({ cache: "no-store", headers: { "X-API-Key": "test-key" } }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      "http://api.test/api/graph/partitions/Lecture%201?knowledge_base_id=knowledge-base-1&graph_type=evidence&view=detail",
-      expect.objectContaining({ cache: "no-store", headers: { "X-API-Key": "test-key" } }),
+      "http://api.test/api/maintenance/rebuild-graph?knowledge_base_id=knowledge-base-1",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ dry_run: false }) }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       3,
       "http://api.test/api/maintenance/rebuild-graph?knowledge_base_id=knowledge-base-1",
-      expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "evidence", dry_run: false }) }),
-    );
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      4,
-      "http://api.test/api/maintenance/rebuild-graph?knowledge_base_id=knowledge-base-1",
-      expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "evidence", dry_run: true }) }),
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ dry_run: true }) }),
     );
   });
 
@@ -296,15 +288,11 @@ describe("api client", () => {
 
   it("parses profile assistant SSE chunks", async () => {
     const profileJson = {
-      schema_version: "strategy_profile_v1",
+      schema_version: "user_profile_v1",
       library_type: "legal",
       ui_labels: {},
       prompt_pack: {},
-      schema_pack: { entity_types: ["clause"], relation_types: ["cites"] },
-      parsing_strategy: {},
-      graph_strategy: {},
-      retrieval_strategy: {},
-      quality_policy: {},
+      conversation_preferences: {},
     };
     const body = new ReadableStream({
       start(controller) {

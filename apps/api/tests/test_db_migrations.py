@@ -1,34 +1,28 @@
 from __future__ import annotations
 
-from pathlib import Path
 
-from alembic import command
-from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
-
-
-def test_alembic_initial_upgrade_creates_evidence_graph_schema(tmp_path, monkeypatch):
-    database_url = f"sqlite:///{(tmp_path / 'alembic-test.db').as_posix()}"
-    monkeypatch.setenv("DATABASE_URL", database_url)
-
+def test_alembic_upgrade_creates_four_layer_schema(tmp_path, monkeypatch):
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import create_engine, inspect
     from app.core.config import get_settings
 
+    database_path = tmp_path / "migration.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{database_path.as_posix()}")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
     get_settings.cache_clear()
-    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    engine = create_engine(f"sqlite:///{database_path.as_posix()}", future=True)
+    config = Config("alembic.ini")
+    config.set_main_option("script_location", "migrations")
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path.as_posix()}")
     command.upgrade(config, "head")
-
-    engine = create_engine(database_url, future=True)
-    try:
-        tables = set(inspect(engine).get_table_names())
-        assert "knowledge_bases" in tables
-        assert "evidence_atoms" in tables
-        assert "active_chunks" in tables
-        assert "policy_states" in tables
-        assert "reward_events" in tables
-        assert "alembic_version" in tables
-        with engine.connect() as connection:
-            version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == "20260611_0002"
-    finally:
-        engine.dispose()
-        get_settings.cache_clear()
+    tables = set(inspect(engine).get_table_names())
+    assert "chunks" in tables
+    assert "chunk_structure_nodes" in tables
+    assert "chunk_relation_edges" in tables
+    assert "fine_clusters" in tables
+    assert "mid_concepts" in tables
+    assert "coarse_concepts" in tables
+    assert "context_packages" in tables
+    assert "evidence_atoms" not in tables
+    assert "active_chunks" not in tables

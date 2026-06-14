@@ -22,7 +22,7 @@ export function CitationCard({ citation, index }: CitationCardProps) {
         </CardTitle>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
-        <MarkdownRenderer content={citation.snippet} className="text-white/68" />
+        <MarkdownRenderer content={citation.snippet ?? ""} className="text-white/68" />
         <div className="flex flex-wrap gap-2 text-xs text-white/48">
           <Badge variant="secondary">{citation.partition ?? "通用"}</Badge>
           {citation.section ? <Badge variant="outline">{citation.section}</Badge> : null}

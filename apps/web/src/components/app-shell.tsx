@@ -56,8 +56,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const deleteKnowledgeBaseMutation = useMutation({
     mutationFn: (knowledgeBaseId: string) => deleteKnowledgeBase(knowledgeBaseId),
     onSuccess: async (data, deletedKnowledgeBaseId) => {
+      const stats = data.stats;
       setDeleteKnowledgeBaseResult(
-        `资料库数据已删除：向量 ${data.deleted_vectors} 条，文档 ${data.deleted_documents} 份，片段 ${data.deleted_chunks} 个，evidence atoms ${data.deleted_evidence_atoms} 个，active chunks ${data.deleted_active_chunks} 个。`,
+        `资料库数据已删除：Qdrant 点 ${stats.qdrant_points ?? stats.deleted_vectors ?? 0} 条，向量记录 ${stats.vector_records ?? stats.deleted_vector_records ?? 0} 条，文档 ${stats.documents ?? stats.deleted_documents ?? 0} 份，片段 ${stats.chunks ?? stats.deleted_chunks ?? 0} 个。`,
       );
       const nextKnowledgeBase = knowledgeBases.find((knowledgeBase) => knowledgeBase.id !== deletedKnowledgeBaseId) ?? null;
       setSelectedKnowledgeBaseId(nextKnowledgeBase?.id ?? null);
@@ -261,7 +262,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <DialogHeader className="border-b border-white/8 px-6 py-5 pr-14">
             <DialogTitle>新资料库操作流程</DialogTitle>
             <DialogDescription className="break-words text-cyan-100/70">
-              新建资料库默认使用内置课程 Profile；后续可以在设置页复制预设并切换为自定义 Profile。
+              新建资料库默认使用内置课程配置档；后续可以在设置页复制预设并切换为自定义配置档。
             </DialogDescription>
           </DialogHeader>
           <div className="max-h-[calc(100vh-10rem)] space-y-4 overflow-y-auto px-6 py-5">
@@ -271,8 +272,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   <TerminalSquare className="size-5" />
                 </div>
                 <div className="min-w-0">
-                  <p className="text-sm font-semibold text-white">Env 设置</p>
-                  <p className="mt-2 break-words text-xs leading-5 text-white/60">确认模型桥、聊天模型、Embedding、并发，以及 Redis、PostgreSQL、Qdrant 运行状态。</p>
+                  <p className="text-sm font-semibold text-white">环境设置</p>
+                  <p className="mt-2 break-words text-xs leading-5 text-white/60">确认模型桥、聊天模型、向量模型、并发，以及 Redis、PostgreSQL、Qdrant 运行状态。</p>
                 </div>
               </div>
               <div className="flex min-w-0 gap-4 rounded-2xl border border-violet-200/15 bg-violet-300/[0.06] p-4">
@@ -280,8 +281,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   <Settings className="size-5" />
                 </div>
                 <div className="min-w-0">
-                  <p className="text-sm font-semibold text-white">Profile 设置</p>
-                  <p className="mt-2 break-words text-xs leading-5 text-white/60">默认 Profile 保持现有课程行为；自定义资料库先复制预设，再编辑 schema、prompt 和策略。</p>
+                  <p className="text-sm font-semibold text-white">配置档设置</p>
+                  <p className="mt-2 break-words text-xs leading-5 text-white/60">默认配置档保持现有课程行为；自定义资料库先复制预设，再编辑结构规则、提示词和策略。</p>
                 </div>
               </div>
               <div className="flex min-w-0 gap-4 rounded-2xl border border-emerald-200/15 bg-emerald-300/[0.06] p-4">
@@ -290,7 +291,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 </div>
                 <div className="min-w-0">
                   <p className="text-sm font-semibold text-white">导入全流程</p>
-                  <p className="mt-2 break-words text-xs leading-5 text-white/60">上传文件后执行解析、构图、检索验证和问答检查；Profile 切换只影响之后的新任务。</p>
+                  <p className="mt-2 break-words text-xs leading-5 text-white/60">上传文件后执行解析、构图、检索验证和问答检查；配置档切换只影响之后的新任务。</p>
                 </div>
               </div>
             </div>

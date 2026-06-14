@@ -14,20 +14,21 @@ from sqlalchemy.orm import Session
 from app.models import KnowledgeBase, StrategyProfile
 
 
-BUILTIN_DEFAULT_PROFILE_NAME = "Default Evidence Profile"
+BUILTIN_DEFAULT_PROFILE_NAME = "Default Context Graph Profile"
 BUILTIN_LIBRARY_TYPE = "general"
+ACTIVE_PROFILE_SCHEMA_VERSION = "user_profile_v1"
 
-DEFAULT_SIGNAL_TYPES = [
+DEFAULT_CONCEPT_TYPES = [
     "claim",
     "definition",
     "method",
     "metric",
     "formula",
-    "evidence_marker",
+    "grounding_marker",
     "topic",
     "constraint",
 ]
-DEFAULT_SIGNAL_RELATION_TYPES = [
+DEFAULT_CONCEPT_RELATION_TYPES = [
     "supports",
     "refines",
     "depends_on",
@@ -38,24 +39,25 @@ DEFAULT_SIGNAL_RELATION_TYPES = [
     "same_topic",
     "related_observation",
 ]
-DEFAULT_SIGNAL_TYPE_ALIASES = {
+DEFAULT_CONCEPT_TYPE_ALIASES = {
     "algorithm": "method",
     "concept": "topic",
     "entity": "topic",
     "term": "topic",
     "theorem": "claim",
+    "evidence_marker": "grounding_marker",
 }
-DEFAULT_SIGNAL_RELATION_ALIASES = {
+DEFAULT_CONCEPT_RELATION_ALIASES = {
     "defined_by": "supports",
     "mentions": "same_topic",
     "references": "cites",
     "related_to": "related_observation",
 }
 
-GENERIC_ANSWER_SYSTEM_PREFIX = "You are an evidence-grounded knowledge-base assistant. "
-GENERIC_CONTEXT_LABEL = "Indexed evidence excerpts"
-GENERIC_NO_CONTEXT_EN = "I could not find enough reliable indexed evidence to answer this question with citations."
-GENERIC_NO_CONTEXT_ZH = "索引资料中没有找到足够可靠的证据来回答这个问题并提供引用。"
+GENERIC_ANSWER_SYSTEM_PREFIX = "You are a context-graph-grounded knowledge-base assistant. "
+GENERIC_CONTEXT_LABEL = "Indexed chunk spans"
+GENERIC_NO_CONTEXT_EN = "I could not find enough reliable indexed context to answer this question with citations."
+GENERIC_NO_CONTEXT_ZH = "索引资料中没有找到足够可靠的上下文来回答这个问题并提供引用。"
 
 DEFAULT_ANSWER_SYSTEM_PREFIX = GENERIC_ANSWER_SYSTEM_PREFIX
 DEFAULT_CONTEXT_LABEL = GENERIC_CONTEXT_LABEL
@@ -63,15 +65,15 @@ DEFAULT_NO_CONTEXT_EN = GENERIC_NO_CONTEXT_EN
 DEFAULT_NO_CONTEXT_ZH = GENERIC_NO_CONTEXT_ZH
 
 DEFAULT_PROFILE: dict[str, Any] = {
-    "schema_version": "strategy_profile_v3",
+    "schema_version": ACTIVE_PROFILE_SCHEMA_VERSION,
     "library_type": BUILTIN_LIBRARY_TYPE,
     "ui_labels": {
         "library": "Knowledge Base",
         "knowledge_base": "Knowledge Base",
         "partition": "partition",
         "partition_fallback": "General",
-        "entity": "signal",
-        "relation": "observed edge",
+        "entity": "concept",
+        "relation": "concept relation",
         "source_route": "retrieve_sources",
         "task_route": "retrieve_tasks",
     },
@@ -80,13 +82,13 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "context_label": GENERIC_CONTEXT_LABEL,
         "no_context_answer_en": GENERIC_NO_CONTEXT_EN,
         "no_context_answer_zh": GENERIC_NO_CONTEXT_ZH,
-        "reflection_domain": "evidence-grounded knowledge-base assistant",
-        "citation_domain": "indexed evidence excerpts",
-        "query_translation_domain": "knowledge-base evidence search",
-        "community_summary_system": "Summarize an evidence graph community for retrieval routing. Return strict JSON.",
-        "quality_judge_system": "You are an LLM-as-a-judge for an evidence-first knowledge-base pipeline. Return strict JSON.",
-        "perception_domain": "evidence-grounded knowledge-base agent",
-        "entity_label": "source-grounded evidence signals",
+        "reflection_domain": "context-graph-grounded knowledge-base assistant",
+        "citation_domain": "indexed chunk spans",
+        "query_translation_domain": "knowledge-base context graph search",
+        "community_summary_system": "Summarize a context graph community for retrieval routing. Return strict JSON.",
+        "quality_judge_system": "You are an LLM-as-a-judge for a four-layer context graph knowledge-base pipeline. Return strict JSON.",
+        "perception_domain": "context-graph-grounded knowledge-base agent",
+        "entity_label": "grounded mid-level concepts",
         "coverage_label": "indexed materials",
         "indexed_coverage_label": "indexed materials",
         "strongest_source_label": "knowledge-base source",
@@ -97,54 +99,26 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "agent_direct_answer_zh": "我可以回答已索引资料中的问题，提供引用，并说明检索如何得到答案。",
         "agent_clarify_answer_en": "Please clarify the source, partition, task, or comparison you want me to retrieve.",
         "agent_clarify_answer_zh": "请进一步说明你要检索的来源、分区、任务或比较问题。",
-        "agent_no_context_answer_en": "I could not find enough relevant indexed evidence to answer this question. If you want me to try with limited retrieved material, please tell me.",
-        "agent_no_context_answer_zh": "索引资料中没有找到足够相关的证据来回答这个问题。如果你希望我基于有限检索材料尝试回答，请告诉我。",
-        "retry_query_suffix": "knowledge-base evidence excerpts examples",
+        "agent_no_context_answer_en": "I could not find enough relevant indexed context to answer this question. If you want me to try with limited retrieved material, please tell me.",
+        "agent_no_context_answer_zh": "索引资料中没有找到足够相关的上下文来回答这个问题。如果你希望我基于有限检索材料尝试回答，请告诉我。",
+        "retry_query_suffix": "knowledge-base chunk spans examples",
     },
-    "schema_pack": {
-        "entity_types": DEFAULT_SIGNAL_TYPES,
-        "relation_types": DEFAULT_SIGNAL_RELATION_TYPES,
-        "entity_aliases": DEFAULT_SIGNAL_TYPE_ALIASES,
-        "relation_aliases": DEFAULT_SIGNAL_RELATION_ALIASES,
-        "disabled_entity_types": [],
-        "disabled_relation_types": [],
-        "default_entity_type": "topic",
-        "default_relation_type": "related_observation",
+    "conversation_preferences": {
+        "default_language": "auto",
+        "citation_strictness": "strict",
+        "clarification_style": "concise",
     },
-    "parsing_strategy": {
-        "partition_label": "partition",
-        "section_label": "Section",
-        "invalid_partition_labels": ["data", "storage", "reviewmarkdown"],
-        "code_keep_markers": ["evidence", "graph", "community", "parser", "retrieval"],
-    },
-    "graph_strategy": {
-        "min_signal_evidence_atoms": 1,
-        "min_signal_confidence": 0.5,
-        "min_observed_edge_confidence": 0.55,
-    },
-    "retrieval_strategy": {
-        "query_type_markers": {
-            "definition": ["what is", "define", "definition", "meaning", "term", "什么是", "定义"],
-            "formula": ["formula", "proof", "derive", "equation", "公式", "证明", "推导"],
-            "example": ["example", "instance", "case", "举例", "例子"],
-            "comparison": ["compare", "versus", "vs", "difference", "relationship", "relate", "区别", "比较", "关系"],
-            "procedure": ["procedure", "steps", "how to", "workflow", "流程", "步骤", "如何"],
-        },
-        "agent_route_markers": {
-            "multi_hop_research": ["compare", "relationship", "related to", "relation between", "difference between", "connect", "derive", "prove", "比较", "关系", "区别", "联系", "推导", "证明"],
-            "retrieve_tasks": ["task", "requirement", "question", "problem", "todo", "checklist"],
-            "retrieve_sources": ["source", "document", "excerpt", "definition", "section", "partition", "reference"],
-        },
-        "route_terms": {
-            "tasks": ["task", "requirement", "question", "problem", "todo", "checklist"],
-            "sources": ["source", "document", "excerpt", "definition", "section", "partition", "reference"],
-        },
-    },
-    "quality_policy": {
-        "structural_role_terms": ["partition", "section", "unit", "module", "page", "outline", "summary", "appendix", "reference"],
-        "generic_signal_terms": ["data", "model", "result", "example", "system", "approach", "process", "value", "function", "feature", "task", "step"],
-        "definition_markers": [" is ", " are ", " refers to ", " defined as ", " means ", " denotes ", " definition ", " 定义 ", " 是 ", " 指 "],
-    },
+}
+
+ACTIVE_PROFILE_KEYS = {"schema_version", "library_type", "ui_labels", "prompt_pack", "conversation_preferences"}
+LEGACY_PROFILE_KEYS = {
+    "schema_pack",
+    "concept_induction_policy",
+    "parsing_strategy",
+    "graph_strategy",
+    "retrieval_strategy",
+    "quality_policy",
+    "signal_induction_policy",
 }
 
 _active_profile_var: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("active_strategy_profile", default=None)
@@ -160,8 +134,14 @@ def default_profile_payload() -> dict[str, Any]:
 
 
 def migrate_profile_payload(profile: dict[str, Any]) -> dict[str, Any]:
-    migrated = copy.deepcopy(profile)
-    migrated["schema_version"] = "strategy_profile_v3"
+    source = copy.deepcopy(profile)
+    migrated: dict[str, Any] = {
+        "schema_version": ACTIVE_PROFILE_SCHEMA_VERSION,
+        "library_type": source.get("library_type") if isinstance(source.get("library_type"), str) else "custom",
+        "ui_labels": source.get("ui_labels") if isinstance(source.get("ui_labels"), dict) else {},
+        "prompt_pack": source.get("prompt_pack") if isinstance(source.get("prompt_pack"), dict) else {},
+        "conversation_preferences": source.get("conversation_preferences") if isinstance(source.get("conversation_preferences"), dict) else {},
+    }
     ui_labels = migrated.setdefault("ui_labels", {})
     if isinstance(ui_labels, dict):
         if "KnowledgeBase" in ui_labels and "knowledge_base" not in ui_labels:
@@ -170,62 +150,36 @@ def migrate_profile_payload(profile: dict[str, Any]) -> dict[str, Any]:
             ui_labels["source_route"] = ui_labels.pop("notes_route")
         if "exercise_route" in ui_labels and "task_route" not in ui_labels:
             ui_labels["task_route"] = ui_labels.pop("exercise_route")
-    retrieval_strategy = migrated.setdefault("retrieval_strategy", {})
-    if isinstance(retrieval_strategy, dict):
-        route_terms = retrieval_strategy.setdefault("route_terms", {})
-        if isinstance(route_terms, dict):
-            if "notes" in route_terms and "sources" not in route_terms:
-                route_terms["sources"] = route_terms.pop("notes")
-            if "exercise" in route_terms and "tasks" not in route_terms:
-                route_terms["tasks"] = route_terms.pop("exercise")
-        markers = retrieval_strategy.setdefault("agent_route_markers", {})
-        if isinstance(markers, dict):
-            if "retrieve_notes" in markers and "retrieve_sources" not in markers:
-                markers["retrieve_sources"] = markers.pop("retrieve_notes")
-            if "retrieve_exercises" in markers and "retrieve_tasks" not in markers:
-                markers["retrieve_tasks"] = markers.pop("retrieve_exercises")
     return migrated
-
-
-def _normalize_schema_name(value: object) -> str:
-    return str(value).strip().lower().replace("-", "_").replace(" ", "_")
 
 
 def validate_profile_payload(payload: object) -> tuple[dict[str, Any], list[str]]:
     if not isinstance(payload, dict):
         raise ValueError("Profile JSON must be an object")
+    legacy_keys = sorted(key for key in payload if key in LEGACY_PROFILE_KEYS)
     profile = migrate_profile_payload(payload)
-    warnings: list[str] = []
-    profile.setdefault("schema_version", "strategy_profile_v3")
+    warnings: list[str] = [
+        f"{key} is ignored on the active profile path; move engineering controls to runtime settings."
+        for key in legacy_keys
+    ]
+    if payload.get("schema_version") and payload.get("schema_version") != ACTIVE_PROFILE_SCHEMA_VERSION:
+        warnings.append(f"schema_version {payload.get('schema_version')} was migrated to {ACTIVE_PROFILE_SCHEMA_VERSION}.")
+    profile["schema_version"] = ACTIVE_PROFILE_SCHEMA_VERSION
     profile.setdefault("library_type", "custom")
-    for key in ("ui_labels", "prompt_pack", "schema_pack", "parsing_strategy", "graph_strategy", "retrieval_strategy", "quality_policy"):
+    for key in ("ui_labels", "prompt_pack", "conversation_preferences"):
         value = profile.setdefault(key, {})
         if not isinstance(value, dict):
             raise ValueError(f"{key} must be an object")
-    schema_pack = profile["schema_pack"]
-    entity_types = schema_pack.get("entity_types")
-    relation_types = schema_pack.get("relation_types")
-    if not isinstance(entity_types, list) or not all(isinstance(item, str) and item.strip() for item in entity_types):
-        raise ValueError("schema_pack.entity_types must be a non-empty list of signal type strings")
-    if not isinstance(relation_types, list) or not all(isinstance(item, str) and item.strip() for item in relation_types):
-        raise ValueError("schema_pack.relation_types must be a non-empty list of observed edge type strings")
-    schema_pack["entity_types"] = list(dict.fromkeys(_normalize_schema_name(item) for item in entity_types))
-    schema_pack["relation_types"] = list(dict.fromkeys(_normalize_schema_name(item) for item in relation_types))
-    if "topic" not in schema_pack["entity_types"]:
-        warnings.append("schema_pack.entity_types does not include topic; unknown signal types will use the configured default")
-    if "related_observation" not in schema_pack["relation_types"]:
-        warnings.append("schema_pack.relation_types does not include related_observation; unknown observed edge types will use the configured default")
-    schema_pack.setdefault("default_entity_type", schema_pack["entity_types"][0])
-    schema_pack.setdefault("default_relation_type", schema_pack["relation_types"][0])
-    for map_key in ("entity_aliases", "relation_aliases"):
-        aliases = schema_pack.get(map_key, {})
-        if not isinstance(aliases, dict):
-            raise ValueError(f"schema_pack.{map_key} must be an object")
-        schema_pack[map_key] = {
-            _normalize_schema_name(key): _normalize_schema_name(value)
-            for key, value in aliases.items()
-            if str(key).strip() and str(value).strip()
+    for key in ("ui_labels", "prompt_pack", "conversation_preferences"):
+        mapping = profile[key]
+        profile[key] = {
+            str(item_key): item_value
+            for item_key, item_value in mapping.items()
+            if str(item_key).strip()
         }
+    for key in list(profile):
+        if key not in ACTIVE_PROFILE_KEYS:
+            profile.pop(key, None)
     profile["profile_hash"] = profile_hash(profile)
     return profile, warnings
 
@@ -408,26 +362,6 @@ def bind_profile_to_knowledge_base(db: Session, *, knowledge_base_id: str, profi
     return knowledge_base
 
 
-async def generate_profile_draft(prompt: str, base_profile: dict[str, Any] | None = None) -> dict[str, Any]:
-    from app.services.embeddings import ChatProvider
-
-    base = base_profile or default_profile_payload()
-    system_prompt = (
-        "You generate a strict JSON strategy profile draft for a local evidence-first knowledge-base system. "
-        "Return JSON only. Preserve the top-level keys from the provided base profile. "
-        "Do not include secrets, API keys, markdown, or commentary."
-    )
-    user_prompt = (
-        f"User request:\n{prompt.strip()}\n\n"
-        "Base profile JSON:\n"
-        f"{json.dumps(base, ensure_ascii=False)}\n\n"
-        "Return an edited profile_json object only."
-    )
-    draft = await ChatProvider().classify_json(system_prompt, user_prompt, fallback=base)
-    validated, warnings = validate_profile_payload(draft or base)
-    return {"profile_json": validated, "warnings": warnings, "profile_hash": profile_hash(validated)}
-
-
 def profile_label(profile_json: dict[str, Any], key: str, default: str) -> str:
     value = ((profile_json or {}).get("ui_labels") or {}).get(key)
     return str(value).strip() if isinstance(value, str) and value.strip() else default
@@ -439,4 +373,11 @@ def profile_prompt(profile_json: dict[str, Any], key: str, default: str) -> str:
 
 
 def profile_schema(profile_json: dict[str, Any]) -> dict[str, Any]:
-    return (profile_json or {}).get("schema_pack") if isinstance((profile_json or {}).get("schema_pack"), dict) else DEFAULT_PROFILE["schema_pack"]
+    return {
+        "entity_types": DEFAULT_CONCEPT_TYPES,
+        "relation_types": DEFAULT_CONCEPT_RELATION_TYPES,
+        "entity_aliases": DEFAULT_CONCEPT_TYPE_ALIASES,
+        "relation_aliases": DEFAULT_CONCEPT_RELATION_ALIASES,
+        "default_entity_type": "topic",
+        "default_relation_type": "related_observation",
+    }

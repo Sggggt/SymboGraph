@@ -151,9 +151,9 @@ class FallbackVectorStore:
 
 
 class VectorStore:
-    def __init__(self, knowledge_base_name: str | None = None) -> None:
+    def __init__(self, knowledge_base_name: str | None = None, collection_name: str | None = None) -> None:
         self.settings = get_settings()
-        self.collection = self.settings.qdrant_collection
+        self.collection = collection_name or self.settings.qdrant_collection
         knowledge_base_paths = self.settings.knowledge_base_paths_for_name(knowledge_base_name or self.settings.knowledge_base_name)
         self.fallback = FallbackVectorStore(knowledge_base_paths["ingestion_root"] / "vector_index.json")
         self.client: QdrantClient | None = None

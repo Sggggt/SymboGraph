@@ -33,6 +33,11 @@ async def save_upload(upload: UploadFile, knowledge_base_name: str | None = None
 
 
 def copy_source_file(source_path: Path, knowledge_base_name: str | None = None) -> Path:
+    settings = get_settings()
+    storage_root = settings.knowledge_base_paths_for_name(knowledge_base_name or settings.knowledge_base_name)["storage_root"].resolve()
+    resolved_source = source_path.resolve()
+    if resolved_source == storage_root or storage_root in resolved_source.parents:
+        return resolved_source
     target = build_storage_path(source_path.name, knowledge_base_name=knowledge_base_name)
     shutil.copy2(source_path, target)
     return target

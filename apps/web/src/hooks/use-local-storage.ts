@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useCallback, useRef, useSyncExternalStore } from "react";
 
 const LOCAL_STORAGE_EVENT = "codex-local-storage";
 const snapshotCache = new Map<string, { raw: string | null; parsed: unknown }>();
@@ -64,15 +64,16 @@ function readLocalStorageValue<T>(key: string, initialValue: T): T {
 }
 
 export function useLocalStorage<T>(key: string, initialValue: T) {
+  const initialValueRef = useRef(initialValue);
   const storedValue = useSyncExternalStore(
     (onStoreChange) => subscribeToKey(key, onStoreChange),
     () => readLocalStorageValue(key, initialValue),
     () => initialValue,
   );
 
-  const setValue = (value: T | ((val: T) => T)) => {
+  const setValue = useCallback((value: T | ((val: T) => T)) => {
     try {
-      const currentValue = readLocalStorageValue(key, initialValue);
+      const currentValue = readLocalStorageValue(key, initialValueRef.current);
       const valueToStore = value instanceof Function ? value(currentValue) : value;
       if (typeof window !== "undefined") {
         const serialized = JSON.stringify(valueToStore);
@@ -83,7 +84,7 @@ export function useLocalStorage<T>(key: string, initialValue: T) {
     } catch (error) {
       console.warn(`Error setting localStorage key "${key}":`, error);
     }
-  };
+  }, [key]);
 
   return [storedValue, setValue] as const;
 }

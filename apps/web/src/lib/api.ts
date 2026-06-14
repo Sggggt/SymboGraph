@@ -19,10 +19,11 @@
   ParseUploadedFilesRequest,
   QARequest,
   QAResponse,
-  QueryEvidenceGraphRequest,
   RebuildGraphRequest,
   RebuildGraphResponse,
   RefreshResponse,
+  ContextPackageResponse,
+  RetrievalTraceStepsResponse,
   RuntimeCheckResponse,
   SearchRequest,
   SearchResponse,
@@ -37,8 +38,6 @@
   StrategyProfileCopyRequest,
   StrategyProfileCreateRequest,
   StrategyProfileDetail,
-  StrategyProfileDraftRequest,
-  StrategyProfileDraftResponse,
   StrategyProfileMutationResponse,
   StrategyProfileSummary,
   StrategyProfileUpdateRequest,
@@ -142,8 +141,14 @@ export async function deleteKnowledgeBase(knowledgeBaseId: string): Promise<Dele
   return parseResponse<DeleteKnowledgeBaseResponse>(response);
 }
 
-export async function fetchDashboard(knowledgeBaseId?: string | null): Promise<DashboardSnapshot> {
-  const response = await fetch(buildApiUrl("/knowledge_bases/current/dashboard", { knowledge_base_id: knowledgeBaseId }), { cache: "no-store", headers: authHeaders() });
+export async function fetchDashboard(knowledgeBaseId?: string | null, options: { includeGraph?: boolean } = {}): Promise<DashboardSnapshot> {
+  const response = await fetch(
+    buildApiUrl("/knowledge_bases/current/dashboard", {
+      knowledge_base_id: knowledgeBaseId,
+      include_graph: options.includeGraph === false ? "false" : undefined,
+    }),
+    { cache: "no-store", headers: authHeaders() },
+  );
   return parseResponse<DashboardSnapshot>(response);
 }
 
@@ -231,15 +236,6 @@ export async function bindStrategyProfile(payload: StrategyProfileBindRequest): 
   return parseResponse<KnowledgeBaseSummary>(response);
 }
 
-export async function draftStrategyProfile(payload: StrategyProfileDraftRequest): Promise<StrategyProfileDraftResponse> {
-  const response = await fetch(buildApiUrl("/settings/profile-drafts"), {
-    method: "POST",
-    headers: jsonHeaders(),
-    body: JSON.stringify(payload),
-  });
-  return parseResponse<StrategyProfileDraftResponse>(response);
-}
-
 export async function fetchProfileAssistantState(sessionId: string): Promise<StrategyProfileAssistantStateResponse> {
   const response = await fetch(buildApiUrl(`/settings/profile-assistant/${encodeURIComponent(sessionId)}`), {
     cache: "no-store",
@@ -269,7 +265,7 @@ export async function streamProfileAssistant(
     throw new Error(message);
   }
   if (!response.body) {
-    const message = "Browser does not support streaming responses";
+    const message = "当前浏览器不支持流式响应";
     handlers.onError?.(message);
     throw new Error(message);
   }
@@ -303,7 +299,7 @@ export async function streamProfileAssistant(
       try {
         parsed = JSON.parse(line);
       } catch (error) {
-        console.warn("Ignoring malformed profile assistant SSE event", { line, error });
+        console.warn("忽略无法解析的配置档助手 SSE 事件", { line, error });
         continue;
       }
       if (parsed.type === "meta") {
@@ -352,14 +348,13 @@ export async function cleanupStaleData(knowledgeBaseId?: string | null): Promise
 
 export async function rebuildGraph(
   knowledgeBaseId?: string | null,
-  mode: "evidence" = "evidence",
   dryRun = false,
   options: Partial<RebuildGraphRequest> = {},
 ): Promise<RebuildGraphResponse> {
   const response = await fetch(buildApiUrl("/maintenance/rebuild-graph", { knowledge_base_id: knowledgeBaseId }), {
     method: "POST",
     headers: jsonHeaders(),
-    body: JSON.stringify({ mode, dry_run: dryRun, ...options } satisfies RebuildGraphRequest),
+    body: JSON.stringify({ dry_run: dryRun, ...options } satisfies RebuildGraphRequest),
   });
   return parseResponse<RebuildGraphResponse>(response);
 }
@@ -369,18 +364,14 @@ export async function fetchGraph(knowledgeBaseId: string | null | undefined, gra
   return parseResponse<GraphResponse>(response);
 }
 
-export async function fetchPartitionGraph(partition: string, knowledgeBaseId: string | null | undefined, graphType: GraphType, view: GraphResponse["view"] = "detail"): Promise<GraphResponse> {
-  const response = await fetch(buildApiUrl(`/graph/partitions/${encodeURIComponent(partition)}`, { knowledge_base_id: knowledgeBaseId, graph_type: graphType, view }), { cache: "no-store", headers: authHeaders() });
-  return parseResponse<GraphResponse>(response);
+export async function fetchContextPackage(packageId: string): Promise<ContextPackageResponse> {
+  const response = await fetch(buildApiUrl(`/context-packages/${encodeURIComponent(packageId)}`), { cache: "no-store", headers: authHeaders() });
+  return parseResponse<ContextPackageResponse>(response);
 }
 
-export async function fetchQueryEvidenceGraph(payload: QueryEvidenceGraphRequest): Promise<GraphResponse> {
-  const response = await fetch(buildApiUrl("/search/evidence-graph"), {
-    method: "POST",
-    headers: jsonHeaders(),
-    body: JSON.stringify(payload),
-  });
-  return parseResponse<GraphResponse>(response);
+export async function fetchRetrievalTraceSteps(traceId: string): Promise<RetrievalTraceStepsResponse> {
+  const response = await fetch(buildApiUrl(`/retrieval-traces/${encodeURIComponent(traceId)}/graph-steps`), { cache: "no-store", headers: authHeaders() });
+  return parseResponse<RetrievalTraceStepsResponse>(response);
 }
 
 export async function searchKnowledge(payload: SearchRequest): Promise<SearchResponse> {

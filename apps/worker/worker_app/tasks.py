@@ -5,8 +5,7 @@ from worker_app.bootstrap import API_ROOT  # noqa: F401
 from worker_app.celery_app import celery_app
 from app.db import SessionLocal
 from app.models import KnowledgeBase
-from app.services.evidence_graph import update_policy_from_rewards
-from app.services.ingestion import ingest_file, run_batch_ingestion, run_uploaded_files_ingestion
+from app.services.ingestion import ingest_file, mark_batch_task_started, run_batch_ingestion, run_uploaded_files_ingestion
 from app.services.maintenance import reconcile_policy_state, reconcile_vector_store_sync
 from app.services.runtime_settings import refresh_runtime_settings_if_needed
 from sqlalchemy import select
@@ -22,16 +21,18 @@ def ingest_path(path: str, trigger_source: str = "watchdog", job_id: str | None 
         session.close()
 
 
-@celery_app.task(name="ingest_batch")
-def ingest_batch(batch_id: str) -> dict:
+@celery_app.task(name="ingest_batch", bind=True)
+def ingest_batch(self, batch_id: str) -> dict:
     refresh_runtime_settings_if_needed(force=True)
+    mark_batch_task_started(batch_id, getattr(self.request, "id", None), "ingest_batch")
     return asyncio.run(run_batch_ingestion(batch_id))
 
 
-@celery_app.task(name="ingest_uploaded_batch")
-def ingest_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False, full_reparse: bool = False) -> dict:
+@celery_app.task(name="ingest_uploaded_batch", bind=True)
+def ingest_uploaded_batch(self, batch_id: str, file_paths: list[str], force: bool = False, full_reparse: bool = False) -> dict:
     refresh_runtime_settings_if_needed(force=True)
-    return asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths, force=force, full_reparse=full_reparse))
+    mark_batch_task_started(batch_id, getattr(self.request, "id", None), "ingest_uploaded_batch")
+    return asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths, force=force, full_reparse=full_reparse, execution_mode="celery"))
 
 
 @celery_app.task(name="reconcile_vector_store")
@@ -53,7 +54,6 @@ def update_policy_backfill_task(knowledge_base_id: str | None = None) -> dict:
         updated = 0
         reconciled = 0
         for kb_id in knowledge_base_ids:
-            updated += update_policy_from_rewards(session, knowledge_base_id=kb_id)
             reconciled += reconcile_policy_state(session, knowledge_base_id=kb_id)
         session.commit()
         return {"updated_observations": updated, "reconciled_policy_states": reconciled, "knowledge_bases": len(knowledge_base_ids)}

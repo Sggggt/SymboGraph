@@ -7,6 +7,7 @@ from app.models import IngestionBatch
 
 CANCEL_REQUESTED = "cancel_requested"
 CANCELLED = "cancelled"
+CANCEL_FAILED = "cancel_failed"
 CANCELLING_STATES = {CANCEL_REQUESTED, "cancelling", "compensating"}
 
 

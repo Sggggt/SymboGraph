@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 
-TERMINAL_LOG_EVENTS = {"batch_completed", "batch_failed", "batch_partial_failed", "batch_skipped", "batch_missing"}
+TERMINAL_LOG_EVENTS = {"batch_completed", "batch_failed", "batch_partial_failed", "batch_skipped", "batch_cancelled", "batch_cancel_failed", "batch_missing"}
 _HISTORY_LIMIT = 500
 _LOG_TOKEN_TTL_SECONDS = 600
 _history: dict[str, list[dict[str, Any]]] = defaultdict(list)

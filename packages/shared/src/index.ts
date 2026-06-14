@@ -1,4 +1,4 @@
-﻿export type Visibility = "private";
+export type Visibility = "private";
 
 export type SourceType =
   | "pdf"
@@ -18,45 +18,53 @@ export type JobState =
   | "chunking"
   | "embedding"
   | "extracting_graph"
+  | "context_graph"
   | "cancel_requested"
   | "cancelling"
+  | "terminating_task"
   | "compensating"
   | "cancelled"
+  | "cancel_failed"
   | "processing"
   | "completed"
   | "partial_failed"
   | "failed"
   | "skipped";
 
-export type KnowledgeBaseFileStatus = "pending" | "parsing" | "parsed" | "failed" | "skipped";
+export type KnowledgeBaseFileStatus = "pending" | "parsing" | "parsed" | "failed" | "skipped" | "active";
 
 export type AgentRoute =
+  | "layered_context_graph"
   | "direct_answer"
-  | "retrieve_sources"
-  | "retrieve_tasks"
-  | "retrieve_both"
-  | "clarify"
-  | "multi_hop_research";
+  | "multi_hop_research"
+  | "definition_lookup"
+  | "formula_table_lookup"
+  | "cross_document_synthesis"
+  | "clarify";
 
 export type AgentRunState = "queued" | "running" | "needs_clarification" | "completed" | "failed";
 
 export interface SearchFilters {
+  document_ids?: string[];
+  source_paths?: string[];
   partition?: string;
   tags?: string[];
-  difficulty?: string;
-  source_type?: SourceType;
+  source_type?: SourceType | string;
+  page_range?: [number | null, number | null] | null;
+  content_kinds?: string[];
+  chunk_version?: number | null;
 }
 
 export interface UploadFileResponse {
   document_id: string;
   job_id?: string | null;
-  status: JobState;
+  status: JobState | string;
   source_path: string;
 }
 
 export interface JobStatusResponse {
   job_id: string;
-  state: JobState;
+  state: JobState | string;
   error?: string | null;
   document_id?: string | null;
   source_path?: string | null;
@@ -71,71 +79,76 @@ export interface SearchRequest {
   top_k?: number;
 }
 
-export interface QueryEvidenceGraphRequest {
-  knowledge_base_id?: string | null;
-  query?: string | null;
-  chunk_ids: string[];
-}
-
 export interface Citation {
   chunk_id: string;
-  document_id: string;
-  document_title: string;
-  source_path: string;
+  document_id?: string | null;
+  document_version_id?: string | null;
+  title?: string | null;
+  document_title?: string | null;
+  source_path?: string | null;
   partition?: string | null;
   section?: string | null;
+  section_path?: string[];
   page_number?: number | null;
-  snippet: string;
-  active_chunk_id?: string | null;
-  evidence_atom_ids?: string[];
+  page_range?: [number | null, number | null] | number[] | null;
+  char_span?: [number | null, number | null] | number[] | null;
+  bbox?: Record<string, unknown> | null;
+  text?: string | null;
+  snippet?: string | null;
   source_span?: Record<string, unknown>;
+  verification?: Record<string, unknown>;
   retrieval_trace_id?: string | null;
   citation_verification_id?: string | null;
 }
 
 export interface SearchResult {
   chunk_id: string;
-  active_chunk_id?: string | null;
+  document_id?: string | null;
+  document_version_id?: string | null;
+  title?: string | null;
   snippet: string;
+  text?: string | null;
+  content?: string | null;
   score: number;
   citations: Citation[];
   metadata: Record<string, unknown>;
-  content?: string | null;
-  child_content?: string | null;
-  document_title?: string | null;
   source_path?: string | null;
+  page_range?: [number | null, number | null] | number[] | null;
+  char_span?: [number | null, number | null] | number[] | null;
+  section_path?: string[];
+  graph_path?: Array<Record<string, unknown>>;
+  document_title?: string | null;
   partition?: string | null;
   source_type?: string | null;
 }
 
 export interface ModelAudit {
-  embedding_provider: string;
+  provider?: string | null;
+  embedding_provider?: string | null;
   embedding_model?: string | null;
-  embedding_external_called: boolean;
-  embedding_fallback_reason?: string | null;
-  reranker_enabled: boolean;
-  reranker_called: boolean;
-  fallback_enabled: boolean;
-  degraded_mode: boolean;
-  vector_index_warning?: string | null;
+  embedding_text_version?: string | null;
+  embedding_external_called?: boolean;
+  retrieval_mode?: string | null;
   retrieval_pipeline?: string | null;
-  signal_state_hash?: string | null;
-  signal_node_ids?: string[];
-  retrieval_cache_scope_hash?: string | null;
-  cached?: boolean;
-  scope_hash?: string | null;
+  retrieval_trace_id?: string | null;
+  context_package_id?: string | null;
+  degraded?: boolean;
+  degraded_mode?: boolean;
+  fallback_used?: boolean;
+  fallback_enabled?: boolean;
+  latency_ms?: number | null;
+  details?: Record<string, unknown>;
   cache?: Record<string, unknown>;
+  cached?: boolean;
 }
 
-export interface AnswerModelAudit {
-  provider: string;
+export interface AnswerModelAudit extends ModelAudit {
+  chat_model?: string | null;
   model?: string | null;
-  external_called: boolean;
-  fallback_reason?: string | null;
+  external_called?: boolean;
   skipped_reason?: string | null;
-  signal_state_hash?: string | null;
-  signal_node_ids?: string[];
-  signal_expansion_used?: boolean;
+  answer_session_id?: string | null;
+  citation_verification_pass_rate?: number | null;
 }
 
 export interface SearchResponse {
@@ -164,39 +177,35 @@ export interface QAResponse {
   session_id?: string | null;
   answer: string;
   citations: Citation[];
-  used_chunks: Array<Record<string, unknown>>;
-  route?: AgentRoute | null;
+  used_chunks?: Array<Record<string, unknown>>;
+  route?: AgentRoute | string | null;
   trace?: AgentTraceEventPayload[];
   degraded_mode: boolean;
-  answer_model_audit: AnswerModelAudit;
+  model_audit?: AnswerModelAudit | Record<string, unknown>;
+  answer_model_audit?: AnswerModelAudit;
+  context_package_id?: string | null;
+  retrieval_trace_id?: string | null;
 }
 
-export interface AgentRequest {
-  question: string;
-  session_id?: string | null;
-  knowledge_base_id?: string | null;
-  filters?: SearchFilters;
-  top_k?: number;
-  history?: ChatMessage[];
+export interface AgentRequest extends QARequest {
   stream_trace?: boolean;
 }
 
 export type AgentTraceNode =
-  | "perception"
-  | "retrieval_planner"
-  | "base_retrieval"
-  | "evidence_anchor_selector"
-  | "evidence_chain_planner"
-  | "controlled_graph_enhancer"
-  | "evidence_assembler"
-  | "document_grader"
-  | "evidence_evaluator"
-  | "context_synthesizer"
-  | "answer_generator"
-  | "citation_checker"
-  | "citation_verifier"
-  | "reflection"
-  | "self_check"
+  | "query_understanding"
+  | "agent_planner"
+  | "typed_action_validation"
+  | "coarse_concept_activation"
+  | "mid_concept_routing"
+  | "fine_cluster_routing"
+  | "chunk_recall"
+  | "structure_context_restoration"
+  | "layered_retrieval"
+  | "context_package"
+  | "grounded_answer"
+  | "citation_verification"
+  | "repair_executed"
+  | "reward_event"
   | "error";
 
 export interface AgentTraceEventPayload {
@@ -213,24 +222,21 @@ export interface AgentTraceEventPayload {
   created_at?: string | null;
 }
 
-export interface AgentResponse {
+export interface AgentResponse extends QAResponse {
   run_id: string;
   session_id: string;
-  answer: string;
-  citations: Citation[];
-  used_chunks: Array<Record<string, unknown>>;
-  route: AgentRoute;
+  route: AgentRoute | string;
   trace: AgentTraceEventPayload[];
-  degraded_mode: boolean;
   answer_model_audit: AnswerModelAudit;
 }
 
 export interface TaskStatusResponse {
   run_id: string;
-  state: AgentRunState;
+  state?: AgentRunState | string;
+  status?: AgentRunState | string;
   current_node?: string | null;
-  retry_count: number;
-  route?: AgentRoute | null;
+  retry_count?: number;
+  route?: AgentRoute | string | null;
   error?: string | null;
   started_at?: string | null;
   completed_at?: string | null;
@@ -256,90 +262,76 @@ export interface DeleteResponse {
 }
 
 export interface CleanupStaleDataResponse {
-  deleted_vectors: number;
-  deleted_chunks: number;
-  deleted_document_versions: number;
-  deleted_documents: number;
-  removed_vector_records: number;
-  removed_evidence_atoms: number;
-  removed_evidence_edges: number;
-  removed_evidence_graph_states: number;
-  removed_active_chunks: number;
-  removed_chunk_candidates: number;
-  removed_chunk_decisions: number;
-  removed_quality_decisions: number;
-  removed_community_states: number;
-  removed_community_memberships: number;
-  removed_community_summaries: number;
+  knowledge_base_id?: string | null;
+  dry_run?: boolean;
+  stats: {
+    documents?: number;
+    chunks?: number;
+    vector_records?: number;
+    qdrant_points?: number;
+    deleted_vectors?: number;
+    removed_vector_records?: number;
+    deleted_chunks?: number;
+    deleted_document_versions?: number;
+    deleted_documents?: number;
+    inactive_chunks?: number;
+    stale_vector_records?: number;
+    stale_qdrant_points?: number;
+    collections?: string[];
+    applied?: boolean;
+    stale_vectors?: number;
+    stale_bm25_records?: number;
+    [key: string]: unknown;
+  };
 }
 
 export interface RebuildGraphRequest {
-  mode: "evidence";
   dry_run?: boolean;
+  layers?: GraphType[];
 }
 
 export interface RebuildGraphResponse {
   batch_id?: string | null;
   state: string;
-  mode: string;
+  mode: "four_layer_context_graph" | string;
   affected_documents: number;
   previous_batch_id?: string | null;
   dry_run?: boolean;
-  evidence_atoms?: number;
-  evidence_edges?: number;
-  active_chunks?: number;
+  stats?: Record<string, unknown>;
 }
 
 export interface BatchLogTokenResponse {
+  batch_id?: string;
   token: string;
   expires_at: string;
 }
 
 export interface DeleteKnowledgeBaseResponse {
   deleted: boolean;
-  deleted_vectors: number;
-  deleted_vector_records: number;
-  deleted_active_chunks: number;
-  deleted_chunk_decisions: number;
-  deleted_quality_decisions: number;
-  deleted_chunk_candidates: number;
-  deleted_evidence_atoms: number;
-  deleted_evidence_edges: number;
-  deleted_evidence_graph_states: number;
-  deleted_community_states: number;
-  deleted_community_memberships: number;
-  deleted_community_summaries: number;
-  deleted_signal_schema_states?: number;
-  deleted_signal_states?: number;
-  deleted_signal_candidates?: number;
-  deleted_signal_decisions?: number;
-  deleted_signal_nodes?: number;
-  deleted_signal_edges?: number;
-  deleted_signal_communities?: number;
-  deleted_signal_community_memberships?: number;
-  deleted_projection_states?: number;
-  deleted_projection_nodes?: number;
-  deleted_projection_edges?: number;
-  deleted_projection_communities?: number;
-  deleted_policy_states: number;
-  deleted_policy_observations: number;
-  deleted_quality_observations: number;
-  deleted_retrieval_traces: number;
-  deleted_answer_sessions: number;
-  deleted_citation_verifications: number;
-  deleted_reward_events: number;
-  deleted_trace_events: number;
-  deleted_agent_runs: number;
-  deleted_sessions: number;
-  deleted_ingestion_logs: number;
-  deleted_compensations: number;
-  deleted_jobs: number;
-  deleted_batches: number;
-  deleted_chunks: number;
-  deleted_document_versions: number;
-  deleted_documents: number;
-  deleted_knowledge_bases: number;
-  deleted_directory: number;
+  knowledge_base_id?: string | null;
+  knowledge_base_name?: string | null;
+  stats: {
+    deleted_vectors?: number;
+    deleted_vector_records?: number;
+    deleted_chunks?: number;
+    deleted_document_versions?: number;
+    deleted_documents?: number;
+    deleted_context_graph_states?: number;
+    deleted_retrieval_traces?: number;
+    deleted_answer_sessions?: number;
+    deleted_citation_verifications?: number;
+    deleted_reward_events?: number;
+    deleted_trace_events?: number;
+    deleted_agent_runs?: number;
+    deleted_sessions?: number;
+    deleted_ingestion_logs?: number;
+    deleted_compensations?: number;
+    deleted_jobs?: number;
+    deleted_batches?: number;
+    deleted_knowledge_bases?: number;
+    deleted_directory?: number;
+    [key: string]: unknown;
+  };
 }
 
 export interface RefreshResponse {
@@ -348,52 +340,58 @@ export interface RefreshResponse {
 }
 
 export interface ModelSettingsResponse {
-  provider: "openai_compatible";
-  chat_base_url: string;
-  embedding_base_url: string;
+  provider?: "openai_compatible" | string;
+  chat_base_url?: string;
+  embedding_base_url?: string;
   chat_resolve_ip?: string | null;
   embedding_resolve_ip?: string | null;
-  embedding_model: string;
-  chat_model: string;
-  embedding_dimensions: number;
-  worker_concurrency: number;
-  ingestion_file_concurrency: number;
-  model_request_concurrency: number;
-  model_request_timeout_seconds: number;
-  chunk_token_budget: number;
-  reranker_enabled: boolean;
-  reranker_model: string;
-  reranker_max_length: number;
-  reranker_device: "cpu" | "cuda";
-  reranker_url: string;
-  semantic_chunking_enabled: boolean;
-  semantic_chunking_min_length: number;
-  retrieval_layer_enabled: boolean;
-  retrieval_cache_ttl_seconds: number;
-  enable_agentic_reflection: boolean;
-  enable_post_generation_reflection: boolean;
-  citation_verification_sample_max: number;
-  reflection_max_retries: number;
-  model_bridge_enabled: boolean;
-  enable_graph_community_summaries: boolean;
-  signal_extraction_max_model_batches: number;
-  signal_extraction_max_candidates_per_batch: number;
-  signal_extraction_max_tokens_per_batch: number;
-  signal_candidate_keep_threshold: number;
-  community_louvain_resolution: number;
-  community_min_modularity_warn: number;
-  graph_overview_max_nodes: number;
-  graph_overview_max_edges: number;
-  enable_model_fallback: boolean;
-  enable_database_fallback: boolean;
-  has_api_key: boolean;
-  has_embedding_api_key: boolean;
-  degraded_mode: boolean;
+  embedding_model?: string;
+  chat_model?: string;
+  embedding_dimensions?: number;
+  embedding_batch_size?: number;
+  worker_concurrency?: number;
+  model_request_concurrency?: number;
+  model_request_timeout_seconds?: number;
+  fixed_chunk_size_tokens?: number;
+  fixed_chunk_overlap_tokens?: number;
+  context_package_token_budget?: number;
+  reranker_enabled?: boolean;
+  reranker_model?: string;
+  reranker_max_length?: number;
+  reranker_device?: "cpu" | "cuda" | string;
+  reranker_url?: string;
+  model_bridge_enabled?: boolean;
+  mid_concept_extraction_max_model_batches?: number;
+  mid_concept_extraction_max_candidates_per_batch?: number;
+  mid_concept_extraction_max_tokens_per_batch?: number;
+  mid_concept_candidate_keep_threshold?: number;
+  rq_kmeans_levels?: number;
+  rq_kmeans_max_k?: number;
+  rq_residual_tau?: number;
+  agent_coarse_activation_budget?: number;
+  agent_coarse_jump_budget?: number;
+  agent_mid_activation_budget?: number;
+  agent_mid_expansion_radius_cap?: number;
+  agent_fine_cluster_budget?: number;
+  agent_chunk_candidate_budget?: number;
+  agent_structure_restore_budget?: number;
+  agent_planning_round_budget?: number;
+  agent_max_typed_actions_per_round?: number;
+  agent_repair_round_budget?: number;
+  agent_verification_budget?: number;
+  enable_model_fallback?: boolean;
+  enable_database_fallback?: boolean;
+  has_api_key?: boolean;
+  has_embedding_api_key?: boolean;
+  degraded_mode?: boolean;
   runtime_settings_version?: string | null;
+  settings?: Record<string, unknown>;
+  runtime_version?: Record<string, unknown>;
 }
 
 export interface ModelSettingsUpdate {
   api_key?: string | null;
+  openai_api_key?: string | null;
   clear_api_key?: boolean;
   chat_base_url?: string | null;
   embedding_base_url?: string | null;
@@ -402,33 +400,36 @@ export interface ModelSettingsUpdate {
   embedding_model?: string | null;
   chat_model?: string | null;
   embedding_dimensions?: number | null;
+  embedding_batch_size?: number | null;
   worker_concurrency?: number | null;
-  ingestion_file_concurrency?: number | null;
   model_request_concurrency?: number | null;
   model_request_timeout_seconds?: number | null;
-  chunk_token_budget?: number | null;
+  fixed_chunk_size_tokens?: number | null;
+  fixed_chunk_overlap_tokens?: number | null;
+  context_package_token_budget?: number | null;
   reranker_enabled?: boolean | null;
   reranker_model?: string | null;
   reranker_max_length?: number | null;
-  reranker_device?: "cpu" | "cuda" | null;
-  semantic_chunking_enabled?: boolean | null;
-  semantic_chunking_min_length?: number | null;
-  retrieval_layer_enabled?: boolean | null;
-  retrieval_cache_ttl_seconds?: number | null;
-  enable_agentic_reflection?: boolean | null;
-  enable_post_generation_reflection?: boolean | null;
-  citation_verification_sample_max?: number | null;
-  reflection_max_retries?: number | null;
+  reranker_device?: "cpu" | "cuda" | string | null;
   model_bridge_enabled?: boolean | null;
-  enable_graph_community_summaries?: boolean | null;
-  signal_extraction_max_model_batches?: number | null;
-  signal_extraction_max_candidates_per_batch?: number | null;
-  signal_extraction_max_tokens_per_batch?: number | null;
-  signal_candidate_keep_threshold?: number | null;
-  community_louvain_resolution?: number | null;
-  community_min_modularity_warn?: number | null;
-  graph_overview_max_nodes?: number | null;
-  graph_overview_max_edges?: number | null;
+  mid_concept_extraction_max_model_batches?: number | null;
+  mid_concept_extraction_max_candidates_per_batch?: number | null;
+  mid_concept_extraction_max_tokens_per_batch?: number | null;
+  mid_concept_candidate_keep_threshold?: number | null;
+  rq_kmeans_levels?: number | null;
+  rq_kmeans_max_k?: number | null;
+  rq_residual_tau?: number | null;
+  agent_coarse_activation_budget?: number | null;
+  agent_coarse_jump_budget?: number | null;
+  agent_mid_activation_budget?: number | null;
+  agent_mid_expansion_radius_cap?: number | null;
+  agent_fine_cluster_budget?: number | null;
+  agent_chunk_candidate_budget?: number | null;
+  agent_structure_restore_budget?: number | null;
+  agent_planning_round_budget?: number | null;
+  agent_max_typed_actions_per_round?: number | null;
+  agent_repair_round_budget?: number | null;
+  agent_verification_budget?: number | null;
   embedding_api_key?: string | null;
   clear_embedding_api_key?: boolean;
 }
@@ -439,6 +440,7 @@ export interface IngestionLogEvent {
   event: string;
   message: string;
   stage?: string;
+  phase?: string;
   objective_mode?: string;
   source_path?: string;
   state?: string;
@@ -452,38 +454,20 @@ export interface IngestionLogEvent {
   model?: string;
   external_called?: boolean;
   fallback_reason?: string | null;
-  vector_count?: number;
   embedding_provider?: string;
   embedding_model?: string;
   embedding_external_called?: boolean;
   embedding_fallback_reason?: string | null;
   embedding_fallback_method?: string | null;
-  graph_runtime?: string;
-  graph_state_id?: string | null;
-  graph_state_hash?: string | null;
-  community_state_id?: string | null;
-  community_state_hash?: string | null;
-  atom_count?: number;
-  evidence_atoms?: number;
-  evidence_edges?: number;
-  active_chunks?: number;
-  chunk_candidates?: number;
-  quality_decisions?: number;
-  community_summary_count?: number;
-  candidate_count?: number;
-  signal_candidates?: number;
-  signal_candidate_count?: number;
-  accepted_signal_candidate_count?: number;
-  rejected_signal_candidate_count?: number;
-  signal_nodes?: number;
-  signal_edges?: number;
-  signal_node_count?: number;
-  signal_edge_count?: number;
-  signal_communities?: number;
-  signal_community_count?: number;
-  signal_state_id?: string | null;
-  signal_state_hash?: string | null;
-  signal_layer_status?: string;
+  graph_runtime?: string | null;
+  vector_count?: number;
+  chunk_count?: number;
+  relation_edge_count?: number;
+  fine_cluster_count?: number;
+  mid_concept_count?: number;
+  coarse_concept_count?: number;
+  context_graph_hash?: string | null;
+  context_graph_state_id?: string | null;
   retry_count?: number;
   max_retries?: number;
 }
@@ -524,11 +508,15 @@ export interface InfrastructureStatus {
 }
 
 export interface RuntimeCheckResponse {
-  env_sync: EnvSyncStatus;
-  reranker: RerankerRuntimeStatus;
-  infrastructure: InfrastructureStatus;
-  blocking_issues: RuntimeIssue[];
-  warnings: RuntimeIssue[];
+  ok?: boolean;
+  env_sync?: EnvSyncStatus;
+  reranker?: RerankerRuntimeStatus;
+  infrastructure?: InfrastructureStatus;
+  blocking_issues?: RuntimeIssue[];
+  warnings?: RuntimeIssue[];
+  issues?: RuntimeIssue[];
+  settings?: Record<string, unknown>;
+  runtime_version?: Record<string, unknown>;
 }
 
 export interface StructuredApiErrorBody {
@@ -539,106 +527,93 @@ export interface StructuredApiErrorBody {
   fix_commands: string[];
 }
 
-export type GraphType = "evidence";
-export type EvidenceSignalType = "topic" | "method" | "formula" | "metric" | "algorithm" | "definition" | "theorem" | "observation" | "claim";
-export type SemanticEntityType = EvidenceSignalType | (string & {});
+export type GraphType = "chunk-structure" | "chunk-relation" | "mid-concepts" | "coarse-concepts" | "context-graph";
+
 export type GraphNodeCategory =
   | "knowledge_base"
-  | "evidence_graph_state"
-  | "evidence_atom"
-  | "active_chunk"
-  | "signal_node"
-  | "community_region"
   | "document"
-  | "partition"
-  | "section"
-  | "evidence_chunk"
   | "document_version"
+  | "chunk"
+  | "section"
+  | "page"
+  | "table"
+  | "formula"
+  | "caption"
+  | "structure_node"
+  | "chunk_relation"
+  | "fine_cluster"
+  | "mid_concept"
+  | "coarse_concept"
+  | "context_package"
   | (string & {});
 
 export interface GraphNode {
   id: string;
-  name: string;
-  category: GraphNodeCategory | string;
+  label?: string;
+  name?: string;
+  type?: string;
+  category?: GraphNodeCategory | string;
+  layer?: string | null;
   value?: number;
-  partition?: string | null;
+  score?: number | null;
   importance_score?: number | null;
-  source_type?: string | null;
-  entity_type?: SemanticEntityType | string | null;
-  aliases?: string[];
-  support_count?: number | null;
-  support_atom_ids?: string[];
-  support_active_chunk_ids?: string[];
-  source_span_union?: Record<string, unknown> | null;
   confidence?: number | null;
-  canonical_key?: string | null;
-  signal_node_id?: string | null;
-  summary?: string | null;
+  support_count?: number | null;
+  support_chunk_ids?: string[];
+  support_fine_cluster_ids?: string[];
+  representative_chunk_ids?: string[];
+  included_mid_concept_ids?: string[];
+  source_path?: string | null;
   document_id?: string | null;
   document_version_id?: string | null;
   snippet?: string | null;
+  text?: string | null;
   page_number?: number | null;
-  evidence_count?: number | null;
-  community_louvain?: number | null;
-  community_spectral?: number | null;
-  component_id?: number | null;
-  centrality_score?: number | null;
-  graph_rank_score?: number | null;
+  page_range?: [number | null, number | null] | number[] | null;
+  section_path?: string[];
+  metadata?: Record<string, unknown>;
 }
 
 export interface GraphEdge {
+  id?: string;
   source: string;
   target: string;
-  label: string;
-  confidence?: number | null;
+  label?: string;
+  type?: string;
   category?: string | null;
-  evidence_chunk_id?: string | null;
+  confidence?: number | null;
   weight?: number | null;
-  semantic_similarity?: number | null;
+  score?: number | null;
   support_count?: number | null;
-  support_atom_ids?: string[];
-  support_active_chunk_ids?: string[];
-  source_span_union?: Record<string, unknown> | null;
+  support_chunk_ids?: string[];
   relation_source?: string | null;
+  is_bridge?: boolean;
   is_inferred?: boolean;
+  metadata?: Record<string, unknown>;
 }
 
 export interface GraphResponse {
-  graph_type: GraphType;
-  schema_version: string;
+  knowledge_base_id?: string;
+  graph_type: GraphType | string;
+  schema_version?: string;
   view?: "overview" | "detail" | "neighborhood" | null;
   nodes: GraphNode[];
   edges: GraphEdge[];
-  node_counts: Record<string, number>;
-  edge_counts: Record<string, number>;
-  focus_partition?: string | null;
-  signal_layer_status?: string | null;
-  signal_state_id?: string | null;
-  signal_state_hash?: string | null;
-  signal_layer_complete?: boolean;
-  diagnostics?: Record<string, unknown>;
+  counts: Record<string, number>;
+  full_counts?: Record<string, number>;
+  sampled_counts: Record<string, number>;
+  node_counts?: Record<string, number>;
+  edge_counts?: Record<string, number>;
   freshness: {
-    is_stale: boolean;
+    is_stale?: boolean;
     reason?: string | null;
-    latest_chunk_version?: string | null;
-    active_chunk_versions?: string[];
-    graph_chunk_version?: string | null;
-    graph_chunk_versions?: string[];
-    stale_evidence_chunks?: number;
-    missing_evidence_chunks?: number;
-    current_document_versions?: string[];
-    graph_build_document_versions?: string[];
-    uncovered_document_versions?: string[];
-    removed_document_versions?: string[];
-    graph_active_chunk_count?: number | null;
-    current_active_chunk_count?: number;
-    graph_build_id?: string | null;
-    graph_built_at?: string | null;
-    chunk_scope_changed?: boolean;
-    strategy_profile_changed?: boolean;
-    current_strategy_profile_hash?: string | null;
-    graph_strategy_profile_hash?: string | null;
+    [key: string]: unknown;
   };
+  hash?: string | null;
+  stale_reason?: string | null;
+  grounding?: Record<string, unknown>;
+  retrieval_contribution?: Record<string, unknown>;
+  diagnostics?: Record<string, unknown>;
 }
 
 export interface StrategyProfileSummary {
@@ -646,9 +621,9 @@ export interface StrategyProfileSummary {
   name: string;
   library_type: string;
   is_builtin: boolean;
-  profile_hash: string;
-  is_active: boolean;
-  knowledge_base_ids: string[];
+  profile_hash?: string;
+  is_active?: boolean;
+  knowledge_base_ids?: string[];
   created_at?: string | null;
   updated_at?: string | null;
 }
@@ -684,18 +659,6 @@ export interface StrategyProfileBindRequest {
   profile_id: string;
 }
 
-export interface StrategyProfileDraftRequest {
-  prompt: string;
-  base_profile_id?: string | null;
-  base_profile_json?: Record<string, unknown> | null;
-}
-
-export interface StrategyProfileDraftResponse {
-  profile_json: Record<string, unknown>;
-  warnings: string[];
-  profile_hash?: string;
-}
-
 export interface StrategyProfileAssistantRequest {
   prompt: string;
   session_id?: string | null;
@@ -717,23 +680,29 @@ export interface StrategyProfileAssistantStateResponse {
 
 export interface KnowledgeBaseTreeNode {
   id: string;
-  title: string;
-  type: "knowledge_base" | "partition" | "document" | "signal";
+  title?: string;
+  label?: string;
+  type: "knowledge_base" | "section" | "document" | "chunk" | string;
   children?: KnowledgeBaseTreeNode[];
+  metadata?: Record<string, unknown>;
 }
 
 export interface KnowledgeBaseSummary {
   id: string;
   name: string;
   description?: string | null;
-  source_root: string;
-  storage_root: string;
+  source_root?: string;
+  storage_root?: string;
   document_count: number;
-  evidence_atom_count: number;
+  chunk_count?: number;
+  active_chunk_count?: number;
   current_chunk_version: number;
-  has_parsed_chunks: boolean;
-  can_full_reparse: boolean;
-  degraded_mode: boolean;
+  has_parsed_chunks?: boolean;
+  can_full_reparse?: boolean;
+  degraded_mode?: boolean;
+  context_graph_state_id?: string | null;
+  context_graph_hash?: string | null;
+  stale_reason?: string | null;
   active_profile_id?: string | null;
   active_profile_name?: string | null;
   active_profile_hash?: string | null;
@@ -745,39 +714,49 @@ export interface KnowledgeBaseCreateRequest {
 }
 
 export interface BatchError {
-  source_path: string;
-  message: string;
+  source_path?: string | null;
+  message?: string | null;
 }
 
-  export interface IngestionBatchSummary {
-    batch_id: string;
-    state: JobState;
-    trigger_source: string;
-    source_root: string;
+export interface IngestionBatchSummary {
+  batch_id: string;
+  knowledge_base_id?: string;
+  state: JobState | string;
+  mode?: string | null;
+  trigger_source?: string;
+  source_root?: string;
   total_files: number;
   processed_files: number;
   success_count: number;
   failure_count: number;
-    skipped_count: number;
-    coverage_by_source_type: Record<string, number>;
-    errors: BatchError[];
-    graph_stats: Record<string, unknown>;
-    phase?: string | null;
-    parse_committed: boolean;
-    cancellation_status?: string | null;
-    worker_id?: string | null;
-    heartbeat_at?: string | null;
-    started_at?: string | null;
-    completed_at?: string | null;
-  }
+  skipped_count: number;
+  coverage_by_source_type?: Record<string, number>;
+  errors?: BatchError[];
+  graph_stats?: Record<string, unknown>;
+  stats?: Record<string, unknown>;
+  phase?: string | null;
+  current_phase?: string | null;
+  parse_committed?: boolean;
+  cancellation_status?: string | null;
+  cancel_failure_reason?: string | null;
+  manual_review_required?: boolean;
+  celery_task_id?: string | null;
+  celery_task_name?: string | null;
+  batch_task_ids?: string[];
+  batch_worker_ids?: string[];
+  worker_id?: string | null;
+  heartbeat_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
 
 export interface BatchStartResponse {
   batch_id: string;
-  state: JobState;
+  state: JobState | string;
 }
 
 export interface ParseUploadedFilesRequest {
-  file_paths: string[];
+  file_paths?: string[] | null;
   force?: boolean;
   full_reparse?: boolean;
 }
@@ -786,30 +765,55 @@ export interface DashboardSnapshot {
   knowledge_base: KnowledgeBaseSummary;
   tree: KnowledgeBaseTreeNode[];
   graph: GraphResponse;
+  context_graph?: Record<string, unknown>;
   batch_status?: IngestionBatchSummary | null;
+  recent_batches?: IngestionBatchSummary[];
   ingested_document_count: number;
   chunk_count?: number;
-  evidence_atom_count?: number;
-  active_chunk_count?: number;
-  evidence_edge_count?: number;
-  community_region_count?: number;
-  graph_relation_count: number;
+  graph_relation_count?: number;
+  fine_cluster_count?: number;
+  mid_concept_count?: number;
+  coarse_concept_count?: number;
   coverage_by_source_type: Record<string, number>;
   degraded_mode: boolean;
+  last_refreshed_at?: string | null;
 }
 
 export interface KnowledgeBaseFileSummary {
-  id: string;
+  id?: string;
   document_id?: string | null;
-  title: string;
+  title?: string | null;
   source_path: string;
-  source_type: string;
+  source_type?: string;
   partition?: string | null;
   status: KnowledgeBaseFileStatus;
-  job_state?: JobState | null;
+  job_state?: JobState | string | null;
   batch_id?: string | null;
   error?: string | null;
-  chunk_count: number;
+  chunk_count?: number;
+  current_version?: number | null;
+  active_chunks?: number;
+  checksum?: string | null;
   chunk_version?: number | null;
   updated_at?: string | null;
+  last_ingested_at?: string | null;
+}
+
+export interface ContextPackageResponse {
+  id: string;
+  retrieval_trace_id?: string | null;
+  knowledge_base_id: string;
+  package_hash: string;
+  query: string;
+  contexts: Array<Record<string, unknown>>;
+  token_budget: number;
+  citation_spans: Array<Record<string, unknown>>;
+  graph_expansion_paths: Array<Record<string, unknown>>;
+  diagnostics: Record<string, unknown>;
+  created_at?: string | null;
+}
+
+export interface RetrievalTraceStepsResponse {
+  trace_id: string;
+  steps: Array<Record<string, unknown>>;
 }

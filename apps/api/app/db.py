@@ -50,8 +50,8 @@ def has_materialized_knowledge_base_data(engine) -> bool:
     try:
         with engine.connect() as connection:
             document_count = connection.execute(text("SELECT COUNT(*) FROM documents")).scalar() or 0
-            active_chunk_count = connection.execute(text("SELECT COUNT(*) FROM active_chunks")).scalar() or 0
-        return bool(document_count or active_chunk_count)
+            chunk_count = connection.execute(text("SELECT COUNT(*) FROM chunks")).scalar() or 0
+        return bool(document_count or chunk_count)
     except Exception:
         return False
 
@@ -59,7 +59,19 @@ def has_materialized_knowledge_base_data(engine) -> bool:
 def build_engine():
     database_url = settings.database_url
     connect_args = {"connect_timeout": 5} if database_url.startswith("postgresql") else {}
-    primary = create_engine(database_url, future=True, echo=False, connect_args=connect_args)
+    engine_kwargs = {
+        "future": True,
+        "echo": False,
+        "connect_args": connect_args,
+    }
+    if database_url.startswith("postgresql"):
+        engine_kwargs.update(
+            {
+                "pool_pre_ping": True,
+                "pool_recycle": 1800,
+            }
+        )
+    primary = create_engine(database_url, **engine_kwargs)
     if try_connect(primary):
         if settings.enable_database_fallback:
             for sqlite_path in candidate_sqlite_paths():

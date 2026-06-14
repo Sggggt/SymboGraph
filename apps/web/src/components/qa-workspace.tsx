@@ -29,7 +29,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
 import { deleteSession, fetchDashboard, fetchSessionMessages, fetchSessions, streamAnswer } from "@/lib/api";
-import { evidenceFirstTraceFallbackSteps, traceAuditSummary, traceNodeLabel } from "@/lib/agent-trace";
+import { contextGraphTraceFallbackSteps, traceAuditSummary, traceNodeLabel } from "@/lib/agent-trace";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 
@@ -66,9 +66,9 @@ function answerModelLabel(latestRun: AgentResponse | null): string {
   return "模型：未调用";
 }
 
-function buildKnowledgeBaseSuggestions(tree: Array<{ title: string; children?: Array<{ title: string }> }> | undefined): string[] {
-  const partitions = tree?.map((node) => node.title).filter(Boolean) ?? [];
-  const documents = tree?.flatMap((node) => node.children?.map((child) => child.title) ?? []).filter(Boolean) ?? [];
+function buildKnowledgeBaseSuggestions(tree: Array<{ title?: string; children?: Array<{ title?: string }> }> | undefined): string[] {
+  const partitions = tree?.map((node) => node.title).filter((title): title is string => Boolean(title)) ?? [];
+  const documents = tree?.flatMap((node) => node.children?.map((child) => child.title) ?? []).filter((title): title is string => Boolean(title)) ?? [];
   const suggestions = [
     partitions[0] ? `总结 ${partitions[0]} 的核心内容` : "",
     partitions[1] ? `比较 ${partitions[0]} 和 ${partitions[1]} 的联系` : "",
@@ -90,32 +90,17 @@ function normalizeMessages(messages: Array<Record<string, unknown>>): ChatTurn[]
 }
 
 function ChatHeader({
-  grounded,
-  partitionList,
   latestRun,
 }: {
-  grounded: boolean;
-  partitionList: string;
   latestRun: AgentResponse | null;
 }) {
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-3 px-1">
       <div className="min-w-0">
         <p className="section-kicker">资料库智能问答</p>
-        <h2 className="mt-1 text-2xl font-semibold text-white lg:text-3xl">向推理链路提问</h2>
+        <h2 className="mt-1 text-2xl font-semibold text-white lg:text-3xl">向智能体提问</h2>
       </div>
       <div className="flex w-full flex-wrap gap-2">
-        <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
-          <ShieldCheck data-icon="inline-start" />
-          {grounded ? "已接入证据" : "降级模式"}
-        </span>
-        <span className="kg-micro-chip max-w-full truncate rounded-full px-3 py-2 text-xs">目录：{partitionList || "等待中"}</span>
-        {latestRun?.route ? (
-          <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
-            <BrainCircuit data-icon="inline-start" />
-            {latestRun.route}
-          </span>
-        ) : null}
         <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
           <BrainCircuit data-icon="inline-start" />
           {answerModelLabel(latestRun)}
@@ -184,7 +169,7 @@ function EmptyChatState({ suggestions, onPick }: { suggestions: string[]; onPick
         </div>
         <h3 className="glow-text mt-6 text-3xl font-semibold text-white">开始一轮有证据支撑的资料问答</h3>
         <p className="mx-auto mt-3 max-w-2xl text-sm leading-7 text-white/56">
-          系统会先召回基础证据，再选择锚点、规划证据链、受控图增强，并校验引用来源。
+          系统会按粗概念、中概念、细聚类和片段结构逐层寻址，组装上下文证据包后生成带引用的回答。
         </p>
         <div className="mt-7">
           <SuggestionChips suggestions={suggestions} onPick={onPick} />
@@ -224,7 +209,7 @@ function InlineTraceDisclosure({
   const [expanded, setExpanded] = useState(false);
   const steps: AgentTraceEventPayload[] = trace.length
     ? trace
-    : evidenceFirstTraceFallbackSteps.map((node) => ({ node, status: "pending", document_ids: [], scores: {}, duration_ms: 0 }));
+    : contextGraphTraceFallbackSteps.map((node) => ({ node, status: "pending", document_ids: [], scores: {}, duration_ms: 0 }));
 
   if (trace.length === 0 && !isRunning) {
     return null;
@@ -310,13 +295,13 @@ function GeneratingBubble({ content, trace }: { content: string; trace: AgentTra
           </div>
         ) : (
           <div className="flex items-center gap-2 text-sm text-white/56">
-            <span className="signal-bars">
+            <span className="context-bars">
               <span />
               <span />
               <span />
               <span />
             </span>
-            正在路由、检索并检查证据...
+            正在路由、检索并验证引用...
           </div>
         )}
       </div>
@@ -584,7 +569,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
   const storageScope = selectedKnowledgeBaseId ?? "unassigned";
   const dashboardQuery = useQuery({
     queryKey: ["dashboard", selectedKnowledgeBaseId],
-    queryFn: () => fetchDashboard(selectedKnowledgeBaseId),
+    queryFn: () => fetchDashboard(selectedKnowledgeBaseId, { includeGraph: false }),
     enabled: Boolean(selectedKnowledgeBaseId),
   });
   const sessionsQuery = useQuery({
@@ -673,7 +658,6 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
     },
   });
 
-  const partitionList = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title).join(" / ") ?? "", [dashboardQuery.data]);
   const suggestions = useMemo(() => buildKnowledgeBaseSuggestions(dashboardQuery.data?.tree), [dashboardQuery.data?.tree]);
 
   if (dashboardQuery.isLoading) {
@@ -688,11 +672,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_0%,rgba(86,217,255,0.11),transparent_34%),radial-gradient(circle_at_88%_20%,rgba(124,92,255,0.11),transparent_30%),linear-gradient(rgba(120,180,255,0.026)_1px,transparent_1px),linear-gradient(90deg,rgba(120,180,255,0.023)_1px,transparent_1px)] bg-[size:auto,auto,48px_48px,48px_48px]" />
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-64 bg-gradient-to-t from-[#030714] via-[#030714]/88 to-transparent" />
       <div className="relative z-10 flex flex-col gap-7">
-        <ChatHeader
-          grounded={!dashboardQuery.data?.degraded_mode}
-          partitionList={partitionList}
-          latestRun={latestRun}
-        />
+        <ChatHeader latestRun={latestRun} />
         <ChatActionRail
           onOpenSessions={() => setSessionsOpen(true)}
           onOpenCitations={() => setCitationsOpen(true)}

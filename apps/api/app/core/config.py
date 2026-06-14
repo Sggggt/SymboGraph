@@ -22,35 +22,34 @@ HOT_RELOAD_SETTINGS = {
     "chat_model",
     "embedding_dimensions",
     "embedding_batch_size",
-    "worker_concurrency",
-    "ingestion_file_concurrency",
     "model_request_concurrency",
     "model_request_timeout_seconds",
-    "chunk_token_budget",
+    "fixed_chunk_size_tokens",
+    "fixed_chunk_overlap_tokens",
+    "context_package_token_budget",
     "enable_model_fallback",
-    "retrieval_recall_k_default",
-    "retrieval_recall_k_formula",
-    "retrieval_layer_enabled",
-    "retrieval_cache_ttl_seconds",
-    "enable_agentic_reflection",
-    "enable_post_generation_reflection",
-    "citation_verification_sample_max",
-    "reflection_max_retries",
     "reranker_enabled",
     "reranker_model",
     "reranker_max_length",
     "reranker_device",
-    "semantic_chunking_enabled",
-    "semantic_chunking_min_length",
-    "enable_graph_community_summaries",
-    "signal_extraction_max_model_batches",
-    "signal_extraction_max_candidates_per_batch",
-    "signal_extraction_max_tokens_per_batch",
-    "signal_candidate_keep_threshold",
-    "community_louvain_resolution",
-    "community_min_modularity_warn",
-    "graph_overview_max_nodes",
-    "graph_overview_max_edges",
+    "mid_concept_extraction_max_model_batches",
+    "mid_concept_extraction_max_candidates_per_batch",
+    "mid_concept_extraction_max_tokens_per_batch",
+    "mid_concept_candidate_keep_threshold",
+    "rq_kmeans_levels",
+    "rq_kmeans_max_k",
+    "rq_residual_tau",
+    "agent_coarse_activation_budget",
+    "agent_coarse_jump_budget",
+    "agent_mid_activation_budget",
+    "agent_mid_expansion_radius_cap",
+    "agent_fine_cluster_budget",
+    "agent_chunk_candidate_budget",
+    "agent_structure_restore_budget",
+    "agent_planning_round_budget",
+    "agent_max_typed_actions_per_round",
+    "agent_repair_round_budget",
+    "agent_verification_budget",
 }
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -91,37 +90,35 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 1024
     embedding_batch_size: int = Field(default=10, ge=1, le=10)
     worker_concurrency: int = Field(default=3, ge=1, le=32)
-    ingestion_file_concurrency: int = Field(default=3, ge=1, le=8)
     model_request_concurrency: int = Field(default=3, ge=1, le=16)
     model_request_timeout_seconds: int = Field(default=240, ge=5, le=600)
-    chunk_token_budget: int = Field(default=2400, ge=256, le=20000)
+    fixed_chunk_size_tokens: int = Field(default=512, ge=128, le=4096)
+    fixed_chunk_overlap_tokens: int = Field(default=80, ge=0, le=1024)
+    context_package_token_budget: int = Field(default=2400, ge=256, le=20000)
     enable_model_fallback: bool = False
-    retrieval_recall_k_default: int = Field(default=64, ge=1, le=200)
-    retrieval_recall_k_formula: int = Field(default=80, ge=1, le=200)
     reranker_enabled: bool = False
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     reranker_max_length: int = Field(default=512, ge=64, le=2048)
     reranker_device: Literal["cpu", "cuda"] = "cpu"
-    semantic_chunking_enabled: bool = False
-    semantic_chunking_min_length: int = Field(default=2000, ge=500, le=5000)
-    enable_graph_community_summaries: bool = Field(default=True)
-    signal_extraction_max_model_batches: int = Field(default=4, ge=0, le=64)
-    signal_extraction_max_candidates_per_batch: int = Field(default=40, ge=1, le=500)
-    signal_extraction_max_tokens_per_batch: int = Field(default=6000, ge=500, le=50000)
-    signal_candidate_keep_threshold: float = Field(default=0.62, ge=0.0, le=1.0)
-    community_louvain_resolution: float = Field(default=1.0, ge=0.05, le=5.0)
-    community_min_modularity_warn: float = Field(default=0.18, ge=-1.0, le=1.0)
-    graph_overview_max_nodes: int = Field(default=260, ge=20, le=2000)
-    graph_overview_max_edges: int = Field(default=800, ge=20, le=5000)
+    mid_concept_extraction_max_model_batches: int = Field(default=4, ge=0, le=64)
+    mid_concept_extraction_max_candidates_per_batch: int = Field(default=8, ge=1, le=500)
+    mid_concept_extraction_max_tokens_per_batch: int = Field(default=2400, ge=500, le=50000)
+    mid_concept_candidate_keep_threshold: float = Field(default=0.62, ge=0.0, le=1.0)
+    rq_kmeans_levels: int = Field(default=3, ge=1, le=8)
+    rq_kmeans_max_k: int = Field(default=6, ge=1, le=64)
+    rq_residual_tau: float = Field(default=0.65, gt=0.0, le=10.0)
+    agent_coarse_activation_budget: int = Field(default=8, ge=1, le=100)
+    agent_coarse_jump_budget: int = Field(default=2, ge=0, le=20)
+    agent_mid_activation_budget: int = Field(default=16, ge=1, le=200)
+    agent_mid_expansion_radius_cap: int = Field(default=2, ge=0, le=8)
+    agent_fine_cluster_budget: int = Field(default=16, ge=1, le=500)
+    agent_chunk_candidate_budget: int = Field(default=80, ge=1, le=1000)
+    agent_structure_restore_budget: int = Field(default=16, ge=1, le=200)
+    agent_planning_round_budget: int = Field(default=2, ge=1, le=10)
+    agent_max_typed_actions_per_round: int = Field(default=8, ge=1, le=50)
+    agent_repair_round_budget: int = Field(default=2, ge=0, le=10)
+    agent_verification_budget: int = Field(default=8, ge=1, le=100)
     model_cache_root: Path = Field(default=WORKSPACE_ROOT / "models" / "huggingface")
-
-    # Retrieval Layering & Agentic RAG
-    retrieval_layer_enabled: bool = True
-    retrieval_cache_ttl_seconds: int = 120
-    enable_agentic_reflection: bool = True
-    citation_verification_sample_max: int = 3
-    reflection_max_retries: int = 2
-    enable_post_generation_reflection: bool = False
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -191,58 +188,66 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "model_bridge_enabled",
         "enable_model_fallback",
         "reranker_enabled",
-        "semantic_chunking_enabled",
-        "retrieval_layer_enabled",
-        "enable_agentic_reflection",
-        "enable_post_generation_reflection",
-        "enable_graph_community_summaries",
     }
     int_fields = {
         "model_bridge_port",
         "embedding_dimensions",
         "embedding_batch_size",
-        "worker_concurrency",
-        "ingestion_file_concurrency",
         "model_request_concurrency",
         "model_request_timeout_seconds",
-        "chunk_token_budget",
-        "retrieval_recall_k_default",
-        "retrieval_recall_k_formula",
-        "retrieval_cache_ttl_seconds",
-        "citation_verification_sample_max",
-        "reflection_max_retries",
+        "fixed_chunk_size_tokens",
+        "fixed_chunk_overlap_tokens",
+        "context_package_token_budget",
         "reranker_max_length",
-        "semantic_chunking_min_length",
-        "signal_extraction_max_model_batches",
-        "signal_extraction_max_candidates_per_batch",
-        "signal_extraction_max_tokens_per_batch",
-        "graph_overview_max_nodes",
-        "graph_overview_max_edges",
+        "mid_concept_extraction_max_model_batches",
+        "mid_concept_extraction_max_candidates_per_batch",
+        "mid_concept_extraction_max_tokens_per_batch",
+        "rq_kmeans_levels",
+        "rq_kmeans_max_k",
+        "agent_coarse_activation_budget",
+        "agent_coarse_jump_budget",
+        "agent_mid_activation_budget",
+        "agent_mid_expansion_radius_cap",
+        "agent_fine_cluster_budget",
+        "agent_chunk_candidate_budget",
+        "agent_structure_restore_budget",
+        "agent_planning_round_budget",
+        "agent_max_typed_actions_per_round",
+        "agent_repair_round_budget",
+        "agent_verification_budget",
     }
     float_fields: set[str] = {
-        "signal_candidate_keep_threshold",
-        "community_louvain_resolution",
-        "community_min_modularity_warn",
+        "mid_concept_candidate_keep_threshold",
+        "rq_residual_tau",
     }
     nullable_fields = {
         "chat_resolve_ip",
         "embedding_resolve_ip",
     }
     aliases = {
-        "INGESTION_FILE_CONCURRENCY": "ingestion_file_concurrency",
         "MODEL_REQUEST_CONCURRENCY": "model_request_concurrency",
         "MODEL_REQUEST_TIMEOUT_SECONDS": "model_request_timeout_seconds",
-        "CHUNK_TOKEN_BUDGET": "chunk_token_budget",
-        "ENABLE_GRAPH_COMMUNITY_SUMMARIES": "enable_graph_community_summaries",
-        "SIGNAL_EXTRACTION_MAX_MODEL_BATCHES": "signal_extraction_max_model_batches",
-        "SIGNAL_EXTRACTION_MAX_CANDIDATES_PER_BATCH": "signal_extraction_max_candidates_per_batch",
-        "SIGNAL_EXTRACTION_MAX_TOKENS_PER_BATCH": "signal_extraction_max_tokens_per_batch",
-        "SIGNAL_CANDIDATE_KEEP_THRESHOLD": "signal_candidate_keep_threshold",
-        "COMMUNITY_LOUVAIN_RESOLUTION": "community_louvain_resolution",
-        "COMMUNITY_MIN_MODULARITY_WARN": "community_min_modularity_warn",
-        "GRAPH_OVERVIEW_MAX_NODES": "graph_overview_max_nodes",
-        "GRAPH_OVERVIEW_MAX_EDGES": "graph_overview_max_edges",
-        "WORKER_CONCURRENCY": "worker_concurrency",
+        "FIXED_CHUNK_SIZE_TOKENS": "fixed_chunk_size_tokens",
+        "FIXED_CHUNK_OVERLAP_TOKENS": "fixed_chunk_overlap_tokens",
+        "CONTEXT_PACKAGE_TOKEN_BUDGET": "context_package_token_budget",
+        "MID_CONCEPT_EXTRACTION_MAX_MODEL_BATCHES": "mid_concept_extraction_max_model_batches",
+        "MID_CONCEPT_EXTRACTION_MAX_CANDIDATES_PER_BATCH": "mid_concept_extraction_max_candidates_per_batch",
+        "MID_CONCEPT_EXTRACTION_MAX_TOKENS_PER_BATCH": "mid_concept_extraction_max_tokens_per_batch",
+        "MID_CONCEPT_CANDIDATE_KEEP_THRESHOLD": "mid_concept_candidate_keep_threshold",
+        "RQ_KMEANS_LEVELS": "rq_kmeans_levels",
+        "RQ_KMEANS_MAX_K": "rq_kmeans_max_k",
+        "RQ_RESIDUAL_TAU": "rq_residual_tau",
+        "AGENT_COARSE_ACTIVATION_BUDGET": "agent_coarse_activation_budget",
+        "AGENT_COARSE_JUMP_BUDGET": "agent_coarse_jump_budget",
+        "AGENT_MID_ACTIVATION_BUDGET": "agent_mid_activation_budget",
+        "AGENT_MID_EXPANSION_RADIUS_CAP": "agent_mid_expansion_radius_cap",
+        "AGENT_FINE_CLUSTER_BUDGET": "agent_fine_cluster_budget",
+        "AGENT_CHUNK_CANDIDATE_BUDGET": "agent_chunk_candidate_budget",
+        "AGENT_STRUCTURE_RESTORE_BUDGET": "agent_structure_restore_budget",
+        "AGENT_PLANNING_ROUND_BUDGET": "agent_planning_round_budget",
+        "AGENT_MAX_TYPED_ACTIONS_PER_ROUND": "agent_max_typed_actions_per_round",
+        "AGENT_REPAIR_ROUND_BUDGET": "agent_repair_round_budget",
+        "AGENT_VERIFICATION_BUDGET": "agent_verification_budget",
     }
     for env_key, value in env_entries.items():
         attr = aliases.get(env_key, env_key.lower())
@@ -336,10 +341,11 @@ def _build_settings() -> Settings:
 
     for env_key, attr in {
         "WORKER_CONCURRENCY": "worker_concurrency",
-        "INGESTION_FILE_CONCURRENCY": "ingestion_file_concurrency",
         "MODEL_REQUEST_CONCURRENCY": "model_request_concurrency",
         "MODEL_REQUEST_TIMEOUT_SECONDS": "model_request_timeout_seconds",
-        "CHUNK_TOKEN_BUDGET": "chunk_token_budget",
+        "FIXED_CHUNK_SIZE_TOKENS": "fixed_chunk_size_tokens",
+        "FIXED_CHUNK_OVERLAP_TOKENS": "fixed_chunk_overlap_tokens",
+        "CONTEXT_PACKAGE_TOKEN_BUDGET": "context_package_token_budget",
     }.items():
         raw_value = env_entries.get(env_key) or os.getenv(env_key)
         if raw_value is None:

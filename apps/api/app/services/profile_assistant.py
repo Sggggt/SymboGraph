@@ -59,8 +59,9 @@ def _assistant_system_prompt() -> str:
     return (
         "You are a strategy-profile configuration assistant for a local knowledge-base system. "
         "Return strict JSON only, with keys explanation and profile_json. "
-        "explanation must be concise natural language describing the profile changes, expected fit, and risks. "
-        "profile_json must be a complete strategy_profile_v1 object preserving all top-level keys from the base profile. "
+        "explanation must be concise natural language describing prompt, UI, or conversation-preference changes and risks. "
+        "profile_json must be a complete user_profile_v1 object using only schema_version, library_type, ui_labels, prompt_pack, and conversation_preferences. "
+        "Do not generate chunking, embedding, graph build, clustering, retrieval scoring, quality gate, ontology, fallback, model, cache, or runtime controls. "
         "Do not include markdown fences, API keys, secrets, or instructions to save automatically. "
         "Prefer the user's language for explanation."
     )
@@ -76,7 +77,7 @@ async def generate_profile_assistant_response(prompt: str, base_profile: dict[st
         '{"explanation":"...","profile_json":{...}}'
     )
     fallback = {
-        "explanation": "已基于当前 Profile 生成草案。请检查实体、关系、解析策略和检索策略后再保存。",
+        "explanation": "已基于当前 Profile 生成草案。请检查提示词、界面标签和对话偏好后再保存。",
         "profile_json": base,
     }
     result = await ChatProvider().classify_json(_assistant_system_prompt(), user_prompt, fallback=fallback)
@@ -86,7 +87,7 @@ async def generate_profile_assistant_response(prompt: str, base_profile: dict[st
     validated, warnings = validate_profile_payload(profile_candidate)
     explanation = result.get("explanation") if isinstance(result, dict) else None
     if not isinstance(explanation, str) or not explanation.strip():
-        explanation = "已基于当前 Profile 生成草案。请检查实体、关系、解析策略和检索策略后再保存。"
+        explanation = "已基于当前 Profile 生成草案。请检查提示词、界面标签和对话偏好后再保存。"
     return {
         "explanation": explanation.strip(),
         "profile_json": validated,

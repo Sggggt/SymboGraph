@@ -5,6 +5,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -17,6 +18,7 @@ import httpx
 
 from app.core.concurrency import model_request_slot
 from app.core.config import get_settings
+from app.services.resource_guard import effective_embedding_batch_size, enforce_memory_budget
 from app.services.strategy_profiles import (
     DEFAULT_ANSWER_SYSTEM_PREFIX,
     DEFAULT_CONTEXT_LABEL,
@@ -140,10 +142,14 @@ class EmbeddingProvider:
             )
 
     async def _openai_compatible_embeddings(self, texts: list[str], text_type: str = "document") -> list[list[float]]:
-        batch_size = self.settings.embedding_batch_size
         vectors: list[list[float]] = []
-        for start in range(0, len(texts), batch_size):
-            vectors.extend(await self._openai_compatible_embeddings_batch(texts[start : start + batch_size], text_type=text_type))
+        start = 0
+        while start < len(texts):
+            batch_size = effective_embedding_batch_size(self.settings.embedding_batch_size)
+            enforce_memory_budget("embedding_batch")
+            batch = texts[start : start + batch_size]
+            vectors.extend(await self._openai_compatible_embeddings_batch(batch, text_type=text_type))
+            start += batch_size
         return vectors
 
     async def _openai_compatible_embeddings_batch(self, texts: list[str], text_type: str = "document") -> list[list[float]]:
@@ -214,7 +220,7 @@ class ChatProvider:
     async def answer_question(self, question: str, contexts: list[dict], history: list[dict] | None = None) -> str:
         return (await self.answer_question_with_meta(question, contexts, history)).answer
 
-    async def answer_question_with_meta(self, question: str, contexts: list[dict], history: list[dict] | None = None, evidence_quality: str = "normal") -> ChatCallResult:
+    async def answer_question_with_meta(self, question: str, contexts: list[dict], history: list[dict] | None = None, context_quality: str = "normal") -> ChatCallResult:
         if not contexts:
             return ChatCallResult(
                 answer=no_context_answer(question),
@@ -234,7 +240,7 @@ class ChatProvider:
                 fallback_reason="missing_openai_api_key",
             )
         try:
-            answer = await self._openai_compatible_chat(question, contexts, history or [], evidence_quality=evidence_quality)
+            answer = await self._openai_compatible_chat(question, contexts, history or [], context_quality=context_quality)
             return ChatCallResult(
                 answer=answer,
                 provider="openai_compatible_chat",
@@ -343,64 +349,12 @@ class ChatProvider:
                 raise
             return {"has_issue": False, "issue_type": "none", "suggestion": ""}
 
-    async def verify_citations(self, answer: str, citations: list[dict], contexts: list[dict]) -> dict[str, Any]:
-        if not self.settings.openai_api_key:
-            if not self.settings.enable_model_fallback:
-                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
-            return {"verified": True, "unverified_indices": []}
-        if not citations or not contexts:
-            return {"verified": True, "unverified_indices": []}
-        context_map = {ctx.get("chunk_id"): ctx for ctx in contexts}
-        claims: list[str] = []
-        for sentence in re.split(r'(?<=[.!?。！？])\s+', answer):
-            if any(str(c.get("index", idx+1)) in sentence for idx, c in enumerate(citations)):
-                claims.append(sentence.strip())
-        if not claims:
-            return {"verified": True, "unverified_indices": []}
-        # Sample at most N claims
-        sample = claims[: self.settings.citation_verification_sample_max]
-        context_text = "\n\n".join(
-            f"[{c.get('index', i+1)}] {context_map.get(c.get('chunk_id'), {}).get('document_title', '')}\n{context_map.get(c.get('chunk_id'), {}).get('content', '')[:400]}"
-            for i, c in enumerate(citations)
-            if c.get("chunk_id") in context_map
-        )
-        profile = active_profile_json()
-        citation_domain = profile_prompt(profile, "citation_domain", "KnowledgeBase excerpts")
-        system_prompt = (
-            f"You verify whether specific claims in an answer are supported by cited {citation_domain}. "
-            "Return ONLY a JSON object with keys: verified (boolean), unverified_indices (list of citation numbers that are NOT supported)."
-        )
-        user_prompt = (
-            f"Claims to verify:\n" + "\n".join(f"- {claim}" for claim in sample) + "\n\n"
-            f"Cited excerpts:\n{context_text}\n\n"
-            "For each claim, check if it is directly supported by the cited excerpt. List unsupported citation numbers."
-        )
-        payload = {
-            "model": self.settings.chat_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.0,
-            "response_format": {"type": "json_object"},
-        }
-        try:
-            result = await self._post_chat_json_with_response_format_fallback(payload)
-            return {
-                "verified": bool(result.get("verified", True)),
-                "unverified_indices": list(result.get("unverified_indices", [])),
-            }
-        except Exception:
-            if not self.settings.enable_model_fallback:
-                raise
-            return {"verified": True, "unverified_indices": []}
-
     async def perceive_question(self, question: str, history: list[dict] | None = None) -> dict[str, Any]:
         """Perceive user intent, extract entities, and decompose the question.
 
         Returns a dict with keys:
         - intent: one of definition, comparison, application, procedure, analysis, unknown
-        - entities: list of source-grounded evidence signals found in the question
+        - entities: list of source-grounded concepts found in the question
         - sub_queries: list of sub-questions if multi-hop
         - needs_graph: whether graph search is likely helpful
         - suggested_strategy: one of global_dense, local_graph, hybrid, community
@@ -417,18 +371,18 @@ class ChatProvider:
             }
         history_text = "\n".join(f"{item.get('role')}: {item.get('content')}" for item in (history or [])[-4:])
         profile = active_profile_json()
-        perception_domain = profile_prompt(profile, "perception_domain", "evidence-grounded knowledge-base agent")
-        entity_label = profile_prompt(profile, "entity_label", "source-grounded evidence signals")
+        perception_domain = profile_prompt(profile, "perception_domain", "context-graph-grounded knowledge-base agent")
+        entity_label = profile_prompt(profile, "entity_label", "source-grounded concepts")
         system_prompt = (
             f"You are a perception module for a {perception_domain}. "
             "Analyze the user's question and return ONLY a JSON object with these exact keys:\n"
             "- intent: one of [definition, comparison, application, procedure, analysis, unknown]\n"
             f"- entities: list of {entity_label} explicitly mentioned or implied in the question\n"
             "- sub_queries: list of simpler sub-questions if the original is complex/multi-hop; otherwise [original_question]\n"
-            "- needs_graph: boolean, true if the question asks about observed connections, comparisons, dependencies, or derivations across evidence\n"
+            "- needs_graph: boolean, true if the question asks about observed connections, comparisons, dependencies, or derivations across indexed context\n"
             "- suggested_strategy: one of [global_dense, local_graph, hybrid, community]\n"
             "  * global_dense: simple definition, formula, or single-fact lookup\n"
-            "  * local_graph: question centers around specific evidence signals and observed connections\n"
+            "  * local_graph: question centers around specific grounded concepts and observed connections\n"
             "  * hybrid: multi-aspect or comparison questions\n"
             "  * community: broad summary or overview questions\n"
         )
@@ -466,7 +420,7 @@ class ChatProvider:
                 raise
             return default_result
 
-    async def _openai_compatible_chat(self, question: str, contexts: list[dict], history: list[dict], evidence_quality: str = "normal") -> str:
+    async def _openai_compatible_chat(self, question: str, contexts: list[dict], history: list[dict], context_quality: str = "normal") -> str:
         target_language = answer_language_name(question)
         citations = "\n\n".join(
             f"[{idx + 1}] {item['document_title']} / {item.get('partition') or 'General'}\n{item['content']}"
@@ -483,7 +437,7 @@ class ChatProvider:
                 "content": (
                     profile_prompt(profile, "answer_system_prefix", DEFAULT_ANSWER_SYSTEM_PREFIX)
                     + f"Answer only from the supplied {context_label_lower} and do not invent unsupported facts. "
-                    "Keep the answer direct, concise, and say when the evidence is insufficient. "
+                    "Make the answer as complete as the supplied evidence supports, and say when the evidence is insufficient. "
                     "Always follow the required answer language below. "
                     "Do not infer the answer language from the retrieved excerpts. "
                     f"Required answer language: {target_language}. "
@@ -504,7 +458,7 @@ class ChatProvider:
                         "do not cover this topic, and do NOT force citations from irrelevant excerpts. "
                         "You may provide a brief conceptual answer based on general knowledge, but explicitly note that it is not "
                         f"supported by the {indexed_coverage_label}."
-                        if evidence_quality == "low"
+                        if context_quality == "low"
                         else "If the supplied excerpts do not contain information that directly answers the question, "
                         f"clearly state that the {coverage_label} do not cover this topic and do NOT force citations."
                     )
@@ -522,7 +476,7 @@ class ChatProvider:
                         "Note: the above excerpts have been assessed as potentially irrelevant. "
                         "Only cite them if they truly support a specific claim in your answer. "
                         f"If none are relevant, answer without citations and note the lack of {coverage_label} coverage.\n\n"
-                        if evidence_quality == "low"
+                        if context_quality == "low"
                         else ""
                     )
                     + "Before finalizing, check that every formula is either inline LaTeX or display LaTeX, "

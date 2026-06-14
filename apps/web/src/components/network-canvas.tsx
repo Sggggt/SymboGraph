@@ -14,14 +14,18 @@ const ReactECharts = dynamic(
 
 const palette: Record<string, string> = {
   knowledge_base: "#a5e9ff",
-  partition: "#8f97ff",
   document: "#6be2bf",
-  section: "#7dd3fc",
-  active_chunk: "#94a3b8",
-  evidence_atom: "#fbbf24",
-  signal_node: "#c084fc",
-  evidence_chunk: "#fbbf24",
   document_version: "#6be2bf",
+  structure_node: "#7dd3fc",
+  section: "#7dd3fc",
+  page: "#60a5fa",
+  chunk: "#fbbf24",
+  chunk_relation: "#fbbf24",
+  fine_cluster: "#5eead4",
+  mid_concept: "#c084fc",
+  coarse_concept: "#fb7185",
+  context_package: "#a5e9ff",
+  table: "#f59e0b",
   topic: "#63cbff",
   observation: "#a78bfa",
   claim: "#fb7185",
@@ -48,23 +52,23 @@ const communityPalette = [
 ];
 
 function colorForNode(node: GraphResponse["nodes"][number]): string {
-  if (node.category === "signal_node" && typeof node.community_louvain === "number") {
-    return communityPalette[Math.abs(node.community_louvain) % communityPalette.length];
+  const category = node.category ?? node.type ?? "chunk";
+  const metadataCommunity = node.metadata?.community_id;
+  if ((category === "mid_concept" || category === "coarse_concept" || category === "fine_cluster") && typeof metadataCommunity === "number") {
+    return communityPalette[Math.abs(metadataCommunity) % communityPalette.length];
   }
-  if (node.category === "signal_node" && node.entity_type) {
-    return palette[node.entity_type] ?? palette.signal_node;
-  }
-  return palette[node.category] ?? "#63cbff";
+  return palette[category] ?? "#63cbff";
 }
 
 function symbolSizeForNode(node: GraphResponse["nodes"][number]): number {
-  if (node.category === "signal_node") {
-    return 14 + Math.min(26, Math.max((node.value ?? 2) * 0.75, (node.centrality_score ?? 0) * 48, (node.graph_rank_score ?? 0) * 34));
+  const category = node.category ?? node.type ?? "chunk";
+  if (category === "mid_concept" || category === "coarse_concept") {
+    return 16 + Math.min(24, Math.max((node.value ?? 2) * 0.85, (node.score ?? 0) * 32));
   }
-  if (node.category === "evidence_chunk" || node.category === "active_chunk" || node.category === "evidence_atom") {
+  if (category === "chunk" || category === "chunk_relation") {
     return 10 + Math.min(10, (node.value ?? 1) * 2);
   }
-  if (node.category === "document" || node.category === "document_version") {
+  if (category === "document" || category === "document_version" || category === "fine_cluster") {
     return 16;
   }
   return 20;
@@ -197,34 +201,39 @@ export function buildBaseOption(graph: GraphResponse): EChartsOption {
         edgeLabel: { show: false },
         data: graph.nodes.map((node) => ({
           ...node,
+          name: node.name ?? node.label ?? node.id,
+          category: node.category ?? node.type ?? "chunk",
           draggable: true,
           fixed: false,
           symbolSize: symbolSizeForNode(node),
           itemStyle: {
             color: colorForNode(node),
-            borderWidth: node.category === "signal_node" && (node.centrality_score ?? 0) > 0.18 ? 1.8 : 0.8,
-            borderColor: node.category === "signal_node" && (node.centrality_score ?? 0) > 0.18 ? "rgba(255,255,255,0.72)" : "rgba(255,255,255,0.14)",
-            shadowBlur: node.category === "signal_node" ? 10 + Math.min(16, (node.centrality_score ?? 0) * 44) : 7,
-            shadowColor: node.category === "signal_node" ? "rgba(255, 255, 255, 0.16)" : "rgba(99, 203, 255, 0.08)",
+            borderWidth: (node.category ?? node.type) === "mid_concept" || (node.category ?? node.type) === "coarse_concept" ? 1.4 : 0.8,
+            borderColor: "rgba(255,255,255,0.16)",
+            shadowBlur: (node.category ?? node.type) === "mid_concept" || (node.category ?? node.type) === "coarse_concept" ? 13 : 7,
+            shadowColor: "rgba(99, 203, 255, 0.08)",
           },
           label: {
             color: "#dff7ff",
           },
         })),
-        links: graph.edges.map((edge) => ({
-          source: edge.source,
-          target: edge.target,
-          relationLabel: edge.label,
-          confidence: edge.confidence,
-          category: edge.category,
-          evidence_chunk_id: edge.evidence_chunk_id,
-          lineStyle: {
-            color: edge.is_inferred ? "rgba(255, 207, 112, 0.26)" : edge.category === "signal_projection" ? "rgba(216, 180, 254, 0.24)" : edge.category === "semantic" ? "rgba(84, 213, 255, 0.18)" : "rgba(155, 165, 255, 0.11)",
-            width: edge.category === "signal_projection" || edge.category === "semantic" ? 0.8 + Math.min(2.8, (edge.weight ?? edge.confidence ?? 0.4) * 2.6) : 0.8,
-            opacity: edge.category === "signal_projection" || edge.category === "semantic" ? 0.36 + Math.min(0.48, (edge.weight ?? 0.3) * 0.55) : 0.38,
-            type: edge.is_inferred ? "dashed" : "solid",
-          },
-        })),
+        links: graph.edges.map((edge) => {
+          const category = edge.category ?? edge.type ?? "";
+          const isRqEdge = category.startsWith("rq_");
+          return {
+            source: edge.source,
+            target: edge.target,
+            relationLabel: edge.label ?? edge.type,
+            confidence: edge.confidence,
+            category,
+            lineStyle: {
+              color: edge.is_bridge ? "rgba(255, 207, 112, 0.28)" : isRqEdge ? "rgba(94, 234, 212, 0.24)" : category === "concept_relation" ? "rgba(216, 180, 254, 0.24)" : "rgba(155, 165, 255, 0.12)",
+              width: 0.8 + Math.min(2.6, (edge.weight ?? edge.confidence ?? 0.35) * 2.3),
+              opacity: edge.is_bridge || isRqEdge ? 0.64 : 0.42,
+              type: edge.is_bridge || edge.is_inferred || isRqEdge ? "dashed" : "solid",
+            },
+          };
+        }),
       },
     ],
   };
@@ -455,12 +464,12 @@ export const NetworkCanvas = forwardRef<NetworkCanvasHandle, NetworkCanvasProps>
         onEvents={{
           click: (params: { data?: { id?: string; category?: string } }) => {
             if (params.data?.id) {
-              onNodeClick?.(params.data.id, params.data.category ?? "signal_node");
+              onNodeClick?.(params.data.id, params.data.category ?? "chunk");
             }
           },
           dblclick: (params: { data?: { id?: string; category?: string } }) => {
             if (params.data?.id) {
-              onNodeDoubleClick?.(params.data.id, params.data.category ?? "signal_node");
+              onNodeDoubleClick?.(params.data.id, params.data.category ?? "chunk");
             }
           },
         }}

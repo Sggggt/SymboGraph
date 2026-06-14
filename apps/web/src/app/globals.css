@@ -148,7 +148,13 @@ select option:hover {
 
 .kg-page {
   min-height: calc(100dvh - 11.5rem);
+  align-items: stretch;
   overflow: visible;
+}
+
+.kg-page > .kg-scroll-panel {
+  height: calc(100dvh - 11.5rem);
+  max-height: calc(100dvh - 11.5rem);
 }
 
 @media (max-width: 1023px) {
@@ -414,7 +420,7 @@ select option:hover {
   animation: tech-cursor 0.9s steps(1) infinite;
 }
 
-.signal-bars {
+.context-bars {
   display: inline-grid;
   grid-auto-flow: column;
   align-items: end;
@@ -422,29 +428,29 @@ select option:hover {
   height: 12px;
 }
 
-.signal-bars span {
+.context-bars span {
   width: 3px;
   border-radius: 999px;
   background: linear-gradient(180deg, rgba(116, 227, 255, 0.96), rgba(124, 124, 255, 0.35));
   animation: tech-bars 1.05s ease-in-out infinite;
 }
 
-.signal-bars span:nth-child(1) {
+.context-bars span:nth-child(1) {
   height: 35%;
   animation-delay: 0s;
 }
 
-.signal-bars span:nth-child(2) {
+.context-bars span:nth-child(2) {
   height: 85%;
   animation-delay: 0.12s;
 }
 
-.signal-bars span:nth-child(3) {
+.context-bars span:nth-child(3) {
   height: 55%;
   animation-delay: 0.24s;
 }
 
-.signal-bars span:nth-child(4) {
+.context-bars span:nth-child(4) {
   height: 100%;
   animation-delay: 0.36s;
 }
@@ -520,7 +526,7 @@ select option:hover {
   .tech-progress::after,
   .tech-dot,
   .stream-cursor,
-  .signal-bars span {
+  .context-bars span {
     animation: none !important;
   }
 }

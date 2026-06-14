@@ -1,4 +1,4 @@
-"""Initial evidence graph policy engine schema.
+"""Initial four-layer context graph schema.
 
 Revision ID: 20260611_0001
 Revises: None

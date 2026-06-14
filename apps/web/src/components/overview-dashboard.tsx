@@ -21,6 +21,7 @@ const batchStateLabels: Record<string, string> = {
   cancelling: "正在取消",
   compensating: "正在回滚",
   cancelled: "已取消",
+  cancel_failed: "取消失败",
   completed: "已完成",
   partial_failed: "部分失败",
   failed: "失败",
@@ -30,12 +31,12 @@ const batchStateLabels: Record<string, string> = {
 
 const sourceTypeLabels: Record<string, string> = {
   pdf: "PDF",
-  notebook: "Notebook",
-  markdown: "Markdown",
+  notebook: "笔记本",
+  markdown: "Markdown 文档",
   text: "文本",
   image: "图片",
-  docx: "Word",
-  pptx: "PowerPoint",
+  docx: "Word 文档",
+  pptx: "演示文稿",
   unknown: "未知",
 };
 
@@ -68,10 +69,12 @@ export function OverviewDashboard() {
 
   const stats = useMemo(() => {
     if (!data) return [];
+    const counts = (data.context_graph?.counts ?? {}) as Record<string, number>;
     return [
       { label: "文档原件", value: data.ingested_document_count },
-      { label: "Active chunks", value: data.active_chunk_count },
-      { label: "Evidence edges", value: data.evidence_edge_count },
+      { label: "活跃片段", value: counts.active_chunks ?? data.chunk_count ?? 0 },
+      { label: "关系边", value: counts.chunk_relation_edges ?? data.graph_relation_count ?? 0 },
+      { label: "RQ 边", value: counts.rq_edges ?? 0 },
       { label: "目录分组", value: data.tree.length },
     ];
   }, [data]);
@@ -98,7 +101,7 @@ export function OverviewDashboard() {
             <div className="max-w-4xl space-y-4">
               <p className="section-kicker">本地资料 / 知识智能</p>
               <h2 className="glow-text text-3xl font-semibold leading-tight text-white lg:text-4xl">本地知识图谱、向量检索与 RAG 联动。</h2>
-              <p className="max-w-3xl text-sm leading-7 text-cyan-50/72">围绕本地原件、目录脉络、证据 atom 和 active chunk 展开。新资料导入后自动解析、构建 evidence graph、切块、质量门禁并向量化。</p>
+              <p className="max-w-3xl text-sm leading-7 text-cyan-50/72">围绕本地原件、结构路径、片段关系、RQ-KMeans、概念图和上下文证据包展开。新资料导入后自动解析、固定切块、构建四层图谱并向量化。</p>
             </div>
             <div className="flex flex-wrap gap-3">
               <Link href="/upload" className="rounded-full border border-cyan-300/40 bg-cyan-300/12 px-4 py-2.5 text-xs uppercase tracking-[0.24em] text-white">
@@ -108,7 +111,7 @@ export function OverviewDashboard() {
                 打开图谱
               </Link>
             </div>
-            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
               {stats.map((stat) => (
                 <div key={stat.label} className="metric-line rounded-[20px] border border-white/8 bg-white/[0.03] px-4 py-3">
                   <p className="text-[11px] uppercase tracking-[0.28em] text-white/45">{stat.label}</p>
@@ -124,7 +127,7 @@ export function OverviewDashboard() {
             <div>
               <p className="section-kicker">实时图谱</p>
               <div className="mt-1.5 flex flex-wrap items-center gap-2">
-                <h3 className="text-xl font-semibold text-white">证据图谱热区</h3>
+                <h3 className="text-xl font-semibold text-white">四层图谱热区</h3>
                 <GraphStaleBadge isStale={data.graph.freshness?.is_stale} />
               </div>
             </div>
@@ -158,7 +161,7 @@ export function OverviewDashboard() {
             <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
               <p className="text-xs uppercase tracking-[0.28em] text-white/45">向量模型模式</p>
               <p className="mt-3 text-2xl font-semibold text-white">{data.degraded_mode ? "降级不可用" : "真实模型链路"}</p>
-              <p className="mt-2 text-sm text-white/55">{data.degraded_mode ? "当前未检测到真实模型链路" : "真实向量模型与 evidence graph 链路已启用"}</p>
+              <p className="mt-2 text-sm text-white/55">{data.degraded_mode ? "当前未检测到真实模型链路" : "真实向量模型与四层图谱链路已启用"}</p>
             </div>
           </div>
           <div className="mt-6 space-y-3">
@@ -216,7 +219,7 @@ export function OverviewDashboard() {
               {[
                 { href: "/search", title: "搜索实验室", description: "带过滤条件的向量检索与目录联动视图。" },
                 { href: "/qa", title: "问答实验室", description: "流式回答、证据轨迹和命中片段并行展开。" },
-                { href: "/graph", title: "证据图谱", description: "查看 evidence atom、active chunk、文档版本和观测边。" },
+                { href: "/graph", title: "四层图谱", description: "查看片段结构图、片段关系图、中粒度概念图和粗粒度概念图。" },
               ].map((entry) => (
                 <Link
                   key={entry.href}

@@ -1,11 +1,11 @@
-"""Service module map for the Evidence Graph Policy Engine.
+"""Service module map for the Four-Layer Context Graph RAG runtime.
 
-See apps/api/README.md for the architecture overview. Key modules:
-- evidence_graph: evidence atoms, observed edges, chunk candidates, quality decisions, policy states, active chunks.
-- evidence_signal_projection: evidence-bound signal layer and projection diagnostics.
-- retrieval: evidence-first dense/lexical/graph/community retrieval and retrieval traces.
-- agent_graph: grounded QA workflow, citation verification, reward events, policy updates.
-- ingestion: file parsing orchestration, cancellation compensation, vector indexing.
-- maintenance: stale-data cleanup, vector-store reconciliation, policy-state reconciliation.
+Active services:
+- chunking: fixed-token chunking with protected table, formula, code, heading, and caption spans.
+- context_graph: structure graph, chunk relation graph, fine clusters, mid/coarse concepts, layered retrieval, and context packages.
+- retrieval: search/dashboard helpers backed by context_graph.
+- agent_graph: grounded QA over context packages with citation verification and reward events.
+- ingestion: parsing orchestration, versioning, cancellation boundaries, embedding, BM25, and graph rebuilds.
+- maintenance: destructive cleanup, vector-store reconciliation, and context-graph policy state reconciliation.
 - runtime_settings: shared .env updates, runtime version publishing, singleton cache refresh.
 """

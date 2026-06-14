@@ -19,10 +19,10 @@ type UploadedFile = {
   path: string;
 };
 
-const terminalLogEvents = new Set(["batch_completed", "batch_failed", "batch_partial_failed", "batch_skipped", "batch_cancelled", "batch_missing"]);
-const failureLogEvents = new Set(["batch_failed", "batch_partial_failed", "graph_failed", "global_graph_failed", "signal_schema_failed", "signal_layer_failed"]);
-const terminalBatchStates = new Set(["completed", "partial_failed", "failed", "skipped", "cancelled"]);
-const failureBatchStates = new Set(["partial_failed", "failed"]);
+const terminalLogEvents = new Set(["batch_completed", "batch_failed", "batch_partial_failed", "batch_skipped", "batch_cancelled", "batch_cancel_failed", "batch_missing"]);
+const failureLogEvents = new Set(["batch_failed", "batch_partial_failed", "batch_cancel_failed", "context_graph_failed", "graph_failed"]);
+const terminalBatchStates = new Set(["completed", "partial_failed", "failed", "skipped", "cancelled", "cancel_failed"]);
+const failureBatchStates = new Set(["partial_failed", "failed", "cancel_failed"]);
 const logStreamMaxRetries = 3;
 const logStreamRetryDelayMs = 1200;
 
@@ -36,33 +36,32 @@ const logEventLabels: Record<string, string> = {
   file_failed: "文件失败",
   batch_graph_started: "图谱生成",
   batch_graph_selected: "图谱片段选择",
-  batch_graph_progress: "Evidence graph 进度",
-  graph_rebuilt: "Evidence graph 完成",
-  graph_failed: "Evidence graph 失败",
-  global_graph_scanning: "Global evidence graph publish",
-  global_graph_active: "Global evidence graph active",
-  global_graph_failed: "Global evidence graph failed",
-  signal_candidate_scanning: "Signal candidate scan",
-  signal_candidate_gate: "Signal candidate gate",
-  signal_schema_failed: "Signal schema failed",
-  signal_layer_assembling: "Signal layer assembling",
-  signal_layer_active: "Signal layer active",
-  signal_layer_failed: "Signal layer failed",
+  batch_graph_progress: "四层图谱进度",
+  graph_rebuilt: "四层图谱完成",
+  graph_failed: "四层图谱失败",
+  context_graph_started: "四层图谱开始",
+  chunk_structure_completed: "片段结构图完成",
+  chunk_relation_completed: "片段关系图完成",
+  fine_clusters_completed: "细聚类完成",
+  mid_concepts_completed: "中粒度概念完成",
+  coarse_concepts_completed: "粗粒度概念完成",
+  context_graph_completed: "四层图谱完成",
   batch_completed: "批次完成",
   batch_partial_failed: "部分失败",
   batch_failed: "批次失败",
   batch_cancel_requested: "请求取消",
+  batch_cancel_targeted_task: "终止目标任务",
   batch_cancelled: "已取消",
+  batch_cancel_failed: "取消失败",
   batch_skipped: "批次跳过",
   batch_missing: "批次丢失",
   log_stream_retry: "日志重连",
   log_stream_warning: "日志流告警",
-  evidence_section_sizing: "Evidence section sizing",
-  chunk_adaptive: "Evidence section sizing",
+  fixed_chunking: "固定切块",
 };
 
 function logEventLabel(event: string): string {
-  return logEventLabels[event] ?? event.replaceAll("_", " ");
+  return logEventLabels[event] ?? `未知事件：${event.replaceAll("_", " ")}`;
 }
 
 const batchStateLabels: Record<string, string> = {
@@ -73,8 +72,10 @@ const batchStateLabels: Record<string, string> = {
   extracting_graph: "生成图谱中",
   cancel_requested: "正在取消",
   cancelling: "正在取消",
+  terminating_task: "终止目标任务",
   compensating: "正在回滚",
   cancelled: "已取消",
+  cancel_failed: "取消失败",
   completed: "已完成",
   partial_failed: "部分失败",
   failed: "失败",
@@ -85,6 +86,17 @@ function batchStateLabel(state?: string | null): string {
   return state ? batchStateLabels[state] ?? state : "未启动";
 }
 
+function cancellationStatusLabel(status?: string | null): string | null {
+  if (!status) {
+    return null;
+  }
+  return batchStateLabels[status] ?? status;
+}
+
+function shortId(value?: string | null): string | null {
+  return value ? value.slice(0, 8) : null;
+}
+
 function fallbackMethodLabel(value?: string | null): string {
   if (!value) {
     return "本地模拟";
@@ -92,7 +104,30 @@ function fallbackMethodLabel(value?: string | null): string {
   if (value === "deterministic_local_hash_embedding") {
     return "本地确定性哈希向量";
   }
-  return value;
+  return `未知回退方式：${value}`;
+}
+
+function sourceTypeLabel(value?: string | null): string {
+  const labels: Record<string, string> = {
+    pdf: "PDF",
+    notebook: "笔记本",
+    markdown: "Markdown 文档",
+    text: "文本",
+    image: "图片",
+    docx: "Word 文档",
+    pptx: "演示文稿",
+  };
+  return value ? labels[value] ?? value : "未知";
+}
+
+function modelProviderLabel(value?: string | null): string {
+  const labels: Record<string, string> = {
+    fake: "本地模拟",
+    openai: "OpenAI 兼容接口",
+    model_bridge: "模型桥",
+    local: "本地模型",
+  };
+  return value ? labels[value] ?? value : "未知提供方";
 }
 
 function isBatchNotFoundError(error: unknown): boolean {
@@ -108,7 +143,7 @@ function formatBatchFailureDetails(errors?: Array<{ source_path?: string | null;
   }
   return errors
     .slice(0, 5)
-    .map((item) => `${item.source_path ?? "unknown"}: ${item.message ?? "未返回错误信息"}`)
+    .map((item) => `${item.source_path ?? "未知文件"}: ${item.message ?? "未返回错误信息"}`)
     .join("\n");
 }
 
@@ -122,11 +157,12 @@ const fileStatusMeta: Record<KnowledgeBaseFileStatus, { label: string; className
   parsing: { label: "解析中", className: "border-cyan-200/28 bg-cyan-300/10 text-cyan-100" },
   failed: { label: "解析失败", className: "border-rose-200/28 bg-rose-300/10 text-rose-100" },
   skipped: { label: "已跳过", className: "border-white/14 bg-white/[0.05] text-white/58" },
+  active: { label: "已启用", className: "border-emerald-200/24 bg-emerald-300/10 text-emerald-100" },
 };
 
 function FileStatusBadge({ status }: { status: KnowledgeBaseFileStatus }) {
   const meta = fileStatusMeta[status];
-  const Icon = status === "parsed" ? CheckCircle2 : status === "failed" ? AlertCircle : status === "parsing" ? LoaderCircle : Clock3;
+  const Icon = status === "parsed" || status === "active" ? CheckCircle2 : status === "failed" ? AlertCircle : status === "parsing" ? LoaderCircle : Clock3;
   return (
     <span className={cn("inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs", meta.className, status === "parsing" && "animate-pulse")}>
       <Icon className={cn("size-3.5", status === "parsing" && "animate-spin")} />
@@ -141,6 +177,7 @@ const fileProgressMeta: Record<KnowledgeBaseFileStatus, { value: number; barClas
   parsed: { value: 100, barClassName: "bg-emerald-300/80" },
   failed: { value: 100, barClassName: "bg-rose-300/72" },
   skipped: { value: 100, barClassName: "bg-white/28" },
+  active: { value: 100, barClassName: "bg-emerald-300/80" },
 };
 
 function FileProgressBar({ status }: { status: KnowledgeBaseFileStatus }) {
@@ -195,7 +232,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
 
   const dashboardQuery = useQuery({
     queryKey: ["dashboard", selectedKnowledgeBaseId],
-    queryFn: () => fetchDashboard(selectedKnowledgeBaseId),
+    queryFn: () => fetchDashboard(selectedKnowledgeBaseId, { includeGraph: false }),
     enabled: Boolean(selectedKnowledgeBaseId),
   });
   const activeBatchCandidate = batchId ?? dashboardQuery.data?.batch_status?.batch_id ?? null;
@@ -334,9 +371,10 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
   });
   const cleanupStaleDataMutation = useMutation({
     mutationFn: () => cleanupStaleData(selectedKnowledgeBaseId),
-    onSuccess: (stats) => {
+    onSuccess: (response) => {
+      const stats = response.stats;
       setCleanupMessage(
-        `旧数据清理完成：Qdrant 向量 ${stats.deleted_vectors}，向量记录 ${stats.removed_vector_records}，旧派生 chunks ${stats.deleted_chunks}，版本 ${stats.deleted_document_versions}，文档 ${stats.deleted_documents}，evidence atoms ${stats.removed_evidence_atoms}，evidence graph states ${stats.removed_evidence_graph_states}，active chunks ${stats.removed_active_chunks}`,
+        `旧数据清理完成：已禁用片段行 ${stats.inactive_chunks ?? 0}，失效向量记录 ${stats.stale_vector_records ?? 0}，失效 Qdrant 点 ${stats.stale_qdrant_points ?? 0}，实际执行 ${stats.applied ? "是" : "否"}`,
       );
       void queryClient.invalidateQueries({ queryKey: ["knowledgeBase-files", selectedKnowledgeBaseId] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedKnowledgeBaseId] });
@@ -352,6 +390,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
       return "模型：等待后端返回模型审计";
     }
     const provider = audit.provider ?? audit.embedding_provider ?? "未知";
+    const providerText = modelProviderLabel(provider);
     const embeddingModel = audit.model ?? audit.embedding_model ?? provider;
     const externalCalled = audit.external_called ?? audit.embedding_external_called ?? false;
     const fallbackReason = audit.fallback_reason ?? audit.embedding_fallback_reason ?? null;
@@ -359,9 +398,9 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
     const graphRuntime = audit.graph_runtime;
     const embeddingText =
       provider === "fake"
-        ? `向量模型 ${embeddingModel}（${provider} 降级：${fallbackMethodLabel(fallbackMethod ?? fallbackReason)}）`
-        : `向量模型 ${embeddingModel}（${provider}${externalCalled ? "，已调用外部 API" : ""}）`;
-    const graphText = graphRuntime ? `；evidence graph ${graphRuntime}` : "";
+        ? `向量模型 ${embeddingModel}（${providerText} 降级：${fallbackMethodLabel(fallbackMethod ?? fallbackReason)}）`
+        : `向量模型 ${embeddingModel}（${providerText}${externalCalled ? "，已调用外部 API" : ""}）`;
+    const graphText = graphRuntime ? `；上下文图谱 ${graphRuntime}` : "";
     return `模型：${embeddingText}${graphText}`;
   }, [logs]);
   const fileItems = useMemo<FileBrowserItem[]>(() => {
@@ -411,7 +450,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
         return next.length === current.length ? current : next;
       });
     });
-  }, [parseTargetPaths]);
+  }, [parseTargetPaths, setSelectedFilePathValues]);
 
   useEffect(() => {
     if (!activeBatchId || terminalBatchStates.has(batchQuery.data?.state ?? "")) {
@@ -427,7 +466,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
         return activeBatchId;
       });
     });
-  }, [activeBatchId, batchQuery.data?.state]);
+  }, [activeBatchId, batchQuery.data?.state, setActiveLogBatchId, setLogs]);
 
   useEffect(() => {
     if (!activeLogBatchId) {
@@ -519,10 +558,9 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
         };
         appendLog(item);
         if (failureLogEvents.has(item.event)) {
-          const isGraphFailure = item.event === "graph_failed" || item.event === "global_graph_failed";
-          const isSignalFailure = item.event.startsWith("signal_");
+          const isGraphFailure = item.event === "graph_failed" || item.event === "context_graph_failed";
           setFailureDialog({
-            title: isGraphFailure ? "Evidence graph 更新失败" : isSignalFailure ? "Signal layer 更新失败" : "解析失败",
+            title: isGraphFailure ? "四层图谱更新失败" : "解析失败",
             message: item.message || "任务失败，后端未返回错误详情。",
             details: item.error ?? null,
           });
@@ -578,17 +616,22 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
       }
       closeSource();
     };
-  }, [activeLogBatchId, queryClient, selectedKnowledgeBaseId]);
+  }, [activeLogBatchId, queryClient, selectedKnowledgeBaseId, setActiveLogBatchId, setBatchId, setDismissedBatchId, setLogs]);
 
   useEffect(() => {
     if (batchQuery.data?.state && terminalBatchStates.has(batchQuery.data.state)) {
       const terminalBatch = batchQuery.data;
       queueMicrotask(() => {
         if (failureBatchStates.has(terminalBatch.state)) {
+          const cancelFailed = terminalBatch.state === "cancel_failed";
           setFailureDialog({
-            title: terminalBatch.state === "partial_failed" ? "解析部分失败" : "解析失败",
-            message: `${batchStateLabel(terminalBatch.state)}：成功 ${terminalBatch.success_count}，失败 ${terminalBatch.failure_count}，跳过 ${terminalBatch.skipped_count}。`,
-            details: formatBatchFailureDetails(terminalBatch.errors),
+            title: cancelFailed ? "取消失败" : terminalBatch.state === "partial_failed" ? "解析部分失败" : "解析失败",
+            message: cancelFailed
+              ? `${terminalBatch.cancel_failure_reason || "取消补偿未完成，需要人工核对后重试。"}`
+              : `${batchStateLabel(terminalBatch.state)}：成功 ${terminalBatch.success_count}，失败 ${terminalBatch.failure_count}，跳过 ${terminalBatch.skipped_count}。`,
+            details: cancelFailed && terminalBatch.manual_review_required
+              ? "后端已停止该批次并标记 manual_review_required，请查看实时日志和批次任务 ID。"
+              : formatBatchFailureDetails(terminalBatch.errors),
           });
         }
         setBatchId(null);
@@ -597,7 +640,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
       void queryClient.invalidateQueries({ queryKey: ["knowledgeBase-files", selectedKnowledgeBaseId] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedKnowledgeBaseId] });
     }
-  }, [activeBatchId, batchQuery.data?.state, queryClient, selectedKnowledgeBaseId]);
+  }, [activeBatchId, batchQuery.data, queryClient, selectedKnowledgeBaseId, setBatchId, setDismissedBatchId]);
 
   useEffect(() => {
     if (!activeBatchId || !isBatchNotFoundError(batchQuery.error)) {
@@ -619,7 +662,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
     });
     void queryClient.invalidateQueries({ queryKey: ["knowledgeBase-files", selectedKnowledgeBaseId] });
     void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedKnowledgeBaseId] });
-  }, [activeBatchId, batchQuery.error, queryClient, selectedKnowledgeBaseId]);
+  }, [activeBatchId, batchQuery.error, queryClient, selectedKnowledgeBaseId, setActiveLogBatchId, setBatchId, setDismissedBatchId, setLogs]);
 
   const inclusionRules = useMemo(
     () => [
@@ -661,7 +704,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
                   if (effectiveParseTargetPaths.length === 0) return;
                   setConfirmDialog({
                     title: "确认解析文件",
-                    message: `即将强制解析 ${effectiveParseTargetPaths.length} 个文件，包括切块、证据图构建与向量化。`,
+                    message: `即将强制解析 ${effectiveParseTargetPaths.length} 个文件，包括固定切块、四层图谱构建与向量化。`,
                     onConfirm: () => parseUploadsMutation.mutate({ paths: effectiveParseTargetPaths, force: true, fullReparse: false }),
                     confirmText: "确认解析",
                   });
@@ -678,7 +721,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
                   if (parseTargetPaths.length === 0 || !canFullReparse) return;
                   setConfirmDialog({
                     title: "确认全量重新解析",
-                    message: "强制重建当前资料库所有文件的片段、证据图、向量和 Qdrant 向量记录。",
+                    message: "强制重建当前资料库所有文件的片段、四层图谱、向量和 Qdrant 向量记录。",
                     onConfirm: () => parseUploadsMutation.mutate({ paths: parseTargetPaths, force: true, fullReparse: true }),
                     confirmText: "确认重建",
                     variant: "danger",
@@ -772,6 +815,28 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
             {cleanupStaleDataMutation.error ? (
               <p className="text-xs leading-5 text-rose-100/72">{(cleanupStaleDataMutation.error as Error).message}</p>
             ) : null}
+            {visibleBatch ? (
+              <div className="flex max-w-2xl flex-wrap gap-2 text-xs text-cyan-50/62">
+                <span className="rounded-full border border-cyan-200/14 bg-cyan-300/[0.055] px-3 py-1.5">
+                  阶段 {batchStateLabel(visibleBatch.phase ?? visibleBatch.state)}
+                </span>
+                {cancellationStatusLabel(visibleBatch.cancellation_status) ? (
+                  <span className="rounded-full border border-rose-200/16 bg-rose-300/[0.055] px-3 py-1.5">
+                    取消 {cancellationStatusLabel(visibleBatch.cancellation_status)}
+                  </span>
+                ) : null}
+                {shortId(visibleBatch.worker_id) ? (
+                  <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5">
+                    工作进程 {shortId(visibleBatch.worker_id)}
+                  </span>
+                ) : null}
+                {(visibleBatch.batch_task_ids ?? []).slice(0, 2).map((taskId) => (
+                  <span key={taskId} className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5">
+                    任务 {shortId(taskId)}
+                  </span>
+                ))}
+              </div>
+            ) : null}
             {uploadMutation.isPending ? (
               <div className="max-w-md">
                 <div className="flex items-center justify-between text-xs uppercase tracking-[0.22em] text-white/45">
@@ -813,12 +878,12 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
             {[
               {
                 label: "最新批次",
-                value: visibleBatch?.state ?? "idle",
+                value: visibleBatch ? batchStateLabel(visibleBatch.state) : "空闲",
                 hint: visibleBatch ? `${visibleBatch.processed_files}/${visibleBatch.total_files}` : "等待启动",
               },
               {
                 label: "最近上传",
-                value: uploadedFiles.length > 0 ? String(uploadedFiles.length) : "idle",
+                value: uploadedFiles.length > 0 ? String(uploadedFiles.length) : "空闲",
                 hint: uploadedFiles.length > 0 ? "等待解析" : "暂无待解析上传",
               },
               {
@@ -827,9 +892,9 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
                 hint: "当前资料库有效版本",
               },
               {
-                label: "证据边",
-                value: String(dashboardQuery.data?.evidence_edge_count ?? 0),
-                hint: "当前 evidence graph 观测边",
+                label: "关系边",
+                value: String(((dashboardQuery.data?.context_graph?.counts ?? {}) as Record<string, number>).chunk_relation_edges ?? 0),
+                hint: "当前片段关系边",
               },
             ].map((item) => (
               <div key={item.label} className="border-l border-white/10 px-4 py-3">
@@ -922,7 +987,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
                   </button>
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-white/42">
-                  <span className="rounded-full border border-white/8 px-2.5 py-1">{file.source_type || "未知"}</span>
+                  <span className="rounded-full border border-white/8 px-2.5 py-1">{sourceTypeLabel(file.source_type)}</span>
                   {file.partition ? <span className="rounded-full border border-white/8 px-2.5 py-1">{file.partition}</span> : null}
                   <span className="rounded-full border border-white/8 px-2.5 py-1">{file.chunk_count} 个片段</span>
                   {isSelected ? <span className="rounded-full border border-cyan-200/30 bg-cyan-300/10 px-2.5 py-1 text-cyan-50">已选择</span> : null}
@@ -981,8 +1046,8 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
                     <LoaderCircle className="size-6 animate-spin text-cyan-100" />
                   </div>
                   <div className="min-w-0">
-                    <p className="text-sm font-semibold text-cyan-50">正在更新 evidence graph</p>
-                    <p className="mt-2 text-sm leading-6 text-cyan-50/72">Evidence atoms、观测边、候选 chunks 和向量索引正在提交，请不要关闭页面、停止后端或重启服务。</p>
+                    <p className="text-sm font-semibold text-cyan-50">正在更新四层图谱</p>
+                    <p className="mt-2 text-sm leading-6 text-cyan-50/72">片段关系图、RQ-KMeans、概念图、上下文图谱和索引状态正在提交，请不要关闭页面、停止后端或重启服务。</p>
                     <div className="mt-4 flex items-center gap-2">
                       {[0, 1, 2, 3].map((item) => (
                         <span key={item} className="size-2 animate-pulse rounded-full bg-cyan-100/80" style={{ animationDelay: `${item * 150}ms` }} />
@@ -1024,7 +1089,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
               <div className="rounded-[22px] border border-rose-300/20 bg-rose-400/[0.05] p-5">
                 <p className="text-xs uppercase tracking-[0.26em] text-rose-100/70">失败项</p>
                 <div className="custom-scrollbar kg-rounded-scrollbar mt-4 max-h-64 space-y-3 overflow-y-auto pr-1">
-                  {visibleBatch?.errors.map((error) => (
+                  {(visibleBatch?.errors ?? []).map((error) => (
                     <div key={`${error.source_path}-${error.message}`} className="rounded-[18px] border border-white/8 px-4 py-3 text-sm text-white/72">
                       <p className="font-medium text-white">{error.source_path}</p>
                       <p className="mt-1 text-white/58">{error.message}</p>
