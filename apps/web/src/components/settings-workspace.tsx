@@ -80,13 +80,22 @@ type SettingsForm = {
   rq_kmeans_levels: string;
   rq_kmeans_max_k: string;
   rq_residual_tau: string;
-  agent_coarse_activation_budget: string;
+  agent_coarse_entry_budget: string;
   agent_coarse_jump_budget: string;
-  agent_mid_activation_budget: string;
+  agent_mid_entry_budget: string;
   agent_mid_expansion_radius_cap: string;
-  agent_fine_cluster_budget: string;
+  agent_fine_entry_budget: string;
+  agent_frontier_expansion_budget: string;
+  agent_max_depth_per_layer: string;
+  agent_max_labels_per_node: string;
+  agent_max_edge_reuse: string;
+  agent_max_cycle_reward_per_path: string;
+  agent_ambiguous_edge_distance_low: string;
+  agent_ambiguous_edge_distance_high: string;
+  agent_drilldown_budget_per_layer: string;
   agent_chunk_candidate_budget: string;
   agent_structure_restore_budget: string;
+  context_path_summary_budget: string;
   agent_planning_round_budget: string;
   agent_max_typed_actions_per_round: string;
   agent_repair_round_budget: string;
@@ -964,13 +973,22 @@ export function SettingsWorkspace() {
       rq_kmeans_levels: String(settingsQuery.data.rq_kmeans_levels ?? 3),
       rq_kmeans_max_k: String(settingsQuery.data.rq_kmeans_max_k ?? 6),
       rq_residual_tau: String(settingsQuery.data.rq_residual_tau ?? 0.65),
-      agent_coarse_activation_budget: String(settingsQuery.data.agent_coarse_activation_budget ?? 8),
+      agent_coarse_entry_budget: String(settingsQuery.data.agent_coarse_entry_budget ?? 8),
       agent_coarse_jump_budget: String(settingsQuery.data.agent_coarse_jump_budget ?? 2),
-      agent_mid_activation_budget: String(settingsQuery.data.agent_mid_activation_budget ?? 16),
+      agent_mid_entry_budget: String(settingsQuery.data.agent_mid_entry_budget ?? 16),
       agent_mid_expansion_radius_cap: String(settingsQuery.data.agent_mid_expansion_radius_cap ?? 2),
-      agent_fine_cluster_budget: String(settingsQuery.data.agent_fine_cluster_budget ?? 16),
+      agent_fine_entry_budget: String(settingsQuery.data.agent_fine_entry_budget ?? 16),
+      agent_frontier_expansion_budget: String(settingsQuery.data.agent_frontier_expansion_budget ?? 80),
+      agent_max_depth_per_layer: String(settingsQuery.data.agent_max_depth_per_layer ?? 3),
+      agent_max_labels_per_node: String(settingsQuery.data.agent_max_labels_per_node ?? 3),
+      agent_max_edge_reuse: String(settingsQuery.data.agent_max_edge_reuse ?? 2),
+      agent_max_cycle_reward_per_path: String(settingsQuery.data.agent_max_cycle_reward_per_path ?? 0.18),
+      agent_ambiguous_edge_distance_low: String(settingsQuery.data.agent_ambiguous_edge_distance_low ?? 0.45),
+      agent_ambiguous_edge_distance_high: String(settingsQuery.data.agent_ambiguous_edge_distance_high ?? 1.35),
+      agent_drilldown_budget_per_layer: String(settingsQuery.data.agent_drilldown_budget_per_layer ?? 16),
       agent_chunk_candidate_budget: String(settingsQuery.data.agent_chunk_candidate_budget ?? 80),
       agent_structure_restore_budget: String(settingsQuery.data.agent_structure_restore_budget ?? 16),
+      context_path_summary_budget: String(settingsQuery.data.context_path_summary_budget ?? 32),
       agent_planning_round_budget: String(settingsQuery.data.agent_planning_round_budget ?? 2),
       agent_max_typed_actions_per_round: String(settingsQuery.data.agent_max_typed_actions_per_round ?? 8),
       agent_repair_round_budget: String(settingsQuery.data.agent_repair_round_budget ?? 2),
@@ -1045,13 +1063,22 @@ export function SettingsWorkspace() {
     rq_kmeans_levels: parseIntField(form.rq_kmeans_levels),
     rq_kmeans_max_k: parseIntField(form.rq_kmeans_max_k),
     rq_residual_tau: parseFloatField(form.rq_residual_tau),
-    agent_coarse_activation_budget: parseIntField(form.agent_coarse_activation_budget),
+    agent_coarse_entry_budget: parseIntField(form.agent_coarse_entry_budget),
     agent_coarse_jump_budget: parseIntField(form.agent_coarse_jump_budget),
-    agent_mid_activation_budget: parseIntField(form.agent_mid_activation_budget),
+    agent_mid_entry_budget: parseIntField(form.agent_mid_entry_budget),
     agent_mid_expansion_radius_cap: parseIntField(form.agent_mid_expansion_radius_cap),
-    agent_fine_cluster_budget: parseIntField(form.agent_fine_cluster_budget),
+    agent_fine_entry_budget: parseIntField(form.agent_fine_entry_budget),
+    agent_frontier_expansion_budget: parseIntField(form.agent_frontier_expansion_budget),
+    agent_max_depth_per_layer: parseIntField(form.agent_max_depth_per_layer),
+    agent_max_labels_per_node: parseIntField(form.agent_max_labels_per_node),
+    agent_max_edge_reuse: parseIntField(form.agent_max_edge_reuse),
+    agent_max_cycle_reward_per_path: parseFloatField(form.agent_max_cycle_reward_per_path),
+    agent_ambiguous_edge_distance_low: parseFloatField(form.agent_ambiguous_edge_distance_low),
+    agent_ambiguous_edge_distance_high: parseFloatField(form.agent_ambiguous_edge_distance_high),
+    agent_drilldown_budget_per_layer: parseIntField(form.agent_drilldown_budget_per_layer),
     agent_chunk_candidate_budget: parseIntField(form.agent_chunk_candidate_budget),
     agent_structure_restore_budget: parseIntField(form.agent_structure_restore_budget),
+    context_path_summary_budget: parseIntField(form.context_path_summary_budget),
     agent_planning_round_budget: parseIntField(form.agent_planning_round_budget),
     agent_max_typed_actions_per_round: parseIntField(form.agent_max_typed_actions_per_round),
     agent_repair_round_budget: parseIntField(form.agent_repair_round_budget),
@@ -1127,12 +1154,15 @@ export function SettingsWorkspace() {
             <section className={sectionClass}>
               <div className="mb-5 flex items-center justify-between gap-3">
                 <div>
-                  <p className="text-sm font-semibold text-white">模型连接</p>
-                  <p className="mt-1 text-sm text-white/52">只保留当前请求链路实际读取的连接参数。</p>
+                  <p className="text-sm font-semibold text-white">模型连接与密钥</p>
+                  <p className="mt-1 text-sm text-white/52">聊天模型、向量模型、连接地址和接口密钥集中在这里维护。</p>
                 </div>
               </div>
               <BoundaryNote title="生效边界：下一次请求或下一次模型调用">
                 聊天地址、聊天 DNS、聊天模型、向量地址、向量 DNS、模型桥和密钥保存后会广播运行时版本；已经在执行的模型调用不会中途切换。
+              </BoundaryNote>
+              <BoundaryNote title="向量模型边界：已有 active 向量不会自动改写">
+                修改向量模型后只影响后续解析、重嵌入或全量重建任务；已有资料库向量需要显式重新解析或重建。
               </BoundaryNote>
               <div className="mt-5 grid gap-4 md:grid-cols-2">
                 <SwitchRow
@@ -1148,6 +1178,88 @@ export function SettingsWorkspace() {
                 <SettingField label="聊天 DNS 覆盖 IP" value={form.chat_resolve_ip} onChange={(value) => updateForm("chat_resolve_ip", value)} placeholder="可选，留空使用系统 DNS" />
                 <SettingField label="向量 DNS 覆盖 IP" value={form.embedding_resolve_ip} onChange={(value) => updateForm("embedding_resolve_ip", value)} placeholder="可选，留空使用系统 DNS" />
                 <SettingField label="聊天模型" value={form.chat_model} onChange={(value) => updateForm("chat_model", value)} />
+                <SettingField label="向量模型" value={form.embedding_model} onChange={(value) => updateForm("embedding_model", value)} />
+              </div>
+              <div className="mt-6 grid gap-4 md:grid-cols-2">
+                <label className="flex flex-col gap-2">
+                  <span className="text-xs uppercase tracking-[0.2em] text-cyan-100/46">聊天接口密钥</span>
+                  <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3">
+                    <KeyRound className="size-4 text-cyan-100/58" />
+                    <input
+                      type="password"
+                      value={showApiKeyMask ? "••••••••••••••••" : form.api_key}
+                      readOnly={showApiKeyMask}
+                      disabled={form.clear_api_key}
+                      onChange={(event) => updateForm("api_key", event.target.value)}
+                      placeholder={settings?.has_api_key ? "留空则保留当前密钥" : "输入接口密钥"}
+                      className="h-11 min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-white/30"
+                      autoComplete="off"
+                    />
+                    {showApiKeyMask ? (
+                      <button type="button" onClick={() => setApiKeyEditing(true)} className="inline-flex items-center gap-1 rounded-full border border-white/8 px-2.5 py-1 text-xs text-white/55 transition hover:border-cyan-200/24 hover:text-cyan-100">
+                        <PencilLine className="size-3.5" />
+                        修改
+                      </button>
+                    ) : null}
+                    <EyeOff className="size-4 text-white/32" />
+                  </div>
+                </label>
+
+                <label className="flex flex-col gap-2">
+                  <span className="text-xs uppercase tracking-[0.2em] text-cyan-100/46">向量接口密钥</span>
+                  <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3">
+                    <KeyRound className="size-4 text-cyan-100/58" />
+                    <input
+                      type="password"
+                      value={showEmbeddingApiKeyMask ? "••••••••••••••••" : form.embedding_api_key}
+                      readOnly={showEmbeddingApiKeyMask}
+                      disabled={form.clear_embedding_api_key}
+                      onChange={(event) => updateForm("embedding_api_key", event.target.value)}
+                      placeholder={settings?.has_embedding_api_key ? "留空则保留当前密钥" : "输入向量接口密钥"}
+                      className="h-11 min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-white/30"
+                      autoComplete="off"
+                    />
+                    {showEmbeddingApiKeyMask ? (
+                      <button type="button" onClick={() => setEmbeddingApiKeyEditing(true)} className="inline-flex items-center gap-1 rounded-full border border-white/8 px-2.5 py-1 text-xs text-white/55 transition hover:border-cyan-200/24 hover:text-cyan-100">
+                        <PencilLine className="size-3.5" />
+                        修改
+                      </button>
+                    ) : null}
+                    <EyeOff className="size-4 text-white/32" />
+                  </div>
+                </label>
+              </div>
+              <div className="mt-4 grid gap-3 md:grid-cols-2">
+                <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
+                  <input
+                    type="checkbox"
+                    checked={form.clear_api_key}
+                    onChange={(event) => {
+                      updateForm("clear_api_key", event.target.checked);
+                      if (event.target.checked) {
+                        setApiKeyEditing(false);
+                        updateForm("api_key", "");
+                      }
+                    }}
+                    className="size-4 accent-rose-300"
+                  />
+                  清除当前聊天接口密钥
+                </label>
+                <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
+                  <input
+                    type="checkbox"
+                    checked={form.clear_embedding_api_key}
+                    onChange={(event) => {
+                      updateForm("clear_embedding_api_key", event.target.checked);
+                      if (event.target.checked) {
+                        setEmbeddingApiKeyEditing(false);
+                        updateForm("embedding_api_key", "");
+                      }
+                    }}
+                    className="size-4 accent-rose-300"
+                  />
+                  清除当前向量接口密钥
+                </label>
               </div>
             </section>
 
@@ -1161,13 +1273,22 @@ export function SettingsWorkspace() {
                 <SettingField label="模型超时秒数" type="number" min={5} max={600} value={form.model_request_timeout_seconds} onChange={(value) => updateForm("model_request_timeout_seconds", value)} />
                 <SettingField label="Embedding 批大小" type="number" min={1} max={10} value={form.embedding_batch_size} onChange={(value) => updateForm("embedding_batch_size", value)} />
                 <SettingField label="证据包 token 预算" type="number" min={256} max={20000} value={form.context_package_token_budget} onChange={(value) => updateForm("context_package_token_budget", value)} />
-                <SettingField label="粗粒度激活预算" type="number" min={1} max={100} value={form.agent_coarse_activation_budget} onChange={(value) => updateForm("agent_coarse_activation_budget", value)} />
+                <SettingField label="粗粒度入口预算" type="number" min={1} max={100} value={form.agent_coarse_entry_budget} onChange={(value) => updateForm("agent_coarse_entry_budget", value)} />
                 <SettingField label="粗粒度跳转预算" type="number" min={0} max={20} value={form.agent_coarse_jump_budget} onChange={(value) => updateForm("agent_coarse_jump_budget", value)} />
-                <SettingField label="中粒度激活预算" type="number" min={1} max={200} value={form.agent_mid_activation_budget} onChange={(value) => updateForm("agent_mid_activation_budget", value)} />
+                <SettingField label="中粒度入口预算" type="number" min={1} max={200} value={form.agent_mid_entry_budget} onChange={(value) => updateForm("agent_mid_entry_budget", value)} />
                 <SettingField label="中粒度扩展半径" type="number" min={0} max={8} value={form.agent_mid_expansion_radius_cap} onChange={(value) => updateForm("agent_mid_expansion_radius_cap", value)} />
-                <SettingField label="细聚类预算" type="number" min={1} max={500} value={form.agent_fine_cluster_budget} onChange={(value) => updateForm("agent_fine_cluster_budget", value)} />
+                <SettingField label="细粒度入口预算" type="number" min={1} max={500} value={form.agent_fine_entry_budget} onChange={(value) => updateForm("agent_fine_entry_budget", value)} />
+                <SettingField label="Frontier 扩展预算" type="number" min={1} max={2000} value={form.agent_frontier_expansion_budget} onChange={(value) => updateForm("agent_frontier_expansion_budget", value)} />
+                <SettingField label="每层最大深度" type="number" min={1} max={12} value={form.agent_max_depth_per_layer} onChange={(value) => updateForm("agent_max_depth_per_layer", value)} />
+                <SettingField label="每节点标签上限" type="number" min={1} max={20} value={form.agent_max_labels_per_node} onChange={(value) => updateForm("agent_max_labels_per_node", value)} />
+                <SettingField label="边复用上限" type="number" min={1} max={20} value={form.agent_max_edge_reuse} onChange={(value) => updateForm("agent_max_edge_reuse", value)} />
+                <SettingField label="Cycle reward 上限" type="number" min={0} max={2} step={0.01} value={form.agent_max_cycle_reward_per_path} onChange={(value) => updateForm("agent_max_cycle_reward_per_path", value)} />
+                <SettingField label="灰区边下界" type="number" min={0} max={20} step={0.01} value={form.agent_ambiguous_edge_distance_low} onChange={(value) => updateForm("agent_ambiguous_edge_distance_low", value)} />
+                <SettingField label="灰区边上界" type="number" min={0} max={20} step={0.01} value={form.agent_ambiguous_edge_distance_high} onChange={(value) => updateForm("agent_ambiguous_edge_distance_high", value)} />
+                <SettingField label="每层下钻预算" type="number" min={1} max={500} value={form.agent_drilldown_budget_per_layer} onChange={(value) => updateForm("agent_drilldown_budget_per_layer", value)} />
                 <SettingField label="片段候选预算" type="number" min={1} max={1000} value={form.agent_chunk_candidate_budget} onChange={(value) => updateForm("agent_chunk_candidate_budget", value)} />
                 <SettingField label="结构恢复预算" type="number" min={1} max={200} value={form.agent_structure_restore_budget} onChange={(value) => updateForm("agent_structure_restore_budget", value)} />
+                <SettingField label="路径摘要预算" type="number" min={1} max={500} value={form.context_path_summary_budget} onChange={(value) => updateForm("context_path_summary_budget", value)} />
                 <SettingField label="规划轮次预算" type="number" min={1} max={10} value={form.agent_planning_round_budget} onChange={(value) => updateForm("agent_planning_round_budget", value)} />
                 <SettingField label="每轮动作上限" type="number" min={1} max={50} value={form.agent_max_typed_actions_per_round} onChange={(value) => updateForm("agent_max_typed_actions_per_round", value)} />
                 <SettingField label="修复轮次预算" type="number" min={0} max={10} value={form.agent_repair_round_budget} onChange={(value) => updateForm("agent_repair_round_budget", value)} />
@@ -1178,12 +1299,11 @@ export function SettingsWorkspace() {
             <section className={sectionClass}>
               <p className="text-sm font-semibold text-white">重建参数</p>
               <BoundaryNote title="生效边界：新任务会读取，但已有 active 数据不会改变">
-                固定切块、向量模型/维度、RQ-KMeans 和中粒度概念抽取参数必须通过重解析或图谱重建，才能影响已有资料库的 chunk、向量、关系图和概念图。
+                固定切块、向量维度、RQ-KMeans 和中粒度概念抽取参数必须通过重解析或图谱重建，才能影响已有资料库的 chunk、向量、关系图和概念图。
               </BoundaryNote>
               <div className="mt-5 grid gap-4 md:grid-cols-4">
                 <SettingField label="固定切块尺寸" type="number" min={128} max={4096} value={form.fixed_chunk_size_tokens} onChange={(value) => updateForm("fixed_chunk_size_tokens", value)} />
                 <SettingField label="固定切块重叠" type="number" min={0} max={1024} value={form.fixed_chunk_overlap_tokens} onChange={(value) => updateForm("fixed_chunk_overlap_tokens", value)} />
-                <SettingField label="向量模型" value={form.embedding_model} onChange={(value) => updateForm("embedding_model", value)} />
                 <SettingField label="向量维度" type="number" min={1} max={8192} value={form.embedding_dimensions} onChange={(value) => updateForm("embedding_dimensions", value)} />
                 <SettingField label="中粒度模型批次数" type="number" min={0} max={64} value={form.mid_concept_extraction_max_model_batches} onChange={(value) => updateForm("mid_concept_extraction_max_model_batches", value)} />
                 <SettingField label="概念候选批量" type="number" min={1} max={500} value={form.mid_concept_extraction_max_candidates_per_batch} onChange={(value) => updateForm("mid_concept_extraction_max_candidates_per_batch", value)} />
@@ -1264,94 +1384,6 @@ export function SettingsWorkspace() {
               </BoundaryNote>
               <div className="mt-5 grid gap-4 md:grid-cols-3">
                 <SettingField label="工作进程并发" type="number" min={1} max={32} value={form.worker_concurrency} onChange={(value) => updateForm("worker_concurrency", value)} />
-              </div>
-            </section>
-
-            <section className={sectionClass}>
-              <p className="text-sm font-semibold text-white">密钥</p>
-              <BoundaryNote title="生效边界：下一次模型调用">
-                聊天接口密钥和向量接口密钥保存后写入运行时配置；已经在执行的模型请求不会中途切换。
-              </BoundaryNote>
-              <div className="mt-5 grid gap-4 md:grid-cols-2">
-                <label className="flex flex-col gap-2">
-                  <span className="text-xs uppercase tracking-[0.2em] text-cyan-100/46">聊天接口密钥</span>
-                  <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3">
-                    <KeyRound className="size-4 text-cyan-100/58" />
-                    <input
-                      type="password"
-                      value={showApiKeyMask ? "••••••••••••••••" : form.api_key}
-                      readOnly={showApiKeyMask}
-                      disabled={form.clear_api_key}
-                      onChange={(event) => updateForm("api_key", event.target.value)}
-                      placeholder={settings?.has_api_key ? "留空则保留当前密钥" : "输入接口密钥"}
-                      className="h-11 min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-white/30"
-                      autoComplete="off"
-                    />
-                    {showApiKeyMask ? (
-                      <button type="button" onClick={() => setApiKeyEditing(true)} className="inline-flex items-center gap-1 rounded-full border border-white/8 px-2.5 py-1 text-xs text-white/55 transition hover:border-cyan-200/24 hover:text-cyan-100">
-                        <PencilLine className="size-3.5" />
-                        修改
-                      </button>
-                    ) : null}
-                    <EyeOff className="size-4 text-white/32" />
-                  </div>
-                </label>
-
-                <label className="flex flex-col gap-2">
-                  <span className="text-xs uppercase tracking-[0.2em] text-cyan-100/46">向量接口密钥</span>
-                  <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3">
-                    <KeyRound className="size-4 text-cyan-100/58" />
-                    <input
-                      type="password"
-                      value={showEmbeddingApiKeyMask ? "••••••••••••••••" : form.embedding_api_key}
-                      readOnly={showEmbeddingApiKeyMask}
-                      disabled={form.clear_embedding_api_key}
-                      onChange={(event) => updateForm("embedding_api_key", event.target.value)}
-                      placeholder={settings?.has_embedding_api_key ? "留空则保留当前密钥" : "输入向量接口密钥"}
-                      className="h-11 min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-white/30"
-                      autoComplete="off"
-                    />
-                    {showEmbeddingApiKeyMask ? (
-                      <button type="button" onClick={() => setEmbeddingApiKeyEditing(true)} className="inline-flex items-center gap-1 rounded-full border border-white/8 px-2.5 py-1 text-xs text-white/55 transition hover:border-cyan-200/24 hover:text-cyan-100">
-                        <PencilLine className="size-3.5" />
-                        修改
-                      </button>
-                    ) : null}
-                    <EyeOff className="size-4 text-white/32" />
-                  </div>
-                </label>
-              </div>
-              <div className="mt-4 grid gap-3 md:grid-cols-2">
-                <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
-                  <input
-                    type="checkbox"
-                    checked={form.clear_api_key}
-                    onChange={(event) => {
-                      updateForm("clear_api_key", event.target.checked);
-                      if (event.target.checked) {
-                        setApiKeyEditing(false);
-                        updateForm("api_key", "");
-                      }
-                    }}
-                    className="size-4 accent-rose-300"
-                  />
-                  清除当前聊天接口密钥
-                </label>
-                <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
-                  <input
-                    type="checkbox"
-                    checked={form.clear_embedding_api_key}
-                    onChange={(event) => {
-                      updateForm("clear_embedding_api_key", event.target.checked);
-                      if (event.target.checked) {
-                        setEmbeddingApiKeyEditing(false);
-                        updateForm("embedding_api_key", "");
-                      }
-                    }}
-                    className="size-4 accent-rose-300"
-                  />
-                  清除当前向量接口密钥
-                </label>
               </div>
             </section>
 

@@ -135,7 +135,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 <p className="mt-1 text-xs text-white/45">{selectedKnowledgeBase?.name ?? "选择资料库空间"}</p>
               </div>
             </div>
-            <div className="flex flex-wrap items-center justify-end gap-2">
+            <div className="flex w-full min-w-0 flex-wrap items-center gap-2 lg:w-auto lg:justify-end">
               <div className="relative">
                 <Button
                   type="button"
@@ -154,13 +154,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   </span>
                 ) : null}
               </div>
-              <div className="flex items-center gap-2 rounded-full border border-cyan-300/16 bg-cyan-300/[0.06] px-3 py-2 text-xs text-white/75 shadow-[0_0_24px_rgba(85,215,255,0.06)]">
+              <div className="flex shrink-0 items-center gap-2 rounded-full border border-cyan-300/16 bg-cyan-300/[0.06] px-3 py-2 text-xs text-white/75 shadow-[0_0_24px_rgba(85,215,255,0.06)]">
                 <BookOpenText className="size-4 text-cyan-100/78" />
                 <select
                   value={selectedKnowledgeBaseId ?? ""}
                   onChange={(event) => setSelectedKnowledgeBaseId(event.target.value || null)}
                   disabled={knowledgeBases.length === 0}
-                  className="min-w-[11rem] bg-transparent text-sm text-white outline-none"
+                  className="w-[min(12rem,52vw)] min-w-0 bg-transparent text-sm text-white outline-none lg:w-auto lg:min-w-[11rem]"
                 >
                   {knowledgeBases.length === 0 ? (
                     <option value="" className="bg-[#081126] text-white">
@@ -191,15 +191,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   <Trash2 className="size-4" />
                 </button>
               </div>
-              <Button type="button" variant="outline" className="rounded-full" onClick={() => setCreateOpen(true)}>
+              <Button type="button" variant="outline" className="shrink-0 rounded-full" onClick={() => setCreateOpen(true)}>
                 <FolderPlus data-icon="inline-start" />
                 新建资料库
               </Button>
-              <div className="kg-micro-chip rounded-full px-3 py-2 text-xs">
+              <div className="kg-micro-chip !hidden shrink-0 rounded-full px-3 py-2 text-xs sm:!inline-flex">
                 <Sparkles data-icon="inline-start" />
                 智能检索问答
               </div>
-              <div className="kg-micro-chip rounded-full px-3 py-2 text-xs">
+              <div className="kg-micro-chip !hidden shrink-0 rounded-full px-3 py-2 text-xs sm:!inline-flex">
                 <TerminalSquare data-icon="inline-start" />
                 混合图谱链路
               </div>
@@ -207,7 +207,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </div>
         </header>
 
-        <main className="px-4 pb-5 pt-[9.5rem] lg:px-7 lg:pb-7 lg:pt-[8.5rem]">
+        <main className="px-4 pb-5 pt-[12.5rem] sm:pt-[10.5rem] lg:px-7 lg:pb-7 lg:pt-[8.5rem]">
           <div className="flex w-full flex-col gap-8">{children}</div>
         </main>
       </div>

@@ -53,11 +53,11 @@ def main() -> None:
     args = parse_args()
     search_queries = args.search_query or [
         "What is the Metropolis Hastings acceptance probability?",
-        "贝叶斯后验分布和先验似然的关系是什么？",
+        "How do posterior, prior, and likelihood relate in Bayesian inference?",
     ]
     qa_questions = args.qa_question or [
         "Explain the Metropolis-Hastings acceptance probability using the course material.",
-        "请用资料库说明贝叶斯后验分布与先验、似然之间的关系，并给出引用。",
+        "Use the knowledge base to explain how Bayesian posterior distribution is connected to prior and likelihood, with citations.",
     ]
 
     search_rows: list[dict[str, Any]] = []

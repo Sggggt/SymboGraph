@@ -29,7 +29,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
 import { deleteSession, fetchDashboard, fetchSessionMessages, fetchSessions, streamAnswer } from "@/lib/api";
-import { contextGraphTraceFallbackSteps, traceAuditSummary, traceNodeLabel } from "@/lib/agent-trace";
+import { contextGraphTraceFallbackSteps, groupTraceEvents, traceAuditSummary, traceNodeLabel } from "@/lib/agent-trace";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 
@@ -143,7 +143,7 @@ function ChatActionRail({
 
 function SuggestionChips({ suggestions, onPick }: { suggestions: string[]; onPick: (value: string) => void }) {
   return (
-    <div className="mx-auto flex max-w-3xl flex-wrap justify-center gap-2">
+    <div className="mx-auto flex max-w-3xl flex-wrap justify-center gap-2 px-1">
       {suggestions.map((suggestion) => (
         <motion.button
           key={suggestion}
@@ -151,7 +151,7 @@ function SuggestionChips({ suggestions, onPick }: { suggestions: string[]; onPic
           whileHover={{ y: -2 }}
           whileTap={{ scale: 0.98 }}
           onClick={() => onPick(suggestion)}
-          className="kg-micro-chip rounded-full px-4 py-2 text-sm transition hover:border-cyan-200/30 hover:text-white"
+          className="kg-micro-chip max-w-full rounded-full px-3 py-2 text-xs transition hover:border-cyan-200/30 hover:text-white sm:px-4 sm:text-sm"
         >
           {suggestion}
         </motion.button>
@@ -162,13 +162,15 @@ function SuggestionChips({ suggestions, onPick }: { suggestions: string[]; onPic
 
 function EmptyChatState({ suggestions, onPick }: { suggestions: string[]; onPick: (value: string) => void }) {
   return (
-    <div className="grid min-h-[calc(100dvh-21rem)] place-items-center px-4 pb-44 pt-12 text-center">
-      <div className="-translate-y-24">
-        <div className="mx-auto grid size-16 place-items-center rounded-3xl border border-cyan-200/14 bg-cyan-300/[0.045] text-cyan-100 shadow-[0_0_42px_rgba(86,217,255,0.08)]">
+    <div className="grid min-h-[calc(100dvh-21rem)] place-items-center px-2 pb-44 pt-12 text-center sm:px-4">
+      <div className="-translate-y-16 sm:-translate-y-24">
+        <div className="mx-auto grid size-14 place-items-center rounded-3xl border border-cyan-200/14 bg-cyan-300/[0.045] text-cyan-100 shadow-[0_0_42px_rgba(86,217,255,0.08)] sm:size-16">
           <Sparkles />
         </div>
-        <h3 className="glow-text mt-6 text-3xl font-semibold text-white">开始一轮有证据支撑的资料问答</h3>
-        <p className="mx-auto mt-3 max-w-2xl text-sm leading-7 text-white/56">
+        <h3 className="glow-text mx-auto mt-6 max-w-[16rem] break-words text-xl font-semibold leading-snug text-white sm:max-w-3xl sm:text-3xl">
+          开始一轮有证据支撑的资料问答
+        </h3>
+        <p className="mx-auto mt-3 max-w-[21rem] text-sm leading-7 text-white/56 sm:max-w-2xl">
           系统会按粗概念、中概念、细聚类和片段结构逐层寻址，组装上下文证据包后生成带引用的回答。
         </p>
         <div className="mt-7">
@@ -210,6 +212,9 @@ function InlineTraceDisclosure({
   const steps: AgentTraceEventPayload[] = trace.length
     ? trace
     : contextGraphTraceFallbackSteps.map((node) => ({ node, status: "pending", document_ids: [], scores: {}, duration_ms: 0 }));
+  const groups = trace.length
+    ? groupTraceEvents(steps)
+    : [{ key: "entry" as const, label: "待执行链路", events: steps }];
 
   if (trace.length === 0 && !isRunning) {
     return null;
@@ -222,23 +227,31 @@ function InlineTraceDisclosure({
         <span className="shrink-0 text-[11px] text-cyan-100/55">{expanded ? "收起" : "查看轨迹"}</span>
       </button>
       {expanded ? (
-        <div className="mt-3 flex flex-col gap-2 border-t border-white/8 pt-3">
-          {steps.map((event, index) => {
-            const latest = isRunning && index === steps.length - 1;
-            const auditSummary = traceAuditSummary(event.scores);
-            return (
-              <div key={event.id ?? `${event.node}-${index}`} className="rounded-xl border border-white/8 bg-black/10 px-3 py-2">
-                <div className="flex items-center justify-between gap-3">
-                  <span className={cn("min-w-0 truncate text-xs font-medium", latest ? "text-cyan-100" : "text-white/70")}>
-                    {traceNodeLabel(event.node)}
-                  </span>
-                  <span className="shrink-0 font-mono text-[10px] text-white/34">{event.duration_ms}ms</span>
-                </div>
-                {event.output_summary ? <MarkdownRenderer content={event.output_summary} compact className="mt-1 text-xs leading-5 text-white/46" /> : null}
-                {auditSummary.length ? <p className="mt-1 truncate text-[10px] text-white/34">{auditSummary.join(" / ")}</p> : null}
+        <div className="mt-3 flex flex-col gap-3 border-t border-white/8 pt-3">
+          {groups.map((group) => (
+            <section key={group.key} className="space-y-2">
+              <div className="flex items-center justify-between gap-2 text-[11px] text-white/46">
+                <span>{group.label}</span>
+                <span>{group.events.length} 项</span>
               </div>
-            );
-          })}
+              {group.events.map((event, index) => {
+                const latest = isRunning && index === group.events.length - 1 && group.key === groups.at(-1)?.key;
+                const auditSummary = traceAuditSummary(event.scores);
+                return (
+                  <div key={event.id ?? `${event.node}-${index}`} className="rounded-xl border border-white/8 bg-black/10 px-3 py-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className={cn("min-w-0 truncate text-xs font-medium", latest ? "text-cyan-100" : "text-white/70")}>
+                        {traceNodeLabel(event.node)}
+                      </span>
+                      <span className="shrink-0 font-mono text-[10px] text-white/34">{event.duration_ms}ms</span>
+                    </div>
+                    {event.output_summary ? <MarkdownRenderer content={event.output_summary} compact className="mt-1 text-xs leading-5 text-white/46" /> : null}
+                    {auditSummary.length ? <p className="mt-1 line-clamp-2 text-[10px] text-white/34">{auditSummary.join(" / ")}</p> : null}
+                  </div>
+                );
+              })}
+            </section>
+          ))}
         </div>
       ) : null}
     </div>

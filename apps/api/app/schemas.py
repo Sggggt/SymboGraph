@@ -92,6 +92,11 @@ class Citation(APIModel):
     bbox: dict[str, Any] | None = None
     section_path: list[str] = Field(default_factory=list)
     text: str | None = None
+    snippet: str | None = None
+    source_span: dict[str, Any] = Field(default_factory=dict)
+    retrieval_trace_id: str | None = None
+    answer_session_id: str | None = None
+    citation_verification_id: str | None = None
     verification: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -426,13 +431,22 @@ class ModelSettingsUpdate(APIModel):
     rq_kmeans_levels: int | None = None
     rq_kmeans_max_k: int | None = None
     rq_residual_tau: float | None = None
-    agent_coarse_activation_budget: int | None = None
+    agent_coarse_entry_budget: int | None = None
     agent_coarse_jump_budget: int | None = None
-    agent_mid_activation_budget: int | None = None
+    agent_mid_entry_budget: int | None = None
     agent_mid_expansion_radius_cap: int | None = None
-    agent_fine_cluster_budget: int | None = None
+    agent_fine_entry_budget: int | None = None
+    agent_frontier_expansion_budget: int | None = None
+    agent_max_depth_per_layer: int | None = None
+    agent_max_labels_per_node: int | None = None
+    agent_max_edge_reuse: int | None = None
+    agent_max_cycle_reward_per_path: float | None = None
+    agent_ambiguous_edge_distance_low: float | None = None
+    agent_ambiguous_edge_distance_high: float | None = None
+    agent_drilldown_budget_per_layer: int | None = None
     agent_chunk_candidate_budget: int | None = None
     agent_structure_restore_budget: int | None = None
+    context_path_summary_budget: int | None = None
     agent_planning_round_budget: int | None = None
     agent_max_typed_actions_per_round: int | None = None
     agent_repair_round_budget: int | None = None

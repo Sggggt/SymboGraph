@@ -4,6 +4,45 @@ import pytest
 
 
 @pytest.mark.asyncio
+async def test_citation_verification_normalizes_label_confidence(monkeypatch):
+    from app.services import agent_graph
+
+    class LabelConfidenceChatProvider:
+        async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
+            return {
+                "verifications": [
+                    {
+                        "citation_index": 1,
+                        "verdict": "supported",
+                        "failure_type": "none",
+                        "confidence": "high",
+                        "reason": "The cited context entails the claim.",
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(agent_graph, "ChatProvider", LabelConfidenceChatProvider)
+
+    results = await agent_graph.verify_answer_against_context(
+        "Bayesian regression uses a normal likelihood.",
+        [
+            {
+                "citation_index": 1,
+                "chunk_id": "chunk-1",
+                "source_span": {"chunk_id": "chunk-1", "char_span": [0, 42]},
+            }
+        ],
+        [{"chunk_id": "chunk-1", "content": "Bayesian regression uses a normal likelihood."}],
+        verification_budget=1,
+    )
+
+    assert results[0]["verdict"] == "supported"
+    assert results[0]["confidence"] == 0.85
+    assert results[0]["diagnostics"]["llm_entailment_confidence"]["confidence_raw"] == "high"
+    assert results[0]["diagnostics"]["llm_entailment_confidence"]["confidence_normalized_from"] == "label"
+
+
+@pytest.mark.asyncio
 async def test_agent_answers_from_context_package_and_records_audit(db_session, populated_context_graph):
     from sqlalchemy import func, select
 

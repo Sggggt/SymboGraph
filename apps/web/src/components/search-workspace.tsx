@@ -51,29 +51,24 @@ type HoverPreviewState = {
 
 type HoverPreviewTimer = ReturnType<typeof setTimeout> | null;
 
-function scoreValue(result: SearchResult, key: string) {
-  const scores = result.metadata.scores as Record<string, number | string | boolean | null> | undefined;
-  const value = scores?.[key];
-  return typeof value === "number" ? value.toFixed(3) : "未参与";
+function resultTraversal(result: SearchResult): Record<string, unknown> {
+  const traversal = result.metadata.traversal;
+  return traversal && typeof traversal === "object" && !Array.isArray(traversal) ? (traversal as Record<string, unknown>) : {};
 }
 
-function scoreKeys(result: SearchResult) {
-  return result.metadata.scores ? ["dense", "bm25", "fine_cluster", "rq_fine", "mid_concept", "coarse_concept", "graph_path", "bridge_bonus", "structure"] : [];
+function traversalTextList(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
 }
 
-function scoreLabel(key: string) {
-  const labels: Record<string, string> = {
-    dense: "向量",
-    bm25: "BM25",
-    fine_cluster: "细聚类",
-    rq_fine: "RQ",
-    mid_concept: "中概念",
-    coarse_concept: "粗概念",
-    graph_path: "图路径",
-    bridge_bonus: "桥边",
-    structure: "结构",
-  };
-  return labels[key] ?? key;
+function traversalMetric(result: SearchResult, key: string): string {
+  const value = resultTraversal(result)[key];
+  if (typeof value === "number") {
+    return value.toFixed(3);
+  }
+  if (Array.isArray(value)) {
+    return value.length ? value.join(" / ") : "无";
+  }
+  return value === undefined || value === null || value === "" ? "无" : String(value);
 }
 
 function resultRq(result: SearchResult): Record<string, unknown> | null {
@@ -267,6 +262,9 @@ function ResultRow({
   onSelect: (result: SearchResult) => void;
 }) {
   const rq = resultRq(result);
+  const traversal = resultTraversal(result);
+  const evidenceRoles = traversalTextList(traversal.evidence_roles).slice(0, 4);
+  const coveredFacets = traversalTextList(traversal.covered_facets).slice(0, 4);
   return (
     <motion.button
       type="button"
@@ -301,9 +299,14 @@ function ResultRow({
         </div>
       </div>
       <div className="mt-4 flex flex-wrap gap-2">
-        {scoreKeys(result).map((key) => (
-          <span key={key} className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">
-            {scoreLabel(key)} {scoreValue(result, key)}
+        <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">距离 {traversalMetric(result, "distance_so_far")}</span>
+        <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">Cycle {traversalMetric(result, "reward_so_far")}</span>
+        {coveredFacets.length ? (
+          <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">覆盖 {coveredFacets.join("/")}</span>
+        ) : null}
+        {evidenceRoles.map((role) => (
+          <span key={role} className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">
+            {role}
           </span>
         ))}
         {rq ? (
@@ -350,7 +353,7 @@ function ResultStream({
             </div>
             <h4 className="mt-5 text-lg font-medium text-white">尚未发起检索</h4>
             <p className="mx-auto mt-2 max-w-md text-sm leading-7 text-white/52">
-              发起一次混合检索后，这里会展示排序片段、分数通道和关联图谱上下文。
+              发起一次图遍历检索后，这里会展示排序片段、frontier 路径和关联图谱上下文。
             </p>
           </div>
         ) : (
@@ -465,12 +468,13 @@ function GraphCanvasPanel({
 
 function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | null; open: boolean; onOpenChange: (open: boolean) => void }) {
   const rq = result ? resultRq(result) : null;
+  const traversal = result ? resultTraversal(result) : {};
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="w-full border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-xl">
         <SheetHeader className="border-b border-white/8 p-6">
           <SheetTitle>结果详情</SheetTitle>
-          <SheetDescription>片段证据、检索分数和来源元数据。</SheetDescription>
+          <SheetDescription>片段证据、图遍历路径和来源元数据。</SheetDescription>
         </SheetHeader>
         {result ? (
           <div className="custom-scrollbar flex-1 overflow-y-auto p-6">
@@ -496,13 +500,24 @@ function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | n
               </div>
             ) : null}
             <div className="mt-5 grid grid-cols-2 gap-3">
-              {scoreKeys(result).map((key) => (
+              {[
+                ["distance_so_far", "路径距离"],
+                ["reward_so_far", "Cycle reward"],
+                ["covered_facets", "覆盖 facets"],
+                ["path_edge_ids", "路径边"],
+              ].map(([key, label]) => (
                 <div key={key} className="rounded-2xl border border-white/8 bg-white/[0.025] p-4">
-                  <p className="text-xs uppercase tracking-[0.2em] text-white/38">{scoreLabel(key)}</p>
-                  <p className="mt-2 font-mono text-lg text-cyan-100">{scoreValue(result, key)}</p>
+                  <p className="text-xs uppercase tracking-[0.2em] text-white/38">{label}</p>
+                  <p className="mt-2 break-words font-mono text-sm text-cyan-100">{traversalMetric(result, key)}</p>
                 </div>
               ))}
             </div>
+            {Array.isArray(traversal.path) && traversal.path.length ? (
+              <div className="mt-5 rounded-2xl border border-white/8 bg-white/[0.03] p-5">
+                <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Graph Path</p>
+                <p className="mt-4 break-words font-mono text-xs leading-6 text-white/62">{traversalTextList(traversal.path).join(" -> ")}</p>
+              </div>
+            ) : null}
             {rq ? (
               <div className="mt-5 rounded-2xl border border-white/8 bg-white/[0.03] p-5">
                 <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">RQ-KMeans 残差路由</p>

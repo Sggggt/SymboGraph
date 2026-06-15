@@ -65,6 +65,8 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
         AgentObservation,
         AgentPlan,
         ChunkRelationEdge,
+        ChunkRelationGraphState,
+        ChunkStructureNode,
         CitationVerification,
         FineCluster,
         FineClusterEdge,
@@ -126,6 +128,44 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
                 add_issue(issues, "blocker", "rq_graph_incomplete", "RQ is enabled but required RQ graph nodes/edges/memberships are incomplete.", summary["rq"])
             if bridge_edges <= 0:
                 add_issue(issues, "blocker", "bridge_edges_missing", "No retained bridge edges were found in the active relation graph.")
+            target_edge_counts = {
+                edge_type: db.scalar(select(func.count(ChunkRelationEdge.id)).where(ChunkRelationEdge.graph_state_id == relation_state_id, ChunkRelationEdge.edge_type == edge_type)) or 0
+                for edge_type in ("co_retrieved", "same_table_formula_context")
+            }
+            relation_state = db.get(ChunkRelationGraphState, relation_state_id)
+            missing_reasons = ((relation_state.diagnostics_json or {}).get("missing_target_relation_edge_type_reasons") or {}) if relation_state else {}
+            summary["target_relation_edge_counts"] = target_edge_counts
+            for edge_type, count in target_edge_counts.items():
+                if count <= 0 and not missing_reasons.get(edge_type):
+                    add_issue(issues, "blocker", "target_relation_edge_type_missing", f"{edge_type} is missing and no explicit blocking reason was recorded.", {"edge_counts": target_edge_counts, "missing_reasons": missing_reasons})
+            missing_edge_metrics = db.scalar(
+                select(func.count(ChunkRelationEdge.id)).where(
+                    ChunkRelationEdge.graph_state_id == relation_state_id,
+                    (ChunkRelationEdge.distance.is_(None)) | (ChunkRelationEdge.raw_strength.is_(None)),
+                )
+            ) or 0
+            if missing_edge_metrics:
+                add_issue(issues, "blocker", "relation_edge_distance_raw_strength_missing", "Active relation edges must carry distance and raw_strength.", {"count": missing_edge_metrics})
+            unsupported_fine_edges = db.scalar(
+                select(func.count(FineClusterEdge.id)).where(
+                    FineClusterEdge.graph_state_id == relation_state_id,
+                    (FineClusterEdge.support_chunk_edge_ids_json.is_(None)) | (func.json_array_length(FineClusterEdge.support_chunk_edge_ids_json) <= 0),
+                )
+            ) or 0
+            if unsupported_fine_edges:
+                add_issue(issues, "blocker", "fine_edge_support_missing", "Active fine_cluster_edges must have support_chunk_edge_ids_json.", {"count": unsupported_fine_edges})
+            structure_node_types = {
+                row[0]
+                for row in db.execute(
+                    select(ChunkStructureNode.node_type)
+                    .where(ChunkStructureNode.knowledge_base_id == knowledge_base.id)
+                    .distinct()
+                ).all()
+            }
+            required_structure_types = {"document", "section", "page", "region", "paragraph"}
+            missing_structure_types = sorted(required_structure_types - structure_node_types)
+            if missing_structure_types:
+                add_issue(issues, "blocker", "structure_closure_node_type_missing", "Structure graph is missing required closure node types.", {"missing": missing_structure_types, "present": sorted(structure_node_types)})
         latest_trace = db.scalar(select(RetrievalTrace).where(RetrievalTrace.knowledge_base_id == knowledge_base.id).order_by(RetrievalTrace.created_at.desc()))
         if latest_trace:
             step_layers = set(
@@ -133,6 +173,19 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
             )
             if "structure" not in step_layers:
                 add_issue(issues, "blocker", "trace_missing_structure_restore", "Latest retrieval trace does not include structure restoration.")
+            for required_layer in ("coarse", "mid", "fine", "chunk"):
+                step = db.scalar(
+                    select(GraphRetrievalStep)
+                    .where(GraphRetrievalStep.retrieval_trace_id == latest_trace.id, GraphRetrievalStep.layer == required_layer)
+                    .order_by(GraphRetrievalStep.step_index.asc())
+                )
+                if step is None:
+                    add_issue(issues, "blocker", "trace_layer_missing", f"Latest retrieval trace is missing {required_layer} traversal step.")
+                    continue
+                if not step.popped_frontier_state_json and (step.input_json or {}).get("entry_nodes"):
+                    add_issue(issues, "blocker", "trace_frontier_pop_missing", f"{required_layer} traversal step has entries but no popped frontier state.")
+                if not step.stop_reason:
+                    add_issue(issues, "blocker", "trace_convergence_missing", f"{required_layer} traversal step does not record convergence stop reason.")
         else:
             add_issue(issues, "warning", "no_retrieval_trace", "No retrieval traces exist yet.")
         if db.scalar(select(func.count(AgentPlan.id)).where(AgentPlan.knowledge_base_id == knowledge_base.id)) or 0:
@@ -145,6 +198,14 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
         latest_verification = db.scalar(select(CitationVerification).where(CitationVerification.knowledge_base_id == knowledge_base.id).order_by(CitationVerification.created_at.desc()))
         if latest_verification and (latest_verification.diagnostics_json or {}).get("verification_method") == "context_package_span_presence_v1":
             add_issue(issues, "blocker", "old_citation_verification", "Latest citation verification still uses span-presence-only method.")
+        if latest_verification:
+            source_span = latest_verification.source_span_json or {}
+            required_span_keys = {"document_version_id", "chunk_id", "char_span", "page_range", "section_path", "bbox", "context_package_id", "retrieval_trace_id", "verification_id"}
+            missing_span_keys = sorted(key for key in required_span_keys if not source_span.get(key))
+            if missing_span_keys:
+                add_issue(issues, "blocker", "citation_source_span_incomplete", "CitationVerification.source_span_json is missing required raw span fields.", {"missing": missing_span_keys, "source_span": source_span})
+            if (latest_verification.diagnostics_json or {}).get("verification_method") != "structure_plus_llm_entailment_v1":
+                add_issue(issues, "blocker", "citation_verification_protocol_not_strict", "Latest citation verification must use structure_plus_llm_entailment_v1.")
         if (db.scalar(select(func.count(RewardEvent.id)).where(RewardEvent.knowledge_base_id == knowledge_base.id)) or 0) > 0:
             latest_policy = db.scalar(select(PolicyState).where(PolicyState.knowledge_base_id == knowledge_base.id).order_by(PolicyState.created_at.desc()))
             if not latest_policy or not (latest_policy.reward_summary_json or {}).get("last_reward_event_id"):

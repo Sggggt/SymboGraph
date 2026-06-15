@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 
@@ -438,3 +440,48 @@ def test_collect_source_documents_deduplicates_same_named_copies(tmp_path):
     assert original in paths
     assert copied not in paths
     assert same_content_other_name in paths
+
+
+def test_operations_script_matrix_matches_context_graph_todo():
+    repo_root = Path(__file__).resolve().parents[3]
+    scripts_root = repo_root / "scripts"
+    required_scripts = {
+        "check_runtime_settings_contract.py",
+        "destroy_legacy_derived_data.py",
+        "rebuild_chunks.py",
+        "rebuild_structure_graph.py",
+        "rebuild_chunk_relation_graph.py",
+        "rebuild_fine_graph.py",
+        "rebuild_mid_concept_graph.py",
+        "rebuild_coarse_concept_graph.py",
+        "rebuild_context_graph_all.py",
+        "reconcile_vector_records.py",
+        "reconcile_bm25_records.py",
+        "diagnose_context_graph.py",
+        "evaluate_layered_retrieval.py",
+        "evaluate_agent_trace.py",
+        "check_context_package_quality.py",
+        "runtime_hot_reload_probe.py",
+    }
+
+    missing = [name for name in sorted(required_scripts) if not (scripts_root / name).exists()]
+    assert missing == []
+
+    write_scripts = [
+        "destroy_legacy_derived_data.py",
+        "rebuild_chunks.py",
+        "rebuild_structure_graph.py",
+        "rebuild_chunk_relation_graph.py",
+        "rebuild_fine_graph.py",
+        "rebuild_mid_concept_graph.py",
+        "rebuild_coarse_concept_graph.py",
+        "rebuild_context_graph_all.py",
+        "reconcile_bm25_records.py",
+        "runtime_hot_reload_probe.py",
+    ]
+    for name in write_scripts:
+        text = (scripts_root / name).read_text(encoding="utf-8")
+        assert "--execute" in text
+
+    destructive_text = (scripts_root / "destroy_legacy_derived_data.py").read_text(encoding="utf-8")
+    assert "--confirm-destroy-legacy" in destructive_text

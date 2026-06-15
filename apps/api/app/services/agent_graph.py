@@ -11,6 +11,7 @@ from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.config import get_settings
 from app.models import (
@@ -20,7 +21,12 @@ from app.models import (
     AgentRun,
     AgentTraceEvent,
     AnswerSession,
+    Chunk,
     CitationVerification,
+    CoarseConcept,
+    ContextPackage,
+    FineCluster,
+    MidConcept,
     PolicyState,
     QASession,
     RewardEvent,
@@ -34,9 +40,10 @@ from app.services.context_graph import (
     layered_search,
     runtime_settings_state_hash,
 )
-from app.services.embeddings import ChatProvider, is_degraded_mode
+from app.services.embeddings import ChatProvider, FallbackDisabledError, is_degraded_mode
 from app.services.ingestion import resolve_knowledge_base
 from app.services.chunking import stable_hash
+from app.services.model_output import coerce_confidence
 
 
 _TRACE_SUBSCRIBERS: dict[str, set[asyncio.Queue[dict]]] = {}
@@ -103,9 +110,10 @@ def trace(db: Session, run_id: str, node: str, *, input_summary: str = "", outpu
 
 
 ALLOWED_TYPED_ACTIONS = {
-    "activate_coarse_concepts",
-    "route_mid_concepts",
-    "route_fine_clusters",
+    "select_entry_nodes",
+    "walk_graph_frontier",
+    "drill_down_layer",
+    "follow_ambiguous_edge",
     "recall_chunks",
     "restore_context_package",
     "build_context_package",
@@ -114,16 +122,29 @@ ALLOWED_TYPED_ACTIONS = {
     "repair_concept_gap",
     "repair_bridge_gap",
     "repair_formula_context",
+    "reduce_drift_and_repack",
 }
 
-REQUIRED_TYPED_ACTIONS = ["recall_chunks", "restore_context_package", "verify_citations"]
+REQUIRED_TYPED_ACTIONS = ["select_entry_nodes", "walk_graph_frontier", "recall_chunks", "restore_context_package", "verify_citations"]
 
 
 def _default_budget_for_action(action_type: str, envelope: dict[str, Any]) -> dict[str, int]:
     mapping = {
-        "activate_coarse_concepts": {"coarse_activation_budget": int(envelope.get("coarse_activation_budget") or 0)},
-        "route_mid_concepts": {"mid_activation_budget": int(envelope.get("mid_activation_budget") or 0)},
-        "route_fine_clusters": {"fine_cluster_budget": int(envelope.get("fine_cluster_budget") or 0)},
+        "select_entry_nodes": {
+            "coarse_entry_budget": int(envelope.get("coarse_entry_budget") or 0),
+            "mid_entry_budget": int(envelope.get("mid_entry_budget") or 0),
+            "fine_entry_budget": int(envelope.get("fine_entry_budget") or 0),
+        },
+        "walk_graph_frontier": {
+            "frontier_expansion_budget": int(envelope.get("frontier_expansion_budget") or 0),
+            "max_depth_per_layer": int(envelope.get("max_depth_per_layer") or 0),
+            "max_labels_per_node": int(envelope.get("max_labels_per_node") or 0),
+        },
+        "drill_down_layer": {"drilldown_budget_per_layer": int(envelope.get("drilldown_budget_per_layer") or 0)},
+        "follow_ambiguous_edge": {
+            "ambiguous_edge_distance_low": float(envelope.get("ambiguous_edge_distance_low") or 0),
+            "ambiguous_edge_distance_high": float(envelope.get("ambiguous_edge_distance_high") or 0),
+        },
         "recall_chunks": {"chunk_candidate_budget": int(envelope.get("chunk_candidate_budget") or 0)},
         "restore_context_package": {"structure_restore_budget": int(envelope.get("structure_restore_budget") or 0)},
         "build_context_package": {"context_package_token_budget": int(envelope.get("context_package_token_budget") or 0)},
@@ -132,6 +153,7 @@ def _default_budget_for_action(action_type: str, envelope: dict[str, Any]) -> di
         "repair_concept_gap": {"repair_round_budget": int(envelope.get("repair_round_budget") or 0)},
         "repair_bridge_gap": {"repair_round_budget": int(envelope.get("repair_round_budget") or 0)},
         "repair_formula_context": {"repair_round_budget": int(envelope.get("repair_round_budget") or 0)},
+        "reduce_drift_and_repack": {"repair_round_budget": int(envelope.get("repair_round_budget") or 0)},
     }
     return mapping.get(action_type, {})
 
@@ -139,9 +161,9 @@ def _default_budget_for_action(action_type: str, envelope: dict[str, Any]) -> di
 def fallback_typed_actions(question: str, envelope: dict[str, Any]) -> list[dict[str, Any]]:
     formula_hint = any(token in question.lower() for token in ("formula", "table", "equation", "公式", "表格"))
     actions = [
-        "activate_coarse_concepts",
-        "route_mid_concepts",
-        "route_fine_clusters",
+        "select_entry_nodes",
+        "drill_down_layer",
+        "walk_graph_frontier",
         "recall_chunks",
         "restore_context_package",
         "build_context_package",
@@ -160,6 +182,41 @@ def fallback_typed_actions(question: str, envelope: dict[str, Any]) -> list[dict
         }
         for action_type in actions
     ]
+
+
+ACTION_TARGET_LAYERS: dict[str, set[str]] = {
+    "select_entry_nodes": {"coarse", "mid", "fine", "chunk"},
+    "walk_graph_frontier": {"coarse", "mid", "fine", "chunk"},
+    "drill_down_layer": {"coarse", "mid", "fine"},
+    "follow_ambiguous_edge": {"coarse", "mid", "fine", "chunk"},
+    "recall_chunks": {"fine", "chunk"},
+    "restore_context_package": {"chunk", "context_package"},
+    "build_context_package": {"chunk", "context_package"},
+    "verify_citations": {"chunk", "context_package", "citation"},
+    "repair_missing_citation": {"coarse", "mid", "fine", "chunk", "context_package"},
+    "repair_concept_gap": {"coarse", "mid", "fine"},
+    "repair_bridge_gap": {"coarse", "mid", "fine", "chunk"},
+    "repair_formula_context": {"fine", "chunk", "context_package"},
+    "reduce_drift_and_repack": {"chunk", "context_package"},
+}
+
+
+def _target_id_layers(db: Session, knowledge_base_id: str, target_ids: list[str]) -> dict[str, set[str]]:
+    if not target_ids:
+        return {}
+    target_set = set(target_ids)
+    layers: dict[str, set[str]] = {target_id: set() for target_id in target_ids}
+    for row in db.scalars(select(CoarseConcept).where(CoarseConcept.id.in_(target_set), CoarseConcept.knowledge_base_id == knowledge_base_id)).all():
+        layers[row.id].add("coarse")
+    for row in db.scalars(select(MidConcept).where(MidConcept.id.in_(target_set), MidConcept.knowledge_base_id == knowledge_base_id)).all():
+        layers[row.id].add("mid")
+    for row in db.scalars(select(FineCluster).where(FineCluster.id.in_(target_set))).all():
+        layers[row.id].add("fine")
+    for row in db.scalars(select(Chunk).where(Chunk.id.in_(target_set), Chunk.knowledge_base_id == knowledge_base_id, Chunk.state == "active")).all():
+        layers[row.id].add("chunk")
+    for row in db.scalars(select(ContextPackage).where(ContextPackage.id.in_(target_set), ContextPackage.knowledge_base_id == knowledge_base_id)).all():
+        layers[row.id].add("context_package")
+    return layers
 
 
 def heuristic_query_intent(question: str, history: list[dict] | None = None) -> dict[str, Any]:
@@ -217,13 +274,28 @@ async def propose_agent_plan(question: str, history: list[dict], query_intent: d
     output = await ChatProvider().classify_json(system_prompt=system, user_prompt=user_prompt, fallback=fallback)
     actions = output.get("typed_actions") if isinstance(output, dict) else None
     if not isinstance(actions, list):
+        if not get_settings().enable_model_fallback:
+            raise RuntimeError("Agent planner returned invalid JSON: typed_actions array is required")
         actions = fallback["typed_actions"]
     return [action for action in actions if isinstance(action, dict)], output if isinstance(output, dict) else {}
 
 
-def validate_typed_actions(actions: list[dict[str, Any]], envelope: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def validate_typed_actions(
+    actions: list[dict[str, Any]],
+    envelope: dict[str, Any],
+    *,
+    db: Session | None = None,
+    knowledge_base_id: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     max_actions = int(envelope.get("max_typed_actions_per_round") or 1)
-    diagnostics: dict[str, Any] = {"accepted": [], "rejected": [], "inserted_required_actions": []}
+    diagnostics: dict[str, Any] = {
+        "accepted": [],
+        "rejected": [],
+        "inserted_required_actions": [],
+        "fallback_disabled": not bool(get_settings().enable_model_fallback),
+        "required_restore_modes": envelope.get("required_restore_modes") or [],
+        "allowed_relation_types": envelope.get("allowed_relation_types") or [],
+    }
     accepted: list[dict[str, Any]] = []
     seen_types: set[str] = set()
     for index, action in enumerate(actions[: max_actions * 2]):
@@ -246,14 +318,56 @@ def validate_typed_actions(actions: list[dict[str, Any]], envelope: dict[str, An
         if budget_errors:
             diagnostics["rejected"].append({"index": index, "action_type": action_type, "reason": "budget_exceeded", "details": budget_errors})
             continue
+        target_ids = [str(value) for value in (action.get("target_ids") or []) if str(value).strip()]
+        target_layers = _target_id_layers(db, knowledge_base_id, target_ids) if db is not None and knowledge_base_id and target_ids else {}
+        missing_targets = [target_id for target_id in target_ids if target_id not in target_layers or not target_layers[target_id]]
+        allowed_layers = ACTION_TARGET_LAYERS.get(action_type, set())
+        incompatible_targets = [
+            {"target_id": target_id, "layers": sorted(target_layers.get(target_id, set()))}
+            for target_id in target_ids
+            if target_layers.get(target_id) and allowed_layers and not target_layers[target_id].intersection(allowed_layers)
+        ]
+        if missing_targets:
+            diagnostics["rejected"].append({"index": index, "action_type": action_type, "reason": "target_id_not_found", "target_ids": missing_targets})
+            continue
+        if incompatible_targets:
+            diagnostics["rejected"].append({"index": index, "action_type": action_type, "reason": "target_layer_mismatch", "details": incompatible_targets})
+            continue
+        expected_evidence = action.get("expected_evidence") if isinstance(action.get("expected_evidence"), dict) else {}
+        requested_relation_types = set(expected_evidence.get("allowed_relation_types") or expected_evidence.get("relation_types") or [])
+        allowed_relation_types = set(envelope.get("allowed_relation_types") or [])
+        disallowed_relation_types = sorted(requested_relation_types - allowed_relation_types)
+        if disallowed_relation_types:
+            diagnostics["rejected"].append({"index": index, "action_type": action_type, "reason": "relation_type_not_allowed", "details": disallowed_relation_types})
+            continue
+        if expected_evidence.get("fallback_allowed") and not bool(get_settings().enable_model_fallback):
+            diagnostics["rejected"].append({"index": index, "action_type": action_type, "reason": "fallback_disabled"})
+            continue
+        required_restore_modes = list(envelope.get("required_restore_modes") or [])
+        if action_type in {"restore_context_package", "build_context_package"}:
+            restore_modes = set(expected_evidence.get("required_restore_modes") or [])
+            expected_evidence["required_restore_modes"] = sorted(set(required_restore_modes).union(restore_modes))
+        if action_type == "verify_citations":
+            expected_evidence["required_verification_stage"] = "structure_plus_llm_entailment"
+        expected_evidence.setdefault("allowed_relation_types", sorted(allowed_relation_types))
         normalized = {
             "action_type": action_type,
-            "target_ids": [str(value) for value in (action.get("target_ids") or [])],
+            "target_ids": target_ids,
             "reason": str(action.get("reason") or ""),
             "budget_request": {**_default_budget_for_action(action_type, envelope), **budget_request},
-            "expected_evidence": action.get("expected_evidence") if isinstance(action.get("expected_evidence"), dict) else {},
+            "expected_evidence": expected_evidence,
             "stop_condition": action.get("stop_condition") if isinstance(action.get("stop_condition"), dict) else {},
-            "validation": {"valid": True, "budget_checked": True},
+            "validation": {
+                "valid": True,
+                "schema_checked": True,
+                "budget_checked": True,
+                "target_ids_checked": bool(target_ids),
+                "target_layers": {target_id: sorted(target_layers.get(target_id, set())) for target_id in target_ids},
+                "fallback_disabled_checked": True,
+                "bridge_protection_checked": True,
+                "required_restore_modes": required_restore_modes,
+                "required_verification_stage": expected_evidence.get("required_verification_stage"),
+            },
         }
         accepted.append(normalized)
         seen_types.add(action_type)
@@ -267,9 +381,15 @@ def validate_typed_actions(actions: list[dict[str, Any]], envelope: dict[str, An
                 "target_ids": [],
                 "reason": "Inserted by validator because this action is required by the technical spec.",
                 "budget_request": _default_budget_for_action(required, envelope),
-                "expected_evidence": {"source": "context_package", "requires_chunk_spans": True},
+                "expected_evidence": {
+                    "source": "context_package",
+                    "requires_chunk_spans": True,
+                    "required_restore_modes": list(envelope.get("required_restore_modes") or []),
+                    "allowed_relation_types": list(envelope.get("allowed_relation_types") or []),
+                    "required_verification_stage": "structure_plus_llm_entailment" if required == "verify_citations" else None,
+                },
                 "stop_condition": {"required_action_complete": True},
-                "validation": {"valid": True, "inserted_required_action": True},
+                "validation": {"valid": True, "inserted_required_action": True, "fallback_disabled_checked": True},
             }
             accepted.append(inserted)
             diagnostics["inserted_required_actions"].append(required)
@@ -442,22 +562,32 @@ def citation_payloads_from_package(
         hit_chunks = [chunk for _, chunk in supported_hit_chunks[: max(1, min(6, get_settings().agent_verification_budget))]] or hit_chunks[:1]
     for index, item in enumerate(hit_chunks, start=1):
         verification = (verification_by_chunk or {}).get(item["chunk_id"])
+        source_span = dict(item.get("source_span") or {})
+        source_span.update(
+            {
+                "document_version_id": source_span.get("document_version_id") or item.get("document_version_id"),
+                "chunk_id": source_span.get("chunk_id") or item.get("chunk_id"),
+                "char_span": source_span.get("char_span") or item.get("char_span"),
+                "page_range": source_span.get("page_range") or item.get("page_range"),
+                "section_path": source_span.get("section_path") or item.get("section_path"),
+                "bbox": source_span.get("bbox") or item.get("bbox") or {},
+                "context_package_id": source_span.get("context_package_id") or package.id,
+                "retrieval_trace_id": source_span.get("retrieval_trace_id") or retrieval_trace_id or package.retrieval_trace_id,
+                "verification_id": verification.id if verification else source_span.get("verification_id"),
+            }
+        )
         citations.append(
             {
                 "chunk_id": item["chunk_id"],
                 "document_id": item["document_id"],
+                "document_version_id": item.get("document_version_id") or source_span.get("document_version_id"),
                 "document_title": item.get("document_title") or "",
                 "source_path": item.get("source_path") or "",
                 "partition": None,
                 "section": item.get("section_path"),
                 "page_number": (item.get("page_range") or [None])[0],
                 "snippet": _summarize(item.get("content") or "", 240),
-                "source_span": {
-                    "char_span": item.get("char_span"),
-                    "page_range": item.get("page_range"),
-                    "section_path": item.get("section_path"),
-                    "context_package_id": package.id,
-                },
+                "source_span": source_span,
                 "retrieval_trace_id": retrieval_trace_id or package.retrieval_trace_id,
                 "answer_session_id": answer_session_id,
                 "citation_verification_id": verification.id if verification else None,
@@ -563,7 +693,7 @@ def _claim_support(answer: str, context_text: str, df: Counter[str], corpus_size
     }
 
 
-def verify_answer_against_context(answer: str, citations: list[dict], contexts: list[dict], verification_budget: int) -> list[dict[str, Any]]:
+def verify_answer_against_context_rules(answer: str, citations: list[dict], contexts: list[dict], verification_budget: int) -> list[dict[str, Any]]:
     context_by_chunk = {item.get("chunk_id"): item for item in contexts}
     claims = _answer_claims(answer)[: max(1, verification_budget)]
     formula_claim = bool(re.search(r"(\$|\\frac|P\(|=|\bformula\b|\btable\b|公式|表格)", answer or ""))
@@ -629,6 +759,127 @@ def verify_answer_against_context(answer: str, citations: list[dict], contexts: 
     return results
 
 
+async def verify_answer_against_context(answer: str, citations: list[dict], contexts: list[dict], verification_budget: int) -> list[dict[str, Any]]:
+    rule_results = verify_answer_against_context_rules(answer, citations, contexts, verification_budget)
+    if not citations:
+        return rule_results
+    context_by_chunk = {item.get("chunk_id"): item for item in contexts}
+    judge_payload = {
+        "answer": answer,
+        "claims": _answer_claims(answer)[: max(1, verification_budget)],
+        "citations": [
+            {
+                "citation_index": item.get("citation_index"),
+                "chunk_id": item.get("chunk_id"),
+                "source_span": item.get("source_span") or {},
+                "context": _summarize(str((context_by_chunk.get(item.get("chunk_id")) or {}).get("content") or item.get("snippet") or ""), 1600),
+                "rule_verdict": item.get("verdict"),
+                "rule_failure_type": item.get("failure_type"),
+            }
+            for item in rule_results[: max(1, verification_budget)]
+        ],
+    }
+    fallback = {
+        "verifications": [
+            {
+                "citation_index": item.get("citation_index"),
+                "verdict": item.get("verdict"),
+                "failure_type": item.get("failure_type"),
+                "confidence": item.get("confidence"),
+                "reason": "fallback_rule_result",
+            }
+            for item in rule_results
+        ]
+    }
+    try:
+        judged = await ChatProvider().classify_json(
+            system_prompt=(
+                "You are a citation entailment judge for a grounded Four-Layer Context Graph RAG system. "
+                "Use only the supplied cited context and source spans. Return JSON with verifications. "
+                "Each verification must include citation_index, verdict (supported, unsupported, contradicted, missing_citation, "
+                "formula_table_context_missing), failure_type, confidence, and reason. Do not use outside knowledge."
+            ),
+            user_prompt=str(judge_payload),
+            fallback=fallback,
+        )
+    except FallbackDisabledError as exc:
+        return [
+            {
+                **item,
+                "verdict": "unsupported" if item.get("verdict") == "supported" else item.get("verdict"),
+                "failure_type": "verification_model_unavailable" if item.get("verdict") == "supported" else item.get("failure_type"),
+                "confidence": min(coerce_confidence(item.get("confidence"), default=0.0)[0], 0.35),
+                "diagnostics": {
+                    **(item.get("diagnostics") or {}),
+                    "verification_method": "structure_plus_llm_entailment_v1",
+                    "llm_entailment_judge": "unavailable_fallback_disabled",
+                    "error": str(exc),
+                },
+            }
+            for item in rule_results
+        ]
+    except Exception as exc:
+        if not get_settings().enable_model_fallback:
+            return [
+                {
+                    **item,
+                    "verdict": "unsupported" if item.get("verdict") == "supported" else item.get("verdict"),
+                    "failure_type": "verification_model_unavailable" if item.get("verdict") == "supported" else item.get("failure_type"),
+                    "confidence": min(coerce_confidence(item.get("confidence"), default=0.0)[0], 0.35),
+                    "diagnostics": {
+                        **(item.get("diagnostics") or {}),
+                        "verification_method": "structure_plus_llm_entailment_v1",
+                        "llm_entailment_judge": "error_fallback_disabled",
+                        "error_type": type(exc).__name__,
+                    },
+                }
+                for item in rule_results
+            ]
+        judged = fallback
+    judged_by_index = {
+        int(item.get("citation_index") or 0): item
+        for item in (judged.get("verifications") or [])
+        if isinstance(item, dict)
+    } if isinstance(judged, dict) else {}
+    merged: list[dict[str, Any]] = []
+    for item in rule_results:
+        judge = judged_by_index.get(int(item.get("citation_index") or 0), {})
+        rule_confidence, rule_confidence_diagnostics = coerce_confidence(item.get("confidence"), default=0.0)
+        judge_confidence, judge_confidence_diagnostics = coerce_confidence(judge.get("confidence"), default=rule_confidence)
+        rule_verdict = item.get("verdict")
+        judge_verdict = str(judge.get("verdict") or rule_verdict)
+        if rule_verdict in {"missing_citation", "formula_table_context_missing"}:
+            final_verdict = rule_verdict
+            failure_type = item.get("failure_type")
+        elif judge_verdict in {"contradicted", "unsupported", "missing_citation", "formula_table_context_missing"}:
+            final_verdict = judge_verdict
+            failure_type = str(judge.get("failure_type") or item.get("failure_type") or "unsupported_claim")
+        elif rule_verdict == "supported" and judge_verdict == "supported":
+            final_verdict = "supported"
+            failure_type = "none"
+        else:
+            final_verdict = "unsupported"
+            failure_type = str(judge.get("failure_type") or item.get("failure_type") or "unsupported_claim")
+        merged.append(
+            {
+                **item,
+                "verdict": final_verdict,
+                "failure_type": failure_type,
+                "confidence": round(min(rule_confidence, judge_confidence), 6),
+                "diagnostics": {
+                    **(item.get("diagnostics") or {}),
+                    "verification_method": "structure_plus_llm_entailment_v1",
+                    "rule_confidence": rule_confidence_diagnostics,
+                    "llm_entailment_confidence": judge_confidence_diagnostics,
+                    "rule_verdict": rule_verdict,
+                    "llm_entailment_verdict": judge_verdict,
+                    "llm_entailment_reason": judge.get("reason"),
+                },
+            }
+        )
+    return merged
+
+
 def reward_metrics_from_verifications(package, verification_results: list[dict[str, Any]], answer: str) -> dict[str, float]:
     supported = [item for item in verification_results if item.get("verdict") == "supported"]
     total = max(len(verification_results), 1)
@@ -671,24 +922,32 @@ def update_policy_state_from_reward(db: Session, knowledge_base_id: str, reward:
     citation_pass = float(reward_json.get("citation_pass_rate") or 0.0)
     context_recall = float(reward_json.get("context_recall") or 0.0)
     concept_path = float(reward_json.get("concept_path_accuracy") or 0.0)
-    bridge_bonus = 0.2 if (reward.action_json or {}).get("repair_actions") else 0.0
+    bridge_repair_boost = 0.2 if (reward.action_json or {}).get("repair_actions") else 0.0
     weights = {
         "high_precision_direct_chunk": max(0.1, previous_weights.get("high_precision_direct_chunk", 1.0) * (0.9 + 0.2 * citation_pass)),
         "structure_context_heavy": max(0.1, previous_weights.get("structure_context_heavy", 1.0) * (0.9 + 0.2 * context_recall)),
         "fine_cluster_expansion": max(0.1, previous_weights.get("fine_cluster_expansion", 1.0) * (0.9 + 0.1 * concept_path)),
         "mid_concept_expansion": max(0.1, previous_weights.get("mid_concept_expansion", 1.0) * (0.9 + 0.2 * concept_path)),
         "coarse_to_mid_drilldown": max(0.1, previous_weights.get("coarse_to_mid_drilldown", 1.0) * (0.9 + 0.15 * concept_path)),
-        "bridge_edge_exploration": max(0.1, previous_weights.get("bridge_edge_exploration", 1.0) * (0.9 + bridge_bonus)),
+        "bridge_edge_exploration": max(0.1, previous_weights.get("bridge_edge_exploration", 1.0) * (0.9 + bridge_repair_boost)),
         "formula_table_closure": max(0.1, previous_weights.get("formula_table_closure", 1.0) * (0.9 + 0.1 * citation_pass)),
         "cross_document_synthesis": max(0.1, previous_weights.get("cross_document_synthesis", 1.0)),
         "low_latency_minimal_context": max(0.1, previous_weights.get("low_latency_minimal_context", 1.0) * (1.05 if citation_pass >= 1.0 else 0.9)),
     }
     safe_arms = [arm for arm in arms if weights.get(arm, 0.0) >= 0.5]
+    previous_reward_history = []
+    if latest and isinstance(latest.reward_summary_json, dict):
+        previous_reward_history = latest.reward_summary_json.get("reward_history_tail") or []
     reward_summary = {
         "last_reward_event_id": reward.id,
         "last_reward": reward_json,
+        "reward_history_tail": previous_reward_history[-7:] + [reward_json],
         "safe_arms": safe_arms,
+        "posterior": weights,
         "posterior_proxy": weights,
+        "exploration_rate": 0.05,
+        "drift_status": "normal" if float(reward_json.get("drift_rate") or 0.0) <= 0.2 else "elevated",
+        "policy_version": "context_graph_bandit_v1",
         "runtime_settings_hash": runtime_settings_state_hash(),
         "agent_operating_envelope_hash": agent_operating_envelope_state_hash(),
     }
@@ -698,8 +957,19 @@ def update_policy_state_from_reward(db: Session, knowledge_base_id: str, reward:
         policy_family="context_graph_bandit",
         policy_version="context_graph_bandit_v1",
         weights_json=weights,
-        constraints_json={"fallback_disabled": True, "citation_verification_required": True, "agent_operating_envelope": agent_operating_envelope()},
-        exploration_json={"epsilon": 0.05, "safe_arms": safe_arms},
+        constraints_json={
+            "fallback_disabled": True,
+            "citation_verification_required": True,
+            "agent_operating_envelope": agent_operating_envelope(),
+            "runtime_settings_hash": runtime_settings_state_hash(),
+        },
+        exploration_json={
+            "epsilon": 0.05,
+            "exploration_rate": 0.05,
+            "safe_arms": safe_arms,
+            "ambiguous_edge_distance_low": agent_operating_envelope().get("ambiguous_edge_distance_low"),
+            "ambiguous_edge_distance_high": agent_operating_envelope().get("ambiguous_edge_distance_high"),
+        },
         reward_summary_json=reward_summary,
         state_hash=state_hash,
     )
@@ -709,7 +979,7 @@ def update_policy_state_from_reward(db: Session, knowledge_base_id: str, reward:
     return policy_state
 
 
-def record_answer_audit(
+async def record_answer_audit(
     db: Session,
     *,
     knowledge_base_id: str,
@@ -722,7 +992,7 @@ def record_answer_audit(
     repair_actions: list[dict[str, Any]] | None = None,
 ) -> AnswerSession:
     citations = citation_payloads_from_package(package, retrieval_trace_id=package.retrieval_trace_id, answer=answer)
-    verification_results = verify_answer_against_context(
+    verification_results = await verify_answer_against_context(
         answer,
         citations,
         contexts,
@@ -742,7 +1012,7 @@ def record_answer_audit(
             "context_package_id": package.id,
             "citation_count": len(citations),
             "context_token_count": package.token_count,
-            "verification_protocol": "adaptive_context_idf_overlap_v1",
+            "verification_protocol": "structure_plus_llm_entailment_v1",
         },
     )
     db.add(answer_session)
@@ -750,6 +1020,7 @@ def record_answer_audit(
     verification_ids: list[str] = []
     for result in verification_results:
         source_span = result.get("source_span") or {}
+        stored_confidence, stored_confidence_diagnostics = coerce_confidence(result.get("confidence"), default=0.0)
         verification = CitationVerification(
             knowledge_base_id=knowledge_base_id,
             answer_session_id=answer_session.id,
@@ -759,14 +1030,20 @@ def record_answer_audit(
             claim_text=str(result.get("claim_text") or "")[:1000],
             source_span_json=source_span,
             verdict=str(result.get("verdict") or "unsupported"),
-            confidence=float(result.get("confidence") or 0.0),
-            diagnostics_json=result.get("diagnostics") or {},
+            confidence=stored_confidence,
+            diagnostics_json={**(result.get("diagnostics") or {}), "stored_confidence": stored_confidence_diagnostics},
         )
         db.add(verification)
         db.flush()
+        verification_source_span = {**(verification.source_span_json or {}), "verification_id": verification.id}
+        verification.source_span_json = verification_source_span
+        result["source_span"] = verification_source_span
+        flag_modified(verification, "source_span_json")
         for citation in citations:
             if citation.get("chunk_id") == verification.chunk_id:
                 citation["citation_verification_id"] = verification.id
+                if isinstance(citation.get("source_span"), dict):
+                    citation["source_span"] = {**citation["source_span"], "verification_id": verification.id}
                 citation["verification"] = {
                     "verdict": verification.verdict,
                     "confidence": verification.confidence,
@@ -842,7 +1119,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             query_intent,
             envelope,
         )
-        typed_actions, validation = validate_typed_actions(proposed_actions, envelope)
+        typed_actions, validation = validate_typed_actions(proposed_actions, envelope, db=db, knowledge_base_id=run.knowledge_base_id)
         plan, action_rows = record_agent_plan_and_actions(
             db,
             run=run,
@@ -889,9 +1166,9 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             verdict="sufficient" if search_result.results else "insufficient",
         )
         for action_type, observation_type in [
-            ("activate_coarse_concepts", "coarse_activation"),
-            ("route_mid_concepts", "mid_routing"),
-            ("route_fine_clusters", "fine_routing"),
+            ("select_entry_nodes", "entry_selection"),
+            ("drill_down_layer", "layer_drilldown"),
+            ("walk_graph_frontier", "frontier_traversal"),
         ]:
             record_observation(
                 db,
@@ -903,6 +1180,55 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                 verdict="observed",
             )
         db.commit()
+        audit = search_result.audit or {}
+        trace(
+            db,
+            run.id,
+            "entry_selection",
+            input_summary=request.question,
+            output_summary=f"coarse={audit.get('coarse_entries', 0)}, mid={audit.get('mid_entries', 0)}, fine={audit.get('fine_entries', 0)}",
+            document_ids=[item["chunk_id"] for item in search_result.results],
+            scores={
+                "retrieval_trace_id": search_result.trace.id,
+                "coarse_entries": audit.get("coarse_entries", 0),
+                "mid_entries": audit.get("mid_entries", 0),
+                "fine_entries": audit.get("fine_entries", 0),
+            },
+        )
+        trace(
+            db,
+            run.id,
+            "layer_drilldown",
+            input_summary=f"trace={search_result.trace.id}",
+            output_summary=f"fine candidates={audit.get('fine_entries', 0)}",
+            document_ids=[item["chunk_id"] for item in search_result.results],
+            scores={
+                "retrieval_trace_id": search_result.trace.id,
+                "query_rq_path": audit.get("query_rq_path") or [],
+            },
+        )
+        trace(
+            db,
+            run.id,
+            "frontier_traversal",
+            input_summary=f"trace={search_result.trace.id}",
+            output_summary=f"frontier pops={audit.get('frontier_pops', 0)}",
+            document_ids=[item["chunk_id"] for item in search_result.results],
+            scores={
+                "retrieval_trace_id": search_result.trace.id,
+                "frontier_pops": audit.get("frontier_pops", 0),
+                "dominance_pruned_count": audit.get("dominance_pruned_count", 0),
+            },
+        )
+        trace(
+            db,
+            run.id,
+            "chunk_recall",
+            input_summary=f"trace={search_result.trace.id}",
+            output_summary=f"recalled {len(search_result.results)} chunks",
+            document_ids=[item["chunk_id"] for item in search_result.results],
+            scores={"retrieval_trace_id": search_result.trace.id, "chunk_ids": [item["chunk_id"] for item in search_result.results]},
+        )
         trace(
             db,
             run.id,
@@ -923,6 +1249,14 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             results=search_result.results,
         )
         contexts = context_package_to_contexts(package)
+        restoration_scores = {
+            "context_package_id": package.id,
+            "hit_chunks": len(package.hit_chunk_ids_json or []),
+            "restored_chunks": len(package.restored_chunk_ids_json or []),
+            "bridge_chunks": len(package.bridge_chunk_ids_json or []),
+            "parent_structure_nodes": len(package.parent_structure_node_ids_json or []),
+            "graph_path_ids": len(package.graph_path_ids_json or []),
+        }
         record_observation(
             db,
             run_id=run.id,
@@ -930,16 +1264,25 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             observation_type="context_restoration",
             observation={
                 "context_package_id": package.id,
-                "hit_chunks": len(package.hit_chunk_ids_json or []),
-                "restored_chunks": len(package.restored_chunk_ids_json or []),
-                "bridge_chunks": len(package.bridge_chunk_ids_json or []),
-                "parent_structure_nodes": len(package.parent_structure_node_ids_json or []),
+                "hit_chunks": restoration_scores["hit_chunks"],
+                "restored_chunks": restoration_scores["restored_chunks"],
+                "bridge_chunks": restoration_scores["bridge_chunks"],
+                "parent_structure_nodes": restoration_scores["parent_structure_nodes"],
                 "token_count": package.token_count,
             },
             evidence_chunk_ids=list((package.hit_chunk_ids_json or []) + (package.restored_chunk_ids_json or [])),
             verdict="sufficient" if package.hit_chunk_ids_json else "insufficient",
         )
         db.commit()
+        trace(
+            db,
+            run.id,
+            "structure_context_restoration",
+            input_summary=f"trace={search_result.trace.id}",
+            output_summary=f"restored={restoration_scores['restored_chunks']}, bridge={restoration_scores['bridge_chunks']}",
+            document_ids=list((package.hit_chunk_ids_json or []) + (package.restored_chunk_ids_json or [])),
+            scores=restoration_scores,
+        )
         trace(
             db,
             run.id,
@@ -972,7 +1315,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
         )
 
         provisional_citations = citation_payloads_from_package(package, retrieval_trace_id=package.retrieval_trace_id, answer=chat_result.answer)
-        provisional_verifications = verify_answer_against_context(
+        provisional_verifications = await verify_answer_against_context(
             chat_result.answer,
             provisional_citations,
             contexts,
@@ -1061,7 +1404,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                 scores={"repair_actions": repair_actions},
             )
 
-        answer_session = record_answer_audit(
+        answer_session = await record_answer_audit(
             db,
             knowledge_base_id=run.knowledge_base_id,
             qa_session_id=session.id,

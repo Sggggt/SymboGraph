@@ -195,9 +195,9 @@ export type AgentTraceNode =
   | "query_understanding"
   | "agent_planner"
   | "typed_action_validation"
-  | "coarse_concept_activation"
-  | "mid_concept_routing"
-  | "fine_cluster_routing"
+  | "entry_selection"
+  | "layer_drilldown"
+  | "frontier_traversal"
   | "chunk_recall"
   | "structure_context_restoration"
   | "layered_retrieval"
@@ -368,13 +368,22 @@ export interface ModelSettingsResponse {
   rq_kmeans_levels?: number;
   rq_kmeans_max_k?: number;
   rq_residual_tau?: number;
-  agent_coarse_activation_budget?: number;
+  agent_coarse_entry_budget?: number;
   agent_coarse_jump_budget?: number;
-  agent_mid_activation_budget?: number;
+  agent_mid_entry_budget?: number;
   agent_mid_expansion_radius_cap?: number;
-  agent_fine_cluster_budget?: number;
+  agent_fine_entry_budget?: number;
+  agent_frontier_expansion_budget?: number;
+  agent_max_depth_per_layer?: number;
+  agent_max_labels_per_node?: number;
+  agent_max_edge_reuse?: number;
+  agent_max_cycle_reward_per_path?: number;
+  agent_ambiguous_edge_distance_low?: number;
+  agent_ambiguous_edge_distance_high?: number;
+  agent_drilldown_budget_per_layer?: number;
   agent_chunk_candidate_budget?: number;
   agent_structure_restore_budget?: number;
+  context_path_summary_budget?: number;
   agent_planning_round_budget?: number;
   agent_max_typed_actions_per_round?: number;
   agent_repair_round_budget?: number;
@@ -419,13 +428,22 @@ export interface ModelSettingsUpdate {
   rq_kmeans_levels?: number | null;
   rq_kmeans_max_k?: number | null;
   rq_residual_tau?: number | null;
-  agent_coarse_activation_budget?: number | null;
+  agent_coarse_entry_budget?: number | null;
   agent_coarse_jump_budget?: number | null;
-  agent_mid_activation_budget?: number | null;
+  agent_mid_entry_budget?: number | null;
   agent_mid_expansion_radius_cap?: number | null;
-  agent_fine_cluster_budget?: number | null;
+  agent_fine_entry_budget?: number | null;
+  agent_frontier_expansion_budget?: number | null;
+  agent_max_depth_per_layer?: number | null;
+  agent_max_labels_per_node?: number | null;
+  agent_max_edge_reuse?: number | null;
+  agent_max_cycle_reward_per_path?: number | null;
+  agent_ambiguous_edge_distance_low?: number | null;
+  agent_ambiguous_edge_distance_high?: number | null;
+  agent_drilldown_budget_per_layer?: number | null;
   agent_chunk_candidate_budget?: number | null;
   agent_structure_restore_budget?: number | null;
+  context_path_summary_budget?: number | null;
   agent_planning_round_budget?: number | null;
   agent_max_typed_actions_per_round?: number | null;
   agent_repair_round_budget?: number | null;
@@ -461,6 +479,7 @@ export interface IngestionLogEvent {
   embedding_fallback_method?: string | null;
   graph_runtime?: string | null;
   vector_count?: number;
+  bm25_record_count?: number;
   chunk_count?: number;
   relation_edge_count?: number;
   fine_cluster_count?: number;
@@ -468,6 +487,7 @@ export interface IngestionLogEvent {
   coarse_concept_count?: number;
   context_graph_hash?: string | null;
   context_graph_state_id?: string | null;
+  context_graph_phase?: string | null;
   retry_count?: number;
   max_retries?: number;
 }
@@ -583,6 +603,8 @@ export interface GraphEdge {
   category?: string | null;
   confidence?: number | null;
   weight?: number | null;
+  distance?: number | null;
+  raw_strength?: number | null;
   score?: number | null;
   support_count?: number | null;
   support_chunk_ids?: string[];

@@ -1,44 +1,76 @@
 # Web 前端
 
+## 项目简介
+
 `apps/web` 是 SymboGraph 的 Next.js 前端，用于管理本地知识库、上传资料、查看导入日志、浏览四层图谱、执行 layered search、展开 context package、进行引用问答并配置 profile/runtime settings。
-
-## 技术栈
-
-```text
-Next.js 16.2.4
-React 19.2.4
-TypeScript
-TanStack Query
-Tailwind CSS
-ECharts
-Vitest
-ESLint
-```
-
-修改 `apps/web` 前，优先查看本地 Next.js 文档：
-
-```text
-apps/web/node_modules/next/dist/docs/
-```
-
-如果本地文档不存在，以当前依赖版本、现有代码和实际构建结果为准。
 
 ## 目录
 
 | 路径 | 职责 |
 | --- | --- |
-| `src/app/` | App Router 页面入口。 |
-| `src/components/app-shell.tsx` | 应用壳层和导航。 |
-| `src/components/overview-dashboard.tsx` | 知识库概览。 |
-| `src/components/upload-workspace.tsx` | 上传、导入和日志。 |
+| `src/app/` | Next.js App Router 页面入口。 |
+| `src/components/app-shell.tsx` | 应用壳层、导航、资料库切换。 |
+| `src/components/overview-dashboard.tsx` | 知识库概览、导入状态和快捷入口。 |
+| `src/components/upload-workspace.tsx` | 上传、全量重新解析、批次状态和中文日志流。 |
 | `src/components/graph-panel.tsx` | Chunk Structure、Chunk Relations、Mid Concepts、Coarse Concepts。 |
-| `src/components/search-workspace.tsx` | Layered search、score components、graph expansion steps。 |
-| `src/components/qa-workspace.tsx` | Context package、citations、verification、Agent trace。 |
-| `src/components/settings-workspace.tsx` | Profile 和 runtime settings。 |
+| `src/components/search-workspace.tsx` | Layered search、trace、context package 和图路径。 |
+| `src/components/qa-workspace.tsx` | QA、Agent trace、citations、verification 和会话。 |
+| `src/components/settings-workspace.tsx` | Profile settings 与 runtime settings。 |
 | `src/lib/api.ts` | 后端 API 集中入口。 |
-| `src/lib/agent-trace.ts` | Agent trace 展示转换。 |
+| `src/lib/agent-trace.ts` | Agent trace 中文展示映射。 |
+| `src/lib/ingestion-log-meta.ts` | 导入日志阶段中文展示映射。 |
 
-## 启动
+## 产品定位
+
+Web 前端是四层图谱和问答审计的可视化入口。搜索页展示 deterministic layered retrieval；QA 页面展示 Agent 轨迹、context package、citation verification 和 repair；设置页分离 Profile Settings 与 Runtime Settings。
+
+## 技术栈
+
+| 范围 | 技术 |
+| --- | --- |
+| Framework | Next.js 16.2.4 App Router |
+| UI | React 19.2.4, TypeScript, Tailwind CSS, lucide-react |
+| 数据 | TanStack Query, shared TypeScript contracts |
+| 图谱 | ECharts |
+| 测试 | Vitest, ESLint, TypeScript typecheck |
+
+修改 `apps/web` 前必须优先查看本地 Next.js 文档：
+
+```text
+apps/web/node_modules/next/dist/docs/
+```
+
+若本地文档不存在，以当前依赖版本、现有代码和实际构建结果为准。
+
+## 主链路
+
+```text
+dashboard
+-> upload / batch log
+-> graph payload
+-> layered search trace
+-> context package
+-> QA stream
+-> Agent trace groups
+-> citation verification
+-> runtime/profile settings
+```
+
+## 环境配置
+
+Web 通过 Docker Compose 访问 API：
+
+```env
+NEXT_PUBLIC_API_BASE_URL=http://api:8000/api
+```
+
+本地浏览器访问默认地址：
+
+```text
+http://127.0.0.1:3000
+```
+
+## 快速启动
 
 推荐通过 Docker Compose：
 
@@ -46,17 +78,19 @@ apps/web/node_modules/next/dist/docs/
 docker compose -f infra/docker-compose.yml up -d --build web
 ```
 
-访问：
-
-```text
-http://127.0.0.1:3000
-```
-
 本地开发：
 
 ```powershell
 npm run dev --workspace web
 ```
+
+## 参数列表
+
+| 分类 | 参数 |
+| --- | --- |
+| API | `NEXT_PUBLIC_API_BASE_URL` |
+| Next.js | 版本固定在 `apps/web/package.json` 的 `next@16.2.4` |
+| 测试 | `npm run typecheck --workspace web`, `npm run lint --workspace web`, `npm run test --workspace web` |
 
 ## 验证
 
@@ -68,14 +102,35 @@ npm run lint --workspace web
 npm run test --workspace web
 ```
 
-## 前端边界
+前端可视变更需要浏览器检查关键页面：
 
-- 服务端状态优先使用 TanStack Query。
-- mutation 后必须明确失效相关 query。
-- API 类型与后端 Pydantic schema、`packages/shared` 保持同步。
-- 图谱页展示四层：Chunk Structure、Chunk Relations、Mid Concepts、Coarse Concepts。
-- 图谱页展示 full counts、sampled counts、freshness、hash、stale reason、grounding 和 retrieval contribution。
-- 搜索页走 layered search，展示 layered route、concept path、score components、graph expansion steps 和结构上下文。
-- QA 页面展示 context package、前后文 chunk、结构路径、图扩展步骤、agent plan、typed actions、observations、budget usage、citations、verification 和 repair actions。
-- 多轮 QA 页面展示 conversation state 中的 active user constraints、任务状态和过往 context package/answer session 引用。
+```text
+/upload
+/search
+/qa
+/graph
+/settings
+```
+
+## 运维测试
+
+```powershell
+python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
+```
+
+截图、视觉 QA 和临时浏览器输出写入 `output/`，不提交。
+
+## 文档
+
+- [../../README.md](../../README.md)：仓库总览。
+- [../../docs/technical-spec.md](../../docs/technical-spec.md)：技术白皮书。
+- [../../packages/shared/src/index.ts](../../packages/shared/src/index.ts)：共享类型契约。
+
+## 边界
+
+- 前端 API 访问默认集中在 `src/lib/api.ts`。
+- 服务端状态优先使用 TanStack Query，mutation 后明确失效相关 query。
+- shared TS 类型必须与 Pydantic schema 和脚本输出同步。
+- 用户可见 trace/log 文案中文优先，底层 JSON key 保持英文协议字段。
 - 前端不保存 API key、Authorization header 或 provider 原始响应。
+- 搜索页不触发完整 Agent P&E；QA 页面才展示 Agent plan/action/observation、verification 和 repair。

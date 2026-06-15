@@ -33,6 +33,10 @@ class CacheManager:
     def _hash(self, text: str) -> str:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
+    def _payload_hash(self, payload: dict[str, Any]) -> str:
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
     def get_embedding(self, knowledge_base_id: str, query: str, embedding_version: str) -> list[float] | None:
         key = self._key("emb", knowledge_base_id, self._hash(query), embedding_version)
         return self._get(key)
@@ -41,12 +45,36 @@ class CacheManager:
         key = self._key("emb", knowledge_base_id, self._hash(query), embedding_version)
         self._set(key, vector, ttl)
 
-    def get_search_results(self, knowledge_base_id: str, query: str, scope_hash: str, embedding_version: str) -> dict | None:
-        key = self._key("search", knowledge_base_id, self._hash(query), scope_hash, embedding_version)
+    def get_search_results(
+        self,
+        knowledge_base_id: str,
+        query: str,
+        scope_hash: str,
+        embedding_version: str,
+        *,
+        cache_components: dict[str, Any] | None = None,
+    ) -> dict | None:
+        if cache_components:
+            key = self._key("search", knowledge_base_id, self._payload_hash(cache_components))
+        else:
+            key = self._key("search", knowledge_base_id, self._hash(query), scope_hash, embedding_version)
         return self._get(key)
 
-    def set_search_results(self, knowledge_base_id: str, query: str, scope_hash: str, embedding_version: str, payload: dict, ttl: int = 300) -> None:
-        key = self._key("search", knowledge_base_id, self._hash(query), scope_hash, embedding_version)
+    def set_search_results(
+        self,
+        knowledge_base_id: str,
+        query: str,
+        scope_hash: str,
+        embedding_version: str,
+        payload: dict,
+        ttl: int = 300,
+        *,
+        cache_components: dict[str, Any] | None = None,
+    ) -> None:
+        if cache_components:
+            key = self._key("search", knowledge_base_id, self._payload_hash(cache_components))
+        else:
+            key = self._key("search", knowledge_base_id, self._hash(query), scope_hash, embedding_version)
         self._set(key, payload, ttl)
 
     def get_quality_judgment(self, cache_key: str) -> dict | None:

@@ -39,13 +39,22 @@ HOT_RELOAD_SETTINGS = {
     "rq_kmeans_levels",
     "rq_kmeans_max_k",
     "rq_residual_tau",
-    "agent_coarse_activation_budget",
+    "agent_coarse_entry_budget",
     "agent_coarse_jump_budget",
-    "agent_mid_activation_budget",
+    "agent_mid_entry_budget",
     "agent_mid_expansion_radius_cap",
-    "agent_fine_cluster_budget",
+    "agent_fine_entry_budget",
+    "agent_frontier_expansion_budget",
+    "agent_max_depth_per_layer",
+    "agent_max_labels_per_node",
+    "agent_max_edge_reuse",
+    "agent_max_cycle_reward_per_path",
+    "agent_ambiguous_edge_distance_low",
+    "agent_ambiguous_edge_distance_high",
+    "agent_drilldown_budget_per_layer",
     "agent_chunk_candidate_budget",
     "agent_structure_restore_budget",
+    "context_path_summary_budget",
     "agent_planning_round_budget",
     "agent_max_typed_actions_per_round",
     "agent_repair_round_budget",
@@ -107,13 +116,22 @@ class Settings(BaseSettings):
     rq_kmeans_levels: int = Field(default=3, ge=1, le=8)
     rq_kmeans_max_k: int = Field(default=6, ge=1, le=64)
     rq_residual_tau: float = Field(default=0.65, gt=0.0, le=10.0)
-    agent_coarse_activation_budget: int = Field(default=8, ge=1, le=100)
+    agent_coarse_entry_budget: int = Field(default=8, ge=1, le=100)
     agent_coarse_jump_budget: int = Field(default=2, ge=0, le=20)
-    agent_mid_activation_budget: int = Field(default=16, ge=1, le=200)
+    agent_mid_entry_budget: int = Field(default=16, ge=1, le=200)
     agent_mid_expansion_radius_cap: int = Field(default=2, ge=0, le=8)
-    agent_fine_cluster_budget: int = Field(default=16, ge=1, le=500)
+    agent_fine_entry_budget: int = Field(default=16, ge=1, le=500)
+    agent_frontier_expansion_budget: int = Field(default=80, ge=1, le=2000)
+    agent_max_depth_per_layer: int = Field(default=3, ge=1, le=12)
+    agent_max_labels_per_node: int = Field(default=3, ge=1, le=20)
+    agent_max_edge_reuse: int = Field(default=2, ge=1, le=20)
+    agent_max_cycle_reward_per_path: float = Field(default=0.18, ge=0.0, le=2.0)
+    agent_ambiguous_edge_distance_low: float = Field(default=0.45, ge=0.0, le=20.0)
+    agent_ambiguous_edge_distance_high: float = Field(default=1.35, ge=0.0, le=20.0)
+    agent_drilldown_budget_per_layer: int = Field(default=16, ge=1, le=500)
     agent_chunk_candidate_budget: int = Field(default=80, ge=1, le=1000)
     agent_structure_restore_budget: int = Field(default=16, ge=1, le=200)
+    context_path_summary_budget: int = Field(default=32, ge=1, le=500)
     agent_planning_round_budget: int = Field(default=2, ge=1, le=10)
     agent_max_typed_actions_per_round: int = Field(default=8, ge=1, le=50)
     agent_repair_round_budget: int = Field(default=2, ge=0, le=10)
@@ -204,13 +222,19 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "mid_concept_extraction_max_tokens_per_batch",
         "rq_kmeans_levels",
         "rq_kmeans_max_k",
-        "agent_coarse_activation_budget",
+        "agent_coarse_entry_budget",
         "agent_coarse_jump_budget",
-        "agent_mid_activation_budget",
+        "agent_mid_entry_budget",
         "agent_mid_expansion_radius_cap",
-        "agent_fine_cluster_budget",
+        "agent_fine_entry_budget",
+        "agent_frontier_expansion_budget",
+        "agent_max_depth_per_layer",
+        "agent_max_labels_per_node",
+        "agent_max_edge_reuse",
+        "agent_drilldown_budget_per_layer",
         "agent_chunk_candidate_budget",
         "agent_structure_restore_budget",
+        "context_path_summary_budget",
         "agent_planning_round_budget",
         "agent_max_typed_actions_per_round",
         "agent_repair_round_budget",
@@ -219,6 +243,9 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
     float_fields: set[str] = {
         "mid_concept_candidate_keep_threshold",
         "rq_residual_tau",
+        "agent_max_cycle_reward_per_path",
+        "agent_ambiguous_edge_distance_low",
+        "agent_ambiguous_edge_distance_high",
     }
     nullable_fields = {
         "chat_resolve_ip",
@@ -237,13 +264,22 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "RQ_KMEANS_LEVELS": "rq_kmeans_levels",
         "RQ_KMEANS_MAX_K": "rq_kmeans_max_k",
         "RQ_RESIDUAL_TAU": "rq_residual_tau",
-        "AGENT_COARSE_ACTIVATION_BUDGET": "agent_coarse_activation_budget",
+        "AGENT_COARSE_ENTRY_BUDGET": "agent_coarse_entry_budget",
         "AGENT_COARSE_JUMP_BUDGET": "agent_coarse_jump_budget",
-        "AGENT_MID_ACTIVATION_BUDGET": "agent_mid_activation_budget",
+        "AGENT_MID_ENTRY_BUDGET": "agent_mid_entry_budget",
         "AGENT_MID_EXPANSION_RADIUS_CAP": "agent_mid_expansion_radius_cap",
-        "AGENT_FINE_CLUSTER_BUDGET": "agent_fine_cluster_budget",
+        "AGENT_FINE_ENTRY_BUDGET": "agent_fine_entry_budget",
+        "AGENT_FRONTIER_EXPANSION_BUDGET": "agent_frontier_expansion_budget",
+        "AGENT_MAX_DEPTH_PER_LAYER": "agent_max_depth_per_layer",
+        "AGENT_MAX_LABELS_PER_NODE": "agent_max_labels_per_node",
+        "AGENT_MAX_EDGE_REUSE": "agent_max_edge_reuse",
+        "AGENT_MAX_CYCLE_REWARD_PER_PATH": "agent_max_cycle_reward_per_path",
+        "AGENT_AMBIGUOUS_EDGE_DISTANCE_LOW": "agent_ambiguous_edge_distance_low",
+        "AGENT_AMBIGUOUS_EDGE_DISTANCE_HIGH": "agent_ambiguous_edge_distance_high",
+        "AGENT_DRILLDOWN_BUDGET_PER_LAYER": "agent_drilldown_budget_per_layer",
         "AGENT_CHUNK_CANDIDATE_BUDGET": "agent_chunk_candidate_budget",
         "AGENT_STRUCTURE_RESTORE_BUDGET": "agent_structure_restore_budget",
+        "CONTEXT_PATH_SUMMARY_BUDGET": "context_path_summary_budget",
         "AGENT_PLANNING_ROUND_BUDGET": "agent_planning_round_budget",
         "AGENT_MAX_TYPED_ACTIONS_PER_ROUND": "agent_max_typed_actions_per_round",
         "AGENT_REPAIR_ROUND_BUDGET": "agent_repair_round_budget",

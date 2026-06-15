@@ -51,12 +51,42 @@ async def main() -> None:
             "has_previous_or_next_context": any((item.get("role") in {"restored_context", "bridge"}) for item in contexts),
             "has_parent_structure": any(item.get("structure_path") for item in contexts),
             "has_citation_spans": bool(citation_spans),
+            "citation_spans_have_raw_addresses": all(
+                span.get("document_version_id")
+                and span.get("chunk_id")
+                and span.get("char_span")
+                and span.get("page_range") is not None
+                and span.get("section_path")
+                and span.get("bbox") is not None
+                and span.get("context_package_id")
+                and span.get("retrieval_trace_id")
+                for span in citation_spans
+            ),
+            "contexts_have_source_span_and_closure": all(
+                item.get("source_span")
+                and item.get("structure_closure")
+                and item.get("why_selected")
+                and item.get("dedupe_key")
+                for item in contexts
+            ),
             "has_graph_path": bool(graph_paths),
             "has_rq_query_path": bool((((trace.diagnostics_json or {}).get("rq") or {}).get("query_rq_path")) if trace else False),
             "has_rq_candidate_metrics": any(
                 "lcp_depth" in candidate and "residual_distance" in candidate
                 for candidate in rq_candidates.values()
                 if isinstance(candidate, dict)
+            ),
+            "each_layer_has_frontier_path_convergence": all(
+                bool(step and step.popped_frontier_state_json and step.stop_reason)
+                for layer in ("coarse", "mid", "fine", "chunk")
+                for step in [
+                    db.scalar(
+                        select(GraphRetrievalStep).where(
+                            GraphRetrievalStep.retrieval_trace_id == package.retrieval_trace_id,
+                            GraphRetrievalStep.layer == layer,
+                        )
+                    )
+                ]
             ),
             "token_budget_recorded": package.token_budget > 0 and package.token_count >= 0,
         }

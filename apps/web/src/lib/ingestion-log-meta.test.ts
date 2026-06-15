@@ -12,7 +12,7 @@ describe("ingestion log metadata", () => {
   });
 
   it("summarizes four-layer graph phase logs", () => {
-    expect(logEventLabel("context_graph_started")).toBe("上下文图谱构建");
+    expect(logEventLabel("context_graph_started")).toBe("四层上下文图谱开始");
     expect(logEventLabel("chunk_relation_completed")).toBe("片段关系图完成");
     expect(logVisualTone({ event: "context_graph_completed" })).toBe("graph");
     expect(
@@ -20,12 +20,13 @@ describe("ingestion log metadata", () => {
         timestamp: "2026-01-01T00:00:00",
         event: "context_graph_completed",
         message: "done",
+        phase: "context_graph:completed",
         chunk_count: 12,
         relation_edge_count: 8,
         fine_cluster_count: 4,
         context_graph_hash: "abcdef123456",
       }),
-    ).toBe("片段 12 / 关系边 8 / 细聚类 4 / 哈希 abcdef12");
+    ).toBe("阶段 图谱闭环完成 / 片段 12 / 关系边 8 / Fine/RQ 4 / 哈希 abcdef12");
   });
 
   it("summarizes concept graph events", () => {
@@ -38,6 +39,6 @@ describe("ingestion log metadata", () => {
         message: "done",
         mid_concept_count: 7,
       }),
-    ).toBe("中粒度概念 7");
+    ).toBe("中概念 7");
   });
 });

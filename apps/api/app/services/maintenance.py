@@ -24,6 +24,7 @@ from app.models import (
     DocumentVersion,
     FineClusterMembership,
     IngestionBatch,
+    IngestionCompensationLog,
     KnowledgeBase,
     PolicyState,
     VectorRecord,
@@ -74,7 +75,22 @@ def delete_knowledge_base_data(db: Session, knowledge_base: KnowledgeBase) -> di
         points_by_collection[record.collection_name].append(record.qdrant_point_id)
     deleted_points = 0
     for collection_name, point_ids in points_by_collection.items():
-        VectorStore(knowledge_base.name, collection_name=collection_name).delete(point_ids)
+        try:
+            VectorStore(knowledge_base.name, collection_name=collection_name).delete(point_ids)
+        except Exception as exc:
+            db.add(
+                IngestionCompensationLog(
+                    job_id=None,
+                    knowledge_base_id=knowledge_base.id,
+                    operation="qdrant_delete",
+                    target_ids_json=point_ids,
+                    payload_json={"collection_name": collection_name, "maintenance_operation": "delete_knowledge_base_data"},
+                    status="failed",
+                    error_message=f"{type(exc).__name__}: {exc}",
+                )
+            )
+            db.commit()
+            raise
         deleted_points += len(point_ids)
     stats = {
         "documents": db.scalar(select(func.count(Document.id)).where(Document.knowledge_base_id == knowledge_base.id)) or 0,
@@ -158,7 +174,22 @@ def cleanup_stale_data(
     }
     if not dry_run:
         for collection_name, point_ids in points_by_collection.items():
-            VectorStore(knowledge_base_name, collection_name=collection_name).delete(point_ids)
+            try:
+                VectorStore(knowledge_base_name, collection_name=collection_name).delete(point_ids)
+            except Exception as exc:
+                db.add(
+                    IngestionCompensationLog(
+                        job_id=None,
+                        knowledge_base_id=knowledge_base_id,
+                        operation="qdrant_delete",
+                        target_ids_json=point_ids,
+                        payload_json={"collection_name": collection_name, "maintenance_operation": "cleanup_stale_data"},
+                        status="failed",
+                        error_message=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+                db.commit()
+                raise
         if stale_records:
             db.query(VectorRecord).filter(VectorRecord.id.in_([record.id for record in stale_records])).delete(synchronize_session=False)
         if stale_bm25_records:
@@ -243,6 +274,8 @@ def reconcile_vector_store_sync(db: Session, knowledge_base_id: str | None = Non
 
 
 def reconcile_policy_state(db: Session, knowledge_base_id: str) -> int:
+    from app.services.context_graph import agent_operating_envelope, agent_operating_envelope_state_hash, runtime_settings_state_hash
+
     latest = db.scalar(
         select(PolicyState)
         .where(PolicyState.knowledge_base_id == knowledge_base_id, PolicyState.policy_family == "context_graph_bandit")
@@ -260,7 +293,18 @@ def reconcile_policy_state(db: Session, knowledge_base_id: str) -> int:
         "low_latency_minimal_context",
     ]
     weights = {arm: 1.0 for arm in arms}
-    state_hash = stable_hash({"policy_version": "context_graph_bandit_v1", "weights": weights})
+    safe_arms = list(arms)
+    reward_summary = {
+        "safe_arms": safe_arms,
+        "posterior": weights,
+        "exploration_rate": 0.05,
+        "drift_status": "normal",
+        "policy_version": "context_graph_bandit_v1",
+        "runtime_settings_hash": runtime_settings_state_hash(),
+        "agent_operating_envelope_hash": agent_operating_envelope_state_hash(),
+        "reward_history_tail": [],
+    }
+    state_hash = stable_hash({"policy_version": "context_graph_bandit_v1", "weights": weights, "summary": reward_summary})
     if latest and latest.state_hash == state_hash:
         return 0
     db.add(
@@ -269,9 +313,14 @@ def reconcile_policy_state(db: Session, knowledge_base_id: str) -> int:
             policy_family="context_graph_bandit",
             policy_version="context_graph_bandit_v1",
             weights_json=weights,
-            constraints_json={"fallback_disabled": True, "citation_verification_required": True},
-            exploration_json={"epsilon": 0.05, "max_bridge_expansion": 4},
-            reward_summary_json={},
+            constraints_json={
+                "fallback_disabled": True,
+                "citation_verification_required": True,
+                "agent_operating_envelope": agent_operating_envelope(),
+                "runtime_settings_hash": runtime_settings_state_hash(),
+            },
+            exploration_json={"epsilon": 0.05, "exploration_rate": 0.05, "safe_arms": safe_arms},
+            reward_summary_json=reward_summary,
             state_hash=state_hash,
         )
     )

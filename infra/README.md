@@ -1,31 +1,32 @@
 # Infra
 
+## 项目简介
+
 `infra` 保存 SymboGraph 默认 Docker Compose 运行环境，包含 API、Worker、Web、PostgreSQL、Redis 和 Qdrant。
 
-## 启动
+## 目录
 
-首次启动前创建 `.env`：
+| 路径 | 职责 |
+| --- | --- |
+| `docker-compose.yml` | 默认本地生产形态栈。 |
+| `README.md` | Compose 运行说明。 |
 
-```powershell
-Copy-Item .env.example .env
-```
+## 产品定位
 
-启动完整栈：
+默认运行路径是 Docker Compose。涉及 PostgreSQL、Qdrant、Redis、模型接口和无 fallback 的集成路径必须在该栈内验证；`experiment` profile 不属于默认运行路径。
 
-```powershell
-docker compose -f infra/docker-compose.yml up -d --build
-```
+## 技术栈
 
-## 服务
+| 服务 | 技术 |
+| --- | --- |
+| API | FastAPI container |
+| Worker | Celery container |
+| Web | Next.js container |
+| Metadata | PostgreSQL 16 |
+| Cache / broker | Redis 7 |
+| Vector index | Qdrant 1.17.1 |
 
-| Compose 服务 | 容器名 | 职责 |
-| --- | --- | --- |
-| `api` | `course-kg-api` | FastAPI 后端。 |
-| `worker` | `course-kg-worker` | Celery 长任务和 watcher。 |
-| `web` | `course-kg-web` | Next.js 前端。 |
-| `postgres` | `course-kg-postgres` | PostgreSQL 事实源。 |
-| `redis` | `course-kg-redis` | Celery broker、共享缓存、runtime settings version broadcast。 |
-| `qdrant` | `course-kg-qdrant` | Chunk 向量派生索引。 |
+## 主链路
 
 ```mermaid
 flowchart TB
@@ -36,9 +37,19 @@ flowchart TB
     W["course-kg-worker"] --> R
     W --> PG
     W --> Q
+    API --> M["OpenAI-compatible models"]
+    W --> M
 ```
 
-## 关键环境
+## 环境配置
+
+首次启动前创建 `.env`：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+关键模型配置：
 
 ```env
 OPENAI_API_KEY=...
@@ -61,27 +72,59 @@ REDIS_URL=redis://redis:6379/0
 DATA_ROOT=/app/data
 ```
 
-## 常用命令
+## 快速启动
+
+启动完整栈：
+
+```powershell
+docker compose -f infra/docker-compose.yml up -d --build
+```
+
+查看服务：
 
 ```powershell
 docker compose -f infra/docker-compose.yml ps
-docker compose -f infra/docker-compose.yml logs -f api
-docker compose -f infra/docker-compose.yml logs -f worker
-docker compose -f infra/docker-compose.yml restart api worker
-docker compose -f infra/docker-compose.yml down
 ```
 
-## 健康检查
+## 参数列表
+
+| 分类 | 参数 |
+| --- | --- |
+| 镜像与端口 | `API_IMAGE`, `WEB_IMAGE`, `API_HOST_PORT`, `WEB_HOST_PORT` |
+| 数据服务 | `DATABASE_URL`, `QDRANT_URL`, `QDRANT_COLLECTION`, `REDIS_URL` |
+| 数据目录 | `DATA_ROOT`, `STORAGE_ROOT`, `INGESTION_ROOT` |
+| 模型 | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT`, `CHAT_*`, `EMBEDDING_*` |
+| Worker | `WORKER_CONCURRENCY`, `INGESTION_TASK_QUEUE` |
+| Fallback | `ENABLE_MODEL_FALLBACK`, `ENABLE_DATABASE_FALLBACK` |
+
+## 验证
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health
 Invoke-WebRequest -UseBasicParsing http://127.0.0.1:3000
+docker exec -w /app/apps/api course-kg-api python -m pytest tests
+```
+
+## 运维测试
+
+```powershell
+docker compose -f infra/docker-compose.yml logs -f api
+docker compose -f infra/docker-compose.yml logs -f worker
+docker compose -f infra/docker-compose.yml restart api worker
 python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --worker-container course-kg-worker
 ```
 
+## 文档
+
+- [../README.md](../README.md)：仓库总览。
+- [../apps/api/README.md](../apps/api/README.md)：API 后端。
+- [../apps/worker/README.md](../apps/worker/README.md)：Worker。
+- [../scripts/README.md](../scripts/README.md)：运维脚本。
+
 ## 边界
 
-- 涉及 PostgreSQL、Qdrant、Redis、模型接口和无 fallback 的集成路径在 Docker 栈内运行。
 - 不绕过 Docker 直接修改生产形态 PostgreSQL、Redis 或 Qdrant。
-- `experiment` profile 不属于默认运行路径。
+- Compose 默认服务名保持 `course-kg-*`。
+- API 容器工作目录是 `/app/apps/api`，脚本挂载到 `/app/scripts`，数据目录挂载到 `/app/data`。
 - 日志、smoke 输出和临时报告写入仓库根目录 `output/`。
+- 改动端口、镜像依赖、Celery pool/fork 规模等需要 service recreate 或 rebuild。

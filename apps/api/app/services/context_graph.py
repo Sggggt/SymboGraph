@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import math
 import re
 from collections import Counter, defaultdict
@@ -40,6 +41,7 @@ from app.models import (
     FineClusterEdge,
     FineClusterMembership,
     GraphRetrievalStep,
+    IngestionCompensationLog,
     KnowledgeBase,
     MidConcept,
     MidConceptDefinition,
@@ -61,7 +63,9 @@ from app.services.chunking import (
     rough_token_count,
     stable_hash,
 )
-from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded_mode
+from app.services.cancellation import ensure_not_cancelled
+from app.services.embeddings import ChatProvider, EmbeddingProvider, FallbackDisabledError, is_degraded_mode
+from app.services.model_output import coerce_confidence
 from app.services.parsers import ParsedSection
 from app.services.vector_store import VectorStore
 
@@ -71,6 +75,9 @@ MID_CONCEPT_PROMPT_VERSION = "mid_concept_definition_v1"
 COARSE_CONCEPT_PROMPT_VERSION = "coarse_concept_definition_v1"
 CONTEXT_GRAPH_PROTOCOL_VERSION = "context_graph_v1"
 ANSWER_PROMPT_PROTOCOL_VERSION = "context_graph_answer_v1"
+EDGE_DISTANCE_PROTOCOL_VERSION = "edge_distance_log_raw_strength_v1"
+EDGE_PROJECTION_PROTOCOL_VERSION = "edge_projection_support_ids_v1"
+TRAVERSAL_PROTOCOL_VERSION = "priority_queue_layered_traversal_v1"
 
 
 def runtime_settings_snapshot() -> dict[str, Any]:
@@ -88,14 +95,23 @@ def runtime_settings_state_hash() -> str:
 def agent_operating_envelope(settings: Any | None = None) -> dict[str, Any]:
     settings = settings or get_settings()
     return {
-        "coarse_activation_budget": int(settings.agent_coarse_activation_budget),
+        "coarse_entry_budget": int(settings.agent_coarse_entry_budget),
         "coarse_jump_budget": int(settings.agent_coarse_jump_budget),
-        "mid_activation_budget": int(settings.agent_mid_activation_budget),
+        "mid_entry_budget": int(settings.agent_mid_entry_budget),
         "mid_expansion_radius_cap": int(settings.agent_mid_expansion_radius_cap),
-        "fine_cluster_budget": int(settings.agent_fine_cluster_budget),
+        "fine_entry_budget": int(settings.agent_fine_entry_budget),
+        "frontier_expansion_budget": int(settings.agent_frontier_expansion_budget),
+        "max_depth_per_layer": int(settings.agent_max_depth_per_layer),
+        "max_labels_per_node": int(settings.agent_max_labels_per_node),
+        "max_edge_reuse": int(settings.agent_max_edge_reuse),
+        "max_cycle_reward_per_path": float(settings.agent_max_cycle_reward_per_path),
+        "ambiguous_edge_distance_low": float(settings.agent_ambiguous_edge_distance_low),
+        "ambiguous_edge_distance_high": float(settings.agent_ambiguous_edge_distance_high),
+        "drilldown_budget_per_layer": int(settings.agent_drilldown_budget_per_layer),
         "chunk_candidate_budget": int(settings.agent_chunk_candidate_budget),
         "structure_restore_budget": int(settings.agent_structure_restore_budget),
         "context_package_token_budget": int(settings.context_package_token_budget),
+        "context_path_summary_budget": int(settings.context_path_summary_budget),
         "planning_round_budget": int(settings.agent_planning_round_budget),
         "max_typed_actions_per_round": int(settings.agent_max_typed_actions_per_round),
         "repair_round_budget": int(settings.agent_repair_round_budget),
@@ -104,11 +120,12 @@ def agent_operating_envelope(settings: Any | None = None) -> dict[str, Any]:
             "dense_knn",
             "bm25_overlap",
             "structure_adjacent",
-            "same_section",
-            "same_page_region",
-            "co_retrieved",
-            "fine_cluster_bridge",
-            "centroid_near",
+        "same_section",
+        "same_page_region",
+        "same_table_formula_context",
+        "co_retrieved",
+        "fine_cluster_bridge",
+        "centroid_near",
             "rq_hierarchy_near",
             "rq_prefix_sibling",
             "rq_residual_near",
@@ -139,6 +156,80 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     left_norm = math.sqrt(sum(float(a) * float(a) for a in left)) or 1.0
     right_norm = math.sqrt(sum(float(b) * float(b) for b in right)) or 1.0
     return numerator / (left_norm * right_norm)
+
+
+def normalized_strength(value: float) -> float:
+    return round(max(1e-6, min(1.0, float(value))), 6)
+
+
+def distance_from_strength(raw_strength: float) -> float:
+    return round(-math.log(max(1e-6, normalized_strength(raw_strength))), 6)
+
+
+def edge_distance_protocol_hash() -> str:
+    return stable_hash({"protocol": EDGE_DISTANCE_PROTOCOL_VERSION, "formula": "distance=-log(max(epsilon,raw_strength))"})
+
+
+def edge_projection_protocol_hash() -> str:
+    return stable_hash({"protocol": EDGE_PROJECTION_PROTOCOL_VERSION, "support": ["chunk_edges", "fine_edges", "mid_edges"]})
+
+
+def traversal_protocol_hash() -> str:
+    return stable_hash({"protocol": TRAVERSAL_PROTOCOL_VERSION, "queue_key": ["uncovered_facets", "distance_minus_reward", "depth", "negative_evidence_roles"]})
+
+
+def context_graph_cache_key_components(
+    *,
+    knowledge_base_id: str,
+    query: str,
+    filters: SearchFilters | dict[str, Any] | None,
+    context_state: ContextGraphState | None,
+    retrieval_mode: str,
+    conversation_state_scope_hash: str | None = None,
+) -> dict[str, Any]:
+    filter_payload = filters.model_dump() if isinstance(filters, SearchFilters) else dict(filters or {})
+    return {
+        "knowledge_base_id": knowledge_base_id,
+        "query": query,
+        "filters": filter_payload,
+        "embedding_text_version": CURRENT_EMBEDDING_TEXT_VERSION,
+        "chunk_scope_hash": context_state.chunk_scope_hash if context_state else None,
+        "structure_graph_hash": context_state.structure_graph_hash if context_state else None,
+        "chunk_relation_graph_hash": context_state.chunk_relation_graph_hash if context_state else None,
+        "fine_cluster_hash": context_state.fine_cluster_hash if context_state else None,
+        "mid_concept_hash": context_state.mid_concept_hash if context_state else None,
+        "coarse_concept_hash": context_state.coarse_concept_hash if context_state else None,
+        "edge_distance_protocol_hash": edge_distance_protocol_hash(),
+        "edge_projection_protocol_hash": edge_projection_protocol_hash(),
+        "traversal_protocol_hash": traversal_protocol_hash(),
+        "runtime_settings_hash": runtime_settings_state_hash(),
+        "policy_state_hash": context_state.policy_state_hash if context_state else None,
+        "agent_operating_envelope_hash": agent_operating_envelope_state_hash(),
+        "conversation_state_scope_hash": conversation_state_scope_hash or stable_hash({"conversation_state": "none"}),
+        "prompt_protocol_hash": context_state.prompt_protocol_hash if context_state else None,
+        "retrieval_mode": retrieval_mode,
+    }
+
+
+def context_graph_cache_key(
+    *,
+    knowledge_base_id: str,
+    query: str,
+    filters: SearchFilters | dict[str, Any] | None,
+    context_state: ContextGraphState | None,
+    retrieval_mode: str,
+    conversation_state_scope_hash: str | None = None,
+) -> str:
+    return stable_hash(
+        context_graph_cache_key_components(
+            knowledge_base_id=knowledge_base_id,
+            query=query,
+            filters=filters,
+            context_state=context_state,
+            retrieval_mode=retrieval_mode,
+            conversation_state_scope_hash=conversation_state_scope_hash,
+        )
+    )
 
 
 def active_chunks_query(knowledge_base_id: str):
@@ -347,6 +438,60 @@ def write_structure_graph(
     version: DocumentVersion,
     prepared: PreparedDocument,
 ) -> list[ChunkStructureNode]:
+    def add_node(
+        *,
+        node_type: str,
+        parent_id: str | None,
+        depth: int,
+        title: str | None,
+        char_start: int | None,
+        char_end: int | None,
+        page_number: int | None,
+        path: str | None,
+        bbox: dict[str, Any] | None = None,
+        layout: dict[str, Any] | None = None,
+        previous_sibling_id: str | None = None,
+    ) -> ChunkStructureNode:
+        node = ChunkStructureNode(
+            knowledge_base_id=knowledge_base.id,
+            document_id=document.id,
+            document_version_id=version.id,
+            node_type=node_type,
+            parent_id=parent_id,
+            previous_sibling_id=previous_sibling_id,
+            depth=depth,
+            title=title,
+            char_start=char_start,
+            char_end=char_end,
+            page_number=page_number,
+            bbox_json=bbox or {},
+            path=path,
+            layout_json=layout or {},
+        )
+        db.add(node)
+        db.flush()
+        return node
+
+    def add_edge(
+        source: ChunkStructureNode,
+        target: ChunkStructureNode,
+        edge_type: str,
+        *,
+        weight: float = 1.0,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        db.add(
+            ChunkStructureEdge(
+                knowledge_base_id=knowledge_base.id,
+                document_version_id=version.id,
+                source_node_id=source.id,
+                target_node_id=target.id,
+                edge_type=edge_type,
+                weight=weight,
+                metadata_json=metadata or {},
+            )
+        )
+
     document_node = ChunkStructureNode(
         knowledge_base_id=knowledge_base.id,
         document_id=document.id,
@@ -362,60 +507,113 @@ def write_structure_graph(
     db.add(document_node)
     db.flush()
     nodes = [document_node]
+    section_items = [item for item in prepared.section_offsets if int(item.get("char_end") or 0) > int(item.get("char_start") or 0)]
+    page_groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for item in section_items:
+        page_number = item.get("page_number")
+        page_groups[int(page_number) if page_number is not None else 1].append(item)
+    page_nodes: dict[int, ChunkStructureNode] = {}
+    for page_number, items in sorted(page_groups.items()):
+        synthetic_page = all(item.get("page_number") is None for item in items)
+        char_start = min(int(item["char_start"]) for item in items)
+        char_end = max(int(item["char_end"]) for item in items)
+        page_node = add_node(
+            node_type="page",
+            parent_id=document_node.id,
+            depth=1,
+            title=f"Page {page_number}" if not synthetic_page else "Source text page",
+            char_start=char_start,
+            char_end=char_end,
+            page_number=None if synthetic_page else page_number,
+            path=f"{document.title} / page:{page_number}",
+            bbox=_normalized_bbox(page_number=page_number, region_index=0, region_count=1),
+            layout={"synthetic_page": synthetic_page, "source": "parser_page_number_or_text_fallback"},
+        )
+        add_edge(document_node, page_node, "parent_child", metadata={"node_type": "page", "synthetic_page": synthetic_page})
+        nodes.append(page_node)
+        page_nodes[page_number] = page_node
+
     previous_section: ChunkStructureNode | None = None
-    for item in prepared.section_offsets:
-        section_node = ChunkStructureNode(
-            knowledge_base_id=knowledge_base.id,
-            document_id=document.id,
-            document_version_id=version.id,
+    previous_block_by_section: ChunkStructureNode | None = None
+    sections_by_page: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for item in section_items:
+        page_number = item.get("page_number")
+        sections_by_page[int(page_number) if page_number is not None else 1].append(item)
+    for item in section_items:
+        item_page_number = item.get("page_number")
+        page_key = int(item_page_number) if item_page_number is not None else 1
+        page_node = page_nodes[page_key]
+        page_sections = sections_by_page[page_key]
+        region_index = max(0, page_sections.index(item))
+        region_node = add_node(
+            node_type="region",
+            parent_id=page_node.id,
+            depth=2,
+            title=str(item.get("section_path") or item.get("title") or "Region"),
+            char_start=int(item["char_start"]),
+            char_end=int(item["char_end"]),
+            page_number=item_page_number,
+            path=f"{page_node.path} / region:{region_index + 1}",
+            bbox=_normalized_bbox(page_number=page_key, region_index=region_index, region_count=max(len(page_sections), 1)),
+            layout={"region_index": region_index, "region_count": len(page_sections), "source": "section_span_projection"},
+        )
+        add_edge(page_node, region_node, "parent_child", metadata={"node_type": "region"})
+        nodes.append(region_node)
+        section_node = add_node(
             node_type="section",
             parent_id=document_node.id,
             previous_sibling_id=previous_section.id if previous_section else None,
-            depth=1,
+            depth=2,
             title=str(item.get("section_path") or item.get("title") or document.title),
             char_start=int(item["char_start"]),
             char_end=int(item["char_end"]),
             page_number=item.get("page_number"),
             path=f"{document.title} / {item.get('section_path') or item.get('title')}",
-            layout_json=item.get("metadata") or {},
+            layout=item.get("metadata") or {},
         )
-        db.add(section_node)
-        db.flush()
         if previous_section is not None:
             previous_section.next_sibling_id = section_node.id
-            db.add(
-                ChunkStructureEdge(
-                    knowledge_base_id=knowledge_base.id,
-                    document_version_id=version.id,
-                    source_node_id=previous_section.id,
-                    target_node_id=section_node.id,
-                    edge_type="prev_next",
-                    weight=1.0,
-                )
-            )
-        db.add(
-            ChunkStructureEdge(
-                knowledge_base_id=knowledge_base.id,
-                document_version_id=version.id,
-                source_node_id=document_node.id,
-                target_node_id=section_node.id,
-                edge_type="parent_child",
-                weight=1.0,
-            )
-        )
-        if item.get("page_number") is not None:
-            db.add(
-                ChunkStructureEdge(
-                    knowledge_base_id=knowledge_base.id,
-                    document_version_id=version.id,
-                    source_node_id=section_node.id,
-                    target_node_id=section_node.id,
-                    edge_type="same_page",
-                    weight=1.0,
-                    metadata_json={"page_number": item.get("page_number")},
-                )
-            )
+            add_edge(previous_section, section_node, "prev_next")
+        add_edge(document_node, section_node, "parent_child", metadata={"node_type": "section"})
+        add_edge(region_node, section_node, "contains_section", metadata={"page_number": item.get("page_number")})
+        add_edge(section_node, region_node, "located_in_region", metadata={"page_number": item.get("page_number")})
         nodes.append(section_node)
+        section_text = prepared.text[int(item["char_start"]) : int(item["char_end"])]
+        block_nodes: list[ChunkStructureNode] = []
+        previous_block_by_section = None
+        for block_index, block in enumerate(_structure_blocks_for_section(section_text, base_offset=int(item["char_start"]), metadata=item.get("metadata") or {})):
+            block_node = add_node(
+                node_type=block["node_type"],
+                parent_id=section_node.id,
+                depth=3,
+                title=block["title"],
+                char_start=block["char_start"],
+                char_end=block["char_end"],
+                page_number=item.get("page_number"),
+                path=f"{section_node.path} / {block['node_type']}:{block_index + 1}",
+                bbox=_normalized_bbox(page_number=page_key, region_index=region_index, region_count=max(len(page_sections), 1), block_index=block_index, block_count=8),
+                layout={
+                    "source": block["source"],
+                    "section_index": item.get("index"),
+                    "block_index": block_index,
+                    "content_flags": block.get("content_flags") or [],
+                },
+                previous_sibling_id=previous_block_by_section.id if previous_block_by_section else None,
+            )
+            if previous_block_by_section is not None:
+                previous_block_by_section.next_sibling_id = block_node.id
+                add_edge(previous_block_by_section, block_node, "prev_next", metadata={"scope": "section_blocks"})
+            add_edge(section_node, block_node, "parent_child", metadata={"node_type": block["node_type"]})
+            add_edge(region_node, block_node, "contains_block", metadata={"node_type": block["node_type"]})
+            if block["node_type"] in {"table", "formula", "caption", "code_block"}:
+                add_edge(page_node, block_node, "same_page_region", metadata={"node_type": block["node_type"]})
+            nodes.append(block_node)
+            block_nodes.append(block_node)
+            previous_block_by_section = block_node
+        special_nodes = [node for node in block_nodes if node.node_type in {"table", "formula", "caption"}]
+        for left_index, left in enumerate(special_nodes):
+            for right in special_nodes[left_index + 1 : left_index + 4]:
+                add_edge(left, right, "table_formula_context", weight=0.92, metadata={"section_node_id": section_node.id})
         previous_section = section_node
     return nodes
 
@@ -436,9 +634,134 @@ def write_structure_mappings_for_chunk(db: Session, *, chunk: Chunk, nodes: list
                 overlap_chars=overlap,
                 overlap_tokens=max(0, round(((chunk.token_end - chunk.token_start) or 0) * (overlap / denominator))),
                 coverage_ratio=round(overlap / denominator, 6),
-                mapping_role="parent" if node.node_type == "document" else "overlap",
+                mapping_role=_structure_mapping_role(node.node_type),
             )
         )
+
+
+def _normalized_bbox(
+    *,
+    page_number: int | None,
+    region_index: int,
+    region_count: int,
+    block_index: int | None = None,
+    block_count: int | None = None,
+) -> dict[str, Any]:
+    y0 = region_index / max(region_count, 1)
+    y1 = (region_index + 1) / max(region_count, 1)
+    if block_index is not None and block_count:
+        block_height = (y1 - y0) / max(block_count, 1)
+        y0 = min(0.98, y0 + block_height * min(block_index, block_count - 1))
+        y1 = min(1.0, y0 + block_height)
+    return {
+        "page_number": page_number,
+        "x0": 0.0,
+        "y0": round(y0, 6),
+        "x1": 1.0,
+        "y1": round(max(y1, y0 + 0.01), 6),
+        "coordinate_system": "normalized_page_region_v1",
+        "synthetic": True,
+    }
+
+
+def _structure_mapping_role(node_type: str) -> str:
+    return {
+        "document": "document",
+        "section": "parent_section",
+        "page": "page",
+        "region": "region",
+        "paragraph": "paragraph",
+        "list": "list_context",
+        "table": "table_formula_context",
+        "formula": "table_formula_context",
+        "caption": "caption_context",
+        "code_block": "code_context",
+    }.get(node_type, "overlap")
+
+
+def _structure_blocks_for_section(text: str, *, base_offset: int, metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+
+    def add(node_type: str, start: int, end: int, source: str, sample: str) -> None:
+        if end <= start:
+            return
+        title = re.sub(r"\s+", " ", sample or "").strip()[:96] or node_type
+        candidates.append(
+            {
+                "node_type": node_type,
+                "char_start": base_offset + start,
+                "char_end": base_offset + end,
+                "title": title,
+                "source": source,
+                "content_flags": sorted(_content_flags_for_text(sample)),
+            }
+        )
+
+    for match in re.finditer(r"```.*?```", text or "", flags=re.DOTALL):
+        add("code_block", match.start(), match.end(), "fenced_code", match.group(0))
+    for match in re.finditer(r"(?m)^(?:\s*(?:from\s+\S+\s+import|import\s+\S+|def\s+\w+\(|class\s+\w+\(|print\(|[A-Za-z_][\w_]*\s*=).*(?:\n|$)){2,}", text or ""):
+        add("code_block", match.start(), match.end(), "code_line_heuristic", match.group(0))
+    for match in re.finditer(r"\$\$.*?\$\$", text or "", flags=re.DOTALL):
+        add("formula", match.start(), match.end(), "display_math", match.group(0))
+    for match in re.finditer(r"(?m)^\s*(?:[A-Za-z][\w\s()]*\s*[=:]\s*[^:\n]{0,180}(?:\\frac|\\sum|\\prod|P\(|\^|_[A-Za-z0-9]|\d+\s*[+\-*/=]\s*\d+).*)$", text or ""):
+        add("formula", match.start(), match.end(), "formula_line_heuristic", match.group(0))
+    for match in re.finditer(r"(?m)^(?:\|.*\|\s*\n?){2,}", text or ""):
+        add("table", match.start(), match.end(), "markdown_table", match.group(0))
+    for match in re.finditer(r"(?m)^(?:[^\n\t]+\t[^\n]+\n?){2,}", text or ""):
+        add("table", match.start(), match.end(), "tabular_text", match.group(0))
+    for match in re.finditer(r"(?im)^\s*(?:figure|fig\.|table|caption|\u56fe|\u8868)\s*[:\d\uff1a.-].+$", text or ""):
+        add("caption", match.start(), match.end(), "caption_line", match.group(0))
+    for match in re.finditer(r"(?m)^(?:\s*(?:[-*+]|\d+[.)])\s+.+(?:\n|$)){1,}", text or ""):
+        add("list", match.start(), match.end(), "list_line_group", match.group(0))
+    for match in re.finditer(r"(?s)(?:^|\n{2,})([^\n].*?)(?=\n{2,}|$)", text or ""):
+        start, end = match.start(1), match.end(1)
+        paragraph = text[start:end]
+        if paragraph.strip():
+            add("paragraph", start, end, "paragraph_split", paragraph)
+
+    if metadata.get("has_table"):
+        add("table", 0, len(text or ""), "parser_metadata_table", text or "")
+    if metadata.get("has_formula"):
+        add("formula", 0, len(text or ""), "parser_metadata_formula", text or "")
+    if metadata.get("has_caption"):
+        add("caption", 0, len(text or ""), "parser_metadata_caption", text or "")
+    if metadata.get("content_kind") == "code":
+        add("code_block", 0, len(text or ""), "parser_metadata_code", text or "")
+
+    candidates.sort(key=lambda item: (item["char_start"], item["char_end"], item["node_type"]))
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, int]] = set()
+    for item in candidates:
+        key = (str(item["node_type"]), int(item["char_start"]), int(item["char_end"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped or [
+        {
+            "node_type": "paragraph",
+            "char_start": base_offset,
+            "char_end": base_offset + len(text or ""),
+            "title": re.sub(r"\s+", " ", text or "").strip()[:96] or "paragraph",
+            "source": "section_fallback_paragraph",
+            "content_flags": sorted(_content_flags_for_text(text or "")),
+        }
+    ]
+
+
+def _content_flags_for_text(text: str) -> set[str]:
+    flags: set[str] = set()
+    if re.search(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+", text or ""):
+        flags.add("list")
+    if "|" in (text or "") or "\t" in (text or ""):
+        flags.add("table")
+    if re.search(r"(?:\\frac|\\sum|\\prod|P\(|\^|=|[+\-*/]\s*\d)", text or ""):
+        flags.add("formula")
+    if re.search(r"(?im)^\s*(?:figure|fig\.|table|caption|\u56fe|\u8868)\s*[:\d\uff1a.-]", text or ""):
+        flags.add("caption")
+    if re.search(r"(?m)^\s*(?:from\s+\S+\s+import|import\s+\S+|def\s+\w+\(|class\s+\w+\(|```)", text or ""):
+        flags.add("code")
+    return flags
 
 
 async def write_contextual_indexes(
@@ -519,7 +842,27 @@ async def write_contextual_indexes(
         vector_records.append(record)
         points.append({"id": chunk.id, "vector": vector, "payload": payload})
     db.flush()
-    await VectorStore(knowledge_base_name=knowledge_base.name, collection_name=collection_name).async_upsert(points)
+    try:
+        await VectorStore(knowledge_base_name=knowledge_base.name, collection_name=collection_name).async_upsert(points)
+    except Exception as exc:
+        db.add(
+            IngestionCompensationLog(
+                job_id=None,
+                knowledge_base_id=knowledge_base.id,
+                operation="qdrant_upsert",
+                target_ids_json=[point["id"] for point in points],
+                payload_json={
+                    "collection_name": collection_name,
+                    "embedding_model": settings.embedding_model,
+                    "embedding_text_version": CURRENT_EMBEDDING_TEXT_VERSION,
+                    "chunk_schema_version": CHUNK_SCHEMA_VERSION,
+                },
+                status="failed",
+                error_message=f"{type(exc).__name__}: {exc}",
+            )
+        )
+        db.flush()
+        raise
     for record in vector_records:
         record.vector_status = "ready"
 
@@ -561,7 +904,7 @@ async def rebuild_context_graph(db: Session, knowledge_base_id: str, *, batch_id
     context_graph_batch_heartbeat(batch_id, "starting", {"chunks": len(chunks)})
     deactivate_derived_states(db, knowledge_base_id)
     context_graph_batch_heartbeat(batch_id, "chunk_relation", {"chunks": len(chunks)})
-    relation_state = build_chunk_relation_graph(db, knowledge_base_id, chunks)
+    relation_state = build_chunk_relation_graph(db, knowledge_base_id, chunks, batch_id=batch_id)
     context_graph_batch_heartbeat(batch_id, "mid_concepts", dict(relation_state.stats_json or {}))
     mid_state = await build_mid_concept_graph(db, knowledge_base_id, relation_state, batch_id=batch_id)
     context_graph_batch_heartbeat(batch_id, "coarse_concepts", dict(mid_state.diagnostics_json or {}))
@@ -595,7 +938,7 @@ def context_graph_batch_heartbeat(batch_id: str | None, phase: str, metrics: dic
         session.commit()
 
 
-def build_chunk_relation_graph(db: Session, knowledge_base_id: str, chunks: list[Chunk]) -> ChunkRelationGraphState:
+def build_chunk_relation_graph(db: Session, knowledge_base_id: str, chunks: list[Chunk], *, batch_id: str | None = None) -> ChunkRelationGraphState:
     scope_hash = compute_chunk_scope_hash(chunks)
     vectors = {chunk.id: vector_for_chunk(db, chunk.id) for chunk in chunks}
     graph_state = ChunkRelationGraphState(
@@ -614,9 +957,16 @@ def build_chunk_relation_graph(db: Session, knowledge_base_id: str, chunks: list
     db.flush()
 
     edges: dict[tuple[str, str, str], ChunkRelationEdge] = {}
+    ensure_not_cancelled(db, batch_id)
+    context_graph_batch_heartbeat(batch_id, "chunk_relation:chunk_edges", {"chunks": len(chunks)})
     add_relation_edges(db, graph_state, chunks, vectors, edges)
+    ensure_not_cancelled(db, batch_id)
+    context_graph_batch_heartbeat(batch_id, "chunk_relation:fine_clusters", {"chunk_edges": len(edges)})
     clusters = build_fine_clusters(db, graph_state, chunks, vectors, edges)
-    build_fine_cluster_edges(db, graph_state, clusters)
+    ensure_not_cancelled(db, batch_id)
+    context_graph_batch_heartbeat(batch_id, "chunk_relation:fine_edges", {"fine_clusters": len(clusters), "chunk_edges": len(edges)})
+    build_fine_cluster_edges(db, graph_state, clusters, edges, batch_id=batch_id)
+    ensure_not_cancelled(db, batch_id)
     stats = relation_graph_stats(chunks, list(edges.values()), clusters)
     graph_state.stats_json = stats
     graph_state.diagnostics_json = {
@@ -662,16 +1012,29 @@ def add_chunk_relation_edge(
         return None
     left, right = sorted([source_chunk_id, target_chunk_id])
     key = (left, right, edge_type)
-    normalized_weight = round(float(weight), 6)
+    raw_strength = normalized_strength(weight)
+    distance = distance_from_strength(raw_strength)
     if key in edges:
         edge = edges[key]
-        edge.weight = max(edge.weight, normalized_weight)
-        edge.confidence = max(edge.confidence, max(0.0, min(1.0, normalized_weight)))
+        edge.raw_strength = max(edge.raw_strength, raw_strength)
+        edge.distance = distance_from_strength(edge.raw_strength)
+        edge.weight = edge.raw_strength
+        edge.confidence = max(edge.confidence, edge.raw_strength)
         edge.is_bridge = edge.is_bridge or is_bridge
         edge.features_json = {**(edge.features_json or {}), **(features or {})}
+        edge.raw_strength_summary_json = {
+            "max_raw_strength": edge.raw_strength,
+            "distance": edge.distance,
+            "edge_distance_protocol": EDGE_DISTANCE_PROTOCOL_VERSION,
+        }
         edge.protocol_version = graph_state.relation_protocol_version
         edge.source_algorithm = relation_edge_source_algorithm(edge_type)
         edge.graph_state_hash = graph_state.state_hash
+        edge.diagnostics_json = {
+            **(edge.diagnostics_json or {}),
+            "edge_distance_protocol": EDGE_DISTANCE_PROTOCOL_VERSION,
+            "weight_is_compatibility_copy": True,
+        }
         return edge
     edge = ChunkRelationEdge(
         graph_state_id=graph_state.id,
@@ -679,14 +1042,25 @@ def add_chunk_relation_edge(
         source_chunk_id=left,
         target_chunk_id=right,
         edge_type=edge_type,
-        weight=normalized_weight,
-        confidence=max(0.0, min(1.0, normalized_weight)),
+        weight=raw_strength,
+        distance=distance,
+        raw_strength=raw_strength,
+        raw_strength_summary_json={
+            "max_raw_strength": raw_strength,
+            "distance": distance,
+            "edge_distance_protocol": EDGE_DISTANCE_PROTOCOL_VERSION,
+        },
+        confidence=raw_strength,
         features_json=features or {},
         support_json={"source": edge_type},
         source_algorithm=relation_edge_source_algorithm(edge_type),
         protocol_version=graph_state.relation_protocol_version,
         graph_state_hash=graph_state.state_hash,
         is_bridge=is_bridge,
+        diagnostics_json={
+            "edge_distance_protocol": EDGE_DISTANCE_PROTOCOL_VERSION,
+            "weight_is_compatibility_copy": True,
+        },
     )
     db.add(edge)
     edges[key] = edge
@@ -725,11 +1099,14 @@ def add_relation_edges(
     for group in by_page.values():
         for left, right in _sliding_pairs(group, max_pairs=8):
             add(left, right, "same_page_region", 0.68)
+    add_same_table_formula_context_edges(db, graph_state, chunks, edges)
 
     bm25_records = {record.chunk_id: record for record in db.scalars(select(BM25Record).where(BM25Record.knowledge_base_id == graph_state.knowledge_base_id)).all()}
     for i, left in enumerate(chunks):
         dense_scores: list[tuple[float, Chunk]] = []
         lexical_scores: list[tuple[float, Chunk]] = []
+        dense_by_chunk: dict[str, float] = {}
+        lexical_by_chunk: dict[str, float] = {}
         left_vector = vectors.get(left.id) or []
         left_terms = set((bm25_records.get(left.id).term_frequencies_json or {}).keys()) if bm25_records.get(left.id) else set()
         for right in chunks[i + 1 :]:
@@ -737,17 +1114,138 @@ def add_relation_edges(
             if left_vector and right_vector:
                 dense = cosine_similarity(left_vector, right_vector)
                 dense_scores.append((dense, right))
+                dense_by_chunk[right.id] = dense
             right_terms = set((bm25_records.get(right.id).term_frequencies_json or {}).keys()) if bm25_records.get(right.id) else set()
             if left_terms and right_terms:
                 overlap = len(left_terms.intersection(right_terms)) / max(len(left_terms.union(right_terms)), 1)
                 lexical_scores.append((overlap, right))
+                lexical_by_chunk[right.id] = overlap
         for score, right in sorted(dense_scores, key=lambda item: item[0], reverse=True)[:5]:
             if score > 0.3:
                 add(left, right, "dense_knn", score, {"cosine": round(score, 6)}, is_bridge=(left.section_path != right.section_path and score > 0.52))
         for score, right in sorted(lexical_scores, key=lambda item: item[0], reverse=True)[:5]:
             if score > 0.08:
                 add(left, right, "bm25_overlap", min(1.0, score * 3.0), {"term_jaccard": round(score, 6)}, is_bridge=(left.section_path != right.section_path and score > 0.18))
+        co_retrieved_candidates: list[tuple[float, Chunk, float, float]] = []
+        chunk_by_id = {chunk.id: chunk for chunk in chunks}
+        for right_id in set(dense_by_chunk).intersection(lexical_by_chunk):
+            dense = dense_by_chunk[right_id]
+            lexical = lexical_by_chunk[right_id]
+            if dense <= 0.24 or lexical <= 0.05:
+                continue
+            score = normalized_strength(0.55 * max(0.0, dense) + 0.45 * min(1.0, lexical * 3.0))
+            co_retrieved_candidates.append((score, chunk_by_id[right_id], dense, lexical))
+        for score, right, dense, lexical in sorted(co_retrieved_candidates, key=lambda item: item[0], reverse=True)[:3]:
+            add(
+                left,
+                right,
+                "co_retrieved",
+                score,
+                {
+                    "co_activation_source": "dense_and_bm25_candidate_overlap",
+                    "dense_cosine": round(dense, 6),
+                    "term_jaccard": round(lexical, 6),
+                },
+                is_bridge=(left.section_path != right.section_path and score > 0.35),
+            )
     db.flush()
+    edge_types = {edge.edge_type for edge in edges.values()}
+    missing_reasons = {}
+    if "co_retrieved" not in edge_types:
+        missing_reasons["co_retrieved"] = "No dense+BM25 co-activated chunk pair passed the protocol thresholds."
+    if "same_table_formula_context" not in edge_types:
+        missing_reasons["same_table_formula_context"] = "No shared table/formula/caption/code structure closure spanned multiple chunks."
+    if missing_reasons:
+        graph_state.diagnostics_json = {
+            **(graph_state.diagnostics_json or {}),
+            "missing_target_relation_edge_type_reasons": missing_reasons,
+        }
+
+
+def add_same_table_formula_context_edges(
+    db: Session,
+    graph_state: ChunkRelationGraphState,
+    chunks: list[Chunk],
+    edges: dict[tuple[str, str, str], ChunkRelationEdge],
+) -> None:
+    chunk_by_id = {chunk.id: chunk for chunk in chunks}
+    chunk_ids = set(chunk_by_id)
+    rows = db.execute(
+        select(ChunkStructureMapping, ChunkStructureNode)
+        .join(ChunkStructureNode, ChunkStructureMapping.structure_node_id == ChunkStructureNode.id)
+        .where(
+            ChunkStructureMapping.chunk_id.in_(chunk_ids),
+            ChunkStructureNode.node_type.in_(["table", "formula", "caption", "code_block"]),
+        )
+        .order_by(ChunkStructureNode.node_type.asc(), ChunkStructureMapping.coverage_ratio.desc())
+    ).all()
+    chunks_by_structure_node: dict[str, dict[str, Any]] = defaultdict(lambda: {"node": None, "chunk_ids": []})
+    for mapping, node in rows:
+        chunks_by_structure_node[node.id]["node"] = node
+        if mapping.chunk_id not in chunks_by_structure_node[node.id]["chunk_ids"]:
+            chunks_by_structure_node[node.id]["chunk_ids"].append(mapping.chunk_id)
+
+    def add_edge_for_pair(left: Chunk, right: Chunk, strength: float, features: dict[str, Any]) -> None:
+        add_chunk_relation_edge(
+            db,
+            graph_state,
+            left.id,
+            right.id,
+            "same_table_formula_context",
+            strength,
+            features,
+            edges,
+            is_bridge=left.section_path != right.section_path,
+        )
+
+    for structure_node_id, payload in chunks_by_structure_node.items():
+        node = payload.get("node")
+        mapped_chunks = [chunk_by_id[chunk_id] for chunk_id in payload.get("chunk_ids", []) if chunk_id in chunk_by_id]
+        if len(mapped_chunks) < 2:
+            continue
+        for left, right in _sliding_pairs(mapped_chunks, max_pairs=10):
+            add_edge_for_pair(
+                left,
+                right,
+                0.86,
+                {
+                    "structure_node_id": structure_node_id,
+                    "structure_node_type": getattr(node, "node_type", None),
+                    "closure": "shared_structure_node",
+                },
+            )
+
+    flagged_by_section: dict[str, list[Chunk]] = defaultdict(list)
+    for chunk in chunks:
+        metadata = chunk.metadata_json or {}
+        if metadata.get("has_table") or metadata.get("has_formula") or metadata.get("has_caption") or metadata.get("content_kind") in {"table", "formula", "code"}:
+            flagged_by_section[f"{chunk.document_id}:{chunk.section_path or ''}"].append(chunk)
+    for group in flagged_by_section.values():
+        if len(group) < 2:
+            continue
+        for left, right in _sliding_pairs(group, max_pairs=8):
+            add_edge_for_pair(
+                left,
+                right,
+                0.74,
+                {
+                    "closure": "chunk_metadata_table_formula_context",
+                    "left_flags": chunk_relation_content_flags(left),
+                    "right_flags": chunk_relation_content_flags(right),
+                },
+            )
+
+
+def chunk_relation_content_flags(chunk: Chunk) -> list[str]:
+    metadata = chunk.metadata_json or {}
+    flags = []
+    for key in ("has_table", "has_formula", "has_caption"):
+        if metadata.get(key):
+            flags.append(key)
+    content_kind = metadata.get("content_kind")
+    if content_kind and content_kind != "text":
+        flags.append(f"content_kind:{content_kind}")
+    return flags
 
 
 def _sliding_pairs(chunks: list[Chunk], *, max_pairs: int) -> list[tuple[Chunk, Chunk]]:
@@ -761,6 +1259,85 @@ def _sliding_pairs(chunks: list[Chunk], *, max_pairs: int) -> list[tuple[Chunk, 
     return pairs
 
 
+def support_chunk_edge_ids_for_chunks(chunk_ids: set[str] | list[str], edges: dict[tuple[str, str, str], ChunkRelationEdge]) -> list[str]:
+    chunk_set = set(chunk_ids)
+    return [
+        edge.id
+        for edge in edges.values()
+        if edge.id and (edge.source_chunk_id in chunk_set or edge.target_chunk_id in chunk_set)
+    ]
+
+
+def support_chunk_edge_ids_between(
+    left_chunk_ids: set[str],
+    right_chunk_ids: set[str],
+    edges: dict[tuple[str, str, str], ChunkRelationEdge],
+) -> list[str]:
+    direct = [
+        edge.id
+        for edge in edges.values()
+        if edge.id
+        and (
+            (edge.source_chunk_id in left_chunk_ids and edge.target_chunk_id in right_chunk_ids)
+            or (edge.source_chunk_id in right_chunk_ids and edge.target_chunk_id in left_chunk_ids)
+        )
+    ]
+    if direct:
+        return list(dict.fromkeys(direct))
+    return list(dict.fromkeys(support_chunk_edge_ids_for_chunks(left_chunk_ids | right_chunk_ids, edges)))
+
+
+def fine_community_groups(chunks: list[Chunk], edges: dict[tuple[str, str, str], ChunkRelationEdge]) -> list[tuple[str, list[Chunk], dict[str, Any]]]:
+    chunk_by_id = {chunk.id: chunk for chunk in chunks}
+    try:
+        import networkx as nx
+
+        graph = nx.Graph()
+        for chunk in chunks:
+            graph.add_node(chunk.id)
+        for edge in edges.values():
+            if edge.source_chunk_id not in chunk_by_id or edge.target_chunk_id not in chunk_by_id:
+                continue
+            strength = float(edge.raw_strength or edge.weight or 0.0)
+            if strength <= 0:
+                continue
+            graph.add_edge(edge.source_chunk_id, edge.target_chunk_id, weight=strength, edge_type=edge.edge_type)
+        if graph.number_of_edges() > 0:
+            communities = list(nx.community.greedy_modularity_communities(graph, weight="weight"))
+        else:
+            communities = []
+    except Exception:
+        communities = []
+
+    groups: list[list[Chunk]] = []
+    for community in communities:
+        members = [chunk_by_id[chunk_id] for chunk_id in community if chunk_id in chunk_by_id]
+        if members:
+            groups.append(sorted(members, key=lambda chunk: chunk.chunk_index))
+
+    if not groups:
+        ordered = sorted(chunks, key=lambda chunk: chunk.chunk_index)
+        groups = [ordered[index : index + 4] for index in range(0, len(ordered), 4)]
+
+    labelled: list[tuple[str, list[Chunk], dict[str, Any]]] = []
+    for index, members in enumerate(sorted(groups, key=lambda group: min(chunk.chunk_index for chunk in group))):
+        representative_text = "\n".join(chunk.section_path or chunk.text[:600] for chunk in members[:8])
+        label = concept_label_from_text(representative_text)
+        labelled.append(
+            (
+                label,
+                members,
+                {
+                    "community_index": index,
+                    "community_detection": "chunk_relation_greedy_modularity_v1" if communities else "chunk_relation_sequential_fallback_v1",
+                    "member_count": len(members),
+                    "label_source": "diagnostic_representative_terms",
+                },
+            )
+        )
+    return labelled
+
+
 def build_fine_clusters(
     db: Session,
     graph_state: ChunkRelationGraphState,
@@ -768,17 +1345,22 @@ def build_fine_clusters(
     vectors: dict[str, list[float]],
     edges: dict[tuple[str, str, str], ChunkRelationEdge],
 ) -> list[FineCluster]:
-    by_label: dict[str, list[Chunk]] = defaultdict(list)
-    for chunk in chunks:
-        label = concept_label_from_text(chunk.section_path or chunk.text)
-        by_label[label].append(chunk)
-    if len(by_label) == len(chunks) and len(chunks) > 4:
-        by_label = defaultdict(list)
-        for index, chunk in enumerate(chunks):
-            by_label[f"local cluster {index // 4 + 1}"].append(chunk)
     edge_bridge_chunks = {edge.source_chunk_id for edge in edges.values() if edge.is_bridge} | {edge.target_chunk_id for edge in edges.values() if edge.is_bridge}
+    support_edges_by_chunk: dict[str, list[str]] = defaultdict(list)
+    for edge in edges.values():
+        support_edges_by_chunk[edge.source_chunk_id].append(edge.id)
+        support_edges_by_chunk[edge.target_chunk_id].append(edge.id)
     clusters: list[FineCluster] = []
-    for label, members in sorted(by_label.items(), key=lambda item: item[0]):
+    community_groups = fine_community_groups(chunks, edges)
+    graph_state.diagnostics_json = {
+        **(graph_state.diagnostics_json or {}),
+        "fine_seed_community_detection": {
+            "algorithm": community_groups[0][2]["community_detection"] if community_groups else "none",
+            "community_count": len(community_groups),
+            "label_terms_are_diagnostics_only": True,
+        },
+    }
+    for label, members, community_diagnostics in community_groups:
         member_vectors = [vectors.get(chunk.id) for chunk in members if vectors.get(chunk.id)]
         centroid = _centroid([vector for vector in member_vectors if vector])
         representatives = sorted(members, key=lambda item: len(item.text), reverse=True)[:3]
@@ -787,18 +1369,29 @@ def build_fine_clusters(
             knowledge_base_id=graph_state.knowledge_base_id,
             cluster_key=stable_hash({"label": label, "chunks": [chunk.id for chunk in members]})[:24],
             label=label,
+            node_type="fine_seed",
             centroid_json=centroid,
             representative_chunk_ids_json=[chunk.id for chunk in representatives],
             support_chunk_ids_json=[chunk.id for chunk in members],
             bridge_chunk_ids_json=[chunk.id for chunk in members if chunk.id in edge_bridge_chunks],
-            stats_json={"member_count": len(members)},
+            stats_json={"member_count": len(members), **community_diagnostics},
+            diagnostics_json=community_diagnostics,
         )
         db.add(cluster)
         db.flush()
         clusters.append(cluster)
         for chunk in members:
             own_score = 1.0
-            db.add(FineClusterMembership(fine_cluster_id=cluster.id, chunk_id=chunk.id, membership_score=own_score, membership_reason="section_or_term"))
+            db.add(
+                FineClusterMembership(
+                    fine_cluster_id=cluster.id,
+                    chunk_id=chunk.id,
+                    membership_score=own_score,
+                    membership_role="seed_member",
+                    membership_reason="graph_community_seed",
+                    support_chunk_edge_ids_json=list(dict.fromkeys(support_edges_by_chunk.get(chunk.id, [])))[:16],
+                )
+            )
         for chunk in members:
             if chunk.id in edge_bridge_chunks:
                 for other in clusters:
@@ -809,7 +1402,9 @@ def build_fine_clusters(
                             fine_cluster_id=other.id,
                             chunk_id=chunk.id,
                             membership_score=0.35,
+                            membership_role="bridge_member",
                             membership_reason="bridge_fuzzy_membership",
+                            support_chunk_edge_ids_json=list(dict.fromkeys(support_edges_by_chunk.get(chunk.id, [])))[:16],
                             diagnostics_json={"source_cluster_id": cluster.id},
                         )
                     )
@@ -906,6 +1501,7 @@ def build_rq_kmeans_clusters_and_edges(
             knowledge_base_id=graph_state.knowledge_base_id,
             cluster_key=f"rq:L{level}:{'-'.join(str(item) for item in prefix)}",
             label=f"RQ L{level} {'/'.join(str(item) for item in prefix)}",
+            node_type="rq_prefix",
             centroid_json=prefix_vector,
             rq_level=level,
             rq_path_prefix=list(prefix),
@@ -931,9 +1527,11 @@ def build_rq_kmeans_clusters_and_edges(
                     fine_cluster_id=cluster.id,
                     chunk_id=chunk_id,
                     membership_score=rq_membership_score(float(encoded["residual_norm"]), tau_r=float(rq_config["tau_r"])),
+                    membership_role="rq_prefix_member",
                     membership_reason="rq_prefix" if level < len(encoded["rq_path"]) else "rq_leaf",
                     rq_path=encoded["rq_path"],
                     residual_norm=float(encoded["residual_norm"]),
+                    support_chunk_edge_ids_json=support_chunk_edge_ids_for_chunks({chunk_id}, edges)[:16],
                     diagnostics_json={
                         "residual_vector": encoded["residual_vector"],
                         "reconstructed_vector": encoded["reconstructed_vector"],
@@ -943,8 +1541,9 @@ def build_rq_kmeans_clusters_and_edges(
                 )
             )
 
-    add_rq_cluster_edges(db, graph_state, rq_clusters_by_key, base_clusters, bridge_chunk_ids)
     add_rq_relation_edges(db, graph_state, chunk_by_id, assignments, edges)
+    db.flush()
+    add_rq_cluster_edges(db, graph_state, rq_clusters_by_key, base_clusters, bridge_chunk_ids, edges)
 
 
 def add_rq_cluster_edges(
@@ -953,9 +1552,65 @@ def add_rq_cluster_edges(
     rq_clusters_by_key: dict[tuple[int, tuple[int, ...]], FineCluster],
     base_clusters: list[FineCluster],
     bridge_chunk_ids: set[str],
+    edges: dict[tuple[str, str, str], ChunkRelationEdge],
 ) -> None:
     seen: set[tuple[str, str, str]] = set()
     added_types: set[str] = set()
+
+    def representative_support_chunks(source: FineCluster, target: FineCluster, explicit_support_ids: list[str] | None = None) -> list[str]:
+        support_ids = list(dict.fromkeys(explicit_support_ids or []))
+        if support_ids:
+            return support_ids[:16]
+        source_ids = list(source.support_chunk_ids_json or [])
+        target_ids = list(target.support_chunk_ids_json or [])
+        representatives = []
+        if source_ids:
+            representatives.append(source_ids[0])
+        if target_ids:
+            representatives.append(target_ids[0])
+        for chunk_id in source_ids[1:4] + target_ids[1:4]:
+            if chunk_id not in representatives:
+                representatives.append(chunk_id)
+        return representatives[:16]
+
+    def ensure_support_chunk_edge_ids(
+        source: FineCluster,
+        target: FineCluster,
+        edge_type: str,
+        raw_strength: float,
+        diagnostics: dict[str, Any],
+        support_chunk_ids: list[str],
+    ) -> list[str]:
+        existing = support_chunk_edge_ids_for_chunks(support_chunk_ids, edges)[:32]
+        if existing:
+            return existing
+        left_candidates = [chunk_id for chunk_id in (source.support_chunk_ids_json or []) if chunk_id in support_chunk_ids] or list(source.support_chunk_ids_json or [])
+        right_candidates = [chunk_id for chunk_id in (target.support_chunk_ids_json or []) if chunk_id in support_chunk_ids] or list(target.support_chunk_ids_json or [])
+        if not left_candidates or not right_candidates:
+            return []
+        left_chunk_id = left_candidates[0]
+        right_chunk_id = next((chunk_id for chunk_id in right_candidates if chunk_id != left_chunk_id), right_candidates[0])
+        if left_chunk_id == right_chunk_id:
+            return []
+        chunk_edge_type = "rq_prefix_sibling" if edge_type == "rq_sibling" else "rq_residual_near" if edge_type == "rq_centroid_near" else "rq_hierarchy_near"
+        edge = add_chunk_relation_edge(
+            db,
+            graph_state,
+            left_chunk_id,
+            right_chunk_id,
+            chunk_edge_type,
+            max(0.1, raw_strength * 0.75),
+            {
+                "materialized_for_fine_edge_support": True,
+                "fine_edge_type": edge_type,
+                "edge_projection_protocol": EDGE_PROJECTION_PROTOCOL_VERSION,
+                **diagnostics,
+            },
+            edges,
+            is_bridge=True,
+        )
+        db.flush()
+        return [edge.id] if edge is not None and edge.id else []
 
     def add_edge(source: FineCluster, target: FineCluster, edge_type: str, weight: float, support_ids: list[str], diagnostics: dict[str, Any]) -> None:
         if source.id == target.id:
@@ -965,6 +1620,11 @@ def add_rq_cluster_edges(
         if key in seen:
             return
         seen.add(key)
+        raw_strength = normalized_strength(weight)
+        support_chunk_ids = representative_support_chunks(source, target, support_ids)
+        support_chunk_edge_ids = ensure_support_chunk_edge_ids(source, target, edge_type, raw_strength, diagnostics, support_chunk_ids)
+        if not support_chunk_edge_ids:
+            return
         added_types.add(edge_type)
         db.add(
             FineClusterEdge(
@@ -972,11 +1632,24 @@ def add_rq_cluster_edges(
                 source_cluster_id=left.id,
                 target_cluster_id=right.id,
                 edge_type=edge_type,
-                weight=round(max(0.0, min(1.0, float(weight))), 6),
-                support_chunk_ids_json=list(dict.fromkeys(support_ids))[:16],
+                weight=raw_strength,
+                distance=distance_from_strength(raw_strength),
+                raw_strength=raw_strength,
+                raw_strength_summary_json={
+                    "max_raw_strength": raw_strength,
+                    "edge_distance_protocol": EDGE_DISTANCE_PROTOCOL_VERSION,
+                },
+                features_json=diagnostics,
+                source_algorithm="rq_kmeans",
+                protocol_version=graph_state.relation_protocol_version,
+                support_chunk_ids_json=support_chunk_ids,
+                support_chunk_edge_ids_json=support_chunk_edge_ids,
                 diagnostics_json={
                     "source_algorithm": "rq_kmeans",
                     "protocol_version": graph_state.relation_protocol_version,
+                    "edge_projection_protocol": EDGE_PROJECTION_PROTOCOL_VERSION,
+                    "support_materialized": bool((diagnostics or {}).get("fallback_pair")) or bool((diagnostics or {}).get("materialized_for_fine_edge_support")),
+                    "support_chunk_edge_count": len(support_chunk_edge_ids),
                     **diagnostics,
                 },
             )
@@ -1405,41 +2078,211 @@ def _centroid(vectors: list[list[float]]) -> list[float]:
     return [sum(vector[index] for vector in vectors) / len(vectors) for index in range(width)]
 
 
-def build_fine_cluster_edges(db: Session, graph_state: ChunkRelationGraphState, clusters: list[FineCluster]) -> None:
-    for index, left in enumerate(clusters):
-        for right in clusters[index + 1 :]:
-            left_chunks = set(left.support_chunk_ids_json or [])
-            right_chunks = set(right.support_chunk_ids_json or [])
-            left_bridges = set(left.bridge_chunk_ids_json or [])
-            right_bridges = set(right.bridge_chunk_ids_json or [])
-            bridge = left_bridges.intersection(right_chunks) or right_bridges.intersection(left_chunks)
-            sim = cosine_similarity(left.centroid_json or [], right.centroid_json or [])
-            if bridge or sim > 0.45:
-                db.add(
-                    FineClusterEdge(
-                        graph_state_id=graph_state.id,
-                        source_cluster_id=left.id,
-                        target_cluster_id=right.id,
-                        edge_type="overlap_bridge" if bridge else "centroid_near",
-                        weight=round(max(sim, 0.42 if bridge else 0.0), 6),
-                        support_chunk_ids_json=sorted(bridge),
-                        diagnostics_json={"centroid_similarity": round(sim, 6)},
+def build_fine_cluster_edges(
+    db: Session,
+    graph_state: ChunkRelationGraphState,
+    clusters: list[FineCluster],
+    edges: dict[tuple[str, str, str], ChunkRelationEdge],
+    *,
+    batch_id: str | None = None,
+) -> None:
+    if len(clusters) < 2:
+        return
+
+    support_by_cluster = {cluster.id: set(cluster.support_chunk_ids_json or []) for cluster in clusters}
+    bridge_by_cluster = {cluster.id: set(cluster.bridge_chunk_ids_json or []) for cluster in clusters}
+    support_index: dict[str, set[str]] = defaultdict(set)
+    bridge_index: dict[str, set[str]] = defaultdict(set)
+    incident_edges_by_chunk: dict[str, list[ChunkRelationEdge]] = defaultdict(list)
+    for cluster in clusters:
+        for chunk_id in support_by_cluster[cluster.id]:
+            support_index[chunk_id].add(cluster.id)
+        for chunk_id in bridge_by_cluster[cluster.id]:
+            bridge_index[chunk_id].add(cluster.id)
+    for edge in edges.values():
+        incident_edges_by_chunk[edge.source_chunk_id].append(edge)
+        incident_edges_by_chunk[edge.target_chunk_id].append(edge)
+
+    cluster_by_id = {cluster.id: cluster for cluster in clusters}
+    candidate_pairs: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def pair_key(left_id: str, right_id: str) -> tuple[str, str]:
+        return (left_id, right_id) if left_id <= right_id else (right_id, left_id)
+
+    def merge_candidate(left_id: str, right_id: str, edge_type: str, sim: float, bridge_chunks: set[str] | None = None) -> None:
+        if left_id == right_id:
+            return
+        key = pair_key(left_id, right_id)
+        current = candidate_pairs.get(key)
+        if current is None or sim > float(current.get("sim") or 0.0) or edge_type == "overlap_bridge":
+            candidate_pairs[key] = {
+                "edge_type": edge_type if edge_type == "overlap_bridge" or current is None else current["edge_type"],
+                "sim": max(sim, float((current or {}).get("sim") or 0.0)),
+                "bridge_chunks": sorted((set((current or {}).get("bridge_chunks") or []) | set(bridge_chunks or set()))),
+            }
+
+    for chunk_id, bridge_cluster_ids in bridge_index.items():
+        for left_id in bridge_cluster_ids:
+            for right_id in support_index.get(chunk_id, set()):
+                merge_candidate(left_id, right_id, "overlap_bridge", 0.42, {chunk_id})
+
+    centroid_ids = [cluster.id for cluster in clusters if cluster.centroid_json]
+    if len(centroid_ids) >= 2:
+        try:
+            import numpy as np
+
+            width = min(len(cluster_by_id[cluster_id].centroid_json or []) for cluster_id in centroid_ids)
+            matrix = np.array(
+                [
+                    [float(value) for value in (cluster_by_id[cluster_id].centroid_json or [])[:width]]
+                    for cluster_id in centroid_ids
+                ],
+                dtype=float,
+            )
+            norms = np.linalg.norm(matrix, axis=1)
+            valid = norms > 0
+            matrix[valid] = matrix[valid] / norms[valid, None]
+            similarities = matrix @ matrix.T
+            np.fill_diagonal(similarities, -1.0)
+            neighbor_k = min(12, len(centroid_ids) - 1)
+            for row_index, left_id in enumerate(centroid_ids):
+                if row_index % 100 == 0:
+                    ensure_not_cancelled(db, batch_id)
+                    context_graph_batch_heartbeat(
+                        batch_id,
+                        "chunk_relation:fine_edges",
+                        {"fine_clusters": len(clusters), "candidate_pairs": len(candidate_pairs), "centroid_rows": row_index},
                     )
+                top_indexes = np.argpartition(similarities[row_index], -neighbor_k)[-neighbor_k:]
+                for col_index in top_indexes:
+                    sim = float(similarities[row_index, col_index])
+                    if sim > 0.45:
+                        merge_candidate(left_id, centroid_ids[int(col_index)], "centroid_near", sim)
+        except Exception:
+            for index, left in enumerate(clusters):
+                ensure_not_cancelled(db, batch_id)
+                scored: list[tuple[float, str]] = []
+                for right in clusters[index + 1 :]:
+                    sim = cosine_similarity(left.centroid_json or [], right.centroid_json or [])
+                    if sim > 0.45:
+                        scored.append((sim, right.id))
+                for sim, right_id in sorted(scored, key=lambda item: item[0], reverse=True)[:12]:
+                    merge_candidate(left.id, right_id, "centroid_near", sim)
+
+    def support_edge_ids(left_chunks: set[str], right_chunks: set[str]) -> list[str]:
+        direct: list[str] = []
+        smaller, larger = (left_chunks, right_chunks) if len(left_chunks) <= len(right_chunks) else (right_chunks, left_chunks)
+        for chunk_id in smaller:
+            for edge in incident_edges_by_chunk.get(chunk_id, []):
+                other_id = edge.target_chunk_id if edge.source_chunk_id == chunk_id else edge.source_chunk_id
+                if edge.id and other_id in larger:
+                    direct.append(edge.id)
+        if direct:
+            return list(dict.fromkeys(direct))[:32]
+        incident: list[str] = []
+        for chunk_id in list(left_chunks | right_chunks)[:32]:
+            incident.extend(edge.id for edge in incident_edges_by_chunk.get(chunk_id, []) if edge.id)
+        return list(dict.fromkeys(incident))[:32]
+
+    for index, ((left_id, right_id), candidate) in enumerate(sorted(candidate_pairs.items())):
+        if index % 250 == 0:
+            ensure_not_cancelled(db, batch_id)
+            context_graph_batch_heartbeat(
+                batch_id,
+                "chunk_relation:fine_edges",
+                {"fine_clusters": len(clusters), "candidate_pairs": len(candidate_pairs), "written_pairs": index},
+            )
+        left = cluster_by_id[left_id]
+        right = cluster_by_id[right_id]
+        left_chunks = support_by_cluster[left_id]
+        right_chunks = support_by_cluster[right_id]
+        bridge = set(candidate.get("bridge_chunks") or [])
+        sim = float(candidate.get("sim") or 0.0)
+        raw_strength = normalized_strength(max(sim, 0.42 if bridge else 0.0))
+        support_chunk_edge_ids = support_edge_ids(left_chunks, right_chunks)
+        support_chunk_ids = sorted(bridge) or sorted((left_chunks | right_chunks))[:16]
+        if not support_chunk_edge_ids and left_chunks and right_chunks:
+            left_rep = sorted(left_chunks)[0]
+            right_rep = next((chunk_id for chunk_id in sorted(right_chunks) if chunk_id != left_rep), sorted(right_chunks)[0])
+            if left_rep != right_rep:
+                support_edge = add_chunk_relation_edge(
+                    db,
+                    graph_state,
+                    left_rep,
+                    right_rep,
+                    "fine_cluster_bridge" if candidate["edge_type"] == "overlap_bridge" else "centroid_near",
+                    max(0.1, raw_strength * 0.72),
+                    {
+                        "materialized_for_fine_edge_support": True,
+                        "fine_edge_type": candidate["edge_type"],
+                        "edge_projection_protocol": EDGE_PROJECTION_PROTOCOL_VERSION,
+                    },
+                    edges,
+                    is_bridge=True,
                 )
+                db.flush()
+                if support_edge is not None and support_edge.id:
+                    support_chunk_edge_ids = [support_edge.id]
+        if not support_chunk_edge_ids:
+            continue
+        db.add(
+            FineClusterEdge(
+                graph_state_id=graph_state.id,
+                source_cluster_id=left.id,
+                target_cluster_id=right.id,
+                edge_type=candidate["edge_type"],
+                weight=raw_strength,
+                distance=distance_from_strength(raw_strength),
+                raw_strength=raw_strength,
+                raw_strength_summary_json={
+                    "max_raw_strength": raw_strength,
+                    "edge_distance_protocol": EDGE_DISTANCE_PROTOCOL_VERSION,
+                },
+                features_json={"centroid_similarity": round(sim, 6), "candidate_generation": "bridge_index_and_centroid_topk_v1"},
+                source_algorithm="fine_graph_projection",
+                protocol_version=graph_state.relation_protocol_version,
+                support_chunk_ids_json=support_chunk_ids,
+                support_chunk_edge_ids_json=support_chunk_edge_ids,
+                diagnostics_json={
+                    "centroid_similarity": round(sim, 6),
+                    "edge_projection_protocol": EDGE_PROJECTION_PROTOCOL_VERSION,
+                    "support_chunk_edge_count": len(support_chunk_edge_ids),
+                    "candidate_generation": "bridge_index_and_centroid_topk_v1",
+                },
+            )
+        )
 
 
 def relation_graph_stats(chunks: list[Chunk], edges: list[ChunkRelationEdge], clusters: list[FineCluster]) -> dict[str, Any]:
     connected = Counter()
+    edge_type_counts = Counter()
+    distances: list[float] = []
     for edge in edges:
         connected[edge.source_chunk_id] += 1
         connected[edge.target_chunk_id] += 1
+        edge_type_counts[edge.edge_type] += 1
+        if edge.distance is not None:
+            distances.append(float(edge.distance))
     orphan_count = sum(1 for chunk in chunks if connected[chunk.id] == 0)
     singleton_count = sum(1 for cluster in clusters if len(cluster.support_chunk_ids_json or []) <= 1)
+    bridge_edges = sum(1 for edge in edges if edge.is_bridge)
     return {
         "chunk_count": len(chunks),
         "edge_count": len(edges),
         "fine_cluster_count": len(clusters),
-        "bridge_edges": sum(1 for edge in edges if edge.is_bridge),
+        "bridge_edges": bridge_edges,
+        "bridge_ratio": round(bridge_edges / max(len(edges), 1), 6),
+        "edge_type_counts": dict(edge_type_counts),
+        "distance_distribution": {
+            "min": round(min(distances), 6) if distances else None,
+            "max": round(max(distances), 6) if distances else None,
+            "mean": round(sum(distances) / len(distances), 6) if distances else None,
+        },
+        "degree_distribution": {
+            "min": min(connected.values()) if connected else 0,
+            "max": max(connected.values()) if connected else 0,
+            "mean": round(sum(connected.values()) / max(len(connected), 1), 6) if connected else 0,
+        },
         "orphan_chunk_rate": round(orphan_count / max(len(chunks), 1), 6),
         "singleton_rate": round(singleton_count / max(len(clusters), 1), 6),
     }
@@ -1510,9 +2353,14 @@ async def build_mid_concept_graph(db: Session, knowledge_base_id: str, relation_
             {"completed_llm_batches": batch_index, "llm_batches": total_batches, "created_mid_concepts": len(concepts)},
         )
     build_mid_concept_edges(db, state, concepts)
+    db.flush()
+    mid_edges = list(db.scalars(select(MidConceptEdge).where(MidConceptEdge.concept_state_id == state.id)).all())
+    supported_mid_edges = sum(1 for edge in mid_edges if edge.support_fine_edge_ids_json)
     stats = {
         "mid_concept_count": len(concepts),
         "grounded_concept_rate": 1.0 if concepts else 0.0,
+        "mid_edge_count": len(mid_edges),
+        "mid_edge_support_fine_edge_coverage": round(supported_mid_edges / max(len(mid_edges), 1), 6) if mid_edges else 1.0,
         "fine_cluster_candidates": len(clusters),
         "selected_fine_clusters": sum(len(batch) for batch in packet_batches),
         "llm_batches": len(packet_batches),
@@ -1524,6 +2372,7 @@ async def build_mid_concept_graph(db: Session, knowledge_base_id: str, relation_
         "max_candidates_per_batch": settings.mid_concept_extraction_max_candidates_per_batch,
         "max_tokens_per_batch": settings.mid_concept_extraction_max_tokens_per_batch,
         "selected_cluster_ids": [cluster.id for batch in packet_batches for cluster, _ in batch],
+        "edge_projection_protocol": EDGE_PROJECTION_PROTOCOL_VERSION,
     }
     state.state_hash = stable_hash({"concepts": [concept.id for concept in concepts], "stats": stats, "diagnostics": state.diagnostics_json})
     return state
@@ -1540,6 +2389,7 @@ def write_mid_concept_from_output(
     support_chunks = [chunk_id for chunk_id in output.get("support_chunk_ids", []) if chunk_id in set(cluster.support_chunk_ids_json or [])]
     if not support_chunks:
         support_chunks = list(cluster.support_chunk_ids_json or [])[:5]
+    confidence, confidence_diagnostics = coerce_confidence(output.get("confidence"), default=0.72)
     concept = MidConcept(
         concept_state_id=state.id,
         knowledge_base_id=knowledge_base_id,
@@ -1552,8 +2402,13 @@ def write_mid_concept_from_output(
         representative_chunk_ids_json=list(output.get("representative_chunk_ids") or cluster.representative_chunk_ids_json or [])[:5],
         support_fine_cluster_ids_json=[cluster.id],
         support_chunk_ids_json=support_chunks,
-        confidence=float(output.get("confidence") or 0.72),
-        llm_audit_json={"prompt_protocol_version": MID_CONCEPT_PROMPT_VERSION, "packet": packet, "raw_output": output},
+        confidence=confidence,
+        llm_audit_json={
+            "prompt_protocol_version": MID_CONCEPT_PROMPT_VERSION,
+            "packet": packet,
+            "raw_output": output,
+            "confidence": confidence_diagnostics,
+        },
         grounding_hash=stable_hash({"cluster": cluster.id, "chunks": support_chunks}),
     )
     db.add(concept)
@@ -1652,9 +2507,25 @@ async def define_mid_concepts_batch(packets: list[dict[str, Any]]) -> list[dict[
     output = await ChatProvider().classify_json(system_prompt=system, user_prompt=str({"concept_packets": packets}), fallback={"concepts": fallback_concepts})
     raw_concepts = output.get("concepts") if isinstance(output, dict) else None
     if not isinstance(raw_concepts, list):
-        return fallback_concepts
+        if get_settings().enable_model_fallback:
+            return fallback_concepts
+        raise RuntimeError("Mid concept provider returned invalid JSON: concepts array is required")
     by_packet = {str(item.get("packet_id")): item for item in raw_concepts if isinstance(item, dict)}
-    return [by_packet.get(str(packet.get("packet_id")), fallback) for packet, fallback in zip(packets, fallback_concepts, strict=False)]
+    concepts: list[dict[str, Any]] = []
+    missing_packet_ids: list[str] = []
+    for packet, fallback in zip(packets, fallback_concepts, strict=False):
+        packet_id = str(packet.get("packet_id"))
+        concept = by_packet.get(packet_id)
+        if concept is None:
+            if get_settings().enable_model_fallback:
+                concept = fallback
+            else:
+                missing_packet_ids.append(packet_id)
+                continue
+        concepts.append(concept)
+    if missing_packet_ids:
+        raise RuntimeError(f"Mid concept provider omitted packet ids: {', '.join(missing_packet_ids[:8])}")
+    return concepts
 
 
 async def define_mid_concept(packet: dict[str, Any]) -> dict[str, Any]:
@@ -1673,9 +2544,34 @@ def concept_packet_for_cluster(db: Session, cluster: FineCluster) -> dict[str, A
     representative_ids = list(dict.fromkeys(list(cluster.representative_chunk_ids_json or []) + residual_outlier_ids))
     chunk_ids = list(representative_ids or cluster.support_chunk_ids_json or [])[:6]
     chunks = list(db.scalars(select(Chunk).where(Chunk.id.in_(chunk_ids))).all()) if chunk_ids else []
+    support_fine_edges = list(
+        db.scalars(
+            select(FineClusterEdge).where(
+                FineClusterEdge.graph_state_id == cluster.graph_state_id,
+                (FineClusterEdge.source_cluster_id == cluster.id) | (FineClusterEdge.target_cluster_id == cluster.id),
+            )
+        ).all()
+    )
+    support_fine_edge_ids = [edge.id for edge in support_fine_edges if edge.support_chunk_edge_ids_json]
+    related_fine_node_ids = list(
+        dict.fromkeys(
+            [
+                edge.target_cluster_id if edge.source_cluster_id == cluster.id else edge.source_cluster_id
+                for edge in support_fine_edges
+            ]
+        )
+    )
+    rq_paths = [
+        row.rq_path
+        for row in membership_rows
+        if row.rq_path
+    ]
     return {
         "packet_id": stable_hash({"cluster": cluster.id, "chunks": chunk_ids})[:16],
-        "fine_cluster_ids": [cluster.id],
+        "support_fine_node_ids": [cluster.id],
+        "support_fine_edge_ids": support_fine_edge_ids[:30],
+        "bridge_fine_node_ids": related_fine_node_ids[:12] if cluster.bridge_chunk_ids_json else [],
+        "boundary_fine_node_ids": related_fine_node_ids[:12],
         "candidate_labels": [cluster.label],
         "representative_chunk_ids": [chunk.id for chunk in chunks],
         "support_chunk_count": len(cluster.support_chunk_ids_json or []),
@@ -1687,7 +2583,9 @@ def concept_packet_for_cluster(db: Session, cluster: FineCluster) -> dict[str, A
             "level": cluster.rq_level,
             "prefix_depth": len(cluster.rq_path_prefix or []),
             "residual_outlier_chunk_ids": residual_outlier_ids,
+            "residual_quantization_coverage": rq_paths[:12],
         },
+        "source_spans": support_spans_for_chunks(db, list(cluster.support_chunk_ids_json or [])[:12]),
         "chunk_excerpts": [
             {
                 "chunk_id": chunk.id,
@@ -1718,28 +2616,70 @@ def support_spans_for_chunks(db: Session, chunk_ids: list[str]) -> list[dict[str
 def build_mid_concept_edges(db: Session, state: MidConceptState, concepts: list[MidConcept]) -> None:
     if len(concepts) < 2:
         return
-    support_by_concept = {concept.id: set(concept.support_chunk_ids_json or []) for concept in concepts}
+    clusters_by_concept = {concept.id: set(concept.support_fine_cluster_ids_json or []) for concept in concepts}
     for index, left in enumerate(concepts):
         for right in concepts[index + 1 :]:
-            left_support = support_by_concept[left.id]
-            right_support = support_by_concept[right.id]
-            shared = left_support.intersection(right_support)
-            lexical = len(set(tokenize_for_bm25(left.definition)).intersection(tokenize_for_bm25(right.definition)))
-            score = min(1.0, (len(shared) * 0.3) + (lexical * 0.05))
-            if score < 0.1:
+            left_clusters = clusters_by_concept[left.id]
+            right_clusters = clusters_by_concept[right.id]
+            fine_edges = list(
+                db.scalars(
+                    select(FineClusterEdge).where(
+                        FineClusterEdge.graph_state_id == state.chunk_relation_graph_state_id,
+                        (
+                            (FineClusterEdge.source_cluster_id.in_(left_clusters) & FineClusterEdge.target_cluster_id.in_(right_clusters))
+                            | (FineClusterEdge.source_cluster_id.in_(right_clusters) & FineClusterEdge.target_cluster_id.in_(left_clusters))
+                        ),
+                    )
+                ).all()
+            )
+            fine_edges = [edge for edge in fine_edges if edge.support_chunk_edge_ids_json]
+            if not fine_edges:
                 continue
+            support_fine_edge_ids = [edge.id for edge in fine_edges]
+            support_chunk_ids = list(
+                dict.fromkeys(
+                    chunk_id
+                    for edge in fine_edges
+                    for chunk_id in (edge.support_chunk_ids_json or [])
+                )
+            )[:24]
+            distances = [float(edge.distance if edge.distance is not None else distance_from_strength(edge.raw_strength or edge.weight)) for edge in fine_edges]
+            raw_strengths = [normalized_strength(float(edge.raw_strength or edge.weight or 0.1)) for edge in fine_edges]
+            raw_strength = max(raw_strengths) if raw_strengths else 0.1
+            distance = min(distances) if distances else distance_from_strength(raw_strength)
             db.add(
                 MidConceptEdge(
                     concept_state_id=state.id,
                     source_concept_id=left.id,
                     target_concept_id=right.id,
-                    edge_type="bridge_to" if not shared else "co_occurs_with",
-                    weight=round(max(score, 0.32), 6),
-                    network_evidence_score=round(max(score, 0.32), 6),
+                    edge_type="fine_edge_projection",
+                    weight=raw_strength,
+                    distance=distance,
+                    raw_strength_summary_json={
+                        "max_raw_strength": raw_strength,
+                        "mean_raw_strength": round(sum(raw_strengths) / max(len(raw_strengths), 1), 6),
+                        "min_distance": distance,
+                        "support_fine_edge_count": len(support_fine_edge_ids),
+                        "edge_distance_protocol": EDGE_DISTANCE_PROTOCOL_VERSION,
+                    },
+                    network_evidence_score=raw_strength,
                     llm_confidence=0.7,
-                    support_chunk_ids_json=sorted(shared) or sorted((left_support | right_support))[:4],
-                    explanation="Concept edge admitted from bottom network evidence and lexical/cluster overlap.",
-                    diagnostics_json={"shared_support_chunks": len(shared), "lexical_overlap_terms": lexical},
+                    support_chunk_ids_json=support_chunk_ids,
+                    support_relation_edge_ids_json=list(
+                        dict.fromkeys(
+                            chunk_edge_id
+                            for edge in fine_edges
+                            for chunk_edge_id in (edge.support_chunk_edge_ids_json or [])
+                        )
+                    )[:40],
+                    support_fine_edge_ids_json=support_fine_edge_ids,
+                    support_fine_node_ids_json=sorted(left_clusters | right_clusters),
+                    explanation="Concept edge admitted from fine-edge projection support; LLM may explain but cannot create it without bottom evidence.",
+                    diagnostics_json={
+                        "edge_projection_protocol": EDGE_PROJECTION_PROTOCOL_VERSION,
+                        "support_fine_edge_count": len(support_fine_edge_ids),
+                        "support_chunk_edge_count": sum(len(edge.support_chunk_edge_ids_json or []) for edge in fine_edges),
+                    },
                 )
             )
 
@@ -1760,9 +2700,25 @@ async def build_coarse_concept_graph(db: Session, knowledge_base_id: str, mid_st
     )
     db.add(state)
     db.flush()
-    communities = coarse_communities(mid_concepts)
+    communities = coarse_communities(mid_concepts, mid_edges)
+    support_mid_edge_ids_by_community: dict[int, list[str]] = {}
     coarse_concepts: list[CoarseConcept] = []
     for index, community in enumerate(communities, start=1):
+        mid_ids = [concept.id for concept in community]
+        mid_id_set = set(mid_ids)
+        support_mid_edges = [
+            edge
+            for edge in mid_edges
+            if edge.source_concept_id in mid_id_set or edge.target_concept_id in mid_id_set
+        ]
+        support_mid_edge_ids_by_community[index] = [edge.id for edge in support_mid_edges]
+        support_chunks = list(
+            dict.fromkeys(
+                chunk_id
+                for concept in community
+                for chunk_id in (concept.support_chunk_ids_json or [])
+            )
+        )[:50]
         packet = {
             "community_id": index,
             "mid_concepts": [
@@ -1775,10 +2731,13 @@ async def build_coarse_concept_graph(db: Session, knowledge_base_id: str, mid_st
                 for concept in community
             ],
             "bridge_concepts": [concept.id for concept in community if len(concept.support_chunk_ids_json or []) > 2],
+            "support_mid_edge_ids": support_mid_edge_ids_by_community[index],
+            "support_chunk_ids": support_chunks,
+            "community_diagnostics": {"candidate_source": "mid_distance_graph_community"},
             "grounding_hash": stable_hash([concept.id for concept in community]),
         }
         output = await define_coarse_concept(packet)
-        mid_ids = [concept.id for concept in community]
+        confidence, confidence_diagnostics = coerce_confidence(output.get("confidence"), default=0.72)
         coarse = CoarseConcept(
             coarse_state_id=state.id,
             knowledge_base_id=knowledge_base_id,
@@ -1789,8 +2748,13 @@ async def build_coarse_concept_graph(db: Session, knowledge_base_id: str, mid_st
             boundary_mid_concept_ids_json=list(output.get("boundary_concepts") or [])[:10],
             bridge_mid_concept_ids_json=list(output.get("bridge_concepts") or packet["bridge_concepts"])[:10],
             cross_community_weak_ties_json=list(output.get("cross_community_weak_ties") or []),
-            confidence=float(output.get("confidence") or 0.72),
-            llm_audit_json={"prompt_protocol_version": COARSE_CONCEPT_PROMPT_VERSION, "packet": packet, "raw_output": output},
+            confidence=confidence,
+            llm_audit_json={
+                "prompt_protocol_version": COARSE_CONCEPT_PROMPT_VERSION,
+                "packet": packet,
+                "raw_output": output,
+                "confidence": confidence_diagnostics,
+            },
             grounding_hash=stable_hash({"community": index, "mid": mid_ids}),
         )
         db.add(coarse)
@@ -1814,28 +2778,103 @@ async def build_coarse_concept_graph(db: Session, knowledge_base_id: str, mid_st
         coarse_concepts.append(coarse)
     for index, left in enumerate(coarse_concepts):
         for right in coarse_concepts[index + 1 :]:
+            left_mid_ids = set(left.included_mid_concept_ids_json or [])
+            right_mid_ids = set(right.included_mid_concept_ids_json or [])
+            projected_mid_edges = [
+                edge
+                for edge in mid_edges
+                if (
+                    edge.source_concept_id in left_mid_ids
+                    and edge.target_concept_id in right_mid_ids
+                )
+                or (
+                    edge.source_concept_id in right_mid_ids
+                    and edge.target_concept_id in left_mid_ids
+                )
+            ]
+            if not projected_mid_edges:
+                continue
+            raw_strengths = [
+                normalized_strength(float((edge.raw_strength_summary_json or {}).get("max_raw_strength") or edge.weight or 0.1))
+                for edge in projected_mid_edges
+            ]
+            distances = [
+                float(edge.distance if edge.distance is not None else distance_from_strength(raw_strengths[idx]))
+                for idx, edge in enumerate(projected_mid_edges)
+            ]
+            raw_strength = max(raw_strengths) if raw_strengths else 0.1
+            distance = min(distances) if distances else distance_from_strength(raw_strength)
+            support_mid_edge_ids = [edge.id for edge in projected_mid_edges]
+            support_fine_edge_ids = list(
+                dict.fromkeys(
+                    fine_edge_id
+                    for edge in projected_mid_edges
+                    for fine_edge_id in (edge.support_fine_edge_ids_json or [])
+                )
+            )
+            support_chunk_ids = list(
+                dict.fromkeys(
+                    chunk_id
+                    for edge in projected_mid_edges
+                    for chunk_id in (edge.support_chunk_ids_json or [])
+                )
+            )
+            weak_ties = [
+                {
+                    "mid_edge_id": edge.id,
+                    "source_mid_concept_id": edge.source_concept_id,
+                    "target_mid_concept_id": edge.target_concept_id,
+                    "distance": edge.distance,
+                    "raw_strength_summary": edge.raw_strength_summary_json or {},
+                }
+                for edge in projected_mid_edges
+            ]
             db.add(
                 CoarseConceptEdge(
                     coarse_state_id=state.id,
                     source_concept_id=left.id,
                     target_concept_id=right.id,
-                    edge_type="bridge_to",
-                    weight=0.35,
-                    support_mid_concept_ids_json=(left.bridge_mid_concept_ids_json or [])[:2] + (right.bridge_mid_concept_ids_json or [])[:2],
-                    explanation="Weak tie retained between coarse communities for multi-hop retrieval.",
+                    edge_type="mid_edge_projection",
+                    weight=raw_strength,
+                    distance=distance,
+                    raw_strength_summary_json={
+                        "max_raw_strength": raw_strength,
+                        "mean_raw_strength": round(sum(raw_strengths) / max(len(raw_strengths), 1), 6),
+                        "min_distance": distance,
+                        "support_mid_edge_count": len(support_mid_edge_ids),
+                        "edge_distance_protocol": EDGE_DISTANCE_PROTOCOL_VERSION,
+                    },
+                    support_mid_concept_ids_json=list(left_mid_ids | right_mid_ids)[:20],
+                    support_mid_edge_ids_json=support_mid_edge_ids,
+                    support_fine_edge_ids_json=support_fine_edge_ids[:60],
+                    support_chunk_ids_json=support_chunk_ids[:60],
+                    cross_community_weak_ties_json=weak_ties,
+                    explanation="Coarse edge admitted from projected mid edges; weak ties are retained for traversal.",
+                    diagnostics_json={
+                        "edge_projection_protocol": EDGE_PROJECTION_PROTOCOL_VERSION,
+                        "support_mid_edge_count": len(support_mid_edge_ids),
+                        "support_fine_edge_count": len(support_fine_edge_ids),
+                    },
                 )
             )
+    db.flush()
+    coarse_edges = list(db.scalars(select(CoarseConceptEdge).where(CoarseConceptEdge.coarse_state_id == state.id)).all())
+    supported_coarse_edges = sum(1 for edge in coarse_edges if edge.support_mid_edge_ids_json)
     stats = {
         "coarse_concept_count": len(coarse_concepts),
         "mid_concept_count": len(mid_concepts),
+        "coarse_edge_count": len(coarse_edges),
+        "coarse_edge_support_mid_edge_coverage": round(supported_coarse_edges / max(len(coarse_edges), 1), 6) if coarse_edges else 1.0,
         "bridge_concept_count": sum(len(item.bridge_mid_concept_ids_json or []) for item in coarse_concepts),
         "singleton_rate": round(sum(1 for item in coarse_concepts if len(item.included_mid_concept_ids_json or []) <= 1) / max(len(coarse_concepts), 1), 6),
     }
     community_diagnostics = coarse_community_diagnostics(mid_concepts, mid_edges, communities)
     state.stats_json = stats
     state.diagnostics_json = {
-        "community_detection": "bridge_aware_label_bucket_v1",
+        "community_detection": "mid_distance_graph_greedy_modularity_v1",
+        "legacy_label_bucket_active": False,
         "connected_components_used_as_final": False,
+        "edge_projection_protocol": EDGE_PROJECTION_PROTOCOL_VERSION,
         **community_diagnostics,
         "bridge_density": round(stats["bridge_concept_count"] / max(stats["mid_concept_count"], 1), 6),
     }
@@ -1843,19 +2882,40 @@ async def build_coarse_concept_graph(db: Session, knowledge_base_id: str, mid_st
     return state
 
 
-def coarse_communities(mid_concepts: list[MidConcept]) -> list[list[MidConcept]]:
+def coarse_communities(mid_concepts: list[MidConcept], mid_edges: list[MidConceptEdge] | None = None) -> list[list[MidConcept]]:
     if not mid_concepts:
         return []
     if len(mid_concepts) <= 3:
         return [mid_concepts]
-    buckets: dict[str, list[MidConcept]] = defaultdict(list)
-    for concept in mid_concepts:
-        token = (tokenize_for_bm25(concept.canonical_label) or ["general"])[0]
-        buckets[token[:1].lower()].append(concept)
-    communities = [items for items in buckets.values() if items]
-    if len(communities) == len(mid_concepts):
-        communities = [mid_concepts[index : index + 3] for index in range(0, len(mid_concepts), 3)]
-    return communities
+    concept_by_id = {concept.id: concept for concept in mid_concepts}
+    edges = [
+        edge
+        for edge in (mid_edges or [])
+        if edge.source_concept_id in concept_by_id and edge.target_concept_id in concept_by_id
+    ]
+    if not edges:
+        return [mid_concepts]
+    try:
+        import networkx as nx
+
+        graph = nx.Graph()
+        for concept in mid_concepts:
+            graph.add_node(concept.id)
+        for edge in edges:
+            raw_strength = normalized_strength(
+                float((edge.raw_strength_summary_json or {}).get("max_raw_strength") or edge.weight or 0.1)
+            )
+            distance = float(edge.distance if edge.distance is not None else distance_from_strength(raw_strength))
+            graph.add_edge(edge.source_concept_id, edge.target_concept_id, weight=1.0 / max(distance, 1e-6))
+        communities = list(nx.algorithms.community.greedy_modularity_communities(graph, weight="weight"))
+        grouped = [
+            [concept_by_id[concept_id] for concept_id in sorted(group) if concept_id in concept_by_id]
+            for group in communities
+        ]
+        grouped = [group for group in grouped if group]
+        return grouped or [mid_concepts]
+    except Exception:
+        return [mid_concepts]
 
 
 def coarse_community_diagnostics(
@@ -1877,11 +2937,16 @@ def coarse_community_diagnostics(
     for index, community in enumerate(communities):
         for concept in community:
             community_by_concept[concept.id] = index
-    weighted_edges = [
-        (edge.source_concept_id, edge.target_concept_id, max(float(edge.weight or 0.0), 0.0))
-        for edge in mid_edges
-        if edge.source_concept_id in concept_ids and edge.target_concept_id in concept_ids
-    ]
+    weighted_edges = []
+    for edge in mid_edges:
+        if edge.source_concept_id not in concept_ids or edge.target_concept_id not in concept_ids:
+            continue
+        raw_strength = normalized_strength(
+            float((edge.raw_strength_summary_json or {}).get("max_raw_strength") or edge.weight or 0.0)
+        )
+        if edge.distance is not None:
+            raw_strength = max(raw_strength, 1.0 / (1.0 + float(edge.distance)))
+        weighted_edges.append((edge.source_concept_id, edge.target_concept_id, raw_strength))
     total_weight = sum(weight for _source, _target, weight in weighted_edges)
     if total_weight <= 0:
         singleton_rate = sum(1 for community in communities if len(community) <= 1) / max(len(communities), 1)
@@ -1950,7 +3015,25 @@ async def define_coarse_concept(packet: dict[str, Any]) -> dict[str, Any]:
         "Use only the supplied mid concept community. Return strict JSON with coarse_label, definition, "
         "included_mid_concepts, boundary_concepts, bridge_concepts, cross_community_weak_ties, and confidence."
     )
-    return await ChatProvider().classify_json(system_prompt=system, user_prompt=str(packet), fallback=fallback)
+    try:
+        output = await ChatProvider().classify_json(system_prompt=system, user_prompt=str(packet), fallback=fallback)
+    except FallbackDisabledError:
+        raise
+    required = {
+        "coarse_label",
+        "definition",
+        "included_mid_concepts",
+        "boundary_concepts",
+        "bridge_concepts",
+        "cross_community_weak_ties",
+        "confidence",
+    }
+    if not isinstance(output, dict) or not required.issubset(output):
+        if get_settings().enable_model_fallback:
+            return fallback
+        missing = sorted(required.difference(output or {})) if isinstance(output, dict) else sorted(required)
+        raise RuntimeError(f"Coarse concept provider returned invalid JSON; missing: {', '.join(missing)}")
+    return output
 
 
 def write_context_graph_state(
@@ -2047,7 +3130,19 @@ async def layered_search(
 ) -> LayeredSearchResult:
     chunks = list(db.scalars(active_chunks_query(knowledge_base_id)).all())
     if not chunks:
-        trace = RetrievalTrace(knowledge_base_id=knowledge_base_id, query=query, filters_json=filters.model_dump(), result_chunk_ids_json=[], diagnostics_json={"reason": "no_active_chunks"})
+        query_facets = query_facets_for_search(query)
+        trace = RetrievalTrace(
+            knowledge_base_id=knowledge_base_id,
+            query=query,
+            filters_json=filters.model_dump(),
+            result_chunk_ids_json=[],
+            query_facets_json=query_facets,
+            convergence_json={"reason": "no_active_chunks"},
+            diagnostics_json={"reason": "no_active_chunks"},
+            edge_distance_protocol_hash=edge_distance_protocol_hash(),
+            edge_projection_protocol_hash=edge_projection_protocol_hash(),
+            traversal_protocol_hash=traversal_protocol_hash(),
+        )
         db.add(trace)
         db.flush()
         return LayeredSearchResult([], trace, {"retrieval_pipeline": "layered_context_graph", "reason": "no_active_chunks"})
@@ -2055,120 +3150,110 @@ async def layered_search(
     relation_state = latest_relation_state(db, knowledge_base_id)
     query_vector = (await EmbeddingProvider().embed_texts([query], text_type="query"))[0]
     query_rq = encode_query_rq(relation_state, query_vector)
-    query_terms = tokenize_for_bm25(query)
-    candidate_scores: dict[str, dict[str, float]] = defaultdict(dict)
-    candidate_metadata: dict[str, dict[str, Any]] = defaultdict(dict)
-    coarse_hits = coarse_activation(db, knowledge_base_id, query_terms)
-    mid_hits = mid_activation(db, knowledge_base_id, query_terms, coarse_hits)
-    fine_hits = fine_activation(db, knowledge_base_id, query_vector, mid_hits)
-    vector_hits = vector_activation(db, knowledge_base_id, query_vector, filters)
-    lexical_hits = lexical_activation(db, knowledge_base_id, query_terms)
-
-    for chunk_id, score in vector_hits.items():
-        candidate_scores[chunk_id]["dense"] = score
-    for chunk_id, score in lexical_hits.items():
-        candidate_scores[chunk_id]["bm25"] = score
-    for fine_id, score in fine_hits.items():
-        member_rows = db.scalars(select(FineClusterMembership).where(FineClusterMembership.fine_cluster_id == fine_id)).all()
-        for row in member_rows:
-            candidate_scores[row.chunk_id]["fine_cluster"] = max(candidate_scores[row.chunk_id].get("fine_cluster", 0.0), score * row.membership_score)
-            candidate_metadata[row.chunk_id].setdefault("fine_cluster_ids", []).append(fine_id)
-            if query_rq and row.rq_path:
-                rq_diag = rq_candidate_score(query_rq, row)
-                candidate_scores[row.chunk_id]["rq_fine"] = max(candidate_scores[row.chunk_id].get("rq_fine", 0.0), rq_diag["rq_score"])
-                candidate_metadata[row.chunk_id]["rq"] = rq_diag
-    for concept_id, score in mid_hits.items():
-        concept = db.get(MidConcept, concept_id)
-        if concept is None:
-            continue
-        for chunk_id in concept.support_chunk_ids_json or []:
-            candidate_scores[chunk_id]["mid_concept"] = max(candidate_scores[chunk_id].get("mid_concept", 0.0), score)
-            candidate_metadata[chunk_id].setdefault("mid_concept_ids", []).append(concept_id)
-    for concept_id, score in coarse_hits.items():
-        concept = db.get(CoarseConcept, concept_id)
-        if concept is None:
-            continue
-        mid_ids = concept.included_mid_concept_ids_json or []
-        mids = db.scalars(select(MidConcept).where(MidConcept.id.in_(mid_ids))).all() if mid_ids else []
-        for mid in mids:
-            for chunk_id in mid.support_chunk_ids_json or []:
-                candidate_scores[chunk_id]["coarse_concept"] = max(candidate_scores[chunk_id].get("coarse_concept", 0.0), score)
-                candidate_metadata[chunk_id].setdefault("coarse_concept_ids", []).append(concept_id)
-
-    chunk_by_id = {chunk.id: chunk for chunk in chunks}
-    results: list[dict[str, Any]] = []
-    for chunk_id, scores in candidate_scores.items():
-        chunk = chunk_by_id.get(chunk_id)
-        if chunk is None or not passes_filters(db, chunk, filters):
-            continue
-        graph_score = graph_path_score(db, chunk_id)
-        scores["graph_path"] = graph_score
-        scores["structure"] = 0.12 if chunk.previous_chunk_id or chunk.next_chunk_id else 0.0
-        scores["bridge_bonus"] = bridge_bonus(db, chunk_id)
-        scores["redundancy_penalty"] = 0.0
-        rq_drift = float((candidate_metadata.get(chunk_id) or {}).get("rq", {}).get("rq_drift_penalty", 0.0))
-        scores["drift_penalty"] = (0.0 if context_state else 0.08) + rq_drift
-        total = (
-            0.30 * scores.get("dense", 0.0)
-            + 0.22 * scores.get("bm25", 0.0)
-            + 0.12 * scores.get("fine_cluster", 0.0)
-            + 0.13 * scores.get("mid_concept", 0.0)
-            + 0.08 * scores.get("coarse_concept", 0.0)
-            + 0.07 * scores.get("graph_path", 0.0)
-            + 0.07 * scores.get("rq_fine", 0.0)
-            + 0.03 * scores.get("structure", 0.0)
-            + 0.04 * scores.get("bridge_bonus", 0.0)
-            - 0.02 * scores.get("drift_penalty", 0.0)
-        )
-        results.append(search_payload_for_chunk(db, chunk, total, scores, candidate_metadata.get(chunk_id) or {}))
-    results = sorted(results, key=lambda item: item["score"], reverse=True)[:top_k]
-    trace = write_retrieval_trace(db, knowledge_base_id, query, filters, results, context_state, coarse_hits, mid_hits, fine_hits, query_rq)
+    query_facets = query_facets_for_search(query)
+    coarse_entries = select_coarse_entries(db, knowledge_base_id, query_facets)
+    mid_entries = select_mid_entries(db, knowledge_base_id, query_facets, coarse_entries)
+    fine_entries = select_fine_entries(db, knowledge_base_id, query_vector, query_rq, mid_entries)
+    dense_entries = dense_chunk_entries(db, knowledge_base_id, query_vector)
+    lexical_entries = lexical_chunk_entries(db, knowledge_base_id, query_facets["terms"])
+    traversal = execute_priority_queue_traversal(
+        db,
+        knowledge_base_id=knowledge_base_id,
+        chunks=chunks,
+        filters=filters,
+        query_facets=query_facets,
+        coarse_entries=coarse_entries,
+        mid_entries=mid_entries,
+        fine_entries=fine_entries,
+        dense_entries=dense_entries,
+        lexical_entries=lexical_entries,
+        query_rq=query_rq,
+        top_k=top_k,
+    )
+    results = traversal["results"]
+    trace = write_retrieval_trace(
+        db,
+        knowledge_base_id,
+        query,
+        filters,
+        results,
+        context_state,
+        traversal,
+        query_rq,
+    )
     for item in results:
         item["metadata"]["retrieval_trace_id"] = trace.id
         for citation in item["citations"]:
             citation["retrieval_trace_id"] = trace.id
+            if isinstance(citation.get("source_span"), dict):
+                citation["source_span"]["retrieval_trace_id"] = trace.id
     audit = {
         "retrieval_pipeline": "layered_context_graph",
         "retrieval_trace_id": trace.id,
         "context_graph_state_id": context_state.id if context_state else None,
         "degraded_mode": is_degraded_mode(),
-        "coarse_hits": len(coarse_hits),
-        "mid_hits": len(mid_hits),
-        "fine_hits": len(fine_hits),
+        "coarse_entries": len(coarse_entries),
+        "mid_entries": len(mid_entries),
+        "fine_entries": len(fine_entries),
+        "frontier_pops": len(traversal["frontier_pops"]),
+        "dominance_pruned_count": traversal["convergence"]["dominance_pruned_count"],
         "query_rq_path": query_rq.get("rq_path") if query_rq else [],
     }
     return LayeredSearchResult(results, trace, audit)
 
 
-def coarse_activation(db: Session, knowledge_base_id: str, query_terms: list[str]) -> dict[str, float]:
+def query_facets_for_search(query: str) -> dict[str, Any]:
+    terms = tokenize_for_bm25(query)
+    intent = "formula_table_lookup" if any(term in query.lower() for term in ("formula", "equation", "table", "公式", "表格")) else "semantic"
+    return {
+        "query": query,
+        "terms": terms,
+        "required_facets": list(dict.fromkeys(terms[:8])),
+        "intent": intent,
+    }
+
+
+def select_coarse_entries(db: Session, knowledge_base_id: str, query_facets: dict[str, Any]) -> dict[str, float]:
     state = latest_coarse_state(db, knowledge_base_id)
     if state is None:
         return {}
     concepts = db.scalars(select(CoarseConcept).where(CoarseConcept.coarse_state_id == state.id, CoarseConcept.state == "active")).all()
-    return _text_activation({concept.id: f"{concept.canonical_label} {concept.definition}" for concept in concepts}, query_terms, top_n=8)
+    envelope = agent_operating_envelope()
+    scores = _text_entry_score({concept.id: f"{concept.canonical_label} {concept.definition}" for concept in concepts}, query_facets["terms"], top_n=envelope["coarse_entry_budget"])
+    if scores or not concepts:
+        return scores
+    supported = sorted(
+        concepts,
+        key=lambda concept: (len(concept.included_mid_concept_ids_json or []), len(concept.bridge_mid_concept_ids_json or [])),
+        reverse=True,
+    )
+    return {concept.id: 0.35 for concept in supported[: envelope["coarse_entry_budget"]]}
 
 
-def mid_activation(db: Session, knowledge_base_id: str, query_terms: list[str], coarse_hits: dict[str, float]) -> dict[str, float]:
+def select_mid_entries(db: Session, knowledge_base_id: str, query_facets: dict[str, Any], coarse_entries: dict[str, float]) -> dict[str, float]:
     state = latest_mid_state(db, knowledge_base_id)
     if state is None:
         return {}
     concepts = list(db.scalars(select(MidConcept).where(MidConcept.concept_state_id == state.id, MidConcept.state == "active")).all())
-    scores = _text_activation({concept.id: f"{concept.canonical_label} {concept.definition}" for concept in concepts}, query_terms, top_n=16)
-    coarse_ids = set(coarse_hits)
+    envelope = agent_operating_envelope()
+    scores = _text_entry_score({concept.id: f"{concept.canonical_label} {concept.definition}" for concept in concepts}, query_facets["terms"], top_n=envelope["mid_entry_budget"])
+    coarse_ids = set(coarse_entries)
     if coarse_ids:
         coarse_concepts = db.scalars(select(CoarseConcept).where(CoarseConcept.id.in_(coarse_ids))).all()
         boosted_mid_ids = {mid_id for coarse in coarse_concepts for mid_id in (coarse.included_mid_concept_ids_json or [])}
         for concept in concepts:
             if concept.id in boosted_mid_ids:
                 scores[concept.id] = max(scores.get(concept.id, 0.0), 0.45)
+    if not scores and concepts:
+        supported = sorted(concepts, key=lambda concept: len(concept.support_fine_cluster_ids_json or []), reverse=True)
+        scores = {concept.id: 0.35 for concept in supported[: envelope["mid_entry_budget"]]}
     return scores
 
 
-def fine_activation(db: Session, knowledge_base_id: str, query_vector: list[float], mid_hits: dict[str, float]) -> dict[str, float]:
+def select_fine_entries(db: Session, knowledge_base_id: str, query_vector: list[float], query_rq: dict[str, Any] | None, mid_entries: dict[str, float]) -> dict[str, float]:
     relation_state = latest_relation_state(db, knowledge_base_id)
     if relation_state is None:
         return {}
-    query_rq = encode_query_rq(relation_state, query_vector)
     clusters = list(db.scalars(select(FineCluster).where(FineCluster.graph_state_id == relation_state.id, FineCluster.state == "active")).all())
     scores: dict[str, float] = {}
     for cluster in clusters:
@@ -2190,14 +3275,14 @@ def fine_activation(db: Session, knowledge_base_id: str, query_vector: list[floa
             residual_score = math.exp(-distance / max(float(query_rq.get("tau_r") or rq_tau()), 1e-6))
             rq_score = max(0.0, min(1.0, 0.70 * (lcp / levels) + 0.30 * residual_score))
             scores[cluster.id] = max(scores[cluster.id], rq_score)
-    for concept_id, score in mid_hits.items():
+    for concept_id, score in mid_entries.items():
         rows = db.scalars(select(MidConceptMembership).where(MidConceptMembership.mid_concept_id == concept_id)).all()
         for row in rows:
             scores[row.fine_cluster_id] = max(scores.get(row.fine_cluster_id, 0.0), score * row.membership_score)
-    return dict(sorted(scores.items(), key=lambda item: item[1], reverse=True)[:16])
+    return dict(sorted(scores.items(), key=lambda item: item[1], reverse=True)[: agent_operating_envelope()["fine_entry_budget"]])
 
 
-def vector_activation(db: Session, knowledge_base_id: str, query_vector: list[float], filters: SearchFilters) -> dict[str, float]:
+def dense_chunk_entries(db: Session, knowledge_base_id: str, query_vector: list[float]) -> dict[str, float]:
     records = list(db.scalars(select(VectorRecord).where(VectorRecord.knowledge_base_id == knowledge_base_id, VectorRecord.vector_status == "ready")).all())
     scored: list[tuple[str, float]] = []
     for record in records:
@@ -2207,7 +3292,7 @@ def vector_activation(db: Session, knowledge_base_id: str, query_vector: list[fl
     return dict(sorted(scored, key=lambda item: item[1], reverse=True)[:80])
 
 
-def lexical_activation(db: Session, knowledge_base_id: str, query_terms: list[str]) -> dict[str, float]:
+def lexical_chunk_entries(db: Session, knowledge_base_id: str, query_terms: list[str]) -> dict[str, float]:
     records = list(db.scalars(select(BM25Record).where(BM25Record.knowledge_base_id == knowledge_base_id, BM25Record.state == "ready")).all())
     if not query_terms or not records:
         return {}
@@ -2224,7 +3309,7 @@ def lexical_activation(db: Session, knowledge_base_id: str, query_terms: list[st
     return dict(sorted(scored, key=lambda item: item[1], reverse=True)[:80])
 
 
-def _text_activation(text_by_id: dict[str, str], query_terms: list[str], *, top_n: int) -> dict[str, float]:
+def _text_entry_score(text_by_id: dict[str, str], query_terms: list[str], *, top_n: int) -> dict[str, float]:
     if not text_by_id or not query_terms:
         return {}
     scored: list[tuple[str, float]] = []
@@ -2237,31 +3322,663 @@ def _text_activation(text_by_id: dict[str, str], query_terms: list[str], *, top_
     return dict(sorted(scored, key=lambda item: item[1], reverse=True)[:top_n])
 
 
-def graph_path_score(db: Session, chunk_id: str) -> float:
-    relation_state = db.scalar(select(ChunkRelationGraphState).order_by(ChunkRelationGraphState.created_at.desc()))
-    if relation_state is None:
-        return 0.0
-    degree = db.scalar(
-        select(func.count(ChunkRelationEdge.id)).where(
-            ChunkRelationEdge.graph_state_id == relation_state.id,
-            (ChunkRelationEdge.source_chunk_id == chunk_id) | (ChunkRelationEdge.target_chunk_id == chunk_id),
-        )
-    ) or 0
-    return min(1.0, float(degree) / 8.0)
+def _edge_raw_strength(edge: Any) -> float:
+    value = getattr(edge, "raw_strength", None)
+    if value is not None:
+        return normalized_strength(float(value))
+    summary = getattr(edge, "raw_strength_summary_json", None) or {}
+    if summary.get("max_raw_strength") is not None:
+        return normalized_strength(float(summary.get("max_raw_strength")))
+    return normalized_strength(float(getattr(edge, "weight", 0.1) or 0.1))
 
 
-def bridge_bonus(db: Session, chunk_id: str) -> float:
-    relation_state = db.scalar(select(ChunkRelationGraphState).order_by(ChunkRelationGraphState.created_at.desc()))
-    if relation_state is None:
-        return 0.0
-    count = db.scalar(
-        select(func.count(ChunkRelationEdge.id)).where(
-            ChunkRelationEdge.graph_state_id == relation_state.id,
-            ChunkRelationEdge.is_bridge.is_(True),
-            (ChunkRelationEdge.source_chunk_id == chunk_id) | (ChunkRelationEdge.target_chunk_id == chunk_id),
+def _edge_distance(edge: Any) -> float:
+    value = getattr(edge, "distance", None)
+    if value is not None:
+        return float(value)
+    return distance_from_strength(_edge_raw_strength(edge))
+
+
+def _edge_support_refs(edge: Any) -> dict[str, Any]:
+    refs: dict[str, Any] = {"edge_id": getattr(edge, "id", None), "edge_type": getattr(edge, "edge_type", None)}
+    for attr in (
+        "support_chunk_ids_json",
+        "support_chunk_edge_ids_json",
+        "support_relation_edge_ids_json",
+        "support_fine_edge_ids_json",
+        "support_fine_node_ids_json",
+        "support_mid_edge_ids_json",
+        "support_mid_concept_ids_json",
+    ):
+        value = getattr(edge, attr, None)
+        if value:
+            refs[attr.removesuffix("_json")] = value
+    return refs
+
+
+def _build_adjacency(edges: list[Any], source_attr: str, target_attr: str) -> dict[str, list[Any]]:
+    adjacency: dict[str, list[Any]] = defaultdict(list)
+    for edge in edges:
+        source_id = getattr(edge, source_attr, None)
+        target_id = getattr(edge, target_attr, None)
+        if not source_id or not target_id:
+            continue
+        adjacency[source_id].append(edge)
+        adjacency[target_id].append(edge)
+    return adjacency
+
+
+def _edge_neighbor(edge: Any, node_id: str, source_attr: str, target_attr: str) -> str:
+    source_id = getattr(edge, source_attr)
+    target_id = getattr(edge, target_attr)
+    return target_id if source_id == node_id else source_id
+
+
+def execute_layer_priority_walk(
+    *,
+    layer: str,
+    entry_scores: dict[str, float],
+    node_text_by_id: dict[str, str],
+    adjacency: dict[str, list[Any]],
+    query_facets: dict[str, Any],
+    source_attr: str,
+    target_attr: str,
+    envelope: dict[str, Any],
+) -> dict[str, Any]:
+    required_facets = set(query_facets.get("required_facets") or [])
+
+    def covered_facets_for_node(node_id: str) -> set[str]:
+        text_terms = set(tokenize_for_bm25(node_text_by_id.get(node_id, "")))
+        return {facet for facet in required_facets if facet in text_terms}
+
+    entry_nodes = [
+        {
+            "layer": layer,
+            "node_id": node_id,
+            "entry_strength": normalized_strength(score),
+            "roles": [f"{layer}_entry"],
+            "metadata": {},
+        }
+        for node_id, score in sorted(entry_scores.items(), key=lambda item: item[1], reverse=True)
+        if node_id in node_text_by_id
+    ]
+    frontier: list[tuple[tuple[float, float, int, int], int, dict[str, Any]]] = []
+    serial = 0
+    for entry in entry_nodes:
+        node_id = entry["node_id"]
+        covered = covered_facets_for_node(node_id)
+        distance = distance_from_strength(float(entry["entry_strength"]))
+        state = {
+            "layer": layer,
+            "node_id": node_id,
+            "path": [node_id],
+            "path_edge_ids": [],
+            "distance_so_far": distance,
+            "reward_so_far": 0.0,
+            "covered_facets": sorted(covered),
+            "evidence_roles": list(entry["roles"]),
+            "depth": 0,
+            "visit_counts": {node_id: 1},
+            "support_refs": {"entry_strength": entry["entry_strength"]},
+        }
+        key = (len(required_facets - covered), distance, 0, -len(state["evidence_roles"]))
+        heapq.heappush(frontier, (key, serial, state))
+        serial += 1
+
+    frontier_pops: list[dict[str, Any]] = []
+    frontier_snapshots: list[dict[str, Any]] = []
+    path_labels: list[dict[str, Any]] = []
+    ambiguous_decisions: list[dict[str, Any]] = []
+    accepted_by_node: dict[str, dict[str, Any]] = {}
+    dominance_labels: dict[str, list[tuple[float, float, int, int]]] = defaultdict(list)
+    dominance_pruned_count = 0
+    expansion_count = 0
+    max_expansions = int(envelope.get("frontier_expansion_budget") or 0)
+    max_depth = int(envelope.get("max_depth_per_layer") or 1)
+    max_labels = int(envelope.get("max_labels_per_node") or 1)
+    cycle_reward_cap = float(envelope.get("max_cycle_reward_per_path") or 0.0)
+    ambiguous_low = float(envelope.get("ambiguous_edge_distance_low") or 0.0)
+    ambiguous_high = float(envelope.get("ambiguous_edge_distance_high") or 0.0)
+    stop_reason = "no_entry_nodes" if not frontier else "frontier_empty"
+
+    while frontier and expansion_count < max_expansions:
+        key, _serial, state = heapq.heappop(frontier)
+        label_key = (key[0], round(key[1], 6), key[2], key[3])
+        labels = dominance_labels[state["node_id"]]
+        if len(labels) >= max_labels and any(existing <= label_key for existing in labels):
+            dominance_pruned_count += 1
+            continue
+        labels.append(label_key)
+        labels.sort()
+        del labels[max_labels:]
+        frontier_pops.append(state)
+        frontier_snapshots.append({"layer": layer, "popped": state, "queue_size_after_pop": len(frontier), "key": list(key)})
+        current = accepted_by_node.get(state["node_id"])
+        if current is None or key < current["queue_key"]:
+            accepted_by_node[state["node_id"]] = {"state": state, "queue_key": key}
+        if int(state["depth"]) >= max_depth:
+            path_labels.append(
+                {
+                    "layer": layer,
+                    "node_id": state["node_id"],
+                    "path": state["path"],
+                    "path_edge_ids": state["path_edge_ids"],
+                    "covered_facets": state["covered_facets"],
+                    "distance_so_far": state["distance_so_far"],
+                    "reward_so_far": state["reward_so_far"],
+                    "expanded_edge_ids": [],
+                }
+            )
+            continue
+        expanded_edge_ids: list[str] = []
+        for edge in sorted(adjacency.get(state["node_id"], []), key=_edge_distance):
+            neighbor_id = _edge_neighbor(edge, state["node_id"], source_attr, target_attr)
+            if neighbor_id not in node_text_by_id:
+                continue
+            edge_distance = _edge_distance(edge)
+            if ambiguous_low <= edge_distance <= ambiguous_high:
+                ambiguous_decisions.append(
+                    {
+                        "layer": layer,
+                        "edge_id": edge.id,
+                        "from_node_id": state["node_id"],
+                        "to_node_id": neighbor_id,
+                        "distance": edge_distance,
+                        "decision": "follow_within_budget",
+                    }
+                )
+            visit_counts = dict(state["visit_counts"])
+            previous_visits = int(visit_counts.get(neighbor_id, 0))
+            visit_counts[neighbor_id] = previous_visits + 1
+            reward_increment = min(cycle_reward_cap - float(state["reward_so_far"]), 0.04 * _edge_raw_strength(edge)) if previous_visits else 0.0
+            reward_so_far = round(max(0.0, float(state["reward_so_far"]) + max(0.0, reward_increment)), 6)
+            covered = set(state["covered_facets"]) | covered_facets_for_node(neighbor_id)
+            roles = set(state["evidence_roles"])
+            roles.add(str(getattr(edge, "edge_type", "edge")))
+            next_state = {
+                "layer": layer,
+                "node_id": neighbor_id,
+                "path": list(state["path"]) + [neighbor_id],
+                "path_edge_ids": list(state["path_edge_ids"]) + [edge.id],
+                "distance_so_far": round(float(state["distance_so_far"]) + edge_distance, 6),
+                "reward_so_far": reward_so_far,
+                "covered_facets": sorted(covered),
+                "evidence_roles": sorted(roles),
+                "depth": int(state["depth"]) + 1,
+                "visit_counts": visit_counts,
+                "support_refs": _edge_support_refs(edge),
+            }
+            next_key = (
+                len(required_facets - covered),
+                round(float(next_state["distance_so_far"]) - reward_so_far, 6),
+                int(next_state["depth"]),
+                -len(roles),
+            )
+            heapq.heappush(frontier, (next_key, serial, next_state))
+            serial += 1
+            expanded_edge_ids.append(edge.id)
+            expansion_count += 1
+            if expansion_count >= max_expansions:
+                stop_reason = "hard_budget_hit"
+                break
+        path_labels.append(
+            {
+                "layer": layer,
+                "node_id": state["node_id"],
+                "path": state["path"],
+                "path_edge_ids": state["path_edge_ids"],
+                "covered_facets": state["covered_facets"],
+                "distance_so_far": state["distance_so_far"],
+                "reward_so_far": state["reward_so_far"],
+                "expanded_edge_ids": expanded_edge_ids,
+            }
         )
-    ) or 0
-    return min(1.0, float(count) / 4.0)
+
+    accepted = sorted(accepted_by_node.values(), key=lambda item: item["queue_key"])
+    return {
+        "entry_nodes": entry_nodes,
+        "accepted_nodes": [item["state"]["node_id"] for item in accepted],
+        "accepted_states": [item["state"] for item in accepted],
+        "frontier_pops": frontier_pops,
+        "frontier_json": frontier_snapshots,
+        "path_labels": path_labels,
+        "ambiguous_edge_decisions": ambiguous_decisions,
+        "convergence": {
+            "reason": stop_reason,
+            "frontier_expansion_count": expansion_count,
+            "dominance_pruned_count": dominance_pruned_count,
+            "frontier_remaining": len(frontier),
+            "accepted_node_count": len(accepted),
+        },
+    }
+
+
+def execute_priority_queue_traversal(
+    db: Session,
+    *,
+    knowledge_base_id: str,
+    chunks: list[Chunk],
+    filters: SearchFilters,
+    query_facets: dict[str, Any],
+    coarse_entries: dict[str, float],
+    mid_entries: dict[str, float],
+    fine_entries: dict[str, float],
+    dense_entries: dict[str, float],
+    lexical_entries: dict[str, float],
+    query_rq: dict[str, Any] | None,
+    top_k: int,
+) -> dict[str, Any]:
+    envelope = agent_operating_envelope()
+    chunk_by_id = {chunk.id: chunk for chunk in chunks}
+    layer_walks: dict[str, dict[str, Any]] = {}
+
+    coarse_state = latest_coarse_state(db, knowledge_base_id)
+    coarse_concepts = (
+        list(db.scalars(select(CoarseConcept).where(CoarseConcept.coarse_state_id == coarse_state.id, CoarseConcept.state == "active")).all())
+        if coarse_state
+        else []
+    )
+    coarse_text = {concept.id: f"{concept.canonical_label} {concept.definition}" for concept in coarse_concepts}
+    coarse_edges = list(db.scalars(select(CoarseConceptEdge).where(CoarseConceptEdge.coarse_state_id == coarse_state.id)).all()) if coarse_state else []
+    layer_walks["coarse"] = execute_layer_priority_walk(
+        layer="coarse",
+        entry_scores=coarse_entries,
+        node_text_by_id=coarse_text,
+        adjacency=_build_adjacency(coarse_edges, "source_concept_id", "target_concept_id"),
+        query_facets=query_facets,
+        source_attr="source_concept_id",
+        target_attr="target_concept_id",
+        envelope=envelope,
+    )
+    for coarse_id in layer_walks["coarse"]["accepted_nodes"]:
+        coarse = next((item for item in coarse_concepts if item.id == coarse_id), None)
+        if coarse is None:
+            continue
+        coarse_strength = max(coarse_entries.get(coarse_id, 0.35), 0.35)
+        for mid_id in coarse.included_mid_concept_ids_json or []:
+            mid_entries[mid_id] = max(mid_entries.get(mid_id, 0.0), coarse_strength * 0.9)
+
+    mid_state = latest_mid_state(db, knowledge_base_id)
+    mid_concepts = (
+        list(db.scalars(select(MidConcept).where(MidConcept.concept_state_id == mid_state.id, MidConcept.state == "active")).all())
+        if mid_state
+        else []
+    )
+    mid_text = {concept.id: f"{concept.canonical_label} {concept.definition} {concept.scope_note}" for concept in mid_concepts}
+    mid_edges = list(db.scalars(select(MidConceptEdge).where(MidConceptEdge.concept_state_id == mid_state.id)).all()) if mid_state else []
+    layer_walks["mid"] = execute_layer_priority_walk(
+        layer="mid",
+        entry_scores=mid_entries,
+        node_text_by_id=mid_text,
+        adjacency=_build_adjacency(mid_edges, "source_concept_id", "target_concept_id"),
+        query_facets=query_facets,
+        source_attr="source_concept_id",
+        target_attr="target_concept_id",
+        envelope=envelope,
+    )
+    for mid_id in layer_walks["mid"]["accepted_nodes"]:
+        rows = db.scalars(select(MidConceptMembership).where(MidConceptMembership.mid_concept_id == mid_id)).all()
+        mid_strength = max(mid_entries.get(mid_id, 0.35), 0.35)
+        for row in rows:
+            fine_entries[row.fine_cluster_id] = max(fine_entries.get(row.fine_cluster_id, 0.0), mid_strength * float(row.membership_score or 1.0))
+
+    relation_state = latest_relation_state(db, knowledge_base_id)
+    fine_clusters = (
+        list(db.scalars(select(FineCluster).where(FineCluster.graph_state_id == relation_state.id, FineCluster.state == "active")).all())
+        if relation_state
+        else []
+    )
+    fine_text = {
+        cluster.id: " ".join(
+            str(value)
+            for value in [
+                cluster.label,
+                cluster.node_type,
+                cluster.cluster_key,
+                (cluster.diagnostics_json or {}).get("source"),
+                " ".join((cluster.diagnostics_json or {}).get("representative_terms") or []),
+            ]
+            if value
+        )
+        for cluster in fine_clusters
+    }
+    fine_edges = list(db.scalars(select(FineClusterEdge).where(FineClusterEdge.graph_state_id == relation_state.id)).all()) if relation_state else []
+    layer_walks["fine"] = execute_layer_priority_walk(
+        layer="fine",
+        entry_scores=fine_entries,
+        node_text_by_id=fine_text,
+        adjacency=_build_adjacency(fine_edges, "source_cluster_id", "target_cluster_id"),
+        query_facets=query_facets,
+        source_attr="source_cluster_id",
+        target_attr="target_cluster_id",
+        envelope=envelope,
+    )
+    for fine_id in layer_walks["fine"]["accepted_nodes"]:
+        fine_entries[fine_id] = max(fine_entries.get(fine_id, 0.0), 0.34)
+
+    seed_strengths: dict[str, float] = defaultdict(float)
+    seed_roles: dict[str, set[str]] = defaultdict(set)
+    seed_metadata: dict[str, dict[str, Any]] = defaultdict(dict)
+
+    def add_seed(chunk_id: str, strength: float, role: str, metadata: dict[str, Any] | None = None) -> None:
+        chunk = chunk_by_id.get(chunk_id)
+        if chunk is None or not passes_filters(db, chunk, filters):
+            return
+        seed_strengths[chunk_id] = max(seed_strengths[chunk_id], normalized_strength(strength))
+        seed_roles[chunk_id].add(role)
+        if metadata:
+            current = seed_metadata[chunk_id]
+            for key, value in metadata.items():
+                if isinstance(value, list):
+                    current.setdefault(key, [])
+                    current[key].extend(item for item in value if item not in current[key])
+                else:
+                    current[key] = value
+
+    for chunk_id, strength in dense_entries.items():
+        add_seed(chunk_id, strength, "dense_entry")
+    for chunk_id, strength in lexical_entries.items():
+        add_seed(chunk_id, strength, "bm25_entry")
+
+    for fine_id, strength in fine_entries.items():
+        member_rows = list(db.scalars(select(FineClusterMembership).where(FineClusterMembership.fine_cluster_id == fine_id)).all())
+        for row in member_rows:
+            metadata: dict[str, Any] = {"fine_cluster_ids": [fine_id]}
+            if query_rq and row.rq_path:
+                metadata["rq"] = rq_candidate_score(query_rq, row)
+            add_seed(row.chunk_id, strength * float(row.membership_score or 1.0), "fine_membership_entry", metadata)
+
+    for concept_id, strength in mid_entries.items():
+        concept = db.get(MidConcept, concept_id)
+        if concept is None:
+            continue
+        for chunk_id in concept.support_chunk_ids_json or []:
+            add_seed(chunk_id, strength, "mid_drilldown_entry", {"mid_concept_ids": [concept_id]})
+
+    for concept_id, strength in coarse_entries.items():
+        coarse = db.get(CoarseConcept, concept_id)
+        if coarse is None:
+            continue
+        mids = db.scalars(select(MidConcept).where(MidConcept.id.in_(coarse.included_mid_concept_ids_json or []))).all()
+        for mid in mids:
+            for chunk_id in mid.support_chunk_ids_json or []:
+                add_seed(chunk_id, strength, "coarse_to_mid_drilldown_entry", {"coarse_concept_ids": [concept_id], "mid_concept_ids": [mid.id]})
+
+    required_facets = set(query_facets.get("required_facets") or [])
+
+    def covered_facets_for_chunk(chunk: Chunk) -> set[str]:
+        text_terms = set(tokenize_for_bm25(chunk.text))
+        return {facet for facet in required_facets if facet in text_terms}
+
+    adjacency: dict[str, list[ChunkRelationEdge]] = defaultdict(list)
+    if relation_state:
+        for edge in db.scalars(select(ChunkRelationEdge).where(ChunkRelationEdge.graph_state_id == relation_state.id)).all():
+            adjacency[edge.source_chunk_id].append(edge)
+            adjacency[edge.target_chunk_id].append(edge)
+
+    def neighbor_for(edge: ChunkRelationEdge, chunk_id: str) -> str:
+        return edge.target_chunk_id if edge.source_chunk_id == chunk_id else edge.source_chunk_id
+
+    entry_nodes = [
+        {
+            "layer": "chunk",
+            "node_id": chunk_id,
+            "entry_strength": strength,
+            "roles": sorted(seed_roles[chunk_id]),
+            "metadata": seed_metadata.get(chunk_id, {}),
+        }
+        for chunk_id, strength in sorted(seed_strengths.items(), key=lambda item: item[1], reverse=True)
+    ]
+    layer_walks["chunk"] = {
+        "entry_nodes": entry_nodes,
+        "accepted_nodes": [],
+        "accepted_states": [],
+        "frontier_pops": [],
+        "frontier_json": [],
+        "path_labels": [],
+        "ambiguous_edge_decisions": [],
+        "convergence": {},
+    }
+    frontier: list[tuple[tuple[float, float, int, int], int, dict[str, Any]]] = []
+    serial = 0
+    for chunk_id, strength in seed_strengths.items():
+        chunk = chunk_by_id[chunk_id]
+        covered = covered_facets_for_chunk(chunk)
+        distance = distance_from_strength(strength)
+        state = {
+            "layer": "chunk",
+            "node_id": chunk_id,
+            "path": [chunk_id],
+            "path_edge_ids": [],
+            "distance_so_far": distance,
+            "reward_so_far": 0.0,
+            "covered_facets": sorted(covered),
+            "evidence_roles": sorted(seed_roles[chunk_id]),
+            "depth": 0,
+            "visit_counts": {chunk_id: 1},
+            "support_refs": seed_metadata.get(chunk_id, {}),
+        }
+        key = (len(required_facets - covered), distance, 0, -len(state["evidence_roles"]))
+        heapq.heappush(frontier, (key, serial, state))
+        serial += 1
+
+    accepted_by_chunk: dict[str, dict[str, Any]] = {}
+    path_labels: list[dict[str, Any]] = []
+    frontier_pops: list[dict[str, Any]] = []
+    frontier_snapshots: list[dict[str, Any]] = []
+    ambiguous_decisions: list[dict[str, Any]] = []
+    dominance_labels: dict[str, list[tuple[float, float, int, int]]] = defaultdict(list)
+    dominance_pruned_count = 0
+    expansion_count = 0
+    stop_reason = "frontier_empty"
+    max_expansions = int(envelope["frontier_expansion_budget"])
+    max_depth = int(envelope["max_depth_per_layer"])
+    max_labels = int(envelope["max_labels_per_node"])
+    cycle_reward_cap = float(envelope["max_cycle_reward_per_path"])
+    ambiguous_low = float(envelope["ambiguous_edge_distance_low"])
+    ambiguous_high = float(envelope["ambiguous_edge_distance_high"])
+
+    while frontier and expansion_count < max_expansions:
+        key, _serial, state = heapq.heappop(frontier)
+        label_key = (key[0], round(key[1], 6), key[2], key[3])
+        labels = dominance_labels[state["node_id"]]
+        if len(labels) >= max_labels and any(existing <= label_key for existing in labels):
+            dominance_pruned_count += 1
+            continue
+        labels.append(label_key)
+        labels.sort()
+        del labels[max_labels:]
+
+        chunk = chunk_by_id.get(state["node_id"])
+        if chunk is None or not passes_filters(db, chunk, filters):
+            continue
+        frontier_pops.append(state)
+        frontier_snapshots.append(
+            {
+                "popped": state,
+                "queue_size_after_pop": len(frontier),
+                "key": list(key),
+            }
+        )
+        current = accepted_by_chunk.get(chunk.id)
+        if current is None or key < current["queue_key"]:
+            accepted_by_chunk[chunk.id] = {"state": state, "queue_key": key}
+        if len(accepted_by_chunk) >= top_k and set(state.get("covered_facets") or []) >= required_facets:
+            stop_reason = "all_required_facets_covered"
+            break
+        if int(state["depth"]) >= max_depth:
+            continue
+
+        expanded_edge_ids: list[str] = []
+        for edge in sorted(adjacency.get(chunk.id, []), key=lambda item: float(item.distance if item.distance is not None else distance_from_strength(item.raw_strength or 1e-6))):
+            neighbor_id = neighbor_for(edge, chunk.id)
+            neighbor = chunk_by_id.get(neighbor_id)
+            if neighbor is None or not passes_filters(db, neighbor, filters):
+                continue
+            edge_distance = float(edge.distance if edge.distance is not None else distance_from_strength(edge.raw_strength or 1e-6))
+            decision = "follow"
+            if ambiguous_low <= edge_distance <= ambiguous_high:
+                decision = "follow_within_budget"
+                ambiguous_decisions.append(
+                    {
+                        "edge_id": edge.id,
+                        "from_chunk_id": chunk.id,
+                        "to_chunk_id": neighbor_id,
+                        "distance": edge_distance,
+                        "decision": decision,
+                    }
+                )
+            visit_counts = dict(state["visit_counts"])
+            previous_visits = int(visit_counts.get(neighbor_id, 0))
+            visit_counts[neighbor_id] = previous_visits + 1
+            reward_increment = min(cycle_reward_cap - float(state["reward_so_far"]), 0.04 * normalized_strength(edge.raw_strength or 1e-6)) if previous_visits else 0.0
+            reward_so_far = round(max(0.0, float(state["reward_so_far"]) + max(0.0, reward_increment)), 6)
+            covered = set(state["covered_facets"]) | covered_facets_for_chunk(neighbor)
+            roles = set(state["evidence_roles"])
+            roles.add(edge.edge_type)
+            next_state = {
+                "layer": "chunk",
+                "node_id": neighbor_id,
+                "path": list(state["path"]) + [neighbor_id],
+                "path_edge_ids": list(state["path_edge_ids"]) + [edge.id],
+                "distance_so_far": round(float(state["distance_so_far"]) + edge_distance, 6),
+                "reward_so_far": reward_so_far,
+                "covered_facets": sorted(covered),
+                "evidence_roles": sorted(roles),
+                "depth": int(state["depth"]) + 1,
+                "visit_counts": visit_counts,
+                "support_refs": {"edge_id": edge.id, "edge_type": edge.edge_type},
+            }
+            next_key = (
+                len(required_facets - covered),
+                round(float(next_state["distance_so_far"]) - reward_so_far, 6),
+                int(next_state["depth"]),
+                -len(roles),
+            )
+            heapq.heappush(frontier, (next_key, serial, next_state))
+            serial += 1
+            expanded_edge_ids.append(edge.id)
+            expansion_count += 1
+            if expansion_count >= max_expansions:
+                stop_reason = "hard_budget_hit"
+                break
+        path_labels.append(
+            {
+                "chunk_id": chunk.id,
+                "path": state["path"],
+                "path_edge_ids": state["path_edge_ids"],
+                "covered_facets": state["covered_facets"],
+                "distance_so_far": state["distance_so_far"],
+                "reward_so_far": state["reward_so_far"],
+                "expanded_edge_ids": expanded_edge_ids,
+            }
+        )
+
+    accepted_items = sorted(accepted_by_chunk.values(), key=lambda item: item["queue_key"])[:top_k]
+    accepted_chunk_ids = [item["state"]["node_id"] for item in accepted_items]
+    rq_membership_by_chunk: dict[str, FineClusterMembership] = {}
+    if query_rq and accepted_chunk_ids:
+        rq_rows = list(
+            db.scalars(
+                select(FineClusterMembership).where(
+                    FineClusterMembership.chunk_id.in_(accepted_chunk_ids),
+                    FineClusterMembership.rq_path.is_not(None),
+                )
+            ).all()
+        )
+        for row in rq_rows:
+            if not row.rq_path:
+                continue
+            current = rq_membership_by_chunk.get(row.chunk_id)
+            row_rank = (
+                1 if row.membership_reason == "rq_leaf" else 0,
+                len(row.rq_path or []),
+                float(row.membership_score or 0.0),
+            )
+            current_rank = (
+                1 if current and current.membership_reason == "rq_leaf" else 0,
+                len((current.rq_path if current else []) or []),
+                float(current.membership_score or 0.0) if current else 0.0,
+            )
+            if current is None or row_rank > current_rank:
+                rq_membership_by_chunk[row.chunk_id] = row
+    results: list[dict[str, Any]] = []
+    for item in accepted_items:
+        state = item["state"]
+        chunk = chunk_by_id[state["node_id"]]
+        traversal_score = round(1.0 / (1.0 + max(0.0, float(state["distance_so_far"]) - float(state["reward_so_far"]))), 6)
+        metadata = {
+            **seed_metadata.get(chunk.id, {}),
+            "traversal": {
+                "path": state["path"],
+                "path_edge_ids": state["path_edge_ids"],
+                "covered_facets": state["covered_facets"],
+                "distance_so_far": state["distance_so_far"],
+                "reward_so_far": state["reward_so_far"],
+                "evidence_roles": state["evidence_roles"],
+                "why_selected": "accepted_by_priority_queue_graph_traversal",
+            },
+        }
+        rq_membership = rq_membership_by_chunk.get(chunk.id)
+        if query_rq and rq_membership is not None:
+            metadata["rq"] = rq_candidate_score(query_rq, rq_membership)
+        results.append(search_payload_for_chunk(db, chunk, traversal_score, {"traversal_score": traversal_score}, metadata))
+
+    convergence = {
+        "reason": stop_reason,
+        "frontier_expansion_count": expansion_count,
+        "dominance_pruned_count": dominance_pruned_count,
+        "cycle_reward_bounded": True,
+        "accepted_chunk_count": len(results),
+        "frontier_remaining": len(frontier),
+    }
+    chunk_convergence = dict(convergence)
+    layer_walks["chunk"] = {
+        "entry_nodes": entry_nodes,
+        "accepted_nodes": accepted_chunk_ids,
+        "accepted_states": [item["state"] for item in accepted_items],
+        "frontier_pops": frontier_pops,
+        "frontier_json": frontier_snapshots,
+        "path_labels": path_labels,
+        "ambiguous_edge_decisions": ambiguous_decisions,
+        "convergence": chunk_convergence,
+    }
+    all_entry_nodes = [
+        entry
+        for layer_name in ("coarse", "mid", "fine", "chunk")
+        for entry in (layer_walks.get(layer_name, {}).get("entry_nodes") or [])
+    ]
+    all_frontier = [
+        snapshot
+        for layer_name in ("coarse", "mid", "fine", "chunk")
+        for snapshot in (layer_walks.get(layer_name, {}).get("frontier_json") or [])
+    ]
+    all_path_labels = [
+        label
+        for layer_name in ("coarse", "mid", "fine", "chunk")
+        for label in (layer_walks.get(layer_name, {}).get("path_labels") or [])
+    ]
+    all_ambiguous_decisions = [
+        decision
+        for layer_name in ("coarse", "mid", "fine", "chunk")
+        for decision in (layer_walks.get(layer_name, {}).get("ambiguous_edge_decisions") or [])
+    ]
+    layer_convergence = {layer_name: (layer_walks.get(layer_name, {}).get("convergence") or {}) for layer_name in ("coarse", "mid", "fine", "chunk")}
+    convergence["layers"] = layer_convergence
+    return {
+        "query_facets": query_facets,
+        "entry_nodes": all_entry_nodes,
+        "frontier_pops": frontier_pops,
+        "frontier_json": all_frontier,
+        "path_labels": all_path_labels,
+        "convergence": convergence,
+        "ambiguous_edge_decisions": all_ambiguous_decisions,
+        "results": results,
+        "coarse_entries": coarse_entries,
+        "mid_entries": mid_entries,
+        "fine_entries": fine_entries,
+        "layer_walks": layer_walks,
+    }
 
 
 def passes_filters(db: Session, chunk: Chunk, filters: SearchFilters) -> bool:
@@ -2277,9 +3994,57 @@ def passes_filters(db: Session, chunk: Chunk, filters: SearchFilters) -> bool:
     return True
 
 
+def chunk_source_span(
+    db: Session,
+    chunk: Chunk,
+    *,
+    context_package_id: str | None = None,
+    retrieval_trace_id: str | None = None,
+    verification_id: str | None = None,
+) -> dict[str, Any]:
+    coordinate = db.scalar(
+        select(ChunkCoordinate)
+        .where(ChunkCoordinate.chunk_id == chunk.id)
+        .order_by(ChunkCoordinate.confidence.desc())
+    )
+    structure_rows = db.execute(
+        select(ChunkStructureMapping, ChunkStructureNode)
+        .join(ChunkStructureNode, ChunkStructureMapping.structure_node_id == ChunkStructureNode.id)
+        .where(ChunkStructureMapping.chunk_id == chunk.id)
+        .order_by(ChunkStructureMapping.coverage_ratio.desc(), ChunkStructureNode.depth.desc())
+        .limit(8)
+    ).all()
+    section_path = chunk.section_path or next(
+        (
+            node.path or node.title
+            for _mapping, node in structure_rows
+            if node.node_type in {"section", "document"}
+        ),
+        None,
+    )
+    bbox = dict((coordinate.bbox_json or {}) if coordinate else {})
+    if not bbox:
+        bbox = next((dict(node.bbox_json or {}) for _mapping, node in structure_rows if node.bbox_json), {})
+    page_range = (coordinate.page_range_json if coordinate and coordinate.page_range_json else {"start": chunk.page_start, "end": chunk.page_end})
+    return {
+        "document_version_id": chunk.document_version_id,
+        "chunk_id": chunk.id,
+        "char_span": [chunk.char_start, chunk.char_end],
+        "page_range": [page_range.get("start"), page_range.get("end")],
+        "section_path": section_path,
+        "structure_path": section_path,
+        "structure_node_ids": [node.id for _mapping, node in structure_rows],
+        "bbox": bbox,
+        "context_package_id": context_package_id,
+        "retrieval_trace_id": retrieval_trace_id,
+        "verification_id": verification_id,
+    }
+
+
 def search_payload_for_chunk(db: Session, chunk: Chunk, score: float, scores: dict[str, float], metadata: dict[str, Any]) -> dict[str, Any]:
     document = db.get(Document, chunk.document_id)
     snippet = re.sub(r"\s+", " ", chunk.text).strip()[:280]
+    source_span = chunk_source_span(db, chunk, retrieval_trace_id=metadata.get("retrieval_trace_id"))
     citation = {
         "chunk_id": chunk.id,
         "document_id": document.id if document else chunk.document_id,
@@ -2289,12 +4054,7 @@ def search_payload_for_chunk(db: Session, chunk: Chunk, score: float, scores: di
         "section": chunk.section_path,
         "page_number": chunk.page_start,
         "snippet": snippet,
-        "source_span": {
-            "document_version_id": chunk.document_version_id,
-            "char_span": [chunk.char_start, chunk.char_end],
-            "page_range": [chunk.page_start, chunk.page_end],
-            "section_path": chunk.section_path,
-        },
+        "source_span": source_span,
     }
     return {
         "chunk_id": chunk.id,
@@ -2322,9 +4082,7 @@ def write_retrieval_trace(
     filters: SearchFilters,
     results: list[dict[str, Any]],
     context_state: ContextGraphState | None,
-    coarse_hits: dict[str, float],
-    mid_hits: dict[str, float],
-    fine_hits: dict[str, float],
+    traversal: dict[str, Any],
     query_rq: dict[str, Any] | None = None,
 ) -> RetrievalTrace:
     candidate_rq = {
@@ -2332,6 +4090,23 @@ def write_retrieval_trace(
         for item in results
         if (item.get("metadata") or {}).get("rq")
     }
+    path_labels = traversal.get("path_labels") or []
+    concept_path = [
+        {"layer": "coarse", "ids": list((traversal.get("coarse_entries") or {}).keys())[:8]},
+        {"layer": "mid", "ids": list((traversal.get("mid_entries") or {}).keys())[:12]},
+        {"layer": "fine", "ids": list((traversal.get("fine_entries") or {}).keys())[:12]},
+        {"layer": "chunk", "ids": [item["chunk_id"] for item in results]},
+    ]
+    conversation_hash = stable_hash({"conversation_state": "none"})
+    cache_components = context_graph_cache_key_components(
+        knowledge_base_id=knowledge_base_id,
+        query=query,
+        filters=filters,
+        context_state=context_state,
+        retrieval_mode="layered_context_graph",
+        conversation_state_scope_hash=conversation_hash,
+    )
+    cache_key = stable_hash(cache_components)
     trace = RetrievalTrace(
         knowledge_base_id=knowledge_base_id,
         query=query,
@@ -2347,17 +4122,26 @@ def write_retrieval_trace(
         agent_operating_envelope_hash=agent_operating_envelope_state_hash(),
         prompt_protocol_hash=context_state.prompt_protocol_hash if context_state else None,
         result_chunk_ids_json=[item["chunk_id"] for item in results],
-        concept_path_json=[
-            {"layer": "coarse", "ids": list(coarse_hits)[:8]},
-            {"layer": "mid", "ids": list(mid_hits)[:12]},
-            {"layer": "fine", "ids": list(fine_hits)[:12]},
-        ],
-        scores_json={item["chunk_id"]: (item.get("metadata") or {}).get("scores", {}) for item in results},
+        concept_path_json=concept_path,
+        scores_json={},
+        query_facets_json=traversal.get("query_facets") or {},
+        entry_nodes_json=traversal.get("entry_nodes") or [],
+        frontier_json=traversal.get("frontier_json") or [],
+        path_labels_json=path_labels,
+        convergence_json=traversal.get("convergence") or {},
+        edge_distance_protocol_hash=edge_distance_protocol_hash(),
+        edge_projection_protocol_hash=edge_projection_protocol_hash(),
+        traversal_protocol_hash=traversal_protocol_hash(),
+        conversation_state_scope_hash=conversation_hash,
         diagnostics_json={
             "context_graph_state_id": context_state.id if context_state else None,
+            "cache_key": cache_key,
+            "cache_key_components": cache_components,
             "runtime_settings_hash": runtime_settings_state_hash(),
             "agent_operating_envelope": agent_operating_envelope(),
             "agent_operating_envelope_hash": agent_operating_envelope_state_hash(),
+            "scores_json_retired_as_primary_audit": True,
+            "traversal_protocol": TRAVERSAL_PROTOCOL_VERSION,
             "rq": {
                 "query_rq_path": (query_rq or {}).get("rq_path") or [],
                 "query_residual_norm": (query_rq or {}).get("residual_norm"),
@@ -2367,23 +4151,37 @@ def write_retrieval_trace(
     )
     db.add(trace)
     db.flush()
-    steps = [
-        ("coarse", "activate_coarse_concepts", {}, coarse_hits),
-        ("mid", "route_mid_concepts", {"coarse_hits": list(coarse_hits)}, mid_hits),
-        (
-            "fine",
-            "route_fine_clusters",
-            {"mid_hits": list(mid_hits), "query_rq_path": (query_rq or {}).get("rq_path") or []},
-            {"fine_hits": fine_hits, "candidate_rq": candidate_rq},
-        ),
-        (
-            "chunk",
-            "recall_chunks",
-            {"fine_hits": list(fine_hits), "query_rq_path": (query_rq or {}).get("rq_path") or []},
-            {item["chunk_id"]: {"score": item["score"], "rq": (item.get("metadata") or {}).get("rq")} for item in results},
-        ),
-    ]
-    for index, (layer, action, input_json, output_json) in enumerate(steps):
+    layer_walks = traversal.get("layer_walks") or {}
+    steps = []
+    for layer in ("coarse", "mid", "fine", "chunk"):
+        walk = layer_walks.get(layer) or {}
+        if layer == "coarse":
+            input_json = {"entry_nodes": walk.get("entry_nodes") or [], "query_facets": traversal.get("query_facets") or {}}
+            output_json = {"accepted_nodes": walk.get("accepted_nodes") or [], "convergence": walk.get("convergence") or {}}
+        elif layer == "mid":
+            input_json = {"entry_nodes": walk.get("entry_nodes") or [], "coarse_entry_ids": list((traversal.get("coarse_entries") or {}).keys())}
+            output_json = {"accepted_nodes": walk.get("accepted_nodes") or [], "convergence": walk.get("convergence") or {}}
+        elif layer == "fine":
+            input_json = {
+                "entry_nodes": walk.get("entry_nodes") or [],
+                "mid_entry_ids": list((traversal.get("mid_entries") or {}).keys()),
+                "query_rq_path": (query_rq or {}).get("rq_path") or [],
+            }
+            output_json = {"accepted_nodes": walk.get("accepted_nodes") or [], "candidate_rq": candidate_rq, "convergence": walk.get("convergence") or {}}
+        else:
+            input_json = {"entry_nodes": walk.get("entry_nodes") or [], "query_rq_path": (query_rq or {}).get("rq_path") or []}
+            output_json = {
+                "accepted_chunks": {item["chunk_id"]: {"score": item["score"], "rq": (item.get("metadata") or {}).get("rq")} for item in results},
+                "convergence": walk.get("convergence") or traversal.get("convergence") or {},
+            }
+        steps.append((layer, "walk_graph_frontier", input_json, output_json, walk))
+    for index, (layer, action, input_json, output_json, walk) in enumerate(steps):
+        popped = walk.get("frontier_pops") or []
+        popped_state = popped[0] if popped else {}
+        layer_path_labels = walk.get("path_labels") or []
+        expanded_edge_ids = list(dict.fromkeys(edge_id for label in layer_path_labels for edge_id in (label.get("expanded_edge_ids") or [])))
+        cycle_reward = max([float(label.get("reward_so_far") or 0.0) for label in layer_path_labels] + [0.0])
+        convergence = walk.get("convergence") or {}
         db.add(
             GraphRetrievalStep(
                 retrieval_trace_id=trace.id,
@@ -2393,7 +4191,19 @@ def write_retrieval_trace(
                 action=action,
                 input_json=input_json,
                 output_json=output_json,
-                score_json=output_json,
+                score_json={},
+                popped_frontier_state_json=popped_state,
+                expanded_edge_ids_json=expanded_edge_ids,
+                dominance_pruned_count=int(convergence.get("dominance_pruned_count") or 0),
+                cycle_reward=cycle_reward,
+                ambiguous_edge_decisions_json=walk.get("ambiguous_edge_decisions") or [],
+                stop_reason=str(convergence.get("reason") or ""),
+                diagnostics_json={
+                    "traversal_protocol": TRAVERSAL_PROTOCOL_VERSION,
+                    "scores_json_retired_as_primary_audit": True,
+                    "frontier_json": walk.get("frontier_json") or [],
+                    "path_labels": layer_path_labels,
+                },
             )
         )
     db.flush()
@@ -2443,7 +4253,7 @@ def build_context_package(
                 ChunkRelationEdge.is_bridge.is_(True),
                 (ChunkRelationEdge.source_chunk_id == chunk_id) | (ChunkRelationEdge.target_chunk_id == chunk_id),
             )
-            .order_by(ChunkRelationEdge.weight.desc())
+            .order_by(ChunkRelationEdge.distance.asc())
             .limit(2)
         ).all():
             other_id = edge.target_chunk_id if edge.source_chunk_id == chunk_id else edge.source_chunk_id
@@ -2467,6 +4277,8 @@ def build_context_package(
                 "path": node.path,
                 "depth": node.depth,
                 "page_number": node.page_number,
+                "bbox": node.bbox_json or {},
+                "layout": node.layout_json or {},
                 "mapping_role": mapping.mapping_role,
                 "coverage_ratio": mapping.coverage_ratio,
             }
@@ -2489,9 +4301,27 @@ def build_context_package(
             "structure_node_ids": [node["node_id"] for node in nodes],
             "structure_nodes": nodes,
             "parent_section": parent_section,
+            "same_page_region": [node for node in nodes if node.get("node_type") in {"page", "region"}],
+            "table_formula_caption": [node for node in nodes if node.get("node_type") in {"table", "formula", "caption"}],
+            "code_blocks": [node for node in nodes if node.get("node_type") == "code_block"],
         }
         structure_by_chunk_id[chunk.id] = value
         return value
+
+    path_labels = list(trace.path_labels_json or [])
+    traversal_by_chunk = {
+        item["chunk_id"]: (item.get("metadata") or {}).get("traversal") or {}
+        for item in results
+    }
+
+    def why_selected_for_chunk(chunk_id: str, role: str) -> dict[str, Any]:
+        traversal = traversal_by_chunk.get(chunk_id) or {}
+        return {
+            "roles": traversal.get("evidence_roles") or ([role] if role else []),
+            "path_edge_ids": traversal.get("path_edge_ids") or [],
+            "covered_facets": traversal.get("covered_facets") or [],
+            "reason": traversal.get("why_selected") or role or "selected_for_structure_restoration",
+        }
 
     package_chunks: list[dict[str, Any]] = []
     token_count = 0
@@ -2502,10 +4332,14 @@ def build_context_package(
             continue
         document = db.get(Document, chunk.document_id)
         structure = structure_context(chunk)
+        role = "hit" if chunk.id in hit_ids else "bridge" if chunk.id in bridge_ids else "restored_context"
+        source_span = chunk_source_span(db, chunk, retrieval_trace_id=trace.id)
+        dedupe_key = f"{chunk.id}:{[chunk.char_start, chunk.char_end]}"
         package_chunks.append(
             {
                 "chunk_id": chunk.id,
                 "document_id": chunk.document_id,
+                "document_version_id": chunk.document_version_id,
                 "document_title": document.title if document else "",
                 "source_path": document.source_path if document else "",
                 "content": chunk.text,
@@ -2516,24 +4350,49 @@ def build_context_package(
                 "parent_section": structure["parent_section"],
                 "page_range": [chunk.page_start, chunk.page_end],
                 "char_span": [chunk.char_start, chunk.char_end],
-                "role": "hit" if chunk.id in hit_ids else "bridge" if chunk.id in bridge_ids else "restored_context",
+                "bbox": source_span.get("bbox") or {},
+                "source_span": source_span,
+                "structure_closure": {
+                    "previous_chunk_id": chunk.previous_chunk_id,
+                    "next_chunk_id": chunk.next_chunk_id,
+                    "parent_section": structure["parent_section"],
+                    "same_page_region": structure["same_page_region"],
+                    "table_formula_caption": structure["table_formula_caption"],
+                    "code_blocks": structure["code_blocks"],
+                    "bridge_chunk_ids": sorted(bridge_ids),
+                },
+                "why_selected": why_selected_for_chunk(chunk.id, role),
+                "dedupe_key": dedupe_key,
+                "role": role,
             }
         )
         token_count += chunk_tokens
-    citation_spans = [
-        {
-            "chunk_id": item["chunk_id"],
-            "document_id": item["document_id"],
-            "document_version_id": chunks_by_id[item["chunk_id"]].document_version_id,
-            "char_span": item["char_span"],
-            "page_range": item["page_range"],
-            "section_path": item["section_path"],
-            "structure_path": item.get("structure_path"),
-            "structure_node_ids": item.get("structure_node_ids") or [],
-        }
+    graph_path_ids = list(
+        dict.fromkeys(
+            edge_id
+            for label in path_labels
+            for edge_id in (label.get("path_edge_ids") or [])
+        )
+    )
+    why_selected = {
+        chunk_id: why_selected_for_chunk(chunk_id, "hit" if chunk_id in hit_ids else "bridge" if chunk_id in bridge_ids else "restored_context")
+        for chunk_id in selected_ids
+    }
+    dedupe_keys = [
+        item.get("dedupe_key") or f"{item['chunk_id']}:{item.get('char_span')}"
         for item in package_chunks
-        if item["chunk_id"] in hit_ids
     ]
+    covered_facets = sorted(
+        {
+            facet
+            for item in why_selected.values()
+            for facet in (item.get("covered_facets") or [])
+        }
+    )
+    cycle_convergence_score = round(
+        sum(float((traversal_by_chunk.get(chunk_id) or {}).get("reward_so_far") or 0.0) for chunk_id in hit_ids),
+        6,
+    )
     package = ContextPackage(
         knowledge_base_id=knowledge_base_id,
         retrieval_trace_id=trace.id,
@@ -2544,15 +4403,33 @@ def build_context_package(
         parent_structure_node_ids_json=sorted(parent_node_ids),
         concept_path_json=trace.concept_path_json or [],
         package_json={"chunks": package_chunks},
+        graph_path_ids_json=graph_path_ids,
+        why_selected_json=why_selected,
+        cycle_convergence_score=cycle_convergence_score,
+        dedupe_keys_json=dedupe_keys,
+        covered_facets_json=covered_facets,
         token_budget=token_budget,
         token_count=token_count,
         runtime_settings_hash=runtime_settings_state_hash(),
         profile_hash=(active_profile_json(db, knowledge_base_id) or {}).get("profile_hash"),
-        citation_spans_json=citation_spans,
+        citation_spans_json=[],
         diagnostics_json={
             "context_restoration_protocol": "previous_next_structure_bridge_v1",
             "runtime_settings_hash": runtime_settings_state_hash(),
             "profile_hash": (active_profile_json(db, knowledge_base_id) or {}).get("profile_hash"),
+            "path_summary": {
+                "distinct_path_count": len({tuple(label.get("path") or []) for label in path_labels}),
+                "distinct_edge_type_count": len(
+                    {
+                        role
+                        for item in traversal_by_chunk.values()
+                        for role in (item.get("evidence_roles") or [])
+                    }
+                ),
+                "covered_facets": covered_facets,
+                "cycle_convergence_score": cycle_convergence_score,
+            },
+            "dedupe_keys": dedupe_keys,
             "restore_counts": {
                 "hit_chunks": len(hit_ids),
                 "restored_chunks": len([chunk_id for chunk_id in selected_ids if chunk_id not in hit_ids]),
@@ -2563,6 +4440,27 @@ def build_context_package(
     )
     db.add(package)
     db.flush()
+    for item in package_chunks:
+        source_span = item.get("source_span")
+        if isinstance(source_span, dict):
+            source_span["context_package_id"] = package.id
+        item["context_package_id"] = package.id
+    citation_spans = [
+        {
+            **(item.get("source_span") or {}),
+            "document_id": item["document_id"],
+            "document_title": item.get("document_title") or "",
+            "source_path": item.get("source_path") or "",
+            "section_path": item.get("section_path"),
+            "structure_path": item.get("structure_path"),
+            "structure_node_ids": item.get("structure_node_ids") or [],
+            "structure_closure": item.get("structure_closure") or {},
+        }
+        for item in package_chunks
+        if item["chunk_id"] in hit_ids
+    ]
+    package.package_json = {"chunks": package_chunks}
+    package.citation_spans_json = citation_spans
     next_index = (
         db.scalar(select(func.max(GraphRetrievalStep.step_index)).where(GraphRetrievalStep.retrieval_trace_id == trace.id))
         or -1
@@ -2581,9 +4479,25 @@ def build_context_package(
                 "bridge_chunk_ids": list(package.bridge_chunk_ids_json or []),
                 "parent_structure_node_ids": list(package.parent_structure_node_ids_json or []),
                 "citation_spans": citation_spans,
+                "graph_path_ids": graph_path_ids,
+                "why_selected": why_selected,
+                "dedupe_keys": dedupe_keys,
+                "token_count": token_count,
+                "token_budget": token_budget,
             },
-            score_json={"token_count": token_count, "token_budget": token_budget},
-            diagnostics_json=package.diagnostics_json,
+            score_json={},
+            popped_frontier_state_json={},
+            expanded_edge_ids_json=graph_path_ids,
+            dominance_pruned_count=int((trace.convergence_json or {}).get("dominance_pruned_count") or 0),
+            cycle_reward=cycle_convergence_score,
+            ambiguous_edge_decisions_json=trace.convergence_json.get("ambiguous_edge_decisions", []) if isinstance(trace.convergence_json, dict) else [],
+            stop_reason="context_package_built",
+            diagnostics_json={
+                **(package.diagnostics_json or {}),
+                "token_count": token_count,
+                "token_budget": token_budget,
+                "scores_json_retired_as_primary_audit": True,
+            },
         )
     )
     db.flush()
@@ -2603,6 +4517,11 @@ def context_package_to_contexts(package: ContextPackage) -> list[dict[str, Any]]
                 "parent_section": item.get("parent_section"),
                 "structure_node_ids": item.get("structure_node_ids") or [],
                 "page_range": item.get("page_range"),
+                "bbox": item.get("bbox") or (item.get("source_span") or {}).get("bbox") or {},
+                "source_span": item.get("source_span") or {},
+                "structure_closure": item.get("structure_closure") or {},
+                "why_selected": item.get("why_selected") or {},
+                "dedupe_key": item.get("dedupe_key"),
                 "role": item.get("role"),
                 "context_package_id": package.id,
             },
@@ -2951,7 +4870,7 @@ def graph_layer_payload(db: Session, knowledge_base_id: str, layer: str, *, limi
                 "label": cluster.label,
                 "type": "fine_cluster",
                 "name": cluster.label,
-                "category": "rq_prefix" if cluster.rq_level is not None else "fine_cluster",
+                "category": cluster.node_type or ("rq_prefix" if cluster.rq_level is not None else "fine_cluster"),
                 "snippet": f"{len(cluster.support_chunk_ids_json or [])} support chunks",
                 "metadata": {
                     "cluster_key": cluster.cluster_key,
@@ -2986,13 +4905,19 @@ def graph_layer_payload(db: Session, knowledge_base_id: str, layer: str, *, limi
                 "label": edge.edge_type,
                 "type": edge.edge_type,
                 "weight": edge.weight,
+                "distance": edge.distance,
+                "raw_strength": edge.raw_strength,
                 "category": edge.edge_type,
                 "is_bridge": edge.is_bridge,
                 "metadata": {
                     **(edge.features_json or {}),
+                    "distance": edge.distance,
+                    "raw_strength": edge.raw_strength,
+                    "raw_strength_summary": edge.raw_strength_summary_json or {},
                     "source_algorithm": edge.source_algorithm,
                     "protocol_version": edge.protocol_version,
                     "graph_state_hash": edge.graph_state_hash,
+                    "diagnostics": edge.diagnostics_json or {},
                 },
             }
             for edge in chunk_edge_rows
@@ -3007,6 +4932,8 @@ def graph_layer_payload(db: Session, knowledge_base_id: str, layer: str, *, limi
                 "weight": row.membership_score,
                 "category": "rq_membership" if row.rq_path else "fine_cluster_membership",
                 "metadata": {
+                    "membership_role": row.membership_role,
+                    "support_chunk_edge_ids": row.support_chunk_edge_ids_json or [],
                     "rq_path": row.rq_path or [],
                     "residual_norm": row.residual_norm,
                     "diagnostics": row.diagnostics_json or {},
@@ -3022,9 +4949,17 @@ def graph_layer_payload(db: Session, knowledge_base_id: str, layer: str, *, limi
                 "label": edge.edge_type,
                 "type": edge.edge_type,
                 "weight": edge.weight,
+                "distance": edge.distance,
+                "raw_strength": edge.raw_strength,
                 "category": edge.edge_type,
                 "metadata": {
+                    "distance": edge.distance,
+                    "raw_strength": edge.raw_strength,
+                    "raw_strength_summary": edge.raw_strength_summary_json or {},
                     "support_chunk_ids": edge.support_chunk_ids_json or [],
+                    "support_chunk_edge_ids": edge.support_chunk_edge_ids_json or [],
+                    "source_algorithm": edge.source_algorithm,
+                    "protocol_version": edge.protocol_version,
                     **(edge.diagnostics_json or {}),
                 },
             }
@@ -3052,7 +4987,22 @@ def graph_layer_payload(db: Session, knowledge_base_id: str, layer: str, *, limi
         edges = []
         if mid_state:
             edges = [
-                {"source": edge.source_concept_id, "target": edge.target_concept_id, "label": edge.edge_type, "weight": edge.weight, "category": edge.edge_type}
+                {
+                    "source": edge.source_concept_id,
+                    "target": edge.target_concept_id,
+                    "label": edge.edge_type,
+                    "weight": edge.weight,
+                    "distance": edge.distance,
+                    "category": edge.edge_type,
+                    "metadata": {
+                        "raw_strength_summary": edge.raw_strength_summary_json or {},
+                        "support_fine_edge_ids": edge.support_fine_edge_ids_json or [],
+                        "support_fine_node_ids": edge.support_fine_node_ids_json or [],
+                        "support_chunk_ids": edge.support_chunk_ids_json or [],
+                        "support_chunk_edge_ids": edge.support_relation_edge_ids_json or [],
+                        "diagnostics": edge.diagnostics_json or {},
+                    },
+                }
                 | {"id": edge.id, "type": edge.edge_type}
                 for edge in db.scalars(select(MidConceptEdge).where(MidConceptEdge.concept_state_id == mid_state.id).limit(limit * 2)).all()
             ]
@@ -3077,7 +5027,22 @@ def graph_layer_payload(db: Session, knowledge_base_id: str, layer: str, *, limi
         edges = []
         if coarse_state:
             edges = [
-                {"source": edge.source_concept_id, "target": edge.target_concept_id, "label": edge.edge_type, "weight": edge.weight, "category": edge.edge_type}
+                {
+                    "source": edge.source_concept_id,
+                    "target": edge.target_concept_id,
+                    "label": edge.edge_type,
+                    "weight": edge.weight,
+                    "distance": edge.distance,
+                    "category": edge.edge_type,
+                    "metadata": {
+                        "raw_strength_summary": edge.raw_strength_summary_json or {},
+                        "support_mid_edge_ids": edge.support_mid_edge_ids_json or [],
+                        "support_fine_edge_ids": edge.support_fine_edge_ids_json or [],
+                        "support_chunk_ids": edge.support_chunk_ids_json or [],
+                        "cross_community_weak_ties": edge.cross_community_weak_ties_json or [],
+                        "diagnostics": edge.diagnostics_json or {},
+                    },
+                }
                 | {"id": edge.id, "type": edge.edge_type}
                 for edge in db.scalars(select(CoarseConceptEdge).where(CoarseConceptEdge.coarse_state_id == coarse_state.id).limit(limit * 2)).all()
             ]
@@ -3146,14 +5111,24 @@ def grounding_stats(db: Session, knowledge_base_id: str) -> dict[str, Any]:
 
 def retrieval_contribution_stats(db: Session, knowledge_base_id: str) -> dict[str, Any]:
     traces = list(db.scalars(select(RetrievalTrace).where(RetrievalTrace.knowledge_base_id == knowledge_base_id).order_by(RetrievalTrace.created_at.desc()).limit(50)).all())
-    score_totals: Counter[str] = Counter()
+    edge_role_totals: Counter[str] = Counter()
+    stop_reasons: Counter[str] = Counter()
+    frontier_pops = 0
+    dominance_pruned = 0
     for trace in traces:
-        for scores in (trace.scores_json or {}).values():
-            if isinstance(scores, dict):
-                for key, value in scores.items():
-                    try:
-                        score_totals[key] += float(value)
-                    except (TypeError, ValueError):
-                        pass
-    total = sum(score_totals.values()) or 1.0
-    return {key: round(value / total, 6) for key, value in score_totals.items()}
+        frontier_pops += len(trace.frontier_json or [])
+        convergence = trace.convergence_json or {}
+        stop_reason = str(convergence.get("reason") or "unknown")
+        stop_reasons[stop_reason] += 1
+        dominance_pruned += int(convergence.get("dominance_pruned_count") or 0)
+        for label in trace.path_labels_json or []:
+            for edge_id in label.get("expanded_edge_ids") or []:
+                edge_role_totals[str(edge_id)] += 1
+    total_edges = sum(edge_role_totals.values()) or 1
+    return {
+        "frontier_pops": frontier_pops,
+        "dominance_pruned_count": dominance_pruned,
+        "expanded_edge_contribution": {key: round(value / total_edges, 6) for key, value in edge_role_totals.most_common(20)},
+        "convergence_reasons": dict(stop_reasons),
+        "scores_json_primary": False,
+    }

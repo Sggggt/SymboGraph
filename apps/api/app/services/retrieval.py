@@ -69,6 +69,7 @@ def get_context_package(db: Session, package_id: str) -> dict | None:
     package_json = package.package_json or {}
     graph_expansion_paths = [
         {"kind": "concept_path", "path": package.concept_path_json or []},
+        {"kind": "graph_path_ids", "edge_ids": package.graph_path_ids_json or []},
         {"kind": "restored_chunks", "chunk_ids": package.restored_chunk_ids_json or []},
         {"kind": "bridge_chunks", "chunk_ids": package.bridge_chunk_ids_json or []},
         {"kind": "parent_structure_nodes", "node_ids": package.parent_structure_node_ids_json or []},
@@ -97,6 +98,11 @@ def get_context_package(db: Session, package_id: str) -> dict | None:
         "bridge_chunk_ids": package.bridge_chunk_ids_json or [],
         "parent_structure_node_ids": package.parent_structure_node_ids_json or [],
         "concept_path": package.concept_path_json or [],
+        "graph_path_ids": package.graph_path_ids_json or [],
+        "why_selected": package.why_selected_json or {},
+        "cycle_convergence_score": package.cycle_convergence_score,
+        "dedupe_keys": package.dedupe_keys_json or [],
+        "covered_facets": package.covered_facets_json or [],
         "package": package_json,
         "contexts": context_package_to_contexts(package),
         "token_budget": package.token_budget,
@@ -121,6 +127,11 @@ def get_retrieval_trace_steps(db: Session, trace_id: str) -> dict | None:
         "retrieval_mode": trace.retrieval_mode,
         "concept_path": trace.concept_path_json or [],
         "result_chunk_ids": trace.result_chunk_ids_json or [],
+        "query_facets": trace.query_facets_json or {},
+        "entry_nodes": trace.entry_nodes_json or [],
+        "frontier": trace.frontier_json or [],
+        "path_labels": trace.path_labels_json or [],
+        "convergence": trace.convergence_json or {},
         "steps": [
             {
                 "id": step.id,
@@ -130,6 +141,12 @@ def get_retrieval_trace_steps(db: Session, trace_id: str) -> dict | None:
                 "input": step.input_json or {},
                 "output": step.output_json or {},
                 "scores": step.score_json or {},
+                "popped_frontier_state": step.popped_frontier_state_json or {},
+                "expanded_edge_ids": step.expanded_edge_ids_json or [],
+                "dominance_pruned_count": step.dominance_pruned_count,
+                "cycle_reward": step.cycle_reward,
+                "ambiguous_edge_decisions": step.ambiguous_edge_decisions_json or [],
+                "stop_reason": step.stop_reason,
                 "diagnostics": step.diagnostics_json or {},
                 "created_at": step.created_at,
             }

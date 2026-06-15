@@ -615,6 +615,29 @@ async def run_uploaded_files_ingestion(
         db.commit()
         emit_ingestion_log(batch.id, terminal_event, f"Batch {batch.status}: success={batch.success_count}, failed={batch.failure_count}, skipped={batch.skipped_count}")
         return summarize_batch(batch)
+    except Exception as exc:
+        db.rollback()
+        message = exception_message(exc)
+        batch = db.get(IngestionBatch, batch_id)
+        if batch is not None:
+            stats = dict(batch.stats or {})
+            errors = list(stats.get("errors") or [])
+            errors.append({"phase": stats.get("phase") or batch.status, "message": message})
+            batch.status = "failed"
+            batch.last_error = message
+            batch.completed_at = datetime.utcnow()
+            batch.worker_id = None
+            batch.heartbeat_at = None
+            batch.stats = {
+                **stats,
+                "phase": "failed",
+                "errors": errors,
+                "manual_review_required": True,
+                "failed_at": datetime.utcnow().isoformat(),
+            }
+            db.commit()
+            emit_ingestion_log(batch.id, "batch_failed", f"Batch failed during {(stats.get('phase') or batch.status)}: {message}", error=message)
+        raise
     finally:
         db.close()
 
