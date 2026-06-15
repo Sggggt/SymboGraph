@@ -342,25 +342,25 @@ function getProfileJsonDiagnostics(text: string): JsonDiagnostic[] {
     return diagnostics;
   }
   const profile = parsed as Record<string, unknown>;
-  for (const key of ["schema_version", "ui_labels", "prompt_pack", "conversation_preferences"]) {
+  for (const key of ["schema_version", "library_type", "ui_labels", "prompt_pack", "conversation_preferences"]) {
     if (!(key in profile)) {
       diagnostics.push({
         line: 1,
         column: 1,
         severity: "warning",
         message: `缺少 ${key}`,
-        reason: "后端会尝试补默认值，但建议显式保留提示词、界面标签和对话偏好三类交互配置。",
+        reason: "后端会尝试补默认值，但建议显式保留资料库类型、提示词、界面标签和对话偏好。",
       });
     }
   }
-  for (const key of ["schema_pack", "concept_induction_policy", "parsing_strategy", "graph_strategy", "retrieval_strategy", "quality_policy"]) {
+  for (const key of ["schema_pack", "concept_induction_policy", "parsing_strategy", "graph_strategy", "retrieval_strategy", "quality_policy", "signal_induction_policy"]) {
     if (key in profile) {
       diagnostics.push({
         line: getLineForKey(text, key),
         column: 1,
         severity: "warning",
         message: `${key} 已退出活动配置档`,
-        reason: "配置档只保存 prompt_pack、ui_labels 和 conversation_preferences；工程参数必须进入运行时设置。",
+        reason: "配置档 JSON 只保存 library_type、prompt_pack、ui_labels 和 conversation_preferences；工程参数必须进入运行时设置。",
       });
     }
   }
@@ -759,7 +759,7 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
           <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="text-sm font-semibold text-white">高级 JSON</p>
-              <p className="mt-1 text-sm text-white/52">结构化字段与高级 JSON 共用同一份配置档结构规则。</p>
+              <p className="mt-1 text-sm text-white/52">结构化字段与高级 JSON 共用同一份交互配置结构。</p>
             </div>
             <Button type="button" className="rounded-full" onClick={() => saveMutation.mutate()} disabled={isBuiltin || hasJsonErrors || saveMutation.isPending}>
               {saveMutation.isPending ? <Loader2 data-icon="inline-start" className="animate-spin" /> : <Save data-icon="inline-start" />}
@@ -827,7 +827,7 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
           <div ref={assistantScrollRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto py-4 pr-1">
             {assistantMessages.length === 0 && !assistantDraft ? (
               <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4 text-sm leading-7 text-white/62">
-                输入资料库类型、概念/关系标签、章节或条款规则、引用要求和检索偏好。助手会先输出说明，再给出一个可填充的高级 JSON 草案。
+                输入资料库类型、界面标签、回答提示词、引用严格度表达、澄清方式和无上下文回复文案。助手会先输出说明，再给出一个只包含交互配置的 JSON 草案。
               </div>
             ) : null}
             {assistantMessages.map((item) => (
@@ -877,7 +877,7 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
                   void runAssistant();
                 }
               }}
-              placeholder="描述资料库类型、概念/关系标签、引用规则、分区规则和检索偏好。"
+              placeholder="描述资料库类型、界面标签、回答风格、引用严格度表达、澄清方式和无上下文回复文案。"
               className="min-h-24 resize-none rounded-2xl border-white/10 bg-white/[0.04] text-white"
             />
             <Button type="button" className="mt-3 w-full rounded-full" onClick={() => void runAssistant()} disabled={!assistantPrompt.trim() || assistantStreaming}>

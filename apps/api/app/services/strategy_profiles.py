@@ -84,9 +84,6 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "no_context_answer_zh": GENERIC_NO_CONTEXT_ZH,
         "reflection_domain": "context-graph-grounded knowledge-base assistant",
         "citation_domain": "indexed chunk spans",
-        "query_translation_domain": "knowledge-base context graph search",
-        "community_summary_system": "Summarize a context graph community for retrieval routing. Return strict JSON.",
-        "quality_judge_system": "You are an LLM-as-a-judge for a four-layer context graph knowledge-base pipeline. Return strict JSON.",
         "perception_domain": "context-graph-grounded knowledge-base agent",
         "entity_label": "grounded mid-level concepts",
         "coverage_label": "indexed materials",
@@ -101,7 +98,6 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "agent_clarify_answer_zh": "请进一步说明你要检索的来源、分区、任务或比较问题。",
         "agent_no_context_answer_en": "I could not find enough relevant indexed context to answer this question. If you want me to try with limited retrieved material, please tell me.",
         "agent_no_context_answer_zh": "索引资料中没有找到足够相关的上下文来回答这个问题。如果你希望我基于有限检索材料尝试回答，请告诉我。",
-        "retry_query_suffix": "knowledge-base chunk spans examples",
     },
     "conversation_preferences": {
         "default_language": "auto",

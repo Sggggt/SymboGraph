@@ -202,6 +202,33 @@ def test_profile_validation_ignores_legacy_strategy_fields():
     assert any("retrieval_strategy is ignored" in warning for warning in warnings)
 
 
+def test_profile_assistant_prompt_stays_within_profile_boundary():
+    from app.services.profile_assistant import _assistant_system_prompt
+
+    prompt = _assistant_system_prompt()
+
+    assert "user-profile interaction-configuration assistant" in prompt
+    assert "Profiles only affect interaction wording" in prompt
+    assert "Runtime Settings" in prompt
+    assert "chunking" in prompt
+    assert "embedding" in prompt
+    assert "retrieval scoring" in prompt
+    assert "agent envelope" in prompt
+    assert "runtime controls" in prompt
+    assert "strategy-profile" not in prompt
+
+
+def test_default_profile_prompt_pack_excludes_engineering_prompts():
+    from app.services.strategy_profiles import default_profile_payload
+
+    prompt_pack = default_profile_payload()["prompt_pack"]
+
+    assert "community_summary_system" not in prompt_pack
+    assert "quality_judge_system" not in prompt_pack
+    assert "query_translation_domain" not in prompt_pack
+    assert "retry_query_suffix" not in prompt_pack
+
+
 def test_batch_summary_matches_response_schema(db_session, sample_knowledge_base):
     from app.models import IngestionBatch
     from app.schemas import IngestionBatchSummary

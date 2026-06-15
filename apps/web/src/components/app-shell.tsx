@@ -282,7 +282,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 </div>
                 <div className="min-w-0">
                   <p className="text-sm font-semibold text-white">配置档设置</p>
-                  <p className="mt-2 break-words text-xs leading-5 text-white/60">默认配置档保持现有课程行为；自定义资料库先复制预设，再编辑结构规则、提示词和策略。</p>
+                  <p className="mt-2 break-words text-xs leading-5 text-white/60">默认配置档保持现有交互方式；自定义资料库先复制预设，再编辑界面标签、提示词和对话偏好。</p>
                 </div>
               </div>
               <div className="flex min-w-0 gap-4 rounded-2xl border border-emerald-200/15 bg-emerald-300/[0.06] p-4">
