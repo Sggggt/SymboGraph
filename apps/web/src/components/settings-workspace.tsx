@@ -1020,6 +1020,22 @@ export function SettingsWorkspace() {
   const crossEncoderStatus = runtimeQuery.data?.reranker;
   const envSynced = Boolean(runtimeQuery.data?.env_sync?.synced);
   const runtimeWarnings = runtimeQuery.data?.warnings ?? [];
+  const bridgeStatus = settings?.model_bridge_status;
+  const bridgeHealthy =
+    !form?.model_bridge_enabled ||
+    Boolean(bridgeStatus?.reachable && bridgeStatus?.admin_available && bridgeStatus?.config_matches && !bridgeStatus?.self_target_blocked);
+  const bridgeStatusText = !form?.model_bridge_enabled
+    ? "未启用"
+    : bridgeStatus?.self_target_blocked
+      ? "目标自环"
+    : bridgeStatus?.reachable
+      ? bridgeStatus?.admin_available
+        ? bridgeStatus?.config_matches
+          ? "配置已同步"
+          : "配置不一致"
+        : "管理接口不可用"
+      : "不可达";
+  const bridgeWarnings = bridgeStatus?.warnings ?? [];
 
   if (settingsQuery.isLoading || !form) {
     return <LoadingBlock rows={4} />;
@@ -1129,6 +1145,7 @@ export function SettingsWorkspace() {
             <div className="flex flex-wrap gap-2">
               <StatusPill ok={Boolean(settings?.has_api_key)}>聊天密钥 {settings?.has_api_key ? "已配置" : "未配置"}</StatusPill>
               <StatusPill ok={Boolean(settings?.has_embedding_api_key)}>向量密钥 {settings?.has_embedding_api_key ? "已配置" : "未配置"}</StatusPill>
+              <StatusPill ok={bridgeHealthy}>模型桥 {bridgeStatusText}</StatusPill>
               <StatusPill ok={envSynced}>{envSynced ? ".env 已同步" : ".env 需检查"}</StatusPill>
               <StatusPill ok={!settings?.enable_model_fallback && !settings?.enable_database_fallback}>回退已禁用</StatusPill>
               <StatusPill ok={Boolean(settings?.runtime_settings_version)}>运行时 {settings?.runtime_settings_version ? settings.runtime_settings_version.slice(0, 12) : "等待中"}</StatusPill>
@@ -1164,6 +1181,35 @@ export function SettingsWorkspace() {
               <BoundaryNote title="向量模型边界：已有 active 向量不会自动改写">
                 修改向量模型后只影响后续解析、重嵌入或全量重建任务；已有资料库向量需要显式重新解析或重建。
               </BoundaryNote>
+              {form.model_bridge_enabled ? (
+                <div className="mt-4 border-l border-cyan-200/20 bg-cyan-300/[0.035] px-4 py-3 text-sm text-cyan-50/70">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-semibold text-white">模型桥转发状态</span>
+                    <StatusPill ok={bridgeHealthy}>{bridgeStatusText}</StatusPill>
+                    {bridgeStatus?.config_version ? <span className="text-xs text-cyan-100/50">版本 {bridgeStatus.config_version.slice(0, 12)}</span> : null}
+                  </div>
+                  <div className="mt-3 grid gap-2 md:grid-cols-2">
+                    <p className="min-w-0 break-words">聊天 effective 地址：{settings?.effective_chat_base_url || "未读取"}</p>
+                    <p className="min-w-0 break-words">向量 effective 地址：{settings?.effective_embedding_base_url || "未读取"}</p>
+                    <p className="min-w-0 break-words">聊天目标 hash：{bridgeStatus?.chat_target_hash?.slice(0, 12) || "未知"}</p>
+                    <p className="min-w-0 break-words">向量目标 hash：{bridgeStatus?.embedding_target_hash?.slice(0, 12) || "未知"}</p>
+                  </div>
+                  {bridgeStatus?.last_reload ? (
+                    <p className={bridgeStatus.last_reload.ok ? "mt-3 text-emerald-100/75" : "mt-3 text-rose-100/80"}>
+                      最近热加载：{bridgeStatus.last_reload.ok ? "成功" : `失败 ${bridgeStatus.last_reload.error ?? bridgeStatus.last_reload.status_code ?? ""}`}
+                    </p>
+                  ) : null}
+                  {bridgeWarnings.length ? (
+                    <ul className="mt-3 space-y-1 text-amber-100/78">
+                      {bridgeWarnings.map((warning) => (
+                        <li key={warning} className="break-words">
+                          {warning}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </div>
+              ) : null}
               <div className="mt-5 grid gap-4 md:grid-cols-2">
                 <SwitchRow
                   title="模型桥"

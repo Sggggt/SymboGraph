@@ -47,7 +47,10 @@ def get_model_settings() -> dict:
 
 @router.put("/settings/model", response_model=ModelSettingsResponse)
 def save_model_settings(request: ModelSettingsUpdate) -> dict:
-    return update_model_settings(request.model_dump(exclude_unset=True))
+    try:
+        return update_model_settings(request.model_dump(exclude_unset=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/settings/runtime-check", response_model=RuntimeCheckResponse)

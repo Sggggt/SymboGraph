@@ -180,6 +180,151 @@ def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch)
     assert "semantic_chunking_enabled" not in payload
 
 
+def test_model_settings_payload_keeps_bridge_targets_editable(monkeypatch):
+    from app.core.config import get_settings
+    from app.services import runtime_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("MODEL_BRIDGE_ENABLED", "true")
+    monkeypatch.setenv("MODEL_BRIDGE_PORT", "8765")
+    monkeypatch.setenv("CHAT_BASE_URL", "https://chat.example.test/v1")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "https://embedding.example.test/v1")
+    monkeypatch.setenv("CHAT_RESOLVE_IP", "1.1.1.1")
+    monkeypatch.setenv("EMBEDDING_RESOLVE_IP", "2.2.2.2")
+    monkeypatch.setattr(
+        runtime_settings,
+        "_env_entries",
+        lambda _path: {
+            "MODEL_BRIDGE_ENABLED": "true",
+            "MODEL_BRIDGE_PORT": "8765",
+            "CHAT_BASE_URL": "https://chat.example.test/v1",
+            "EMBEDDING_BASE_URL": "https://embedding.example.test/v1",
+            "CHAT_RESOLVE_IP": "1.1.1.1",
+            "EMBEDDING_RESOLVE_IP": "2.2.2.2",
+        },
+    )
+    monkeypatch.setattr(runtime_settings, "current_runtime_settings_version", lambda: "unit-version")
+    monkeypatch.setattr(runtime_settings, "model_bridge_status_payload", lambda settings=None, env_entries=None: {"enabled": True, "config_matches": True})
+
+    payload = runtime_settings.model_settings_payload()
+
+    assert payload["chat_base_url"] == "https://chat.example.test/v1"
+    assert payload["embedding_base_url"] == "https://embedding.example.test/v1"
+    assert payload["effective_chat_base_url"] == "http://host.docker.internal:8765"
+    assert payload["effective_embedding_base_url"] == "http://host.docker.internal:8765"
+    assert payload["chat_resolve_ip"] == "1.1.1.1"
+    assert payload["embedding_resolve_ip"] == "2.2.2.2"
+
+
+def test_update_model_settings_reloads_model_bridge(monkeypatch, tmp_path):
+    from app.core.config import get_settings
+    from app.services import runtime_settings
+
+    env_path = tmp_path / ".env"
+    example_path = tmp_path / ".env.example"
+    env_path.write_text(
+        "\n".join(
+            [
+                "MODEL_BRIDGE_ENABLED=true",
+                "MODEL_BRIDGE_PORT=8765",
+                "MODEL_BRIDGE_ADMIN_TOKEN=unit-token",
+                "CHAT_BASE_URL=https://chat.example.test/v1",
+                "EMBEDDING_BASE_URL=https://embedding.example.test/v1",
+                "CHAT_RESOLVE_IP=1.1.1.1",
+                "EMBEDDING_RESOLVE_IP=2.2.2.2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    example_path.write_text(env_path.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
+    monkeypatch.setattr(runtime_settings, "ENV_EXAMPLE_PATH", example_path)
+    monkeypatch.setenv("MODEL_BRIDGE_ENABLED", "true")
+    monkeypatch.setenv("MODEL_BRIDGE_PORT", "8765")
+    monkeypatch.setenv("MODEL_BRIDGE_ADMIN_TOKEN", "unit-token")
+    monkeypatch.setattr(runtime_settings, "publish_runtime_settings_version", lambda changed_keys, source="api": {"changed_keys": changed_keys, "source": source})
+    monkeypatch.setattr(runtime_settings, "model_bridge_status_payload", lambda settings=None, env_entries=None: {"enabled": True, "config_matches": True})
+    reload_calls: list[dict] = []
+
+    def fake_reload_model_bridge(settings=None, env_entries=None):
+        reload_calls.append(dict(env_entries or {}))
+        return {"attempted": True, "ok": True, "config_version": "bridge-version"}
+
+    monkeypatch.setattr(runtime_settings, "reload_model_bridge", fake_reload_model_bridge)
+    get_settings.cache_clear()
+
+    result = runtime_settings.update_model_settings({"embedding_base_url": "https://embedding.example.test/v2"})
+
+    assert reload_calls
+    assert reload_calls[-1]["EMBEDDING_BASE_URL"] == "https://embedding.example.test/v2"
+    assert result["model_bridge_status"]["last_reload"]["ok"] is True
+
+
+def test_model_bridge_status_blocks_self_target(monkeypatch):
+    from app.core.config import get_settings
+    from app.services import runtime_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("MODEL_BRIDGE_ENABLED", "true")
+    monkeypatch.setenv("MODEL_BRIDGE_PORT", "8765")
+    monkeypatch.setattr(
+        runtime_settings,
+        "_env_entries",
+        lambda _path: {
+            "MODEL_BRIDGE_ENABLED": "true",
+            "MODEL_BRIDGE_PORT": "8765",
+            "CHAT_BASE_URL": "https://chat.example.test/v1",
+            "EMBEDDING_BASE_URL": "http://host.docker.internal:8765",
+        },
+    )
+    monkeypatch.setattr(
+        runtime_settings.httpx,
+        "get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+
+    payload = runtime_settings.model_bridge_status_payload()
+
+    assert payload["self_target_blocked"] is True
+    assert payload["embedding_target_is_bridge"] is True
+    assert payload["config_matches"] is not True
+    assert any("bridge itself" in warning for warning in payload["warnings"])
+
+
+def test_update_model_settings_rejects_bridge_self_target(monkeypatch, tmp_path):
+    from app.core.config import get_settings
+    from app.services import runtime_settings
+
+    env_path = tmp_path / ".env"
+    example_path = tmp_path / ".env.example"
+    env_path.write_text(
+        "\n".join(
+            [
+                "MODEL_BRIDGE_ENABLED=true",
+                "MODEL_BRIDGE_PORT=8765",
+                "MODEL_BRIDGE_ADMIN_TOKEN=unit-token",
+                "CHAT_BASE_URL=https://chat.example.test/v1",
+                "EMBEDDING_BASE_URL=https://embedding.example.test/v1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    example_path.write_text(env_path.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
+    monkeypatch.setattr(runtime_settings, "ENV_EXAMPLE_PATH", example_path)
+    monkeypatch.setenv("MODEL_BRIDGE_ENABLED", "true")
+    monkeypatch.setenv("MODEL_BRIDGE_PORT", "8765")
+    get_settings.cache_clear()
+
+    try:
+        runtime_settings.update_model_settings({"embedding_base_url": "http://host.docker.internal:8765"})
+        raise AssertionError("self-target bridge URL should be rejected")
+    except ValueError as exc:
+        assert "EMBEDDING_BASE_URL" in str(exc)
+
+
 def test_profile_validation_ignores_legacy_strategy_fields():
     from app.services.strategy_profiles import validate_profile_payload
 

@@ -343,6 +343,8 @@ export interface ModelSettingsResponse {
   provider?: "openai_compatible" | string;
   chat_base_url?: string;
   embedding_base_url?: string;
+  effective_chat_base_url?: string;
+  effective_embedding_base_url?: string;
   chat_resolve_ip?: string | null;
   embedding_resolve_ip?: string | null;
   embedding_model?: string;
@@ -361,6 +363,7 @@ export interface ModelSettingsResponse {
   reranker_device?: "cpu" | "cuda" | string;
   reranker_url?: string;
   model_bridge_enabled?: boolean;
+  model_bridge_status?: ModelBridgeStatus;
   mid_concept_extraction_max_model_batches?: number;
   mid_concept_extraction_max_candidates_per_batch?: number;
   mid_concept_extraction_max_tokens_per_batch?: number;
@@ -396,6 +399,34 @@ export interface ModelSettingsResponse {
   runtime_settings_version?: string | null;
   settings?: Record<string, unknown>;
   runtime_version?: Record<string, unknown>;
+}
+
+export interface ModelBridgeStatus {
+  enabled?: boolean;
+  base_url?: string;
+  reachable?: boolean | null;
+  admin_available?: boolean | null;
+  config_matches?: boolean | null;
+  chat_target_is_bridge?: boolean;
+  embedding_target_is_bridge?: boolean;
+  self_target_blocked?: boolean;
+  config_version?: string | null;
+  chat_target_hash?: string | null;
+  embedding_target_hash?: string | null;
+  desired_chat_target_hash?: string | null;
+  desired_embedding_target_hash?: string | null;
+  routes?: Record<string, string>;
+  warnings?: string[];
+  last_reload?: {
+    attempted?: boolean;
+    ok?: boolean;
+    reason?: string;
+    error?: string;
+    status_code?: number;
+    config_version?: string;
+    chat_target_hash?: string;
+    embedding_target_hash?: string;
+  };
 }
 
 export interface ModelSettingsUpdate {
@@ -532,6 +563,7 @@ export interface RuntimeCheckResponse {
   env_sync?: EnvSyncStatus;
   reranker?: RerankerRuntimeStatus;
   infrastructure?: InfrastructureStatus;
+  model_bridge_status?: ModelBridgeStatus;
   blocking_issues?: RuntimeIssue[];
   warnings?: RuntimeIssue[];
   issues?: RuntimeIssue[];

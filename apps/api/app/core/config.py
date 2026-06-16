@@ -18,6 +18,7 @@ HOT_RELOAD_SETTINGS = {
     "embedding_api_key",
     "model_bridge_enabled",
     "model_bridge_port",
+    "model_bridge_admin_token",
     "embedding_model",
     "chat_model",
     "embedding_dimensions",
@@ -94,6 +95,7 @@ class Settings(BaseSettings):
     embedding_api_key: str | None = None
     model_bridge_enabled: bool = False
     model_bridge_port: int = 8765
+    model_bridge_admin_token: str = "local-model-bridge-admin"
     embedding_model: str = "text-embedding-v4"
     chat_model: str = "qwen-plus"
     embedding_dimensions: int = 1024
@@ -326,6 +328,9 @@ def _build_settings() -> Settings:
             settings.model_bridge_port = int(model_bridge_port)
         except ValueError:
             pass
+    model_bridge_admin_token = env_entries.get("MODEL_BRIDGE_ADMIN_TOKEN") or os.getenv("MODEL_BRIDGE_ADMIN_TOKEN")
+    if model_bridge_admin_token:
+        settings.model_bridge_admin_token = model_bridge_admin_token
     settings.model_bridge_enabled = model_bridge_enabled
     if api_chat_base_url:
         settings.chat_base_url = api_chat_base_url

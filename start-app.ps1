@@ -127,6 +127,9 @@ $modelBridgeEnabled = Get-DotEnvBool -Key "MODEL_BRIDGE_ENABLED" -DefaultValue $
 $modelBridgePortRaw = Get-DotEnvValue -Key "MODEL_BRIDGE_PORT" -DefaultValue "8765"
 $chatBaseUrl = Get-DotEnvValue -Key "CHAT_BASE_URL" -DefaultValue "https://api.openai.com/v1"
 $chatResolveIp = Get-DotEnvValue -Key "CHAT_RESOLVE_IP" -DefaultValue ""
+$embeddingBaseUrl = Get-DotEnvValue -Key "EMBEDDING_BASE_URL" -DefaultValue ""
+$embeddingResolveIp = Get-DotEnvValue -Key "EMBEDDING_RESOLVE_IP" -DefaultValue ""
+$modelBridgeAdminToken = Get-DotEnvValue -Key "MODEL_BRIDGE_ADMIN_TOKEN" -DefaultValue "local-model-bridge-admin"
 try {
   $modelBridgePort = [int]$modelBridgePortRaw
 } catch {
@@ -142,6 +145,164 @@ $env:API_HOST_PORT = [string]$BackendPort
 $env:WEB_HOST_PORT = [string]$FrontendPort
 $env:CHAT_BASE_URL = $chatBaseUrl
 $env:CHAT_RESOLVE_IP = $chatResolveIp
+$env:EMBEDDING_BASE_URL = $embeddingBaseUrl
+$env:EMBEDDING_RESOLVE_IP = $embeddingResolveIp
+$env:MODEL_BRIDGE_ADMIN_TOKEN = $modelBridgeAdminToken
+
+function Normalize-BridgeBaseUrl {
+  param([string]$Value)
+  if ([string]::IsNullOrWhiteSpace($Value)) {
+    return ""
+  }
+  return $Value.Trim().TrimEnd("/")
+}
+
+function Normalize-BridgeResolveIp {
+  param([string]$Value)
+  if ([string]::IsNullOrWhiteSpace($Value) -or $Value -eq "__none__") {
+    return ""
+  }
+  return $Value.Trim()
+}
+
+function Test-ModelBridgeSelfTarget {
+  param(
+    [string]$Url,
+    [int]$Port
+  )
+  if ([string]::IsNullOrWhiteSpace($Url)) {
+    return $false
+  }
+  try {
+    $uri = [System.Uri]$Url
+  } catch {
+    return $false
+  }
+  $hostName = $uri.Host.ToLowerInvariant()
+  if ($hostName -notin @("host.docker.internal", "127.0.0.1", "localhost", "::1", "0.0.0.0")) {
+    return $false
+  }
+  return $uri.Port -eq $Port
+}
+
+function Invoke-BridgeAdminJson {
+  param(
+    [string]$Uri,
+    [string]$Method = "GET",
+    [object]$Body = $null
+  )
+  $headers = @{ "X-Bridge-Admin-Token" = $modelBridgeAdminToken }
+  if ($null -eq $Body) {
+    return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $headers -TimeoutSec 5
+  }
+  $jsonBody = $Body | ConvertTo-Json -Depth 6
+  return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $headers -ContentType "application/json" -Body $jsonBody -TimeoutSec 10
+}
+
+function Stop-ModelBridgeOnPort {
+  param([int]$Port)
+  try {
+    $connections = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    foreach ($connection in $connections) {
+      if ($connection.OwningProcess) {
+        Write-Host "Stopping existing model bridge process on port ${Port}: PID $($connection.OwningProcess)" -ForegroundColor Yellow
+        Stop-Process -Id $connection.OwningProcess -Force -ErrorAction SilentlyContinue
+      }
+    }
+    Start-Sleep -Milliseconds 500
+  } catch {
+    Write-Host "Could not stop existing bridge process on port $Port automatically: $($_.Exception.Message)" -ForegroundColor Yellow
+  }
+}
+
+function Start-ModelBridge {
+  param(
+    [string]$BridgeScript,
+    [object]$PythonCommand,
+    [int]$Port
+  )
+
+  if ([string]::IsNullOrWhiteSpace($chatBaseUrl)) {
+    throw "MODEL_BRIDGE_ENABLED=true requires CHAT_BASE_URL."
+  }
+  if ([string]::IsNullOrWhiteSpace($embeddingBaseUrl)) {
+    throw "MODEL_BRIDGE_ENABLED=true requires EMBEDDING_BASE_URL. The bridge no longer reuses CHAT_BASE_URL for embeddings."
+  }
+  if (Test-ModelBridgeSelfTarget -Url $chatBaseUrl -Port $Port) {
+    throw "CHAT_BASE_URL must be the real chat provider URL, not the model bridge URL."
+  }
+  if (Test-ModelBridgeSelfTarget -Url $embeddingBaseUrl -Port $Port) {
+    throw "EMBEDDING_BASE_URL must be the real embedding provider URL, not the model bridge URL."
+  }
+
+  $bridgeArgs = @(
+    $BridgeScript,
+    "--host", "127.0.0.1",
+    "--port", [string]$Port,
+    "--chat-target-base-url", $chatBaseUrl,
+    "--embedding-target-base-url", $embeddingBaseUrl,
+    "--admin-token", $modelBridgeAdminToken
+  )
+  if ($chatResolveIp -and $chatResolveIp -ne "__none__") {
+    $bridgeArgs += @("--chat-resolve-ip", $chatResolveIp)
+  }
+  if ($embeddingResolveIp -and $embeddingResolveIp -ne "__none__") {
+    $bridgeArgs += @("--embedding-resolve-ip", $embeddingResolveIp)
+  }
+  Start-Process -WindowStyle Hidden -FilePath $PythonCommand.Source -ArgumentList $bridgeArgs
+}
+
+function Sync-ModelBridge {
+  param(
+    [string]$BridgeScript,
+    [object]$PythonCommand,
+    [int]$Port
+  )
+
+  $BridgeHealthUrl = "http://127.0.0.1:$Port/health"
+  $BridgeAdminConfigUrl = "http://127.0.0.1:$Port/admin/config"
+  $BridgeAdminReloadUrl = "http://127.0.0.1:$Port/admin/reload"
+  if (Test-ModelBridgeSelfTarget -Url $chatBaseUrl -Port $Port) {
+    throw "CHAT_BASE_URL must be the real chat provider URL, not the model bridge URL."
+  }
+  if (Test-ModelBridgeSelfTarget -Url $embeddingBaseUrl -Port $Port) {
+    throw "EMBEDDING_BASE_URL must be the real embedding provider URL, not the model bridge URL."
+  }
+  $desiredPayload = @{
+    chat_target_base_url = $chatBaseUrl
+    chat_resolve_ip = (Normalize-BridgeResolveIp $chatResolveIp)
+    embedding_target_base_url = $embeddingBaseUrl
+    embedding_resolve_ip = (Normalize-BridgeResolveIp $embeddingResolveIp)
+  }
+
+  if (-not (Test-Url $BridgeHealthUrl)) {
+    Start-ModelBridge -BridgeScript $BridgeScript -PythonCommand $PythonCommand -Port $Port
+    Wait-Url -Url $BridgeHealthUrl -Name "Model bridge" -TimeoutSeconds 20
+    return
+  }
+
+  $currentConfig = $null
+  try {
+    $currentConfig = Invoke-BridgeAdminJson -Uri $BridgeAdminConfigUrl
+  } catch {
+    Write-Host "Existing model bridge does not support admin reload or token mismatch; restarting bridge." -ForegroundColor Yellow
+    Stop-ModelBridgeOnPort -Port $Port
+    Start-ModelBridge -BridgeScript $BridgeScript -PythonCommand $PythonCommand -Port $Port
+    Wait-Url -Url $BridgeHealthUrl -Name "Model bridge" -TimeoutSeconds 20
+    return
+  }
+
+  $needsReload =
+    (Normalize-BridgeBaseUrl $currentConfig.chat_target_base_url) -ne (Normalize-BridgeBaseUrl $chatBaseUrl) -or
+    (Normalize-BridgeBaseUrl $currentConfig.embedding_target_base_url) -ne (Normalize-BridgeBaseUrl $embeddingBaseUrl) -or
+    (Normalize-BridgeResolveIp $currentConfig.chat_resolve_ip) -ne (Normalize-BridgeResolveIp $chatResolveIp) -or
+    (Normalize-BridgeResolveIp $currentConfig.embedding_resolve_ip) -ne (Normalize-BridgeResolveIp $embeddingResolveIp)
+
+  if ($needsReload) {
+    Write-Host "Reloading model bridge target configuration" -ForegroundColor Yellow
+    $null = Invoke-BridgeAdminJson -Uri $BridgeAdminReloadUrl -Method "POST" -Body $desiredPayload
+  }
+}
 
 if ($modelBridgeEnabled) {
   $BridgeScript = Join-Path $Root "infra\model-bridge\model_bridge.py"
@@ -156,20 +317,7 @@ if ($modelBridgeEnabled) {
     throw "MODEL_BRIDGE_ENABLED=true requires Windows curl.exe on PATH."
   }
 
-  $BridgeHealthUrl = "http://127.0.0.1:$modelBridgePort/health"
-  if (-not (Test-Url $BridgeHealthUrl)) {
-    $bridgeArgs = @(
-      $BridgeScript,
-      "--host", "127.0.0.1",
-      "--port", [string]$modelBridgePort,
-      "--target-base-url", $chatBaseUrl
-    )
-    if ($chatResolveIp -and $chatResolveIp -ne "__none__") {
-      $bridgeArgs += @("--resolve-ip", $chatResolveIp)
-    }
-    Start-Process -WindowStyle Hidden -FilePath $pythonCommand.Source -ArgumentList $bridgeArgs
-    Wait-Url -Url $BridgeHealthUrl -Name "Model bridge" -TimeoutSeconds 20
-  }
+  Sync-ModelBridge -BridgeScript $BridgeScript -PythonCommand $pythonCommand -Port $modelBridgePort
 
   $env:API_CHAT_BASE_URL = "http://host.docker.internal:$modelBridgePort"
   $env:API_CHAT_RESOLVE_IP = "__none__"

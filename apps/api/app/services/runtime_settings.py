@@ -86,13 +86,18 @@ def read_env_float(key: str, default: float = 0.0) -> float:
 def model_settings_payload() -> dict:
     settings = get_settings()
     env_entries = _env_entries(ENV_PATH)
-    chat_base_url = env_entries.get("CHAT_BASE_URL", settings.chat_base_url)
-    model_bridge_enabled = env_entries.get("MODEL_BRIDGE_ENABLED", "false").lower() == "true"
+    chat_base_url = env_entries.get("CHAT_BASE_URL", "" if settings.model_bridge_enabled else settings.chat_base_url)
+    embedding_base_url = env_entries.get("EMBEDDING_BASE_URL", "" if settings.model_bridge_enabled else settings.embedding_base_url)
+    model_bridge_enabled = settings.model_bridge_enabled or env_entries.get("MODEL_BRIDGE_ENABLED", "false").lower() == "true"
+    model_bridge_status = model_bridge_status_payload(settings=settings, env_entries=env_entries)
     return {
         "provider": "openai_compatible",
         "chat_base_url": chat_base_url,
+        "embedding_base_url": embedding_base_url,
+        "effective_chat_base_url": settings.chat_base_url,
+        "effective_embedding_base_url": settings.embedding_base_url,
         "model_bridge_enabled": model_bridge_enabled,
-        "chat_resolve_ip": settings.chat_resolve_ip,
+        "chat_resolve_ip": env_entries.get("CHAT_RESOLVE_IP", "" if settings.model_bridge_enabled else (settings.chat_resolve_ip or "")),
         "embedding_model": settings.embedding_model,
         "chat_model": settings.chat_model,
         "embedding_dimensions": settings.embedding_dimensions,
@@ -145,9 +150,9 @@ def model_settings_payload() -> dict:
         "enable_database_fallback": settings.enable_database_fallback,
         "has_api_key": bool(settings.openai_api_key),
         "degraded_mode": not settings.openai_api_key or not settings.embedding_api_key or not settings.embedding_base_url,
-        "embedding_base_url": settings.embedding_base_url,
-        "embedding_resolve_ip": settings.embedding_resolve_ip,
+        "embedding_resolve_ip": env_entries.get("EMBEDDING_RESOLVE_IP", "" if settings.model_bridge_enabled else (settings.embedding_resolve_ip or "")),
         "has_embedding_api_key": bool(settings.embedding_api_key),
+        "model_bridge_status": model_bridge_status,
         "runtime_settings_version": current_runtime_settings_version(),
     }
 
@@ -220,6 +225,174 @@ def _redis_client():
     )
 
 
+def _normalize_bridge_base_url(value: str | None) -> str:
+    return (value or "").strip().rstrip("/")
+
+
+def _normalize_bridge_resolve_ip(value: str | None) -> str:
+    text = (value or "").strip()
+    if not text or text == "__none__":
+        return ""
+    return text
+
+
+def _hash_bridge_target(value: str | None) -> str:
+    return hashlib.sha256(_normalize_bridge_base_url(value).encode("utf-8")).hexdigest()
+
+
+def _bridge_admin_headers(settings=None) -> dict[str, str]:
+    settings = settings or get_settings()
+    token = settings.model_bridge_admin_token or "local-model-bridge-admin"
+    return {"X-Bridge-Admin-Token": token}
+
+
+def _bridge_base_url(settings=None) -> str:
+    settings = settings or get_settings()
+    return _normalize_bridge_base_url(settings.chat_base_url or f"http://host.docker.internal:{settings.model_bridge_port}")
+
+
+def _bridge_target_is_self(value: str | None, settings=None) -> bool:
+    normalized = _normalize_bridge_base_url(value)
+    if not normalized:
+        return False
+    settings = settings or get_settings()
+    parsed = urlparse(normalized)
+    host = (parsed.hostname or "").lower()
+    if host not in {"host.docker.internal", "127.0.0.1", "localhost", "::1", "0.0.0.0"}:
+        return False
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return port == settings.model_bridge_port
+
+
+def _bridge_self_target_keys(desired: dict[str, str | int], settings=None) -> list[str]:
+    settings = settings or get_settings()
+    blocked: list[str] = []
+    if _bridge_target_is_self(str(desired.get("chat_target_base_url") or ""), settings):
+        blocked.append("CHAT_BASE_URL")
+    if _bridge_target_is_self(str(desired.get("embedding_target_base_url") or ""), settings):
+        blocked.append("EMBEDDING_BASE_URL")
+    return blocked
+
+
+def _desired_bridge_config(settings=None, env_entries: dict[str, str] | None = None) -> dict[str, str | int]:
+    settings = settings or get_settings()
+    env_entries = env_entries or _env_entries(ENV_PATH)
+    return {
+        "chat_target_base_url": _normalize_bridge_base_url(env_entries.get("CHAT_BASE_URL") or os.getenv("CHAT_BASE_URL") or ""),
+        "chat_resolve_ip": _normalize_bridge_resolve_ip(env_entries.get("CHAT_RESOLVE_IP") or os.getenv("CHAT_RESOLVE_IP") or ""),
+        "embedding_target_base_url": _normalize_bridge_base_url(env_entries.get("EMBEDDING_BASE_URL") or os.getenv("EMBEDDING_BASE_URL") or ""),
+        "embedding_resolve_ip": _normalize_bridge_resolve_ip(env_entries.get("EMBEDDING_RESOLVE_IP") or os.getenv("EMBEDDING_RESOLVE_IP") or ""),
+        "timeout": int(settings.model_request_timeout_seconds or 180),
+    }
+
+
+def model_bridge_status_payload(settings=None, env_entries: dict[str, str] | None = None) -> dict:
+    settings = settings or get_settings()
+    env_entries = env_entries or _env_entries(ENV_PATH)
+    enabled = bool(settings.model_bridge_enabled)
+    desired = _desired_bridge_config(settings, env_entries)
+    self_target_keys = _bridge_self_target_keys(desired, settings)
+    payload: dict = {
+        "enabled": enabled,
+        "base_url": _bridge_base_url(settings) if enabled else "",
+        "desired_chat_target_hash": _hash_bridge_target(str(desired["chat_target_base_url"])),
+        "desired_embedding_target_hash": _hash_bridge_target(str(desired["embedding_target_base_url"])),
+        "reachable": None,
+        "admin_available": None,
+        "config_matches": None,
+        "chat_target_is_bridge": "CHAT_BASE_URL" in self_target_keys,
+        "embedding_target_is_bridge": "EMBEDDING_BASE_URL" in self_target_keys,
+        "self_target_blocked": bool(self_target_keys),
+        "warnings": [],
+    }
+    if not enabled:
+        return payload
+    if self_target_keys:
+        payload["warnings"].append(
+            "Model bridge target points to the bridge itself: " + ", ".join(self_target_keys) + ". Use the real provider base URL."
+        )
+    if not desired["chat_target_base_url"]:
+        payload["warnings"].append("CHAT_BASE_URL is required when MODEL_BRIDGE_ENABLED=true.")
+    if not desired["embedding_target_base_url"]:
+        payload["warnings"].append("EMBEDDING_BASE_URL is required when MODEL_BRIDGE_ENABLED=true.")
+    base_url = _bridge_base_url(settings)
+    try:
+        health = httpx.get(f"{base_url}/health", timeout=3.0)
+        payload["reachable"] = health.status_code == 200
+        if health.status_code == 200:
+            health_json = health.json()
+            payload["config_version"] = health_json.get("config_version")
+            payload["chat_target_hash"] = health_json.get("chat_target_hash")
+            payload["embedding_target_hash"] = health_json.get("embedding_target_hash")
+            payload["routes"] = health_json.get("routes") or {}
+    except Exception as exc:
+        payload["reachable"] = False
+        payload["warnings"].append(f"Model bridge health check failed: {exc}")
+        return payload
+
+    try:
+        config_response = httpx.get(f"{base_url}/admin/config", headers=_bridge_admin_headers(settings), timeout=3.0)
+        payload["admin_available"] = config_response.status_code == 200
+        if config_response.status_code != 200:
+            payload["warnings"].append(f"Model bridge admin config returned HTTP {config_response.status_code}.")
+            return payload
+        config = config_response.json()
+        payload["config_version"] = config.get("config_version")
+        payload["chat_target_hash"] = config.get("chat_target_hash")
+        payload["embedding_target_hash"] = config.get("embedding_target_hash")
+        payload["config_matches"] = (
+            _normalize_bridge_base_url(config.get("chat_target_base_url")) == desired["chat_target_base_url"]
+            and _normalize_bridge_base_url(config.get("embedding_target_base_url")) == desired["embedding_target_base_url"]
+            and _normalize_bridge_resolve_ip(config.get("chat_resolve_ip")) == desired["chat_resolve_ip"]
+            and _normalize_bridge_resolve_ip(config.get("embedding_resolve_ip")) == desired["embedding_resolve_ip"]
+            and not self_target_keys
+        )
+        if not payload["config_matches"]:
+            payload["warnings"].append("Model bridge config does not match current .env targets.")
+    except Exception as exc:
+        payload["admin_available"] = False
+        payload["warnings"].append(f"Model bridge admin config failed: {exc}")
+    return payload
+
+
+def reload_model_bridge(settings=None, env_entries: dict[str, str] | None = None) -> dict:
+    settings = settings or get_settings()
+    env_entries = env_entries or _env_entries(ENV_PATH)
+    if not settings.model_bridge_enabled:
+        return {"attempted": False, "reason": "model_bridge_disabled"}
+    desired = _desired_bridge_config(settings, env_entries)
+    self_target_keys = _bridge_self_target_keys(desired, settings)
+    if self_target_keys:
+        return {
+            "attempted": True,
+            "ok": False,
+            "self_target_blocked": True,
+            "error": "Model bridge target points to the bridge itself: " + ", ".join(self_target_keys),
+        }
+    if not desired["chat_target_base_url"] or not desired["embedding_target_base_url"]:
+        return {"attempted": False, "ok": False, "error": "CHAT_BASE_URL and EMBEDDING_BASE_URL are required when MODEL_BRIDGE_ENABLED=true."}
+    base_url = _bridge_base_url(settings)
+    try:
+        response = httpx.post(
+            f"{base_url}/admin/reload",
+            headers=_bridge_admin_headers(settings),
+            json=desired,
+            timeout=5.0,
+        )
+        if response.status_code != 200:
+            return {"attempted": True, "ok": False, "status_code": response.status_code, "error": response.text[:500]}
+        payload = response.json()
+        return {
+            "attempted": True,
+            "ok": True,
+            "config_version": payload.get("config_version"),
+            "chat_target_hash": payload.get("chat_target_hash"),
+            "embedding_target_hash": payload.get("embedding_target_hash"),
+        }
+    except Exception as exc:
+        return {"attempted": True, "ok": False, "error": str(exc)}
+
+
 def current_runtime_settings_version() -> str | None:
     with suppress(Exception):
         version = _redis_client().get(SETTINGS_VERSION_REDIS_KEY)
@@ -254,6 +427,7 @@ def _local_runtime_refresh(version: str | None = None) -> None:
 def publish_runtime_settings_version(changed_keys: list[str], source: str = "api") -> dict:
     snapshot = model_settings_payload()
     snapshot.pop("runtime_settings_version", None)
+    snapshot.pop("model_bridge_status", None)
     created_at = datetime.now(timezone.utc).isoformat()
     version_hash = _version_hash(snapshot, changed_keys, created_at)
     message = {
@@ -424,13 +598,10 @@ def _check_redis() -> bool:
 
 def _check_model_bridge() -> bool | None:
     settings = get_settings()
-    parsed = urlparse(settings.chat_base_url)
-    if (parsed.hostname or "").lower() != "host.docker.internal":
+    if not settings.model_bridge_enabled:
         return None
-    with suppress(Exception):
-        response = httpx.get(f"{settings.chat_base_url.rstrip('/')}/health", timeout=3.0)
-        return response.status_code == 200
-    return False
+    status = model_bridge_status_payload(settings=settings)
+    return bool(status.get("reachable") and status.get("admin_available") and status.get("config_matches"))
 
 
 def _reranker_runtime_status() -> dict:
@@ -479,10 +650,22 @@ def runtime_check_payload() -> dict:
                     [".\\start-app.ps1"],
                 )
             )
+    bridge_status = model_bridge_status_payload() if get_settings().model_bridge_enabled else {"enabled": False}
+    if bridge_status.get("enabled"):
+        for warning in bridge_status.get("warnings") or []:
+            warnings.append(
+                _runtime_issue(
+                    "model_bridge_config_warning",
+                    "Model bridge config needs attention",
+                    str(warning),
+                    [".\\start-app.ps1"],
+                )
+            )
     return {
         "env_sync": env_sync,
         "reranker": _reranker_runtime_status(),
         "infrastructure": infrastructure,
+        "model_bridge_status": bridge_status,
         "blocking_issues": blocking_issues,
         "warnings": warnings,
     }
@@ -564,8 +747,36 @@ def update_model_settings(payload: dict) -> dict:
         updates["embedding_api_key"] = embedding_api_key.strip()
 
     if updates:
+        future_env_entries = dict(_env_entries(ENV_PATH))
+        for key, value in updates.items():
+            env_key = key.upper()
+            if value is None:
+                future_env_entries.pop(env_key, None)
+            else:
+                future_env_entries[env_key] = _serialize_env_value(value)
+        future_bridge_enabled = str(future_env_entries.get("MODEL_BRIDGE_ENABLED") or "").strip().lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }
+        if future_bridge_enabled:
+            desired = _desired_bridge_config(get_settings(), future_env_entries)
+            self_target_keys = _bridge_self_target_keys(desired, get_settings())
+            if self_target_keys:
+                raise ValueError(
+                    "MODEL_BRIDGE_ENABLED=true 时 CHAT_BASE_URL/EMBEDDING_BASE_URL 必须是真实模型服务地址，不能指向模型桥自身: "
+                    + ", ".join(self_target_keys)
+                )
+
+    bridge_reload_result: dict | None = None
+    if updates:
         _update_env_file(updates)
         _apply_runtime_env(updates)
+        get_settings.cache_clear()
+        refreshed_settings = get_settings()
+        if refreshed_settings.model_bridge_enabled:
+            bridge_reload_result = reload_model_bridge(settings=refreshed_settings, env_entries=_env_entries(ENV_PATH))
         # 如果 reranker 模型配置发生变化，清除单例缓存以强制重新加载
     if normalized or updates:
         changed_keys = [key.upper() for key in updates]
@@ -575,4 +786,12 @@ def update_model_settings(payload: dict) -> dict:
 
         clear_cache_manager()
         publish_runtime_settings_version(changed_keys=changed_keys, source="api")
-    return model_settings_payload()
+    result = model_settings_payload()
+    if bridge_reload_result is not None:
+        status = dict(result.get("model_bridge_status") or {})
+        status["last_reload"] = bridge_reload_result
+        if bridge_reload_result.get("attempted") and not bridge_reload_result.get("ok"):
+            status.setdefault("warnings", [])
+            status["warnings"].append(f"Model bridge reload failed: {bridge_reload_result.get('error') or bridge_reload_result.get('status_code')}")
+        result["model_bridge_status"] = status
+    return result

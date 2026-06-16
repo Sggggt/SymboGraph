@@ -37,6 +37,7 @@ services:
       - ../apps/worker/worker_app:/app/apps/worker/worker_app
       - ../packages/shared/src:/app/packages/shared/src
       - ../scripts:/app/scripts
+      - ../infra/model-bridge:/app/infra/model-bridge:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -89,6 +90,7 @@ services:
       - ../apps/worker/worker_app:/app/apps/worker/worker_app
       - ../packages/shared/src:/app/packages/shared/src
       - ../scripts:/app/scripts
+      - ../infra/model-bridge:/app/infra/model-bridge:ro
     depends_on:
       postgres:
         condition: service_healthy
