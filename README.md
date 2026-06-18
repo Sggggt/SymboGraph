@@ -8,7 +8,7 @@
 
 ## 项目简介
 
-SymboGraph 是一个本地通用智能知识库系统。系统采用 Four-Layer Context Graph RAG：固定 token chunk 提供稳定索引和引用地址，Chunk Structure Graph 保存原文结构，Chunk Relation Graph 保存可复算的底层关系网络，Mid/Coarse Concept Graph 提供可追溯的概念导航，检索与问答通过 context package 和 citation verification 保持答案接地。
+SymboGraph 是一个本地通用智能知识库系统。系统采用 Four-Layer Context Graph RAG：固定 token chunk 提供稳定索引和引用地址，Chunk Structure Graph 只保存原文结构和上下文恢复路径，Chunk Relation Graph 保存可复算的底层语义关系和 RQ chunk-pair evidence，Mid Concept Graph 严格由 RQ L3 prefix packet 投影，Coarse Concept Graph 严格由 RQ L2 prefix packet 投影，检索与问答通过 context package 和 citation verification 保持答案接地。
 
 ## 目录
 
@@ -41,7 +41,7 @@ SymboGraph 面向本地资料库、课程资料、技术文档和研究资料的
 | 后端 | Python 3.13, FastAPI, SQLAlchemy, Alembic, Pydantic |
 | 存储 | PostgreSQL 16, Qdrant 1.17.1, Redis 7 |
 | 异步任务 | Celery, Redis broker |
-| 检索 | Dense embedding, BM25, chunk relation graph, RQ-KMeans, layered retrieval |
+| 检索 | Dense embedding, BM25, chunk relation graph, RQ membership, layered traversal |
 | 模型接口 | OpenAI-compatible chat 和 embedding endpoint |
 | 精排 | Cross-Encoder reranker，可选 |
 | 前端 | Next.js 16.2.4, React 19.2.4, TypeScript, TanStack Query, Tailwind CSS, ECharts |
@@ -55,10 +55,10 @@ source files
 -> fixed token chunks
 -> chunk structure graph
 -> contextual embedding and BM25
--> chunk relation graph and fine clusters
--> RQ prefix clusters and RQ relation edges
--> mid concept graph
--> coarse concept graph
+-> independent chunk relation graph
+-> RQ prefix address tree and fuzzy membership
+-> RQ L3 mid concept graph
+-> RQ L2 coarse concept graph
 -> active context graph state
 -> conversation state and query intent
 -> Layered P&E Agent typed strategy
@@ -149,7 +149,7 @@ course-kg-qdrant
 | Chunk 与上下文 | `FIXED_CHUNK_SIZE_TOKENS`, `FIXED_CHUNK_OVERLAP_TOKENS`, `CONTEXT_PACKAGE_TOKEN_BUDGET` |
 | Mid concept | `MID_CONCEPT_EXTRACTION_MAX_MODEL_BATCHES`, `MID_CONCEPT_EXTRACTION_MAX_CANDIDATES_PER_BATCH`, `MID_CONCEPT_EXTRACTION_MAX_TOKENS_PER_BATCH`, `MID_CONCEPT_CANDIDATE_KEEP_THRESHOLD` |
 | RQ-KMeans | `RQ_KMEANS_LEVELS`, `RQ_KMEANS_MAX_K`, `RQ_RESIDUAL_TAU` |
-| Agent envelope | `AGENT_COARSE_ENTRY_BUDGET`, `AGENT_MID_ENTRY_BUDGET`, `AGENT_FINE_ENTRY_BUDGET`, `AGENT_FRONTIER_EXPANSION_BUDGET`, `AGENT_MAX_DEPTH_PER_LAYER`, `AGENT_MAX_LABELS_PER_NODE`, `AGENT_MAX_EDGE_REUSE`, `AGENT_MAX_CYCLE_REWARD_PER_PATH`, `AGENT_AMBIGUOUS_EDGE_DISTANCE_LOW`, `AGENT_AMBIGUOUS_EDGE_DISTANCE_HIGH`, `AGENT_DRILLDOWN_BUDGET_PER_LAYER`, `AGENT_CHUNK_CANDIDATE_BUDGET`, `AGENT_STRUCTURE_RESTORE_BUDGET`, `CONTEXT_PATH_SUMMARY_BUDGET`, `AGENT_PLANNING_ROUND_BUDGET`, `AGENT_MAX_TYPED_ACTIONS_PER_ROUND`, `AGENT_REPAIR_ROUND_BUDGET`, `AGENT_VERIFICATION_BUDGET` |
+| Agent envelope | `AGENT_COARSE_ENTRY_BUDGET`, `AGENT_COARSE_JUMP_BUDGET`, `AGENT_MID_ENTRY_BUDGET`, `AGENT_MID_EXPANSION_RADIUS_CAP`, `AGENT_RQ_MEMBERSHIP_SEED_BUDGET`, `AGENT_FRONTIER_EXPANSION_BUDGET`, `AGENT_MAX_DEPTH_PER_LAYER`, `AGENT_MAX_LABELS_PER_NODE`, `AGENT_MAX_EDGE_REUSE`, `AGENT_MAX_CYCLE_REWARD_PER_PATH`, `AGENT_CYCLE_REWARD_DISTANCE_THRESHOLD`, `AGENT_PATH_DISTANCE_GREEN_THRESHOLD`, `AGENT_PATH_DISTANCE_GRAY_THRESHOLD`, `AGENT_PATH_DISTANCE_HARD_THRESHOLD`, `AGENT_DRILLDOWN_BUDGET_PER_LAYER`, `AGENT_CHUNK_CANDIDATE_BUDGET`, `AGENT_STRUCTURE_RESTORE_BUDGET`, `CONTEXT_PATH_SUMMARY_BUDGET`, `AGENT_PLANNING_ROUND_BUDGET`, `AGENT_MAX_TYPED_ACTIONS_PER_ROUND`, `AGENT_REPAIR_ROUND_BUDGET`, `AGENT_VERIFICATION_BUDGET` |
 | 精排 | `RERANKER_ENABLED`, `RERANKER_MODEL`, `RERANKER_MAX_LENGTH`, `RERANKER_DEVICE`, `HF_HUB_OFFLINE` |
 | Fallback | `ENABLE_MODEL_FALLBACK`, `ENABLE_DATABASE_FALLBACK` |
 
@@ -206,9 +206,9 @@ python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --worker-con
 ## 边界
 
 - `chunks` 是索引、引用、检索、问答和图谱关联的主单位。
-- 结构图只保存原文地图，不改变固定 chunk 边界。
-- Chunk relation graph 只表达可重建关系。
-- Mid/Coarse concepts 必须有 support chunks、support spans、fine clusters 或 bridge chunks 支撑。
+- 结构图只保存原文地图和上下文恢复路径，不进入 chunk relation edge 创建、保留或加权。
+- Chunk relation graph 只表达内容语义关系和允许的 RQ chunk-pair evidence。
+- Mid concepts 与 RQ L3 prefixes 一一投影，Coarse concepts 与 RQ L2 prefixes 一一投影；上层边必须由底层 chunk relation edge support 投影。
 - QA 只使用 context package，不直接使用裸 search results。
 - Citation 必须指向 raw chunk span。
 - Qdrant、BM25 和 Redis 均为派生状态，必须能从 PostgreSQL 重建。

@@ -21,7 +21,7 @@ const palette: Record<string, string> = {
   page: "#60a5fa",
   chunk: "#fbbf24",
   chunk_relation: "#fbbf24",
-  fine_cluster: "#5eead4",
+  rq_prefix: "#5eead4",
   mid_concept: "#c084fc",
   coarse_concept: "#fb7185",
   context_package: "#a5e9ff",
@@ -54,7 +54,7 @@ const communityPalette = [
 function colorForNode(node: GraphResponse["nodes"][number]): string {
   const category = node.category ?? node.type ?? "chunk";
   const metadataCommunity = node.metadata?.community_id;
-  if ((category === "mid_concept" || category === "coarse_concept" || category === "fine_cluster") && typeof metadataCommunity === "number") {
+  if ((category === "mid_concept" || category === "coarse_concept" || category === "rq_prefix") && typeof metadataCommunity === "number") {
     return communityPalette[Math.abs(metadataCommunity) % communityPalette.length];
   }
   return palette[category] ?? "#63cbff";
@@ -68,7 +68,7 @@ function symbolSizeForNode(node: GraphResponse["nodes"][number]): number {
   if (category === "chunk" || category === "chunk_relation") {
     return 10 + Math.min(10, (node.value ?? 1) * 2);
   }
-  if (category === "document" || category === "document_version" || category === "fine_cluster") {
+  if (category === "document" || category === "document_version" || category === "rq_prefix") {
     return 16;
   }
   return 20;

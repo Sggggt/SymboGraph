@@ -8,7 +8,7 @@
 
 ## Overview
 
-SymboGraph is a local, general-purpose intelligent knowledge base. It uses Four-Layer Context Graph RAG: fixed token chunks provide stable index and citation addresses, the Chunk Structure Graph preserves the source map, the Chunk Relation Graph stores reproducible low-level relations, Mid/Coarse Concept Graphs provide grounded concept navigation, and QA answers are generated from context packages with citation verification.
+SymboGraph is a local, general-purpose intelligent knowledge base. It uses Four-Layer Context Graph RAG: fixed token chunks provide stable index and citation addresses, the Chunk Structure Graph only preserves the source map and context-restoration paths, the Chunk Relation Graph stores reproducible low-level semantic relations and RQ chunk-pair evidence, the Mid Concept Graph is projected strictly from RQ L3 prefix packets, the Coarse Concept Graph is projected strictly from RQ L2 prefix packets, and QA answers are generated from context packages with citation verification.
 
 ## Repository Layout
 
@@ -34,7 +34,7 @@ SymboGraph is built for local document libraries, course material, technical doc
 | Backend | Python 3.13, FastAPI, SQLAlchemy, Alembic, Pydantic |
 | Storage | PostgreSQL 16, Qdrant 1.17.1, Redis 7 |
 | Jobs | Celery, Redis broker |
-| Retrieval | Dense embedding, BM25, chunk relation graph, RQ-KMeans, layered retrieval |
+| Retrieval | Dense embedding, BM25, chunk relation graph, RQ membership, layered traversal |
 | Models | OpenAI-compatible chat and embedding endpoints |
 | Rerank | Optional Cross-Encoder reranker |
 | Frontend | Next.js 16.2.4, React 19.2.4, TypeScript, TanStack Query, Tailwind CSS, ECharts |
@@ -48,10 +48,10 @@ source files
 -> fixed token chunks
 -> chunk structure graph
 -> contextual embedding and BM25
--> chunk relation graph and fine clusters
--> RQ prefix clusters and RQ relation edges
--> mid concept graph
--> coarse concept graph
+-> independent chunk relation graph
+-> RQ prefix address tree and fuzzy membership
+-> RQ L3 mid concept graph
+-> RQ L2 coarse concept graph
 -> active context graph state
 -> conversation state and query intent
 -> Layered P&E Agent typed strategy
@@ -132,7 +132,7 @@ Health: http://127.0.0.1:8000/api/health
 | Chunks and context | `FIXED_CHUNK_SIZE_TOKENS`, `FIXED_CHUNK_OVERLAP_TOKENS`, `CONTEXT_PACKAGE_TOKEN_BUDGET` |
 | Mid concepts | `MID_CONCEPT_EXTRACTION_MAX_MODEL_BATCHES`, `MID_CONCEPT_EXTRACTION_MAX_CANDIDATES_PER_BATCH`, `MID_CONCEPT_EXTRACTION_MAX_TOKENS_PER_BATCH`, `MID_CONCEPT_CANDIDATE_KEEP_THRESHOLD` |
 | RQ-KMeans | `RQ_KMEANS_LEVELS`, `RQ_KMEANS_MAX_K`, `RQ_RESIDUAL_TAU` |
-| Agent envelope | `AGENT_COARSE_ENTRY_BUDGET`, `AGENT_MID_ENTRY_BUDGET`, `AGENT_FINE_ENTRY_BUDGET`, `AGENT_FRONTIER_EXPANSION_BUDGET`, `AGENT_MAX_DEPTH_PER_LAYER`, `AGENT_MAX_LABELS_PER_NODE`, `AGENT_MAX_EDGE_REUSE`, `AGENT_MAX_CYCLE_REWARD_PER_PATH`, `AGENT_AMBIGUOUS_EDGE_DISTANCE_LOW`, `AGENT_AMBIGUOUS_EDGE_DISTANCE_HIGH`, `AGENT_DRILLDOWN_BUDGET_PER_LAYER`, `AGENT_CHUNK_CANDIDATE_BUDGET`, `AGENT_STRUCTURE_RESTORE_BUDGET`, `CONTEXT_PATH_SUMMARY_BUDGET`, `AGENT_PLANNING_ROUND_BUDGET`, `AGENT_MAX_TYPED_ACTIONS_PER_ROUND`, `AGENT_REPAIR_ROUND_BUDGET`, `AGENT_VERIFICATION_BUDGET` |
+| Agent envelope | `AGENT_COARSE_ENTRY_BUDGET`, `AGENT_COARSE_JUMP_BUDGET`, `AGENT_MID_ENTRY_BUDGET`, `AGENT_MID_EXPANSION_RADIUS_CAP`, `AGENT_RQ_MEMBERSHIP_SEED_BUDGET`, `AGENT_FRONTIER_EXPANSION_BUDGET`, `AGENT_MAX_DEPTH_PER_LAYER`, `AGENT_MAX_LABELS_PER_NODE`, `AGENT_MAX_EDGE_REUSE`, `AGENT_MAX_CYCLE_REWARD_PER_PATH`, `AGENT_CYCLE_REWARD_DISTANCE_THRESHOLD`, `AGENT_PATH_DISTANCE_GREEN_THRESHOLD`, `AGENT_PATH_DISTANCE_GRAY_THRESHOLD`, `AGENT_PATH_DISTANCE_HARD_THRESHOLD`, `AGENT_DRILLDOWN_BUDGET_PER_LAYER`, `AGENT_CHUNK_CANDIDATE_BUDGET`, `AGENT_STRUCTURE_RESTORE_BUDGET`, `CONTEXT_PATH_SUMMARY_BUDGET`, `AGENT_PLANNING_ROUND_BUDGET`, `AGENT_MAX_TYPED_ACTIONS_PER_ROUND`, `AGENT_REPAIR_ROUND_BUDGET`, `AGENT_VERIFICATION_BUDGET` |
 | Rerank | `RERANKER_ENABLED`, `RERANKER_MODEL`, `RERANKER_MAX_LENGTH`, `RERANKER_DEVICE`, `HF_HUB_OFFLINE` |
 | Fallback | `ENABLE_MODEL_FALLBACK`, `ENABLE_DATABASE_FALLBACK` |
 
@@ -177,9 +177,9 @@ Write scripts default to dry-run or require explicit `--execute`. Generated repo
 ## Boundaries
 
 - `chunks` are the primary unit for indexing, citation, retrieval, QA, and graph links.
-- The structure graph preserves the source map and does not change fixed chunk boundaries.
-- The chunk relation graph stores reproducible relations only.
-- Mid/Coarse concepts require support chunks, support spans, fine clusters, or bridge chunks.
+- The structure graph preserves the source map and context-restoration paths only; it does not create, retain, or weight chunk relation edges.
+- The chunk relation graph stores content-semantic relations and allowed RQ chunk-pair evidence only.
+- Mid concepts are a one-to-one projection of RQ L3 prefixes, Coarse concepts are a one-to-one projection of RQ L2 prefixes, and upper-layer edges must be projected from bottom chunk relation edge support.
 - QA uses context packages, not raw search results.
 - Citations point to raw chunk spans.
 - Qdrant, BM25, and Redis are derived state and must be rebuildable from PostgreSQL.

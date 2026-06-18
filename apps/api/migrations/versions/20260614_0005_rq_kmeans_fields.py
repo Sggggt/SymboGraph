@@ -1,4 +1,4 @@
-"""Add residual quantized KMeans metadata to fine graph tables.
+"""Add residual quantized KMeans metadata to RQ membership graph tables.
 
 Revision ID: 20260614_0005
 Revises: 20260614_0004
@@ -36,25 +36,25 @@ def upgrade() -> None:
             batch.add_column(sa.Column("protocol_version", sa.String(length=64), nullable=True))
         if "graph_state_hash" not in relation_edge_columns:
             batch.add_column(sa.Column("graph_state_hash", sa.String(length=64), nullable=True))
-    fine_cluster_columns = _columns("fine_clusters")
-    with op.batch_alter_table("fine_clusters") as batch:
-        if "rq_level" not in fine_cluster_columns:
+    rq_prefix_columns = _columns("rq_prefixes")
+    with op.batch_alter_table("rq_prefixes") as batch:
+        if "rq_level" not in rq_prefix_columns:
             batch.add_column(sa.Column("rq_level", sa.Integer(), nullable=True))
-        if "rq_path_prefix" not in fine_cluster_columns:
+        if "rq_path_prefix" not in rq_prefix_columns:
             batch.add_column(sa.Column("rq_path_prefix", sa.JSON(), nullable=True))
-        if "centroid_vector_ref" not in fine_cluster_columns:
+        if "centroid_vector_ref" not in rq_prefix_columns:
             batch.add_column(sa.Column("centroid_vector_ref", sa.String(length=128), nullable=True))
-    fine_membership_columns = _columns("fine_cluster_memberships")
-    with op.batch_alter_table("fine_cluster_memberships") as batch:
-        if "rq_path" not in fine_membership_columns:
+    rq_prefix_membership_columns = _columns("rq_prefix_memberships")
+    with op.batch_alter_table("rq_prefix_memberships") as batch:
+        if "rq_path" not in rq_prefix_membership_columns:
             batch.add_column(sa.Column("rq_path", sa.JSON(), nullable=True))
-        if "residual_norm" not in fine_membership_columns:
+        if "residual_norm" not in rq_prefix_membership_columns:
             batch.add_column(sa.Column("residual_norm", sa.Float(), nullable=True))
     bind = op.get_bind()
     tables = set(sa.inspect(bind).get_table_names())
     indexes = {
         index["name"]
-        for table in ("chunks", "chunk_relation_edges", "fine_clusters", "fine_cluster_memberships")
+        for table in ("chunks", "chunk_relation_edges", "rq_prefixes", "rq_prefix_memberships")
         if table in tables
         for index in sa.inspect(bind).get_indexes(table)
     }
@@ -66,12 +66,12 @@ def upgrade() -> None:
         op.create_index("ix_chunk_relation_edges_protocol_version", "chunk_relation_edges", ["protocol_version"])
     if "ix_chunk_relation_edges_graph_state_hash" not in indexes:
         op.create_index("ix_chunk_relation_edges_graph_state_hash", "chunk_relation_edges", ["graph_state_hash"])
-    if "ix_fine_clusters_rq_level" not in indexes:
-        op.create_index("ix_fine_clusters_rq_level", "fine_clusters", ["rq_level"])
-    if "ix_fine_clusters_centroid_vector_ref" not in indexes:
-        op.create_index("ix_fine_clusters_centroid_vector_ref", "fine_clusters", ["centroid_vector_ref"])
-    if "ix_fine_cluster_memberships_residual_norm" not in indexes:
-        op.create_index("ix_fine_cluster_memberships_residual_norm", "fine_cluster_memberships", ["residual_norm"])
+    if "ix_rq_prefixes_rq_level" not in indexes:
+        op.create_index("ix_rq_prefixes_rq_level", "rq_prefixes", ["rq_level"])
+    if "ix_rq_prefixes_centroid_vector_ref" not in indexes:
+        op.create_index("ix_rq_prefixes_centroid_vector_ref", "rq_prefixes", ["centroid_vector_ref"])
+    if "ix_rq_prefix_memberships_residual_norm" not in indexes:
+        op.create_index("ix_rq_prefix_memberships_residual_norm", "rq_prefix_memberships", ["residual_norm"])
 
 
 def downgrade() -> None:

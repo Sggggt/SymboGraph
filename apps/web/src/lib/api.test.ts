@@ -65,6 +65,29 @@ describe("api client", () => {
     );
   });
 
+  it("routes search requests through graph-enhanced retrieval", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        query: "markov blanket",
+        results: [],
+        degraded_mode: false,
+        model_audit: { retrieval_pipeline: "layered_context_graph" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const { searchKnowledge } = await import("./api");
+
+    await searchKnowledge({ knowledge_base_id: "kb-1", query: "markov blanket", top_k: 8, filters: {} });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://api.test/api/search/graph-enhanced",
+      expect.objectContaining({
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-API-Key": "test-key" },
+      }),
+    );
+  });
+
   it("passes production runtime setting fields", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ provider: "openai_compatible" }));
     vi.stubGlobal("fetch", fetchMock);
@@ -86,14 +109,16 @@ describe("api client", () => {
       agent_coarse_jump_budget: 2,
       agent_mid_entry_budget: 16,
       agent_mid_expansion_radius_cap: 2,
-      agent_fine_entry_budget: 16,
+      agent_rq_membership_seed_budget: 16,
       agent_frontier_expansion_budget: 80,
       agent_max_depth_per_layer: 3,
       agent_max_labels_per_node: 3,
       agent_max_edge_reuse: 2,
       agent_max_cycle_reward_per_path: 0.18,
-      agent_ambiguous_edge_distance_low: 0.45,
-      agent_ambiguous_edge_distance_high: 1.35,
+      agent_cycle_reward_distance_threshold: 1.2,
+      agent_path_distance_green_threshold: 0.45,
+      agent_path_distance_gray_threshold: 1.35,
+      agent_path_distance_hard_threshold: 2.4,
       agent_drilldown_budget_per_layer: 16,
       agent_chunk_candidate_budget: 80,
       agent_structure_restore_budget: 16,
@@ -120,14 +145,16 @@ describe("api client", () => {
       agent_coarse_jump_budget: 2,
       agent_mid_entry_budget: 16,
       agent_mid_expansion_radius_cap: 2,
-      agent_fine_entry_budget: 16,
+      agent_rq_membership_seed_budget: 16,
       agent_frontier_expansion_budget: 80,
       agent_max_depth_per_layer: 3,
       agent_max_labels_per_node: 3,
       agent_max_edge_reuse: 2,
       agent_max_cycle_reward_per_path: 0.18,
-      agent_ambiguous_edge_distance_low: 0.45,
-      agent_ambiguous_edge_distance_high: 1.35,
+      agent_cycle_reward_distance_threshold: 1.2,
+      agent_path_distance_green_threshold: 0.45,
+      agent_path_distance_gray_threshold: 1.35,
+      agent_path_distance_hard_threshold: 2.4,
       agent_drilldown_budget_per_layer: 16,
       agent_chunk_candidate_budget: 80,
       agent_structure_restore_budget: 16,

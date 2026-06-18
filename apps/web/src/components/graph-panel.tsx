@@ -17,8 +17,8 @@ type SelectedNode = { id: string; category: string } | null;
 
 const GRAPH_LAYERS: Array<{ type: GraphType; label: string; icon: typeof Network; description: string }> = [
   { type: "chunk-structure", label: "片段结构图", icon: Map, description: "标题、页面、坐标、表格、公式、图注和前后片段" },
-  { type: "chunk-relation", label: "片段关系图", icon: Network, description: "向量、BM25、结构邻接、共检索、细聚类、RQ-KMeans 和桥边" },
-  { type: "mid-concepts", label: "中粒度概念图", icon: GitBranch, description: "由片段和细聚类支撑的中粒度概念和关系" },
+  { type: "chunk-relation", label: "片段关系图", icon: Network, description: "向量、BM25、结构邻接、共检索、RQ 前缀、RQ-KMeans 和桥边" },
+  { type: "mid-concepts", label: "中粒度概念图", icon: GitBranch, description: "由片段和RQ 前缀支撑的中粒度概念和关系" },
   { type: "coarse-concepts", label: "粗粒度概念图", icon: Layers3, description: "社区、桥接概念、弱边和主题区域" },
 ];
 
@@ -53,7 +53,6 @@ function nodeCategory(node: GraphResponse["nodes"][number]): string {
   const category = node.category ?? node.type ?? "chunk";
   const labels: Record<string, string> = {
     chunk: "片段",
-    fine_cluster: "细聚类",
     rq_prefix: "RQ 前缀",
     mid_concept: "中粒度概念",
     coarse_concept: "粗粒度概念",
@@ -333,8 +332,8 @@ function GraphPanelContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBaseI
           {selectedGraphType === "chunk-relation" ? (
             <MetricCard
               label="RQ-KMeans"
-              value={statNumber(graph.counts, "rq_clusters")}
-              hint={`片段边 ${statNumber(graph.counts, "rq_edges")} / 聚类边 ${statNumber(graph.counts, "rq_cluster_edges")} / 成员 ${statNumber(graph.counts, "rq_memberships")}`}
+              value={statNumber(graph.counts, "rq_prefixes")}
+              hint={`片段 RQ 边 ${statNumber(graph.counts, "rq_relation_edges")} / 前缀 ${statNumber(graph.counts, "rq_prefixes")} / 归属 ${statNumber(graph.counts, "rq_prefix_memberships")}`}
             />
           ) : (
             <MetricCard label="检索贡献" value={statusLabel(contribution.role ?? "available")} hint={`权重 ${String(contribution.weight ?? contribution.score ?? EMPTY_VALUE)}`} />

@@ -23,10 +23,10 @@ describe("ingestion log metadata", () => {
         phase: "context_graph:completed",
         chunk_count: 12,
         relation_edge_count: 8,
-        fine_cluster_count: 4,
+        rq_prefix_count: 4,
         context_graph_hash: "abcdef123456",
       }),
-    ).toBe("阶段 图谱闭环完成 / 片段 12 / 关系边 8 / Fine/RQ 4 / 哈希 abcdef12");
+    ).toBe("阶段 图谱闭环完成 / 片段 12 / 关系边 8 / RQ membership 4 / 哈希 abcdef12");
   });
 
   it("summarizes concept graph events", () => {

@@ -10,10 +10,10 @@
 | --- | --- |
 | `rebuild_chunks.py` | 将 source files 重解析为 fixed token chunks、structure graph、contextual embeddings、BM25 和四层图。写入需要 `--execute`；已有解析数据还需要 `--full-reparse`。 |
 | `rebuild_structure_graph.py` | 重建 structure nodes、edges、mappings 和 coordinates。写入需要 `--execute`；已有解析数据还需要 `--full-reparse`。 |
-| `rebuild_chunk_relation_graph.py` | 重建 chunk relation graph 以及依赖的 fine/mid/coarse/context states。写入需要 `--execute`。 |
-| `rebuild_fine_graph.py` | 重建 active fine graph 以及依赖的 mid/coarse/context states。写入需要 `--execute`。 |
-| `rebuild_mid_concept_graph.py` | 重建 LLM-grounded mid concepts 和依赖状态。写入需要 `--execute`。 |
-| `rebuild_coarse_concept_graph.py` | 重建 coarse concepts 和 active context graph state。写入需要 `--execute`。 |
+| `rebuild_chunk_relation_graph.py` | 重建 independent chunk relation graph、RQ address/membership 以及依赖的 mid/coarse/context states。写入需要 `--execute`。 |
+| `rebuild_rq_membership_graph.py` | 重建 active RQ address/membership 以及依赖的 mid/coarse/context states。写入需要 `--execute`。 |
+| `rebuild_mid_concept_graph.py` | 重建 RQ L3 投影的 LLM-grounded mid concepts 和依赖状态。写入需要 `--execute`。 |
+| `rebuild_coarse_concept_graph.py` | 重建 RQ L2 投影的 coarse concepts 和 active context graph state。写入需要 `--execute`。 |
 | `rebuild_context_graph_all.py` | 从当前 chunks 重建所有 active 四层派生图状态。写入需要 `--execute`。 |
 | `destroy_legacy_derived_data.py` | 清理 legacy derived state、legacy profile strategy keys 和可选 legacy score audit。写入需要 `--execute --confirm-destroy-legacy`。 |
 | `cleanup_stale_data.py` | 清理 stale vector/BM25/Qdrant state；`--execute --delete-inactive-chunks` 会删除 inactive chunk versions 和依赖项。 |
@@ -31,7 +31,7 @@
 
 ## 产品定位
 
-脚本是派生状态修复、白皮书合规、真实语料验收和 Docker smoke 的运维入口。写数据脚本必须 dry-run 或显式 `--execute`；破坏性脚本必须打印目标对象和影响范围，并要求确认 flag。
+脚本是派生状态修复、白皮书合规、真实语料验收和 Docker smoke 的运维入口。写数据脚本必须 dry-run 或显式 `--execute`；破坏性脚本必须打印目标对象和影响范围，并要求确认 flag。脚本从宿主机运行时会使用宿主可达的模型桥地址，容器内运行时使用容器网络地址。
 
 ## 技术栈
 
@@ -135,4 +135,6 @@ python scripts/run_bayes_chain_acceptance.py --base-url http://127.0.0.1:8000/ap
 - 写数据脚本默认 dry-run 或要求 `--execute`。
 - 破坏性 legacy cleanup 必须同时要求 `--execute` 和确认 flag。
 - 报告必须包含目标知识库、写入模式、影响范围和可审计计数。
+- RQ missing edge type 只能记录 diagnostics，不允许用 fallback pair 补边。
+- Mid/Coarse 重建脚本必须保持 RQ L3/L2 投影边界。
 - 不新增依赖个人绝对路径、未声明服务或本地隐藏状态的脚本。

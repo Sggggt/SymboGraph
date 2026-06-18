@@ -375,7 +375,7 @@ export async function fetchRetrievalTraceSteps(traceId: string): Promise<Retriev
 }
 
 export async function searchKnowledge(payload: SearchRequest): Promise<SearchResponse> {
-  const response = await fetch(buildApiUrl("/search"), {
+  const response = await fetch(buildApiUrl("/search/graph-enhanced"), {
     method: "POST",
     headers: jsonHeaders(),
     body: JSON.stringify(payload),

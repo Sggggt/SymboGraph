@@ -8,7 +8,7 @@ from _context_graph_maintenance import active_chunk_count, resolve_knowledge_bas
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Rebuild chunk relation graph and downstream fine/mid/coarse/context states.")
+    parser = argparse.ArgumentParser(description="Rebuild chunk relation graph and downstream RQ membership/mid/coarse/context states.")
     parser.add_argument("--knowledge-base-id")
     parser.add_argument("--knowledge-base-name")
     parser.add_argument("--execute", action="store_true", help="Write new states. Omit for dry-run.")
@@ -27,7 +27,7 @@ async def main() -> None:
             "knowledge_base_name": knowledge_base.name,
             "active_chunks": active_chunk_count(db, knowledge_base.id),
             "execute": args.execute,
-            "impact": "replace relation graph plus dependent fine/mid/coarse/context states" if args.execute else "no writes",
+            "impact": "replace relation graph plus dependent RQ membership/mid/coarse/context states" if args.execute else "no writes",
         }
         if args.execute:
             state = await rebuild_context_graph(db, knowledge_base.id)

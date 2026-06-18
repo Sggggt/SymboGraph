@@ -93,7 +93,7 @@ docker compose -f infra/docker-compose.yml ps
 | 镜像与端口 | `API_IMAGE`, `WEB_IMAGE`, `API_HOST_PORT`, `WEB_HOST_PORT` |
 | 数据服务 | `DATABASE_URL`, `QDRANT_URL`, `QDRANT_COLLECTION`, `REDIS_URL` |
 | 数据目录 | `DATA_ROOT`, `STORAGE_ROOT`, `INGESTION_ROOT` |
-| 模型 | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT`, `CHAT_*`, `EMBEDDING_*` |
+| 模型 | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT`, `MODEL_BRIDGE_ADMIN_TOKEN`, `CHAT_*`, `EMBEDDING_*` |
 | Worker | `WORKER_CONCURRENCY`, `INGESTION_TASK_QUEUE` |
 | Fallback | `ENABLE_MODEL_FALLBACK`, `ENABLE_DATABASE_FALLBACK` |
 
@@ -126,5 +126,6 @@ python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --worker-con
 - 不绕过 Docker 直接修改生产形态 PostgreSQL、Redis 或 Qdrant。
 - Compose 默认服务名保持 `course-kg-*`。
 - API 容器工作目录是 `/app/apps/api`，脚本挂载到 `/app/scripts`，数据目录挂载到 `/app/data`。
+- 模型桥启用时，容器内客户端地址使用 `host.docker.internal`，宿主机脚本使用 `127.0.0.1`，真实模型 endpoint 仍保存在 `CHAT_BASE_URL`/`EMBEDDING_BASE_URL`。
 - 日志、smoke 输出和临时报告写入仓库根目录 `output/`。
 - 改动端口、镜像依赖、Celery pool/fork 规模等需要 service recreate 或 rebuild。

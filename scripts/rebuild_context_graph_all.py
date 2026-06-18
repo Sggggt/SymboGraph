@@ -11,7 +11,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Rebuild the active four-layer context graph for one knowledge base.")
     parser.add_argument("--knowledge-base-id")
     parser.add_argument("--knowledge-base-name")
-    parser.add_argument("--execute", action="store_true", help="Write new chunk relation, fine, mid, coarse, and context graph states. Omit for dry-run.")
+    parser.add_argument("--execute", action="store_true", help="Write new chunk relation, RQ membership, mid, coarse, and context graph states. Omit for dry-run.")
     return parser.parse_args()
 
 

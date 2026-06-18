@@ -1,4 +1,4 @@
-﻿"use client";
+"use client";
 
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -42,7 +42,7 @@ const logEventLabels: Record<string, string> = {
   context_graph_started: "四层图谱开始",
   chunk_structure_completed: "片段结构图完成",
   chunk_relation_completed: "片段关系图完成",
-  fine_clusters_completed: "细聚类完成",
+  rq_prefixes_completed: "RQ 前缀完成",
   mid_concepts_completed: "中粒度概念完成",
   coarse_concepts_completed: "粗粒度概念完成",
   context_graph_completed: "四层图谱完成",

@@ -9,11 +9,15 @@ from app.core.config import get_settings
 
 
 class CacheManager:
-    """Lightweight Redis cache wrapper with in-memory fallback."""
+    """Lightweight Redis cache wrapper.
+
+    Cache misses must preserve correctness. When Redis is unavailable this
+    manager intentionally disables caching instead of keeping process-local
+    state that would diverge across API and worker processes.
+    """
 
     def __init__(self) -> None:
         self._redis = None
-        self._memory: dict[str, Any] = {}
         self._settings = get_settings()
         self._try_connect()
 
@@ -98,7 +102,6 @@ class CacheManager:
                 self._redis.delete(key)
             except Exception:
                 pass
-        self._memory.pop(key, None)
 
     def invalidate_knowledge_base(self, knowledge_base_id: str) -> None:
         if self._redis:
@@ -107,8 +110,6 @@ class CacheManager:
                     self._redis.delete(key)
             except Exception:
                 pass
-        # memory fallback: purge keys containing knowledge_base_id
-        self._memory = {k: v for k, v in self._memory.items() if knowledge_base_id not in k}
 
     def _get(self, key: str) -> Any | None:
         if self._redis:
@@ -118,7 +119,7 @@ class CacheManager:
                     return pickle.loads(raw)
             except Exception:
                 pass
-        return self._memory.get(key)
+        return None
 
     def _set(self, key: str, value: Any, ttl: int) -> None:
         if self._redis:
@@ -127,7 +128,6 @@ class CacheManager:
                 return
             except Exception:
                 pass
-        self._memory[key] = value
 
 
 _cache_manager: CacheManager | None = None

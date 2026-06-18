@@ -46,7 +46,7 @@ describe("agent trace helpers", () => {
         audit: {
           coarse_entries: 2,
           mid_entries: 3,
-          fine_entries: 4,
+          rq_membership_entries: 4,
           frontier_pops: 5,
           query_rq_path: [1, 2, 3],
           recalled_chunks: 10,
@@ -54,6 +54,6 @@ describe("agent trace helpers", () => {
           context_package_id: "pkg-1",
         },
       }),
-    ).toEqual(["粗入口: 2", "中入口: 3", "细入口: 4", "Frontier pop: 5", "RQ 路径: 1/2/3", "召回片段: 10", "结构邻居: 6", "证据包: pkg-1"]);
+    ).toEqual(["粗入口: 2", "中入口: 3", "RQ 归属: 4", "Frontier pop: 5", "RQ 路径: 1/2/3", "召回片段: 10", "结构邻居: 6", "证据包: pkg-1"]);
   });
 });

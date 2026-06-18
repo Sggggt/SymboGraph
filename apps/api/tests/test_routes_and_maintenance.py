@@ -161,7 +161,7 @@ def test_runtime_env_sync_treats_legacy_runtime_keys_as_deprecated(monkeypatch, 
 
 
 def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch):
-    from app.core.config import get_settings
+    from app.core.config import get_settings, model_bridge_client_base_url
     from app.services import runtime_settings
 
     get_settings.cache_clear()
@@ -181,7 +181,7 @@ def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch)
 
 
 def test_model_settings_payload_keeps_bridge_targets_editable(monkeypatch):
-    from app.core.config import get_settings
+    from app.core.config import get_settings, model_bridge_client_base_url
     from app.services import runtime_settings
 
     get_settings.cache_clear()
@@ -210,8 +210,8 @@ def test_model_settings_payload_keeps_bridge_targets_editable(monkeypatch):
 
     assert payload["chat_base_url"] == "https://chat.example.test/v1"
     assert payload["embedding_base_url"] == "https://embedding.example.test/v1"
-    assert payload["effective_chat_base_url"] == "http://host.docker.internal:8765"
-    assert payload["effective_embedding_base_url"] == "http://host.docker.internal:8765"
+    assert payload["effective_chat_base_url"] == model_bridge_client_base_url(8765)
+    assert payload["effective_embedding_base_url"] == model_bridge_client_base_url(8765)
     assert payload["chat_resolve_ip"] == "1.1.1.1"
     assert payload["embedding_resolve_ip"] == "2.2.2.2"
 
@@ -596,7 +596,7 @@ def test_operations_script_matrix_matches_context_graph_todo():
         "rebuild_chunks.py",
         "rebuild_structure_graph.py",
         "rebuild_chunk_relation_graph.py",
-        "rebuild_fine_graph.py",
+        "rebuild_rq_membership_graph.py",
         "rebuild_mid_concept_graph.py",
         "rebuild_coarse_concept_graph.py",
         "rebuild_context_graph_all.py",
@@ -617,7 +617,7 @@ def test_operations_script_matrix_matches_context_graph_todo():
         "rebuild_chunks.py",
         "rebuild_structure_graph.py",
         "rebuild_chunk_relation_graph.py",
-        "rebuild_fine_graph.py",
+        "rebuild_rq_membership_graph.py",
         "rebuild_mid_concept_graph.py",
         "rebuild_coarse_concept_graph.py",
         "rebuild_context_graph_all.py",

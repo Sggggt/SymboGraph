@@ -1,4 +1,4 @@
-﻿"use client";
+"use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ModelSettingsUpdate, RuntimeIssue, StrategyProfileDetail, StructuredApiErrorBody } from "@course-kg/shared";
@@ -84,14 +84,16 @@ type SettingsForm = {
   agent_coarse_jump_budget: string;
   agent_mid_entry_budget: string;
   agent_mid_expansion_radius_cap: string;
-  agent_fine_entry_budget: string;
+  agent_rq_membership_seed_budget: string;
   agent_frontier_expansion_budget: string;
   agent_max_depth_per_layer: string;
   agent_max_labels_per_node: string;
   agent_max_edge_reuse: string;
   agent_max_cycle_reward_per_path: string;
-  agent_ambiguous_edge_distance_low: string;
-  agent_ambiguous_edge_distance_high: string;
+  agent_cycle_reward_distance_threshold: string;
+  agent_path_distance_green_threshold: string;
+  agent_path_distance_gray_threshold: string;
+  agent_path_distance_hard_threshold: string;
   agent_drilldown_budget_per_layer: string;
   agent_chunk_candidate_budget: string;
   agent_structure_restore_budget: string;
@@ -977,14 +979,16 @@ export function SettingsWorkspace() {
       agent_coarse_jump_budget: String(settingsQuery.data.agent_coarse_jump_budget ?? 2),
       agent_mid_entry_budget: String(settingsQuery.data.agent_mid_entry_budget ?? 16),
       agent_mid_expansion_radius_cap: String(settingsQuery.data.agent_mid_expansion_radius_cap ?? 2),
-      agent_fine_entry_budget: String(settingsQuery.data.agent_fine_entry_budget ?? 16),
+      agent_rq_membership_seed_budget: String(settingsQuery.data.agent_rq_membership_seed_budget ?? 16),
       agent_frontier_expansion_budget: String(settingsQuery.data.agent_frontier_expansion_budget ?? 80),
       agent_max_depth_per_layer: String(settingsQuery.data.agent_max_depth_per_layer ?? 3),
       agent_max_labels_per_node: String(settingsQuery.data.agent_max_labels_per_node ?? 3),
       agent_max_edge_reuse: String(settingsQuery.data.agent_max_edge_reuse ?? 2),
       agent_max_cycle_reward_per_path: String(settingsQuery.data.agent_max_cycle_reward_per_path ?? 0.18),
-      agent_ambiguous_edge_distance_low: String(settingsQuery.data.agent_ambiguous_edge_distance_low ?? 0.45),
-      agent_ambiguous_edge_distance_high: String(settingsQuery.data.agent_ambiguous_edge_distance_high ?? 1.35),
+      agent_cycle_reward_distance_threshold: String(settingsQuery.data.agent_cycle_reward_distance_threshold ?? 1.2),
+      agent_path_distance_green_threshold: String(settingsQuery.data.agent_path_distance_green_threshold ?? 0.45),
+      agent_path_distance_gray_threshold: String(settingsQuery.data.agent_path_distance_gray_threshold ?? 1.35),
+      agent_path_distance_hard_threshold: String(settingsQuery.data.agent_path_distance_hard_threshold ?? 2.4),
       agent_drilldown_budget_per_layer: String(settingsQuery.data.agent_drilldown_budget_per_layer ?? 16),
       agent_chunk_candidate_budget: String(settingsQuery.data.agent_chunk_candidate_budget ?? 80),
       agent_structure_restore_budget: String(settingsQuery.data.agent_structure_restore_budget ?? 16),
@@ -1083,14 +1087,16 @@ export function SettingsWorkspace() {
     agent_coarse_jump_budget: parseIntField(form.agent_coarse_jump_budget),
     agent_mid_entry_budget: parseIntField(form.agent_mid_entry_budget),
     agent_mid_expansion_radius_cap: parseIntField(form.agent_mid_expansion_radius_cap),
-    agent_fine_entry_budget: parseIntField(form.agent_fine_entry_budget),
+    agent_rq_membership_seed_budget: parseIntField(form.agent_rq_membership_seed_budget),
     agent_frontier_expansion_budget: parseIntField(form.agent_frontier_expansion_budget),
     agent_max_depth_per_layer: parseIntField(form.agent_max_depth_per_layer),
     agent_max_labels_per_node: parseIntField(form.agent_max_labels_per_node),
     agent_max_edge_reuse: parseIntField(form.agent_max_edge_reuse),
     agent_max_cycle_reward_per_path: parseFloatField(form.agent_max_cycle_reward_per_path),
-    agent_ambiguous_edge_distance_low: parseFloatField(form.agent_ambiguous_edge_distance_low),
-    agent_ambiguous_edge_distance_high: parseFloatField(form.agent_ambiguous_edge_distance_high),
+    agent_cycle_reward_distance_threshold: parseFloatField(form.agent_cycle_reward_distance_threshold),
+    agent_path_distance_green_threshold: parseFloatField(form.agent_path_distance_green_threshold),
+    agent_path_distance_gray_threshold: parseFloatField(form.agent_path_distance_gray_threshold),
+    agent_path_distance_hard_threshold: parseFloatField(form.agent_path_distance_hard_threshold),
     agent_drilldown_budget_per_layer: parseIntField(form.agent_drilldown_budget_per_layer),
     agent_chunk_candidate_budget: parseIntField(form.agent_chunk_candidate_budget),
     agent_structure_restore_budget: parseIntField(form.agent_structure_restore_budget),
@@ -1323,14 +1329,16 @@ export function SettingsWorkspace() {
                 <SettingField label="粗粒度跳转预算" type="number" min={0} max={20} value={form.agent_coarse_jump_budget} onChange={(value) => updateForm("agent_coarse_jump_budget", value)} />
                 <SettingField label="中粒度入口预算" type="number" min={1} max={200} value={form.agent_mid_entry_budget} onChange={(value) => updateForm("agent_mid_entry_budget", value)} />
                 <SettingField label="中粒度扩展半径" type="number" min={0} max={8} value={form.agent_mid_expansion_radius_cap} onChange={(value) => updateForm("agent_mid_expansion_radius_cap", value)} />
-                <SettingField label="细粒度入口预算" type="number" min={1} max={500} value={form.agent_fine_entry_budget} onChange={(value) => updateForm("agent_fine_entry_budget", value)} />
+                <SettingField label="RQ 归属种子预算" type="number" min={1} max={500} value={form.agent_rq_membership_seed_budget} onChange={(value) => updateForm("agent_rq_membership_seed_budget", value)} />
                 <SettingField label="Frontier 扩展预算" type="number" min={1} max={2000} value={form.agent_frontier_expansion_budget} onChange={(value) => updateForm("agent_frontier_expansion_budget", value)} />
                 <SettingField label="每层最大深度" type="number" min={1} max={12} value={form.agent_max_depth_per_layer} onChange={(value) => updateForm("agent_max_depth_per_layer", value)} />
                 <SettingField label="每节点标签上限" type="number" min={1} max={20} value={form.agent_max_labels_per_node} onChange={(value) => updateForm("agent_max_labels_per_node", value)} />
                 <SettingField label="边复用上限" type="number" min={1} max={20} value={form.agent_max_edge_reuse} onChange={(value) => updateForm("agent_max_edge_reuse", value)} />
                 <SettingField label="Cycle reward 上限" type="number" min={0} max={2} step={0.01} value={form.agent_max_cycle_reward_per_path} onChange={(value) => updateForm("agent_max_cycle_reward_per_path", value)} />
-                <SettingField label="灰区边下界" type="number" min={0} max={20} step={0.01} value={form.agent_ambiguous_edge_distance_low} onChange={(value) => updateForm("agent_ambiguous_edge_distance_low", value)} />
-                <SettingField label="灰区边上界" type="number" min={0} max={20} step={0.01} value={form.agent_ambiguous_edge_distance_high} onChange={(value) => updateForm("agent_ambiguous_edge_distance_high", value)} />
+                <SettingField label="Cycle reward 距离阈值" type="number" min={0} max={20} step={0.01} value={form.agent_cycle_reward_distance_threshold} onChange={(value) => updateForm("agent_cycle_reward_distance_threshold", value)} />
+                <SettingField label="路径 green 阈值" type="number" min={0} max={20} step={0.01} value={form.agent_path_distance_green_threshold} onChange={(value) => updateForm("agent_path_distance_green_threshold", value)} />
+                <SettingField label="路径 gray 阈值" type="number" min={0} max={20} step={0.01} value={form.agent_path_distance_gray_threshold} onChange={(value) => updateForm("agent_path_distance_gray_threshold", value)} />
+                <SettingField label="路径 hard 阈值" type="number" min={0} max={40} step={0.01} value={form.agent_path_distance_hard_threshold} onChange={(value) => updateForm("agent_path_distance_hard_threshold", value)} />
                 <SettingField label="每层下钻预算" type="number" min={1} max={500} value={form.agent_drilldown_budget_per_layer} onChange={(value) => updateForm("agent_drilldown_budget_per_layer", value)} />
                 <SettingField label="片段候选预算" type="number" min={1} max={1000} value={form.agent_chunk_candidate_budget} onChange={(value) => updateForm("agent_chunk_candidate_budget", value)} />
                 <SettingField label="结构恢复预算" type="number" min={1} max={200} value={form.agent_structure_restore_budget} onChange={(value) => updateForm("agent_structure_restore_budget", value)} />
@@ -1345,16 +1353,16 @@ export function SettingsWorkspace() {
             <section className={sectionClass}>
               <p className="text-sm font-semibold text-white">重建参数</p>
               <BoundaryNote title="生效边界：新任务会读取，但已有 active 数据不会改变">
-                固定切块、向量维度、RQ-KMeans 和中粒度概念抽取参数必须通过重解析或图谱重建，才能影响已有资料库的 chunk、向量、关系图和概念图。
+                固定切块、向量维度、RQ-KMeans 和概念批处理参数必须通过重解析或图谱重建，才能影响已有资料库的 chunk、向量、关系图和概念图；L3 到中粒度、L2 到粗粒度始终全量投影。
               </BoundaryNote>
               <div className="mt-5 grid gap-4 md:grid-cols-4">
                 <SettingField label="固定切块尺寸" type="number" min={128} max={4096} value={form.fixed_chunk_size_tokens} onChange={(value) => updateForm("fixed_chunk_size_tokens", value)} />
                 <SettingField label="固定切块重叠" type="number" min={0} max={1024} value={form.fixed_chunk_overlap_tokens} onChange={(value) => updateForm("fixed_chunk_overlap_tokens", value)} />
                 <SettingField label="向量维度" type="number" min={1} max={8192} value={form.embedding_dimensions} onChange={(value) => updateForm("embedding_dimensions", value)} />
-                <SettingField label="中粒度模型批次数" type="number" min={0} max={64} value={form.mid_concept_extraction_max_model_batches} onChange={(value) => updateForm("mid_concept_extraction_max_model_batches", value)} />
-                <SettingField label="概念候选批量" type="number" min={1} max={500} value={form.mid_concept_extraction_max_candidates_per_batch} onChange={(value) => updateForm("mid_concept_extraction_max_candidates_per_batch", value)} />
+                <SettingField label="模型批次诊断上限" type="number" min={0} max={64} value={form.mid_concept_extraction_max_model_batches} onChange={(value) => updateForm("mid_concept_extraction_max_model_batches", value)} />
+                <SettingField label="每批 L3 前缀数" type="number" min={1} max={500} value={form.mid_concept_extraction_max_candidates_per_batch} onChange={(value) => updateForm("mid_concept_extraction_max_candidates_per_batch", value)} />
                 <SettingField label="每批概念 token 上限" type="number" min={500} max={50000} value={form.mid_concept_extraction_max_tokens_per_batch} onChange={(value) => updateForm("mid_concept_extraction_max_tokens_per_batch", value)} />
-                <SettingField label="概念保留阈值" type="number" min={0} max={1} step={0.01} value={form.mid_concept_candidate_keep_threshold} onChange={(value) => updateForm("mid_concept_candidate_keep_threshold", value)} />
+                <SettingField label="候选诊断阈值" type="number" min={0} max={1} step={0.01} value={form.mid_concept_candidate_keep_threshold} onChange={(value) => updateForm("mid_concept_candidate_keep_threshold", value)} />
                 <SettingField label="RQ-KMeans 层数" type="number" min={1} max={8} value={form.rq_kmeans_levels} onChange={(value) => updateForm("rq_kmeans_levels", value)} />
                 <SettingField label="RQ-KMeans 最大 K" type="number" min={1} max={64} value={form.rq_kmeans_max_k} onChange={(value) => updateForm("rq_kmeans_max_k", value)} />
                 <SettingField label="RQ 残差 Tau" type="number" min={0.01} max={10} step={0.01} value={form.rq_residual_tau} onChange={(value) => updateForm("rq_residual_tau", value)} />

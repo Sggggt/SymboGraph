@@ -25,7 +25,7 @@ from app.models import (
     CitationVerification,
     CoarseConcept,
     ContextPackage,
-    FineCluster,
+    RQPrefix,
     MidConcept,
     PolicyState,
     QASession,
@@ -110,10 +110,13 @@ def trace(db: Session, run_id: str, node: str, *, input_summary: str = "", outpu
 
 
 ALLOWED_TYPED_ACTIONS = {
+    "activate_coarse_concepts",
+    "route_mid_concepts",
+    "route_rq_memberships",
     "select_entry_nodes",
     "walk_graph_frontier",
     "drill_down_layer",
-    "follow_ambiguous_edge",
+    "evaluate_gray_zone_path",
     "recall_chunks",
     "restore_context_package",
     "build_context_package",
@@ -133,7 +136,7 @@ def _default_budget_for_action(action_type: str, envelope: dict[str, Any]) -> di
         "select_entry_nodes": {
             "coarse_entry_budget": int(envelope.get("coarse_entry_budget") or 0),
             "mid_entry_budget": int(envelope.get("mid_entry_budget") or 0),
-            "fine_entry_budget": int(envelope.get("fine_entry_budget") or 0),
+            "rq_membership_seed_budget": int(envelope.get("rq_membership_seed_budget") or 0),
         },
         "walk_graph_frontier": {
             "frontier_expansion_budget": int(envelope.get("frontier_expansion_budget") or 0),
@@ -141,9 +144,10 @@ def _default_budget_for_action(action_type: str, envelope: dict[str, Any]) -> di
             "max_labels_per_node": int(envelope.get("max_labels_per_node") or 0),
         },
         "drill_down_layer": {"drilldown_budget_per_layer": int(envelope.get("drilldown_budget_per_layer") or 0)},
-        "follow_ambiguous_edge": {
-            "ambiguous_edge_distance_low": float(envelope.get("ambiguous_edge_distance_low") or 0),
-            "ambiguous_edge_distance_high": float(envelope.get("ambiguous_edge_distance_high") or 0),
+        "evaluate_gray_zone_path": {
+            "path_distance_green_threshold": float(envelope.get("path_distance_green_threshold") or 0),
+            "path_distance_gray_threshold": float(envelope.get("path_distance_gray_threshold") or 0),
+            "path_distance_hard_threshold": float(envelope.get("path_distance_hard_threshold") or 0),
         },
         "recall_chunks": {"chunk_candidate_budget": int(envelope.get("chunk_candidate_budget") or 0)},
         "restore_context_package": {"structure_restore_budget": int(envelope.get("structure_restore_budget") or 0)},
@@ -185,18 +189,21 @@ def fallback_typed_actions(question: str, envelope: dict[str, Any]) -> list[dict
 
 
 ACTION_TARGET_LAYERS: dict[str, set[str]] = {
-    "select_entry_nodes": {"coarse", "mid", "fine", "chunk"},
-    "walk_graph_frontier": {"coarse", "mid", "fine", "chunk"},
-    "drill_down_layer": {"coarse", "mid", "fine"},
-    "follow_ambiguous_edge": {"coarse", "mid", "fine", "chunk"},
-    "recall_chunks": {"fine", "chunk"},
+    "activate_coarse_concepts": {"coarse"},
+    "route_mid_concepts": {"coarse", "mid"},
+    "route_rq_memberships": {"mid", "rq_membership"},
+    "select_entry_nodes": {"coarse", "mid", "rq_membership", "chunk"},
+    "walk_graph_frontier": {"coarse", "mid", "chunk"},
+    "drill_down_layer": {"coarse", "mid"},
+    "evaluate_gray_zone_path": {"coarse", "mid", "rq_membership", "chunk"},
+    "recall_chunks": {"rq_membership", "chunk"},
     "restore_context_package": {"chunk", "context_package"},
     "build_context_package": {"chunk", "context_package"},
     "verify_citations": {"chunk", "context_package", "citation"},
-    "repair_missing_citation": {"coarse", "mid", "fine", "chunk", "context_package"},
-    "repair_concept_gap": {"coarse", "mid", "fine"},
-    "repair_bridge_gap": {"coarse", "mid", "fine", "chunk"},
-    "repair_formula_context": {"fine", "chunk", "context_package"},
+    "repair_missing_citation": {"coarse", "mid", "rq_membership", "chunk", "context_package"},
+    "repair_concept_gap": {"coarse", "mid", "rq_membership"},
+    "repair_bridge_gap": {"coarse", "mid", "rq_membership", "chunk"},
+    "repair_formula_context": {"rq_membership", "chunk", "context_package"},
     "reduce_drift_and_repack": {"chunk", "context_package"},
 }
 
@@ -210,8 +217,8 @@ def _target_id_layers(db: Session, knowledge_base_id: str, target_ids: list[str]
         layers[row.id].add("coarse")
     for row in db.scalars(select(MidConcept).where(MidConcept.id.in_(target_set), MidConcept.knowledge_base_id == knowledge_base_id)).all():
         layers[row.id].add("mid")
-    for row in db.scalars(select(FineCluster).where(FineCluster.id.in_(target_set))).all():
-        layers[row.id].add("fine")
+    for row in db.scalars(select(RQPrefix).where(RQPrefix.id.in_(target_set))).all():
+        layers[row.id].add("rq_membership")
     for row in db.scalars(select(Chunk).where(Chunk.id.in_(target_set), Chunk.knowledge_base_id == knowledge_base_id, Chunk.state == "active")).all():
         layers[row.id].add("chunk")
     for row in db.scalars(select(ContextPackage).where(ContextPackage.id.in_(target_set), ContextPackage.knowledge_base_id == knowledge_base_id)).all():
@@ -539,29 +546,44 @@ def citation_payloads_from_package(
     retrieval_trace_id: str | None = None,
     verification_by_chunk: dict[str, CitationVerification] | None = None,
     answer: str | None = None,
+    question: str | None = None,
+    supported_only: bool = False,
 ) -> list[dict]:
     chunks = (package.package_json or {}).get("chunks", [])
-    hit_ids = set(package.hit_chunk_ids_json or [])
+    hit_ids = set(getattr(package, "hit_chunk_ids_json", None) or [])
+    restored_ids = set(getattr(package, "restored_chunk_ids_json", None) or [])
+    bridge_ids = set(getattr(package, "bridge_chunk_ids_json", None) or [])
     citations = []
-    hit_chunks = [chunk for chunk in chunks if chunk.get("chunk_id") in hit_ids]
+    candidate_chunks = [chunk for chunk in chunks if chunk.get("chunk_id") in hit_ids]
     if answer:
-        df, corpus_size = _term_document_frequency([str(chunk.get("content") or chunk.get("snippet") or "") for chunk in chunks])
-        scored_hit_chunks = [
-            (
-                _claim_support(answer, str(chunk.get("content") or chunk.get("snippet") or ""), df, corpus_size),
-                chunk,
-            )
-            for chunk in hit_chunks
+        corpus_texts = [_citation_candidate_text(chunk) for chunk in chunks]
+        df, corpus_size = _term_document_frequency(corpus_texts)
+        scored_chunks = [
+            (_citation_candidate_score(chunk, answer=answer, question=question, df=df, corpus_size=corpus_size, hit_ids=hit_ids, restored_ids=restored_ids, bridge_ids=bridge_ids), chunk)
+            for chunk in chunks
         ]
-        supported_hit_chunks = [
-            (support, chunk)
-            for support, chunk in scored_hit_chunks
-            if float(support["best_support_score"]) >= 0.08 and int(support["best_overlap_count"]) >= 1
+        supported_chunks = [
+            (score, chunk)
+            for score, chunk in scored_chunks
+            if float(score["combined_support_score"]) >= 0.04
+            and (int(score["answer_overlap_count"]) >= 2 or int(score["query_overlap_count"]) >= 1 or chunk.get("chunk_id") in hit_ids)
         ]
-        supported_hit_chunks.sort(key=lambda item: float(item[0]["best_support_score"]), reverse=True)
-        hit_chunks = [chunk for _, chunk in supported_hit_chunks[: max(1, min(6, get_settings().agent_verification_budget))]] or hit_chunks[:1]
-    for index, item in enumerate(hit_chunks, start=1):
+        supported_chunks.sort(
+            key=lambda item: (
+                float(item[0]["combined_support_score"]),
+                int(item[0]["answer_overlap_count"]),
+                1 if item[1].get("chunk_id") in hit_ids else 0,
+                1 if item[1].get("chunk_id") in restored_ids else 0,
+            ),
+            reverse=True,
+        )
+        candidate_chunks = [chunk for _, chunk in supported_chunks[: max(1, min(6, get_settings().agent_verification_budget))]]
+        if not candidate_chunks:
+            candidate_chunks = [chunk for chunk in chunks if chunk.get("chunk_id") in hit_ids] or chunks[:1]
+    for index, item in enumerate(candidate_chunks, start=1):
         verification = (verification_by_chunk or {}).get(item["chunk_id"])
+        if supported_only and (verification is None or verification.verdict != "supported"):
+            continue
         source_span = dict(item.get("source_span") or {})
         source_span.update(
             {
@@ -603,6 +625,65 @@ def citation_payloads_from_package(
             }
         )
     return citations
+
+
+def _citation_candidate_text(chunk: dict[str, Any]) -> str:
+    section_path = chunk.get("section_path") or []
+    if isinstance(section_path, list):
+        section_text = " / ".join(str(item) for item in section_path)
+    else:
+        section_text = str(section_path or "")
+    return "\n".join(
+        item
+        for item in [
+            str(chunk.get("document_title") or ""),
+            section_text,
+            str(chunk.get("content") or chunk.get("snippet") or ""),
+        ]
+        if item.strip()
+    )
+
+
+def _citation_candidate_score(
+    chunk: dict[str, Any],
+    *,
+    answer: str,
+    question: str | None,
+    df: Counter[str],
+    corpus_size: int,
+    hit_ids: set[str],
+    restored_ids: set[str],
+    bridge_ids: set[str],
+) -> dict[str, Any]:
+    text = _citation_candidate_text(chunk)
+    answer_overlap = _weighted_overlap(answer, text, df, corpus_size)
+    query_overlap = _weighted_overlap(question or "", text, df, corpus_size) if question else {"support_score": 0.0, "overlap_count": 0, "overlap_terms": []}
+    claim_support = _claim_support(answer, text, df, corpus_size)
+    chunk_id = chunk.get("chunk_id")
+    provenance_bonus = 0.0
+    if chunk_id in hit_ids:
+        provenance_bonus += 0.02
+    if chunk_id in restored_ids:
+        provenance_bonus += 0.015
+    if chunk_id in bridge_ids:
+        provenance_bonus += 0.01
+    combined = (
+        0.58 * float(answer_overlap["support_score"])
+        + 0.32 * float(query_overlap["support_score"])
+        + 0.08 * min(1.0, int(claim_support["supported_claim_count"]) / 4.0)
+        + provenance_bonus
+    )
+    return {
+        "combined_support_score": round(combined, 6),
+        "answer_support_score": answer_overlap["support_score"],
+        "answer_overlap_count": answer_overlap["overlap_count"],
+        "query_support_score": query_overlap["support_score"],
+        "query_overlap_count": query_overlap["overlap_count"],
+        "query_overlap_terms": query_overlap.get("overlap_terms", []),
+        "supported_claim_count": claim_support["supported_claim_count"],
+        "best_support_score": claim_support["best_support_score"],
+        "best_overlap_count": claim_support["best_overlap_count"],
+    }
 
 
 def citation_verification_summary(db: Session, answer_session_id: str) -> tuple[dict[str, CitationVerification], float | None]:
@@ -909,7 +990,7 @@ def update_policy_state_from_reward(db: Session, knowledge_base_id: str, reward:
     arms = [
         "high_precision_direct_chunk",
         "structure_context_heavy",
-        "fine_cluster_expansion",
+        "rq_membership_expansion",
         "mid_concept_expansion",
         "coarse_to_mid_drilldown",
         "bridge_edge_exploration",
@@ -926,7 +1007,7 @@ def update_policy_state_from_reward(db: Session, knowledge_base_id: str, reward:
     weights = {
         "high_precision_direct_chunk": max(0.1, previous_weights.get("high_precision_direct_chunk", 1.0) * (0.9 + 0.2 * citation_pass)),
         "structure_context_heavy": max(0.1, previous_weights.get("structure_context_heavy", 1.0) * (0.9 + 0.2 * context_recall)),
-        "fine_cluster_expansion": max(0.1, previous_weights.get("fine_cluster_expansion", 1.0) * (0.9 + 0.1 * concept_path)),
+        "rq_membership_expansion": max(0.1, previous_weights.get("rq_membership_expansion", 1.0) * (0.9 + 0.1 * concept_path)),
         "mid_concept_expansion": max(0.1, previous_weights.get("mid_concept_expansion", 1.0) * (0.9 + 0.2 * concept_path)),
         "coarse_to_mid_drilldown": max(0.1, previous_weights.get("coarse_to_mid_drilldown", 1.0) * (0.9 + 0.15 * concept_path)),
         "bridge_edge_exploration": max(0.1, previous_weights.get("bridge_edge_exploration", 1.0) * (0.9 + bridge_repair_boost)),
@@ -967,8 +1048,9 @@ def update_policy_state_from_reward(db: Session, knowledge_base_id: str, reward:
             "epsilon": 0.05,
             "exploration_rate": 0.05,
             "safe_arms": safe_arms,
-            "ambiguous_edge_distance_low": agent_operating_envelope().get("ambiguous_edge_distance_low"),
-            "ambiguous_edge_distance_high": agent_operating_envelope().get("ambiguous_edge_distance_high"),
+            "path_distance_green_threshold": agent_operating_envelope().get("path_distance_green_threshold"),
+            "path_distance_gray_threshold": agent_operating_envelope().get("path_distance_gray_threshold"),
+            "path_distance_hard_threshold": agent_operating_envelope().get("path_distance_hard_threshold"),
         },
         reward_summary_json=reward_summary,
         state_hash=state_hash,
@@ -991,7 +1073,7 @@ async def record_answer_audit(
     answer_model_audit: dict,
     repair_actions: list[dict[str, Any]] | None = None,
 ) -> AnswerSession:
-    citations = citation_payloads_from_package(package, retrieval_trace_id=package.retrieval_trace_id, answer=answer)
+    citations = citation_payloads_from_package(package, retrieval_trace_id=package.retrieval_trace_id, answer=answer, question=question)
     verification_results = await verify_answer_against_context(
         answer,
         citations,
@@ -1186,13 +1268,13 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             run.id,
             "entry_selection",
             input_summary=request.question,
-            output_summary=f"coarse={audit.get('coarse_entries', 0)}, mid={audit.get('mid_entries', 0)}, fine={audit.get('fine_entries', 0)}",
+            output_summary=f"coarse={audit.get('coarse_entries', 0)}, mid={audit.get('mid_entries', 0)}, rq-prefix-address={audit.get('rq_membership_entries', 0)}",
             document_ids=[item["chunk_id"] for item in search_result.results],
             scores={
                 "retrieval_trace_id": search_result.trace.id,
                 "coarse_entries": audit.get("coarse_entries", 0),
                 "mid_entries": audit.get("mid_entries", 0),
-                "fine_entries": audit.get("fine_entries", 0),
+                "rq_membership_entries": audit.get("rq_membership_entries", 0),
             },
         )
         trace(
@@ -1200,7 +1282,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             run.id,
             "layer_drilldown",
             input_summary=f"trace={search_result.trace.id}",
-            output_summary=f"fine candidates={audit.get('fine_entries', 0)}",
+            output_summary=f"rq-prefix-address seeds={audit.get('rq_membership_entries', 0)}",
             document_ids=[item["chunk_id"] for item in search_result.results],
             scores={
                 "retrieval_trace_id": search_result.trace.id,
@@ -1314,7 +1396,12 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
 
-        provisional_citations = citation_payloads_from_package(package, retrieval_trace_id=package.retrieval_trace_id, answer=chat_result.answer)
+        provisional_citations = citation_payloads_from_package(
+            package,
+            retrieval_trace_id=package.retrieval_trace_id,
+            answer=chat_result.answer,
+            question=request.question,
+        )
         provisional_verifications = await verify_answer_against_context(
             chat_result.answer,
             provisional_citations,
@@ -1435,10 +1522,22 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                 "chat_model": chat_result.model,
                 "retrieval_trace_id": package.retrieval_trace_id,
                 "answer_session_id": answer_session.id,
-                "citation_verification_pass_rate": citation_pass_rate,
+                "raw_citation_verification_pass_rate": citation_pass_rate,
                 "repair_actions": repair_actions,
             }
         )
+        citations = citation_payloads_from_package(
+            package,
+            answer_session_id=answer_session.id,
+            retrieval_trace_id=package.retrieval_trace_id,
+            verification_by_chunk=verification_by_chunk,
+            answer=chat_result.answer,
+            question=request.question,
+            supported_only=True,
+        )
+        final_citation_pass_rate = 1.0 if citations else 0.0
+        answer_model_audit["citation_verification_pass_rate"] = final_citation_pass_rate
+        answer_model_audit["returned_citation_count"] = len(citations)
         answer_session.model_json = dict(answer_model_audit)
         db.commit()
         trace(
@@ -1446,9 +1545,14 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             run.id,
             "citation_verification",
             input_summary=f"answer_session={answer_session.id}",
-            output_summary=f"pass_rate={citation_pass_rate}",
-            document_ids=list(package.hit_chunk_ids_json or []),
-            scores={"citation_pass_rate": citation_pass_rate, "repair_actions": repair_actions},
+            output_summary=f"pass_rate={final_citation_pass_rate}",
+            document_ids=[item.get("chunk_id") for item in citations if item.get("chunk_id")],
+            scores={
+                "citation_pass_rate": final_citation_pass_rate,
+                "raw_citation_pass_rate": citation_pass_rate,
+                "returned_citation_count": len(citations),
+                "repair_actions": repair_actions,
+            },
         )
         trace(
             db,
@@ -1457,13 +1561,6 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             input_summary=f"answer_session={answer_session.id}",
             output_summary="reward and policy state updated",
             scores={"runtime_settings_hash": runtime_settings_state_hash(), "agent_operating_envelope_hash": agent_operating_envelope_state_hash()},
-        )
-        citations = citation_payloads_from_package(
-            package,
-            answer_session_id=answer_session.id,
-            retrieval_trace_id=package.retrieval_trace_id,
-            verification_by_chunk=verification_by_chunk,
-            answer=chat_result.answer,
         )
         append_session_turn(db, session, request.question, chat_result.answer, run.id, citations)
         set_run_state(db, run, "completed", current_node=None, answer=chat_result.answer)

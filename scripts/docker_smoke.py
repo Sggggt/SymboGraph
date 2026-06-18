@@ -123,16 +123,14 @@ def main() -> int:
             require(graph.get("graph_type") == graph_type, f"Wrong graph type for {graph_type}: {graph}")
             require("counts" in graph or "node_counts" in graph, f"Missing counts for {graph_type}: {graph}")
             if graph_type == "chunk-relation":
-                rq_edges = [edge for edge in graph.get("edges", []) if str(edge.get("type") or "").startswith("rq_")]
+                rq_relation_edges = [edge for edge in graph.get("edges", []) if str(edge.get("type") or "").startswith("rq_")]
                 rq_chunk_nodes = [node for node in graph.get("nodes", []) if ((node.get("metadata") or {}).get("rq_path"))]
                 rq_prefix_nodes = [node for node in graph.get("nodes", []) if node.get("category") == "rq_prefix"]
                 rq_membership_edges = [edge for edge in graph.get("edges", []) if edge.get("category") == "rq_membership"]
-                rq_cluster_edges = [edge for edge in graph.get("edges", []) if str(edge.get("category") or "").startswith("rq_") and edge.get("category") != "rq_membership"]
-                require(rq_edges, f"Chunk relation graph has no RQ edges: {graph}")
+                require(rq_relation_edges, f"Chunk relation graph has no RQ relation edges: {graph}")
                 require(rq_chunk_nodes, f"Chunk relation graph has no chunk RQ path metadata: {graph}")
                 require(rq_prefix_nodes, f"Chunk relation graph has no visible RQ prefix nodes: {graph}")
                 require(rq_membership_edges, f"Chunk relation graph has no visible RQ membership edges: {graph}")
-                require(rq_cluster_edges, f"Chunk relation graph has no visible RQ cluster edges: {graph}")
             payload["checks"].append({"name": f"graph_{graph_type}", "pass": True, "nodes": len(graph.get("nodes", [])), "edges": len(graph.get("edges", []))})
 
         search = client.request_json("POST", "/search", {"knowledge_base_id": knowledge_base_id, "query": args.query, "top_k": 5, "filters": {}})
@@ -143,8 +141,22 @@ def main() -> int:
         require(any(((item.get("metadata") or {}).get("rq")) for item in search.get("results", [])), f"Search results did not include RQ candidate metrics: {search}")
         trace = client.request_json("GET", f"/retrieval-traces/{trace_id}/graph-steps")
         require(trace.get("steps"), f"Retrieval trace has no steps: {trace}")
-        fine_steps = [step for step in trace.get("steps", []) if step.get("layer") == "fine"]
-        require(fine_steps and (fine_steps[0].get("input") or {}).get("query_rq_path"), f"Retrieval trace has no RQ query path: {trace}")
+        require(
+            not any(step.get("layer") == "fine" for step in trace.get("steps", [])),
+            f"Retrieval trace still exposes RQ prefix as an active traversal layer: {trace}",
+        )
+        seed_steps = [
+            step
+            for step in trace.get("steps", [])
+            if step.get("layer") == "chunk" and step.get("action") == "select_seeds_from_mid_rq_membership"
+        ]
+        require(seed_steps, f"Retrieval trace has no rq-prefix-address seed selection step: {trace}")
+        require((seed_steps[0].get("input") or {}).get("query_rq_path"), f"Retrieval trace has no RQ query path: {trace}")
+        require((seed_steps[0].get("output") or {}).get("candidate_rq"), f"Retrieval trace has no RQ seed diagnostics: {trace}")
+        require(
+            any(step.get("layer") == "chunk" and step.get("action") == "walk_graph_frontier" for step in trace.get("steps", [])),
+            f"Retrieval trace has no active chunk frontier walk: {trace}",
+        )
         payload["checks"].append({"name": "layered_search", "pass": True, "trace_id": trace_id, "result_count": len(search.get("results", []))})
 
         qa = client.request_json(

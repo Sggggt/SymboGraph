@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 import os
 import re
 from typing import Literal
@@ -44,14 +44,16 @@ HOT_RELOAD_SETTINGS = {
     "agent_coarse_jump_budget",
     "agent_mid_entry_budget",
     "agent_mid_expansion_radius_cap",
-    "agent_fine_entry_budget",
+    "agent_rq_membership_seed_budget",
     "agent_frontier_expansion_budget",
     "agent_max_depth_per_layer",
     "agent_max_labels_per_node",
     "agent_max_edge_reuse",
     "agent_max_cycle_reward_per_path",
-    "agent_ambiguous_edge_distance_low",
-    "agent_ambiguous_edge_distance_high",
+    "agent_cycle_reward_distance_threshold",
+    "agent_path_distance_green_threshold",
+    "agent_path_distance_gray_threshold",
+    "agent_path_distance_hard_threshold",
     "agent_drilldown_budget_per_layer",
     "agent_chunk_candidate_budget",
     "agent_structure_restore_budget",
@@ -61,6 +63,17 @@ HOT_RELOAD_SETTINGS = {
     "agent_repair_round_budget",
     "agent_verification_budget",
 }
+
+
+def running_in_container() -> bool:
+    return Path("/.dockerenv").exists() or os.getenv("RUNNING_IN_DOCKER", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def model_bridge_client_base_url(port: int) -> str:
+    host = "host.docker.internal" if running_in_container() else "127.0.0.1"
+    return f"http://{host}:{int(port)}"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=(WORKSPACE_ROOT / ".env", APP_DIR / ".env"),
@@ -122,14 +135,16 @@ class Settings(BaseSettings):
     agent_coarse_jump_budget: int = Field(default=2, ge=0, le=20)
     agent_mid_entry_budget: int = Field(default=16, ge=1, le=200)
     agent_mid_expansion_radius_cap: int = Field(default=2, ge=0, le=8)
-    agent_fine_entry_budget: int = Field(default=16, ge=1, le=500)
+    agent_rq_membership_seed_budget: int = Field(default=16, ge=1, le=500)
     agent_frontier_expansion_budget: int = Field(default=80, ge=1, le=2000)
     agent_max_depth_per_layer: int = Field(default=3, ge=1, le=12)
     agent_max_labels_per_node: int = Field(default=3, ge=1, le=20)
     agent_max_edge_reuse: int = Field(default=2, ge=1, le=20)
     agent_max_cycle_reward_per_path: float = Field(default=0.18, ge=0.0, le=2.0)
-    agent_ambiguous_edge_distance_low: float = Field(default=0.45, ge=0.0, le=20.0)
-    agent_ambiguous_edge_distance_high: float = Field(default=1.35, ge=0.0, le=20.0)
+    agent_cycle_reward_distance_threshold: float = Field(default=1.2, ge=0.0, le=20.0)
+    agent_path_distance_green_threshold: float = Field(default=0.45, ge=0.0, le=20.0)
+    agent_path_distance_gray_threshold: float = Field(default=1.35, ge=0.0, le=20.0)
+    agent_path_distance_hard_threshold: float = Field(default=2.4, ge=0.0, le=40.0)
     agent_drilldown_budget_per_layer: int = Field(default=16, ge=1, le=500)
     agent_chunk_candidate_budget: int = Field(default=80, ge=1, le=1000)
     agent_structure_restore_budget: int = Field(default=16, ge=1, le=200)
@@ -228,7 +243,7 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "agent_coarse_jump_budget",
         "agent_mid_entry_budget",
         "agent_mid_expansion_radius_cap",
-        "agent_fine_entry_budget",
+        "agent_rq_membership_seed_budget",
         "agent_frontier_expansion_budget",
         "agent_max_depth_per_layer",
         "agent_max_labels_per_node",
@@ -246,8 +261,10 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "mid_concept_candidate_keep_threshold",
         "rq_residual_tau",
         "agent_max_cycle_reward_per_path",
-        "agent_ambiguous_edge_distance_low",
-        "agent_ambiguous_edge_distance_high",
+        "agent_cycle_reward_distance_threshold",
+        "agent_path_distance_green_threshold",
+        "agent_path_distance_gray_threshold",
+        "agent_path_distance_hard_threshold",
     }
     nullable_fields = {
         "chat_resolve_ip",
@@ -270,14 +287,16 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "AGENT_COARSE_JUMP_BUDGET": "agent_coarse_jump_budget",
         "AGENT_MID_ENTRY_BUDGET": "agent_mid_entry_budget",
         "AGENT_MID_EXPANSION_RADIUS_CAP": "agent_mid_expansion_radius_cap",
-        "AGENT_FINE_ENTRY_BUDGET": "agent_fine_entry_budget",
+        "AGENT_RQ_MEMBERSHIP_SEED_BUDGET": "agent_rq_membership_seed_budget",
         "AGENT_FRONTIER_EXPANSION_BUDGET": "agent_frontier_expansion_budget",
         "AGENT_MAX_DEPTH_PER_LAYER": "agent_max_depth_per_layer",
         "AGENT_MAX_LABELS_PER_NODE": "agent_max_labels_per_node",
         "AGENT_MAX_EDGE_REUSE": "agent_max_edge_reuse",
         "AGENT_MAX_CYCLE_REWARD_PER_PATH": "agent_max_cycle_reward_per_path",
-        "AGENT_AMBIGUOUS_EDGE_DISTANCE_LOW": "agent_ambiguous_edge_distance_low",
-        "AGENT_AMBIGUOUS_EDGE_DISTANCE_HIGH": "agent_ambiguous_edge_distance_high",
+        "AGENT_CYCLE_REWARD_DISTANCE_THRESHOLD": "agent_cycle_reward_distance_threshold",
+        "AGENT_PATH_DISTANCE_GREEN_THRESHOLD": "agent_path_distance_green_threshold",
+        "AGENT_PATH_DISTANCE_GRAY_THRESHOLD": "agent_path_distance_gray_threshold",
+        "AGENT_PATH_DISTANCE_HARD_THRESHOLD": "agent_path_distance_hard_threshold",
         "AGENT_DRILLDOWN_BUDGET_PER_LAYER": "agent_drilldown_budget_per_layer",
         "AGENT_CHUNK_CANDIDATE_BUDGET": "agent_chunk_candidate_budget",
         "AGENT_STRUCTURE_RESTORE_BUDGET": "agent_structure_restore_budget",
@@ -335,7 +354,7 @@ def _build_settings() -> Settings:
     if api_chat_base_url:
         settings.chat_base_url = api_chat_base_url
     elif model_bridge_enabled:
-        settings.chat_base_url = f"http://host.docker.internal:{settings.model_bridge_port}"
+        settings.chat_base_url = model_bridge_client_base_url(settings.model_bridge_port)
         settings.chat_resolve_ip = "__none__"
     elif env_entries.get("CHAT_BASE_URL"):
         settings.chat_base_url = env_entries["CHAT_BASE_URL"]
@@ -355,7 +374,7 @@ def _build_settings() -> Settings:
     # Embedding-specific overrides (no fallback to chat model settings)
     embedding_base_url = env_entries.get("EMBEDDING_BASE_URL") or os.getenv("EMBEDDING_BASE_URL")
     if model_bridge_enabled:
-        settings.embedding_base_url = f"http://host.docker.internal:{settings.model_bridge_port}"
+        settings.embedding_base_url = model_bridge_client_base_url(settings.model_bridge_port)
         settings.embedding_resolve_ip = "__none__"
     elif embedding_base_url:
         settings.embedding_base_url = embedding_base_url

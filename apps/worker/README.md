@@ -45,7 +45,7 @@ Worker 执行：
 - 文件解析与固定 token chunk。
 - Chunk Structure Graph、坐标和映射。
 - Contextual embedding、Qdrant upsert 和 BM25 records。
-- Chunk Relation Graph、Fine Clusters、RQ-KMeans、Mid/Coarse Concept Graph、Context Graph state。
+- Chunk Relation Graph、RQ address/membership、RQ L3 Mid Concept Graph、RQ L2 Coarse Concept Graph、Context Graph state。
 - 批次取消、补偿记录、可重试失败和 heartbeat。
 
 ## 环境配置

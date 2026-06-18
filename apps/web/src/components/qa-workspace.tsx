@@ -1,4 +1,4 @@
-﻿"use client";
+"use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { AgentResponse, AgentTraceEventPayload, Citation, SessionSummary } from "@course-kg/shared";
@@ -171,7 +171,7 @@ function EmptyChatState({ suggestions, onPick }: { suggestions: string[]; onPick
           开始一轮有证据支撑的资料问答
         </h3>
         <p className="mx-auto mt-3 max-w-[21rem] text-sm leading-7 text-white/56 sm:max-w-2xl">
-          系统会按粗概念、中概念、细聚类和片段结构逐层寻址，组装上下文证据包后生成带引用的回答。
+          系统会按粗概念、中概念、RQ 前缀和片段结构逐层寻址，组装上下文证据包后生成带引用的回答。
         </p>
         <div className="mt-7">
           <SuggestionChips suggestions={suggestions} onPick={onPick} />

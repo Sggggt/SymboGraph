@@ -74,7 +74,7 @@ export function OverviewDashboard() {
       { label: "文档原件", value: data.ingested_document_count },
       { label: "活跃片段", value: counts.active_chunks ?? data.chunk_count ?? 0 },
       { label: "关系边", value: counts.chunk_relation_edges ?? data.graph_relation_count ?? 0 },
-      { label: "RQ 边", value: counts.rq_edges ?? 0 },
+      { label: "RQ 片段边", value: counts.rq_relation_edges ?? 0 },
       { label: "目录分组", value: data.tree.length },
     ];
   }, [data]);

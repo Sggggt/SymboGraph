@@ -14,9 +14,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    from sqlalchemy import func, select
+    from sqlalchemy import func, inspect, select
 
-    from app.models import ChunkRelationEdge, ChunkRelationGraphState, ChunkStructureNode, FineCluster, FineClusterEdge, FineClusterMembership
+    from app.models import ChunkRelationEdge, ChunkRelationGraphState, ChunkStructureNode, RQPrefix, RQPrefixMembership
     from app.services.context_graph import context_graph_stats, graph_layer_payload
 
     args = parse_args()
@@ -40,18 +40,6 @@ def main() -> None:
             or 0
             for edge_type in ("rq_hierarchy_near", "rq_prefix_sibling", "rq_residual_near")
         }
-        rq_cluster_edge_counts = {
-            edge_type: db.scalar(
-                select(func.count(FineClusterEdge.id))
-                .join(FineCluster, FineClusterEdge.source_cluster_id == FineCluster.id)
-                .where(
-                    FineCluster.knowledge_base_id == knowledge_base.id,
-                    FineClusterEdge.edge_type == edge_type,
-                )
-            )
-            or 0
-            for edge_type in ("rq_parent_child", "rq_sibling", "rq_centroid_near", "rq_overlap_bridge")
-        }
         rq_model = ((relation_state.diagnostics_json or {}).get("rq_kmeans") or {}) if relation_state else {}
         rq = {
             "enabled": bool(rq_model.get("enabled")),
@@ -62,21 +50,20 @@ def main() -> None:
                 "tau_r": rq_model.get("tau_r"),
                 "index_protocol": rq_model.get("index_protocol"),
             },
-            "cluster_count": db.scalar(select(func.count(FineCluster.id)).where(FineCluster.knowledge_base_id == knowledge_base.id, FineCluster.rq_level.is_not(None))) or 0,
+            "cluster_count": db.scalar(select(func.count(RQPrefix.id)).where(RQPrefix.knowledge_base_id == knowledge_base.id, RQPrefix.rq_level.is_not(None))) or 0,
             "membership_count": db.scalar(
-                select(func.count(FineClusterMembership.id))
-                .join(FineCluster, FineClusterMembership.fine_cluster_id == FineCluster.id)
-                .where(FineCluster.knowledge_base_id == knowledge_base.id, FineClusterMembership.residual_norm.is_not(None))
+                select(func.count(RQPrefixMembership.id))
+                .join(RQPrefix, RQPrefixMembership.rq_prefix_id == RQPrefix.id)
+                .where(RQPrefix.knowledge_base_id == knowledge_base.id, RQPrefixMembership.residual_norm.is_not(None))
             )
             or 0,
             "edge_counts": rq_edge_counts,
-            "cluster_edge_counts": rq_cluster_edge_counts,
             "pass": bool(relation_state)
             and bool(rq_model.get("enabled"))
-            and all(count > 0 for count in rq_edge_counts.values())
-            and all(count > 0 for count in rq_cluster_edge_counts.values()),
+            and all(count > 0 for count in rq_edge_counts.values()),
         }
         relation_state_id = relation_state.id if relation_state else None
+        legacy_rq_prefix_edges_table_present = "rq_prefix_edges" in inspect(db.bind).get_table_names()
         target_relation_edge_counts = {
             edge_type: (
                 db.scalar(
@@ -89,19 +76,9 @@ def main() -> None:
                 else 0
             )
             or 0
-            for edge_type in ("co_retrieved", "same_table_formula_context")
+            for edge_type in ("co_retrieved",)
         }
         missing_reasons = ((relation_state.diagnostics_json or {}).get("missing_target_relation_edge_type_reasons") or {}) if relation_state else {}
-        unsupported_fine_edges = (
-            db.scalar(
-                select(func.count(FineClusterEdge.id)).where(
-                    FineClusterEdge.graph_state_id == relation_state_id,
-                    (FineClusterEdge.support_chunk_edge_ids_json.is_(None)) | (func.json_array_length(FineClusterEdge.support_chunk_edge_ids_json) <= 0),
-                )
-            )
-            if relation_state_id
-            else 0
-        ) or 0
         missing_relation_metrics = (
             db.scalar(
                 select(func.count(ChunkRelationEdge.id)).where(
@@ -124,7 +101,7 @@ def main() -> None:
         checks = {
             "rq_complete": rq["pass"],
             "target_relation_edges_present_or_blocked": all(count > 0 or missing_reasons.get(edge_type) for edge_type, count in target_relation_edge_counts.items()),
-            "fine_edges_supported": unsupported_fine_edges == 0,
+            "rq_prefix_edges_removed": not legacy_rq_prefix_edges_table_present,
             "relation_metrics_present": missing_relation_metrics == 0,
             "structure_closure_types_present": required_structure_types.issubset(structure_node_types),
         }
@@ -138,8 +115,8 @@ def main() -> None:
             "pass": all(checks.values()),
             "target_relation_edge_counts": target_relation_edge_counts,
             "missing_target_relation_edge_type_reasons": missing_reasons,
-            "unsupported_fine_edge_count": unsupported_fine_edges,
             "missing_relation_metric_count": missing_relation_metrics,
+            "legacy_rq_prefix_edges_table_present": legacy_rq_prefix_edges_table_present,
             "structure_node_types": sorted(structure_node_types),
             "layers": layers,
         }

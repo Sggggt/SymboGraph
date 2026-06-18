@@ -22,7 +22,7 @@ from app.models import (
     CitationVerification,
     Document,
     DocumentVersion,
-    FineClusterMembership,
+    RQPrefixMembership,
     IngestionBatch,
     IngestionCompensationLog,
     KnowledgeBase,
@@ -163,7 +163,7 @@ def cleanup_stale_data(
             )
         )
         or 0,
-        "fine_cluster_memberships": db.scalar(select(func.count(FineClusterMembership.id)).where(FineClusterMembership.chunk_id.in_(inactive_chunk_id_filter))) or 0,
+        "rq_prefix_memberships": db.scalar(select(func.count(RQPrefixMembership.id)).where(RQPrefixMembership.chunk_id.in_(inactive_chunk_id_filter))) or 0,
         "chunk_structure_edges": db.scalar(select(func.count(ChunkStructureEdge.id)).where(ChunkStructureEdge.document_version_id.in_(inactive_document_version_filter))) or 0,
         "chunk_structure_nodes": db.scalar(select(func.count(ChunkStructureNode.id)).where(ChunkStructureNode.document_version_id.in_(inactive_document_version_filter))) or 0,
     }
@@ -199,7 +199,7 @@ def cleanup_stale_data(
             db.query(ChunkRelationEdge).filter(
                 (ChunkRelationEdge.source_chunk_id.in_(inactive_chunk_id_filter)) | (ChunkRelationEdge.target_chunk_id.in_(inactive_chunk_id_filter))
             ).delete(synchronize_session=False)
-            db.query(FineClusterMembership).filter(FineClusterMembership.chunk_id.in_(inactive_chunk_id_filter)).delete(synchronize_session=False)
+            db.query(RQPrefixMembership).filter(RQPrefixMembership.chunk_id.in_(inactive_chunk_id_filter)).delete(synchronize_session=False)
             db.query(ChunkStructureMapping).filter(ChunkStructureMapping.chunk_id.in_(inactive_chunk_id_filter)).delete(synchronize_session=False)
             db.query(ChunkContextText).filter(ChunkContextText.chunk_id.in_(inactive_chunk_id_filter)).delete(synchronize_session=False)
             db.query(ChunkCoordinate).filter(ChunkCoordinate.chunk_id.in_(inactive_chunk_id_filter)).delete(synchronize_session=False)
@@ -284,7 +284,7 @@ def reconcile_policy_state(db: Session, knowledge_base_id: str) -> int:
     arms = [
         "high_precision_direct_chunk",
         "structure_context_heavy",
-        "fine_cluster_expansion",
+        "rq_membership_expansion",
         "mid_concept_expansion",
         "coarse_to_mid_drilldown",
         "bridge_edge_exploration",

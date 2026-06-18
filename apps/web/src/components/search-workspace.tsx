@@ -1,8 +1,8 @@
-﻿"use client";
+"use client";
 
 import { createPortal } from "react-dom";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { GraphResponse, SearchResult, SourceType } from "@course-kg/shared";
+import type { GraphResponse, ModelAudit, SearchResult, SourceType } from "@course-kg/shared";
 import { AnimatePresence, motion } from "framer-motion";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
@@ -31,6 +31,12 @@ import { useLocalStorage } from "@/hooks/use-local-storage";
 
 const sourceOptions: SourceType[] = ["pdf", "notebook", "markdown", "text", "image", "docx", "pptx"];
 const emptySearchResults: SearchResult[] = [];
+
+type SearchState = {
+  results: SearchResult[];
+  degraded_mode: boolean;
+  model_audit?: ModelAudit;
+};
 
 export function toLayeredContextGraph(graph: GraphResponse | undefined): GraphResponse | undefined {
   if (!graph) {
@@ -68,6 +74,34 @@ function traversalMetric(result: SearchResult, key: string): string {
   if (Array.isArray(value)) {
     return value.length ? value.join(" / ") : "无";
   }
+  return value === undefined || value === null || value === "" ? "无" : String(value);
+}
+
+export function pathEdgeSummary(result: SearchResult): string {
+  const traversal = resultTraversal(result);
+  const edgeIds = traversalTextList(traversal.path_edge_ids);
+  if (edgeIds.length) {
+    return edgeIds.length <= 3 ? edgeIds.join(" / ") : `${edgeIds.length} 条：${edgeIds.slice(0, 3).join(" / ")} ...`;
+  }
+  const roles = traversalTextList(traversal.evidence_roles);
+  if (roles.length) {
+    const visibleRoles = roles.slice(0, 3).join(" / ");
+    return roles.length > 3 ? `入口种子：${visibleRoles} ...` : `入口种子：${visibleRoles}`;
+  }
+  return "无";
+}
+
+function pathEdgeBadge(result: SearchResult): string {
+  const traversal = resultTraversal(result);
+  const edgeIds = traversalTextList(traversal.path_edge_ids);
+  if (edgeIds.length) {
+    return `关系边 ${edgeIds.length}`;
+  }
+  return traversalTextList(traversal.evidence_roles).length ? "入口种子" : "关系边 无";
+}
+
+function auditValue(audit: ModelAudit | undefined, key: string): string {
+  const value = audit ? (audit as Record<string, unknown>)[key] : undefined;
   return value === undefined || value === null || value === "" ? "无" : String(value);
 }
 
@@ -136,7 +170,7 @@ function SearchHero({
         <div className="space-y-3">
           <h2 className="glow-text text-4xl font-semibold text-white lg:text-6xl">检索本地上下文图谱</h2>
           <p className="mx-auto max-w-2xl text-sm leading-7 text-cyan-50/58 lg:text-base">
-            稠密向量、BM25、细聚类、RQ-KMeans、中粗概念路由与结构恢复会在这里汇总。
+            稠密向量、BM25、RQ 前缀、RQ-KMeans、中粗概念路由与结构恢复会在这里汇总。
           </p>
         </div>
 
@@ -234,6 +268,28 @@ function SearchFilterBar({
   );
 }
 
+function SearchTraceSummary({ audit }: { audit?: ModelAudit }) {
+  if (!audit) {
+    return null;
+  }
+  const pipeline = audit.retrieval_pipeline ?? audit.retrieval_mode ?? "无";
+  const traceId = audit.retrieval_trace_id ? `${audit.retrieval_trace_id.slice(0, 8)}...` : "无";
+  const queryRqPath = Array.isArray((audit as Record<string, unknown>).query_rq_path) ? ((audit as Record<string, unknown>).query_rq_path as unknown[]).join("/") : "无";
+  return (
+    <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3 text-xs text-white/58">
+      <span className="kg-micro-chip rounded-full px-2.5 py-1">链路 {pipeline}</span>
+      <span className="kg-micro-chip rounded-full px-2.5 py-1">Trace {traceId}</span>
+      <span className="kg-micro-chip rounded-full px-2.5 py-1">粗粒入口 {auditValue(audit, "coarse_entries")}</span>
+      <span className="kg-micro-chip rounded-full px-2.5 py-1">中粒入口 {auditValue(audit, "mid_entries")}</span>
+      <span className="kg-micro-chip rounded-full px-2.5 py-1">RQ 入口 {auditValue(audit, "rq_membership_entries")}</span>
+      <span className="kg-micro-chip rounded-full px-2.5 py-1">Frontier {auditValue(audit, "frontier_pops")}</span>
+      <span className="kg-micro-chip rounded-full px-2.5 py-1">支配剪枝 {auditValue(audit, "dominance_pruned_count")}</span>
+      <span className="kg-micro-chip rounded-full px-2.5 py-1">硬停剪枝 {auditValue(audit, "hard_stop_pruned_count")}</span>
+      <span className="kg-micro-chip rounded-full px-2.5 py-1">查询 RQ {queryRqPath}</span>
+    </div>
+  );
+}
+
 function ResultSkeleton() {
   return (
     <div className="flex flex-col gap-3">
@@ -294,13 +350,16 @@ function ResultRow({
           <MarkdownRenderer content={result.snippet} compact className="mt-3 line-clamp-2 text-white/62" />
         </div>
         <div className="flex shrink-0 flex-col items-end gap-2">
-          <span className="font-mono text-sm text-cyan-100">{result.score.toFixed(3)}</span>
+          <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">
+            遍历分 <span className="font-mono text-cyan-100">{result.score.toFixed(3)}</span>
+          </span>
           <ArrowUpRight className="text-white/32 transition group-hover:text-cyan-100" />
         </div>
       </div>
       <div className="mt-4 flex flex-wrap gap-2">
         <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">距离 {traversalMetric(result, "distance_so_far")}</span>
         <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">Cycle {traversalMetric(result, "reward_so_far")}</span>
+        <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">{pathEdgeBadge(result)}</span>
         {coveredFacets.length ? (
           <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">覆盖 {coveredFacets.join("/")}</span>
         ) : null}
@@ -481,7 +540,7 @@ function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | n
             <div className="flex flex-wrap gap-2">
               <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{resultPartition(result)}</span>
               <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{resultSourceType(result)}</span>
-              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">分数 {result.score.toFixed(3)}</span>
+              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">遍历分 {result.score.toFixed(3)}</span>
             </div>
             <h3 className="mt-5 text-2xl font-semibold text-white">{result.document_title ?? result.citations[0]?.document_title ?? "资料来源"}</h3>
             <p className="mt-3 flex items-center gap-2 truncate text-sm text-white/42">
@@ -504,11 +563,11 @@ function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | n
                 ["distance_so_far", "路径距离"],
                 ["reward_so_far", "Cycle reward"],
                 ["covered_facets", "覆盖 facets"],
-                ["path_edge_ids", "路径边"],
+                ["path_edge_ids", "关系边/入口"],
               ].map(([key, label]) => (
                 <div key={key} className="rounded-2xl border border-white/8 bg-white/[0.025] p-4">
                   <p className="text-xs uppercase tracking-[0.2em] text-white/38">{label}</p>
-                  <p className="mt-2 break-words font-mono text-sm text-cyan-100">{traversalMetric(result, key)}</p>
+                  <p className="mt-2 break-words font-mono text-sm text-cyan-100">{key === "path_edge_ids" ? pathEdgeSummary(result) : traversalMetric(result, key)}</p>
                 </div>
               ))}
             </div>
@@ -608,7 +667,7 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
   const [sourceType, setSourceType] = useLocalStorage(`search.sourceType.${storageScope}`, "");
   const [selectedPartition, setSelectedPartition] = useLocalStorage(`search.selectedPartition.${storageScope}`, "");
   const [selectedChunkId, setSelectedChunkId] = useLocalStorage<string | null>(`search.selectedChunkId.${storageScope}`, null);
-  const [searchResults, setSearchResults] = useLocalStorage<{ results: SearchResult[]; degraded_mode: boolean } | null>(`search.results.${storageScope}`, null);
+  const [searchResults, setSearchResults] = useLocalStorage<SearchState | null>(`search.results.${storageScope}`, null);
   const [hoverPreview, setHoverPreview] = useState<HoverPreviewState | null>(null);
   const [detailResult, setDetailResult] = useState<SearchResult | null>(null);
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -624,9 +683,9 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
           partition: partition || undefined,
           source_type: (sourceType || undefined) as never,
         },
-      }),
+    }),
     onSuccess: (data, searchText) => {
-      setSearchResults({ results: data.results, degraded_mode: Boolean(data.degraded_mode) });
+      setSearchResults({ results: data.results, degraded_mode: Boolean(data.degraded_mode), model_audit: data.model_audit });
       setSearchHistory((current) => [searchText, ...current.filter((item) => item !== searchText)].slice(0, 50));
       const firstResult = data.results[0];
       const nextPartition = partition || (firstResult ? resultPartition(firstResult) : undefined) || (dashboardQuery.data?.tree[0]?.title ?? "");
@@ -742,6 +801,7 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
         onClearSource={() => setSourceType("")}
         degradedMode={Boolean(searchResults?.degraded_mode)}
       />
+      <SearchTraceSummary audit={searchResults?.model_audit} />
 
       {searchMutation.error ? (
         <ErrorBlock message={(searchMutation.error as Error).message || "检索请求失败，请检查模型 API、Qdrant 和后端日志。"} />

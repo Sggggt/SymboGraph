@@ -116,7 +116,12 @@ def main() -> None:
         "qa_has_context_packages": all(row["context_package_id"] and row["retrieval_trace_id"] for row in qa_rows),
         "qa_has_citations": all(row["citation_count"] > 0 for row in qa_rows),
         "qa_required_trace_nodes": all(not row["missing_required_trace_nodes"] for row in qa_rows),
-        "qa_citation_verification": all((row["citation_verification_pass_rate"] or 0) > 0 for row in qa_rows),
+        "qa_citation_verification": all(
+            row["citation_verdicts"]
+            and all(verdict == "supported" for verdict in row["citation_verdicts"])
+            and float(row["citation_verification_pass_rate"] or 0.0) >= 1.0
+            for row in qa_rows
+        ),
         "qa_not_degraded": not any(row["degraded_mode"] for row in qa_rows),
     }
     payload = {

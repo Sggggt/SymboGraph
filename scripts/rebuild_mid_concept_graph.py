@@ -8,7 +8,7 @@ from _context_graph_maintenance import resolve_knowledge_base, session_scope, wr
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Rebuild mid concept graph from active fine clusters and chunks.")
+    parser = argparse.ArgumentParser(description="Rebuild mid concept graph from active RQ prefix clusters and chunks.")
     parser.add_argument("--knowledge-base-id")
     parser.add_argument("--knowledge-base-name")
     parser.add_argument("--execute", action="store_true", help="Write new mid/coarse/context states. Omit for dry-run.")

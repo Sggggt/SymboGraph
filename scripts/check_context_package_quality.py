@@ -39,12 +39,18 @@ async def main() -> None:
         citation_spans = package.citation_spans_json or []
         graph_paths = package.concept_path_json or []
         trace = db.get(RetrievalTrace, package.retrieval_trace_id) if package.retrieval_trace_id else None
-        fine_step = (
-            db.scalar(select(GraphRetrievalStep).where(GraphRetrievalStep.retrieval_trace_id == package.retrieval_trace_id, GraphRetrievalStep.layer == "fine"))
+        seed_step = (
+            db.scalar(
+                select(GraphRetrievalStep).where(
+                    GraphRetrievalStep.retrieval_trace_id == package.retrieval_trace_id,
+                    GraphRetrievalStep.layer == "chunk",
+                    GraphRetrievalStep.action == "select_seeds_from_mid_rq_membership",
+                )
+            )
             if package.retrieval_trace_id
             else None
         )
-        rq_candidates = ((fine_step.output_json or {}).get("candidate_rq") or {}) if fine_step else {}
+        rq_candidates = ((seed_step.output_json or {}).get("candidate_rq") or {}) if seed_step else {}
         checks = {
             "has_retrieval_trace": bool(package.retrieval_trace_id),
             "has_contexts": bool(contexts),
@@ -71,6 +77,7 @@ async def main() -> None:
             ),
             "has_graph_path": bool(graph_paths),
             "has_rq_query_path": bool((((trace.diagnostics_json or {}).get("rq") or {}).get("query_rq_path")) if trace else False),
+            "has_rq_membership_seed_step": bool(seed_step),
             "has_rq_candidate_metrics": any(
                 "lcp_depth" in candidate and "residual_distance" in candidate
                 for candidate in rq_candidates.values()
@@ -78,12 +85,13 @@ async def main() -> None:
             ),
             "each_layer_has_frontier_path_convergence": all(
                 bool(step and step.popped_frontier_state_json and step.stop_reason)
-                for layer in ("coarse", "mid", "fine", "chunk")
+                for layer in ("coarse", "mid", "chunk")
                 for step in [
                     db.scalar(
                         select(GraphRetrievalStep).where(
                             GraphRetrievalStep.retrieval_trace_id == package.retrieval_trace_id,
                             GraphRetrievalStep.layer == layer,
+                            GraphRetrievalStep.action == "walk_graph_frontier",
                         )
                     )
                 ]

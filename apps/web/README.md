@@ -12,7 +12,7 @@
 | `src/components/app-shell.tsx` | 应用壳层、导航、资料库切换。 |
 | `src/components/overview-dashboard.tsx` | 知识库概览、导入状态和快捷入口。 |
 | `src/components/upload-workspace.tsx` | 上传、全量重新解析、批次状态和中文日志流。 |
-| `src/components/graph-panel.tsx` | Chunk Structure、Chunk Relations、Mid Concepts、Coarse Concepts。 |
+| `src/components/graph-panel.tsx` | Chunk Structure、Chunk Relations / RQ Membership、Mid Concepts、Coarse Concepts。 |
 | `src/components/search-workspace.tsx` | Layered search、trace、context package 和图路径。 |
 | `src/components/qa-workspace.tsx` | QA、Agent trace、citations、verification 和会话。 |
 | `src/components/settings-workspace.tsx` | Profile settings 与 runtime settings。 |
@@ -22,7 +22,7 @@
 
 ## 产品定位
 
-Web 前端是四层图谱和问答审计的可视化入口。搜索页展示 deterministic layered retrieval；QA 页面展示 Agent 轨迹、context package、citation verification 和 repair；设置页分离 Profile Settings 与 Runtime Settings。
+Web 前端是四层图谱和问答审计的可视化入口。搜索页展示 deterministic layered traversal、RQ membership seed、frontier/path diagnostics 和 context package；QA 页面展示 Agent 计划、typed actions、observations、citation verification 和 repair；设置页分离 Profile Settings 与 Runtime Settings。
 
 ## 技术栈
 
@@ -49,6 +49,7 @@ dashboard
 -> upload / batch log
 -> graph payload
 -> layered search trace
+-> RQ membership seed diagnostics
 -> context package
 -> QA stream
 -> Agent trace groups
@@ -134,3 +135,4 @@ python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
 - 用户可见 trace/log 文案中文优先，底层 JSON key 保持英文协议字段。
 - 前端不保存 API key、Authorization header 或 provider 原始响应。
 - 搜索页不触发完整 Agent P&E；QA 页面才展示 Agent plan/action/observation、verification 和 repair。
+- 图谱页必须把 Mid 视为 RQ L3 投影、Coarse 视为 RQ L2 投影，不暴露旧版细粒度聚类或 legacy graph 入口。

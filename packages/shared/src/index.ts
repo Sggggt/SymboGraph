@@ -375,14 +375,16 @@ export interface ModelSettingsResponse {
   agent_coarse_jump_budget?: number;
   agent_mid_entry_budget?: number;
   agent_mid_expansion_radius_cap?: number;
-  agent_fine_entry_budget?: number;
+  agent_rq_membership_seed_budget?: number;
   agent_frontier_expansion_budget?: number;
   agent_max_depth_per_layer?: number;
   agent_max_labels_per_node?: number;
   agent_max_edge_reuse?: number;
   agent_max_cycle_reward_per_path?: number;
-  agent_ambiguous_edge_distance_low?: number;
-  agent_ambiguous_edge_distance_high?: number;
+  agent_cycle_reward_distance_threshold?: number;
+  agent_path_distance_green_threshold?: number;
+  agent_path_distance_gray_threshold?: number;
+  agent_path_distance_hard_threshold?: number;
   agent_drilldown_budget_per_layer?: number;
   agent_chunk_candidate_budget?: number;
   agent_structure_restore_budget?: number;
@@ -463,14 +465,16 @@ export interface ModelSettingsUpdate {
   agent_coarse_jump_budget?: number | null;
   agent_mid_entry_budget?: number | null;
   agent_mid_expansion_radius_cap?: number | null;
-  agent_fine_entry_budget?: number | null;
+  agent_rq_membership_seed_budget?: number | null;
   agent_frontier_expansion_budget?: number | null;
   agent_max_depth_per_layer?: number | null;
   agent_max_labels_per_node?: number | null;
   agent_max_edge_reuse?: number | null;
   agent_max_cycle_reward_per_path?: number | null;
-  agent_ambiguous_edge_distance_low?: number | null;
-  agent_ambiguous_edge_distance_high?: number | null;
+  agent_cycle_reward_distance_threshold?: number | null;
+  agent_path_distance_green_threshold?: number | null;
+  agent_path_distance_gray_threshold?: number | null;
+  agent_path_distance_hard_threshold?: number | null;
   agent_drilldown_budget_per_layer?: number | null;
   agent_chunk_candidate_budget?: number | null;
   agent_structure_restore_budget?: number | null;
@@ -513,7 +517,7 @@ export interface IngestionLogEvent {
   bm25_record_count?: number;
   chunk_count?: number;
   relation_edge_count?: number;
-  fine_cluster_count?: number;
+  rq_prefix_count?: number;
   mid_concept_count?: number;
   coarse_concept_count?: number;
   context_graph_hash?: string | null;
@@ -593,7 +597,7 @@ export type GraphNodeCategory =
   | "caption"
   | "structure_node"
   | "chunk_relation"
-  | "fine_cluster"
+  | "rq_prefix"
   | "mid_concept"
   | "coarse_concept"
   | "context_package"
@@ -612,7 +616,7 @@ export interface GraphNode {
   confidence?: number | null;
   support_count?: number | null;
   support_chunk_ids?: string[];
-  support_fine_cluster_ids?: string[];
+  support_rq_prefix_ids?: string[];
   representative_chunk_ids?: string[];
   included_mid_concept_ids?: string[];
   source_path?: string | null;
@@ -825,7 +829,7 @@ export interface DashboardSnapshot {
   ingested_document_count: number;
   chunk_count?: number;
   graph_relation_count?: number;
-  fine_cluster_count?: number;
+  rq_prefix_count?: number;
   mid_concept_count?: number;
   coarse_concept_count?: number;
   coverage_by_source_type: Record<string, number>;

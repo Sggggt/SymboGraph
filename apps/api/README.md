@@ -2,7 +2,7 @@
 
 ## 项目简介
 
-`apps/api` 是 SymboGraph 的 FastAPI 后端，负责知识库、上传、解析、固定 token chunk、Chunk Structure Graph、Chunk Relation Graph、Fine/RQ、Mid/Coarse Concept Graph、layered retrieval、context package、QA、citation verification、runtime settings 和维护入口。
+`apps/api` 是 SymboGraph 的 FastAPI 后端，负责知识库、上传、解析、固定 token chunk、Chunk Structure Graph、Chunk Relation Graph、RQ membership、Mid/Coarse Concept Graph、layered retrieval、context package、QA、citation verification、runtime settings 和维护入口。
 
 ## 目录
 
@@ -14,7 +14,7 @@
 | `app/schemas.py` | Pydantic 请求与响应契约。 |
 | `app/core/config.py` | `.env`、runtime settings 和配置边界。 |
 | `app/services/ingestion.py` | 导入、解析、版本、取消和重建编排。 |
-| `app/services/context_graph.py` | 结构图、关系图、fine clusters、RQ、concept graph、layered retrieval 和 context package。 |
+| `app/services/context_graph.py` | 结构图、独立关系图、RQ address/membership、L3/L2 concept projection、layered retrieval 和 context package。 |
 | `app/services/agent_graph.py` | QA、typed action、Agent trace、citation verification 和 reward/policy audit。 |
 | `app/services/retrieval.py` | Layered search facade。 |
 | `app/services/runtime_settings.py` | `.env` 写入、Redis version broadcast、热加载。 |
@@ -34,7 +34,7 @@ API 层是生产形态的编排层。PostgreSQL 是事实源，Qdrant、BM25 和
 | ORM / Migration | SQLAlchemy, Alembic |
 | 存储 | PostgreSQL, Qdrant, Redis |
 | 异步任务 | Celery 调用 API service logic |
-| 检索 | Dense embedding, BM25, chunk relation graph, RQ-KMeans, layered traversal |
+| 检索 | Dense embedding, BM25, chunk relation graph, RQ membership, layered traversal |
 | QA | OpenAI-compatible chat endpoint, typed action validator, citation verification |
 
 ## 主链路
@@ -45,8 +45,9 @@ upload / source files
 -> fixed token chunks
 -> chunk structure graph
 -> contextual embedding and BM25
--> chunk relation graph / fine / RQ
--> mid and coarse concept graph
+-> independent chunk relation graph
+-> RQ prefix address tree and fuzzy membership
+-> RQ L3 mid concept graph / RQ L2 coarse concept graph
 -> context graph state
 -> layered search or Agent QA
 -> context package
@@ -100,7 +101,7 @@ Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health
 | 基础设施 | `DATABASE_URL`, `QDRANT_URL`, `QDRANT_COLLECTION`, `REDIS_URL`, `CORS_ORIGINS`, `API_KEYS` |
 | 模型 | `OPENAI_API_KEY`, `CHAT_BASE_URL`, `CHAT_MODEL`, `EMBEDDING_API_KEY`, `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS` |
 | Chunk / graph | `FIXED_CHUNK_SIZE_TOKENS`, `FIXED_CHUNK_OVERLAP_TOKENS`, `RQ_KMEANS_LEVELS`, `RQ_KMEANS_MAX_K`, `RQ_RESIDUAL_TAU` |
-| Agent envelope | `AGENT_COARSE_ENTRY_BUDGET`, `AGENT_MID_ENTRY_BUDGET`, `AGENT_FINE_ENTRY_BUDGET`, `AGENT_FRONTIER_EXPANSION_BUDGET`, `AGENT_REPAIR_ROUND_BUDGET`, `AGENT_VERIFICATION_BUDGET` |
+| Agent envelope | `AGENT_COARSE_ENTRY_BUDGET`, `AGENT_COARSE_JUMP_BUDGET`, `AGENT_MID_ENTRY_BUDGET`, `AGENT_MID_EXPANSION_RADIUS_CAP`, `AGENT_RQ_MEMBERSHIP_SEED_BUDGET`, `AGENT_FRONTIER_EXPANSION_BUDGET`, `AGENT_PATH_DISTANCE_GREEN_THRESHOLD`, `AGENT_PATH_DISTANCE_GRAY_THRESHOLD`, `AGENT_PATH_DISTANCE_HARD_THRESHOLD`, `AGENT_REPAIR_ROUND_BUDGET`, `AGENT_VERIFICATION_BUDGET` |
 | 运行边界 | `ENABLE_MODEL_FALLBACK`, `ENABLE_DATABASE_FALLBACK`, `MODEL_REQUEST_CONCURRENCY`, `MODEL_REQUEST_TIMEOUT_SECONDS` |
 
 ## 验证
@@ -141,6 +142,9 @@ python scripts/reconcile_bm25_records.py
 - API 层负责后端编排，Worker 不复制实现。
 - PostgreSQL 保存事实源、生命周期、trace、answer audit、citation verification、reward 和 compensation。
 - Qdrant、BM25、Redis 必须可从 PostgreSQL 重建或刷新。
+- 结构图只用于原文地址和上下文恢复，不进入 chunk relation graph。
+- Mid concepts 必须由 RQ L3 prefixes 投影，Coarse concepts 必须由 RQ L2 prefixes 投影。
+- Mid/coarse edges 必须由底层 chunk relation edge support 投影。
 - 外部副作用失败必须写 compensation log 并抛出可行动错误。
 - QA 事实只来自 context package 和 raw chunk citation span。
 - 无 fallback 的集成路径必须在 Docker 栈内验证。

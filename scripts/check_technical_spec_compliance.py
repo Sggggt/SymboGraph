@@ -42,6 +42,15 @@ def static_checks() -> list[dict[str, Any]]:
     )
     if "strategy_profile_v3" in app_sources:
         add_issue(issues, "blocker", "legacy_profile_contract", "Active source still references strategy_profile_v3.")
+    forbidden_active_tokens = {
+        "agent_rq_prefix_entry_budget": "rq-prefix-entry budget was replaced by rq-prefix-address seed budget.",
+        "agent_ambiguous_edge_distance": "ambiguous-edge thresholds were replaced by path distance green/gray/hard thresholds.",
+        "follow_ambiguous_edge": "ambiguous edge actions were replaced by evaluate_gray_zone_path.",
+        "ambiguous_edge_decisions": "ambiguous edge decisions were replaced by gray_zone_path_decisions.",
+    }
+    for token, message in forbidden_active_tokens.items():
+        if token in app_sources:
+            add_issue(issues, "blocker", "legacy_active_token", f"Active source still references {token}: {message}")
     models = source_text("apps/api/app/models.py")
     for class_name in ("AgentPlan", "AgentAction", "AgentObservation"):
         if f"class {class_name}" not in models:
@@ -58,7 +67,7 @@ def static_checks() -> list[dict[str, Any]]:
 
 
 def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    from sqlalchemy import func, select
+    from sqlalchemy import func, inspect, select
 
     from app.models import (
         AgentAction,
@@ -67,11 +76,12 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
         ChunkRelationEdge,
         ChunkRelationGraphState,
         ChunkStructureNode,
+        CoarseConcept,
         CitationVerification,
-        FineCluster,
-        FineClusterEdge,
-        FineClusterMembership,
+        RQPrefix,
+        RQPrefixMembership,
         GraphRetrievalStep,
+        MidConcept,
         PolicyState,
         RewardEvent,
         RetrievalTrace,
@@ -92,6 +102,8 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
         counts = stats.get("counts") or {}
         state_ids = stats.get("active_state_ids") or {}
         relation_state_id = state_ids.get("chunk_relation_graph_state_id")
+        mid_state_id = state_ids.get("mid_concept_state_id")
+        coarse_state_id = state_ids.get("coarse_concept_state_id")
         if counts.get("active_chunks", 0) <= 0:
             add_issue(issues, "blocker", "no_active_chunks", "Knowledge base has no active chunks.")
         if not relation_state_id:
@@ -109,30 +121,69 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
                 edge_type: db.scalar(select(func.count(ChunkRelationEdge.id)).where(ChunkRelationEdge.graph_state_id == relation_state_id, ChunkRelationEdge.edge_type == edge_type)) or 0
                 for edge_type in ("rq_hierarchy_near", "rq_prefix_sibling", "rq_residual_near")
             }
-            rq_cluster_edges = {
-                edge_type: db.scalar(select(func.count(FineClusterEdge.id)).where(FineClusterEdge.graph_state_id == relation_state_id, FineClusterEdge.edge_type == edge_type)) or 0
-                for edge_type in ("rq_parent_child", "rq_sibling", "rq_centroid_near", "rq_overlap_bridge")
-            }
             bridge_edges = db.scalar(select(func.count(ChunkRelationEdge.id)).where(ChunkRelationEdge.graph_state_id == relation_state_id, ChunkRelationEdge.is_bridge.is_(True))) or 0
+            rq_prefix_count = db.scalar(select(func.count(RQPrefix.id)).where(RQPrefix.graph_state_id == relation_state_id, RQPrefix.rq_level.is_not(None))) or 0
+            rq_l3_prefix_count = db.scalar(select(func.count(RQPrefix.id)).where(RQPrefix.graph_state_id == relation_state_id, RQPrefix.rq_level == 3, RQPrefix.state == "active")) or 0
+            rq_l2_prefix_count = db.scalar(select(func.count(RQPrefix.id)).where(RQPrefix.graph_state_id == relation_state_id, RQPrefix.rq_level == 2, RQPrefix.state == "active")) or 0
+            mid_concept_count = (
+                db.scalar(select(func.count(MidConcept.id)).where(MidConcept.concept_state_id == mid_state_id, MidConcept.state == "active"))
+                if mid_state_id
+                else 0
+            ) or 0
+            coarse_concept_count = (
+                db.scalar(select(func.count(CoarseConcept.id)).where(CoarseConcept.coarse_state_id == coarse_state_id, CoarseConcept.state == "active"))
+                if coarse_state_id
+                else 0
+            ) or 0
             rq_memberships = (
                 db.scalar(
-                    select(func.count(FineClusterMembership.id))
-                    .join(FineCluster, FineClusterMembership.fine_cluster_id == FineCluster.id)
-                    .where(FineCluster.graph_state_id == relation_state_id, FineClusterMembership.residual_norm.is_not(None))
+                    select(func.count(RQPrefixMembership.id))
+                    .join(RQPrefix, RQPrefixMembership.rq_prefix_id == RQPrefix.id)
+                    .where(RQPrefix.graph_state_id == relation_state_id, RQPrefixMembership.residual_norm.is_not(None))
                 )
                 or 0
             )
-            summary["rq"] = {"edge_types": rq_edge_types, "cluster_edge_types": rq_cluster_edges, "memberships": rq_memberships}
+            relation_state = db.get(ChunkRelationGraphState, relation_state_id)
+            missing_rq_reasons = ((relation_state.diagnostics_json or {}).get("missing_rq_pair_edge_type_reasons") or {}) if relation_state else {}
+            rq_pair_edges = list(
+                db.scalars(
+                    select(ChunkRelationEdge).where(
+                        ChunkRelationEdge.graph_state_id == relation_state_id,
+                        ChunkRelationEdge.edge_type.in_(("rq_hierarchy_near", "rq_prefix_sibling", "rq_residual_near")),
+                    )
+                ).all()
+            )
+            fallback_rq_edges = [edge.id for edge in rq_pair_edges if (edge.features_json or {}).get("fallback_pair")]
+            summary["rq"] = {
+                "edge_types": rq_edge_types,
+                "prefixes": rq_prefix_count,
+                "memberships": rq_memberships,
+                "missing_edge_type_reasons": missing_rq_reasons,
+            }
+            summary["concept_projection_coverage"] = {
+                "rq_l3_prefixes": rq_l3_prefix_count,
+                "mid_concepts": mid_concept_count,
+                "rq_l2_prefixes": rq_l2_prefix_count,
+                "coarse_concepts": coarse_concept_count,
+            }
             summary["bridge_edges"] = bridge_edges
-            if any(count <= 0 for count in rq_edge_types.values()) or any(count <= 0 for count in rq_cluster_edges.values()) or rq_memberships <= 0:
+            if rq_prefix_count <= 0 or rq_memberships <= 0 or sum(rq_edge_types.values()) <= 0:
                 add_issue(issues, "blocker", "rq_graph_incomplete", "RQ is enabled but required RQ graph nodes/edges/memberships are incomplete.", summary["rq"])
+            for edge_type, count in rq_edge_types.items():
+                if count <= 0 and not missing_rq_reasons.get(edge_type):
+                    add_issue(issues, "blocker", "rq_pair_edge_type_missing_reason", f"{edge_type} is missing and no diagnostic reason was recorded.", summary["rq"])
+            if fallback_rq_edges:
+                add_issue(issues, "blocker", "rq_fallback_pair_edges_present", "RQ pair evidence must not use fallback_pair edges; missing candidates belong in diagnostics.", {"edge_ids": fallback_rq_edges[:20]})
+            if mid_concept_count != rq_l3_prefix_count:
+                add_issue(issues, "blocker", "rq_l3_mid_projection_incomplete", "Active mid concepts must be a one-to-one projection of active RQ L3 prefixes.", summary["concept_projection_coverage"])
+            if coarse_concept_count != rq_l2_prefix_count:
+                add_issue(issues, "blocker", "rq_l2_coarse_projection_incomplete", "Active coarse concepts must be a one-to-one projection of active RQ L2 prefixes.", summary["concept_projection_coverage"])
             if bridge_edges <= 0:
                 add_issue(issues, "blocker", "bridge_edges_missing", "No retained bridge edges were found in the active relation graph.")
             target_edge_counts = {
                 edge_type: db.scalar(select(func.count(ChunkRelationEdge.id)).where(ChunkRelationEdge.graph_state_id == relation_state_id, ChunkRelationEdge.edge_type == edge_type)) or 0
-                for edge_type in ("co_retrieved", "same_table_formula_context")
+                for edge_type in ("co_retrieved",)
             }
-            relation_state = db.get(ChunkRelationGraphState, relation_state_id)
             missing_reasons = ((relation_state.diagnostics_json or {}).get("missing_target_relation_edge_type_reasons") or {}) if relation_state else {}
             summary["target_relation_edge_counts"] = target_edge_counts
             for edge_type, count in target_edge_counts.items():
@@ -146,14 +197,8 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
             ) or 0
             if missing_edge_metrics:
                 add_issue(issues, "blocker", "relation_edge_distance_raw_strength_missing", "Active relation edges must carry distance and raw_strength.", {"count": missing_edge_metrics})
-            unsupported_fine_edges = db.scalar(
-                select(func.count(FineClusterEdge.id)).where(
-                    FineClusterEdge.graph_state_id == relation_state_id,
-                    (FineClusterEdge.support_chunk_edge_ids_json.is_(None)) | (func.json_array_length(FineClusterEdge.support_chunk_edge_ids_json) <= 0),
-                )
-            ) or 0
-            if unsupported_fine_edges:
-                add_issue(issues, "blocker", "fine_edge_support_missing", "Active fine_cluster_edges must have support_chunk_edge_ids_json.", {"count": unsupported_fine_edges})
+            if "rq_prefix_edges" in inspect(db.bind).get_table_names():
+                add_issue(issues, "blocker", "legacy_rq_prefix_edges_table_present", "rq_prefix_edges must be removed from the active schema; run migrations/cleanup.", {"table_present": True})
             structure_node_types = {
                 row[0]
                 for row in db.execute(
@@ -173,10 +218,14 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
             )
             if "structure" not in step_layers:
                 add_issue(issues, "blocker", "trace_missing_structure_restore", "Latest retrieval trace does not include structure restoration.")
-            for required_layer in ("coarse", "mid", "fine", "chunk"):
+            for required_layer in ("coarse", "mid", "chunk"):
                 step = db.scalar(
                     select(GraphRetrievalStep)
-                    .where(GraphRetrievalStep.retrieval_trace_id == latest_trace.id, GraphRetrievalStep.layer == required_layer)
+                    .where(
+                        GraphRetrievalStep.retrieval_trace_id == latest_trace.id,
+                        GraphRetrievalStep.layer == required_layer,
+                        GraphRetrievalStep.action == "walk_graph_frontier",
+                    )
                     .order_by(GraphRetrievalStep.step_index.asc())
                 )
                 if step is None:
@@ -186,6 +235,18 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
                     add_issue(issues, "blocker", "trace_frontier_pop_missing", f"{required_layer} traversal step has entries but no popped frontier state.")
                 if not step.stop_reason:
                     add_issue(issues, "blocker", "trace_convergence_missing", f"{required_layer} traversal step does not record convergence stop reason.")
+            rq_prefix_step = db.scalar(select(GraphRetrievalStep).where(GraphRetrievalStep.retrieval_trace_id == latest_trace.id, GraphRetrievalStep.layer == "fine"))
+            if rq_prefix_step is not None:
+                add_issue(issues, "blocker", "rq_prefix_active_traversal_present", "Latest retrieval trace still includes RQ prefix as an active traversal layer.")
+            seed_step = db.scalar(
+                select(GraphRetrievalStep).where(
+                    GraphRetrievalStep.retrieval_trace_id == latest_trace.id,
+                    GraphRetrievalStep.layer == "chunk",
+                    GraphRetrievalStep.action == "select_seeds_from_mid_rq_membership",
+                )
+            )
+            if seed_step is None:
+                add_issue(issues, "blocker", "rq_membership_seed_step_missing", "Trace is missing chunk/select_seeds_from_mid_rq_membership.")
         else:
             add_issue(issues, "warning", "no_retrieval_trace", "No retrieval traces exist yet.")
         if db.scalar(select(func.count(AgentPlan.id)).where(AgentPlan.knowledge_base_id == knowledge_base.id)) or 0:

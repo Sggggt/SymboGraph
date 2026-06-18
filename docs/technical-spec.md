@@ -11,7 +11,7 @@
 - [解析、固定 Chunk 与结构图](#解析固定-chunk-与结构图)
 - [Contextual Index Text](#contextual-index-text)
 - [Chunk Relation Graph](#chunk-relation-graph)
-- [Fine Clusters 与 RQ-KMeans](#fine-clusters-与-rq-kmeans)
+- [RQ Membership 与 RQ-KMeans](#rq-membership-与-rq-kmeans)
 - [Mid Concept Graph](#mid-concept-graph)
 - [Coarse Concept Graph](#coarse-concept-graph)
 - [Layered Retrieval](#layered-retrieval)
@@ -34,7 +34,7 @@
 
 SymboGraph 的判断是：瓶颈不一定是“切出完美 chunk”，而是“命中证据后能否恢复正确语义关联与原文上下文”。本项目以 ContextRAG 的上下文恢复思想为灵感，采用最简单、最稳定的固定长度 token chunk，把 chunk 视为地址和引用单位，而不是语义理解结果。系统不要求单个 chunk 自身完整表达知识，而是在 chunk 周围构建可复算关系网络、原文结构地图、概念路由层和 Agent 规划执行层。
 
-因此，SymboGraph 采用 Four-Layer Context Graph RAG：第 0 层保存 Chunk Structure Graph，第 1 层保存 Chunk Relation Graph 与 Fine Clusters，第 2 层保存 Mid Concept Graph，第 3 层保存 Coarse Concept Graph。检索时系统按 coarse、mid、fine、chunk、structure restoration 逐层寻址，再打包 context package，最后执行 grounded answer 与 citation verification。LLM 负责概念定义、查询路由、typed action 规划、证据充分性判断和修复方向；事实证据只能来自 context package 和 raw chunk citation span。
+因此，SymboGraph 采用 Four-Layer Context Graph RAG：第 0 层保存 Chunk Structure Graph，第 1 层保存独立 Chunk Relation Graph 与 RQ membership/address protocol，第 2 层保存由 RQ L3 prefix packet 定义的 Mid Concept Graph，第 3 层保存由 RQ L2 prefix packet 定义的 Coarse Concept Graph。结构图承担完整结构信息存储和上下文恢复；chunk relation graph 只表达由内容语义证据支持的 chunk 间关系；RQ 提供残差语义地址、模糊归属、低置信诊断和路由先验；mid/coarse 边完全由底层 chunk relation edges 投影配权。LLM 负责概念命名、节点摘要、查询路由、typed action 规划、灰区路径价值判断、证据充分性判断和修复方向；事实证据只能来自 context package 和 raw chunk citation span。
 
 总体目标可以写成约束优化问题：
 
@@ -63,7 +63,7 @@ $$
 
 ## 阻断项与收敛要求
 
-本节只汇总会影响 Four-Layer Context Graph RAG 目标闭环的阻断项。固定 chunk、结构图 closure、chunk relation/fine/RQ、mid/coarse projection、全层 traversal、context package、citation verification、reward/policy observation、runtime hash、cache key 和 compensation log 是 active 主链路的强约束；旧 Concept/Relation GraphRAG、atom-first Evidence Graph 或 weighted score fusion active retrieval 只允许出现在 migration、destructive cleanup、legacy warning 或历史说明中。
+本节只汇总会影响 Four-Layer Context Graph RAG 目标闭环的阻断项。固定 chunk、结构图 closure、独立 chunk relation graph、RQ membership/address、RQ L3/L2 concept projection、全层 traversal、context package、citation verification、reward/policy observation、runtime hash、cache key 和 compensation log 是 active 主链路的强约束。
 
 阻断项只允许记录在以下收敛表中：
 
@@ -105,10 +105,12 @@ source files
 -> fixed token chunks
 -> chunk structure graph
 -> contextual embedding and BM25
--> chunk relation graph and fine clusters
--> RQ prefix clusters and RQ relation edges
--> mid concept graph
--> coarse concept graph
+-> RQ-KMeans residual address and fuzzy membership
+-> independent chunk relation graph
+-> RQ L3 mid concept graph
+-> mid edge projection calibration
+-> RQ L2 coarse concept graph
+-> coarse edge projection calibration
 -> active context graph state
 -> layered context graph retrieval
 -> context package
@@ -126,14 +128,16 @@ flowchart TB
     C --> X["Contextual index text"]
     X --> V["Vector records / Qdrant"]
     X --> B["BM25 records"]
-    V --> R["Chunk Relation Graph"]
+    V --> RQ["RQ address and fuzzy membership"]
+    B --> RQ
+    V --> R["Independent Chunk Relation Graph"]
     B --> R
-    S --> R
-    R --> FC["Fine clusters"]
-    FC --> RQ["RQ prefixes and RQ edges"]
-    FC --> M["Mid Concept Graph"]
-    RQ --> M
-    M --> K["Coarse Concept Graph"]
+    RQ --> R
+    RQ --> M["RQ L3 Mid Concept Graph"]
+    R --> M
+    RQ --> K["RQ L2 Coarse Concept Graph"]
+    M --> K
+    R --> K
     R --> CG["Context Graph State"]
     M --> CG
     K --> CG
@@ -152,7 +156,7 @@ $$
 =
 \left(
 q,\ h_{\mathrm{chunk}},h_{\mathrm{struct}},h_{\mathrm{rel}},
-h_{\mathrm{fine}},h_{\mathrm{mid}},h_{\mathrm{coarse}},
+h_{\mathrm{rq}},h_{\mathrm{mid}},h_{\mathrm{coarse}},
 h_{\mathrm{runtime}},h_{\mathrm{agent}}
 \right)
 $$
@@ -160,9 +164,9 @@ $$
 
 
 **架构影响：**
-- 影响对象：解析、固定 chunk、结构图、contextual index、chunk relation graph、fine clusters、mid concepts、coarse concepts、layered retrieval、Agent、context package、citation verification 和 policy update。
+- 影响对象：解析、固定 chunk、结构图、contextual index、RQ membership/address、chunk relation graph、mid concepts、coarse concepts、layered retrieval、Agent、context package、citation verification 和 policy update。
 - 影响方式：端到端链路定义状态传播顺序；任一上游状态 hash 变化都会改变下游候选集合、concept packet、检索路径、证据包和回答审计。
-- 传播字段：`knowledge_base_id`、`document_version_id`、`chunk_version`、`chunk_scope_hash`、`structure_graph_hash`、`chunk_relation_hash`、`fine_cluster_hash`、`mid_concept_hash`、`coarse_concept_hash`、`runtime_settings_hash`。
+- 传播字段：`knowledge_base_id`、`document_version_id`、`chunk_version`、`chunk_scope_hash`、`structure_graph_hash`、`chunk_relation_hash`、`rq_membership_hash`、`mid_concept_hash`、`coarse_concept_hash`、`runtime_settings_hash`。
 - 触发条件：active chunk scope、embedding text、关系边、concept definition、runtime settings 或 policy state 改变时，相关 trace、cache、context package 和 graph freshness 需要重新计算。
 - 验收观察点：`context_graph_states`、`context_graph_freshness`、`retrieval_traces`、`graph_retrieval_steps`、`context_packages` 与 `citation_verifications` 必须形成连续审计链。
 
@@ -178,7 +182,7 @@ G_0,G_1,G_2,G_3,\Pi
 \right)
 $$
 
-其中 \(G_0=(V_0,E_0)\) 是结构图，\(G_1=(V_C\cup V_F,E_{CC}\cup E_{CF}\cup E_{FF})\) 是 chunk relation graph 与 fine clusters，\(G_2=(V_M,E_M)\) 是 mid concept graph，\(G_3=(V_K,E_K)\) 是 coarse concept graph，\(\Pi\) 是跨层 membership 与 trace 投影。
+其中 \(G_0=(V_0,E_0)\) 是结构图，\(G_1=(V_C,E_C,\mathcal{R},\mathcal{M}_R)\) 是独立 chunk relation graph、RQ prefix address space 与 fuzzy membership，\(G_2=(V_M,E_M)\) 是由 RQ L3 prefix packet 定义的 mid concept graph，\(G_3=(V_K,E_K)\) 是由 RQ L2 prefix packet 定义的 coarse concept graph，\(\Pi\) 是跨层 membership、edge projection 与 trace 投影。
 
 跨层投影的目标性质是保守性：
 
@@ -216,28 +220,33 @@ $$
 
 
 **架构影响：**
-- 影响对象：contextual index、chunk relation graph、layered retrieval、context package、citation verification 和前端结构上下文展示。
-- 影响方式：结构图决定 chunk 的 parent section、previous/next、same page 和 section path；检索命中后由它恢复上下文，并为结构邻接边提供输入。
+- 影响对象：contextual index、layered retrieval、context package、citation verification 和前端结构上下文展示。
+- 影响方式：结构图决定 chunk 的 parent section、previous/next、same page、page region、section path 和原文闭包；检索命中后由它恢复上下文。结构图不决定 chunk relation graph 的语义边去留，也不作为高层概念边的直接事实来源。
 - 传播字段：`chunk_structure_nodes`、`chunk_structure_edges`、`chunk_structure_mappings`、`chunk_coordinates`、`section_path`、`page_range`、`bbox`。
 - 触发条件：parser output、section offsets、chunk span、page/region metadata 或 structure mapping coverage 变化时，structure hash、context package 和相关 retrieval cache 需要刷新。
 - 验收观察点：structure mapping coverage、parent section 命中率、previous/next 恢复数量、same page 邻居数量和 citation span 可回溯性。
 
 ### 第 1 层：Chunk Relation Graph
 
-目标 \(G_1\) 是可复算底层关系网络。候选边来自：
+目标 \(G_1\) 是可复算底层语义关系网络与 RQ 地址归属协议：
+
+$$
+G_1=(V_C,E_C,\mathcal{R},\mathcal{M}_R)
+$$
+
+其中 \(V_C\) 是 active chunks，\(E_C\) 是 chunk relation edges，\(\mathcal{R}\) 是 RQ prefix address tree，\(\mathcal{M}_R\) 是 chunk 到 RQ prefixes 的稀疏模糊归属矩阵。底层关系图只接受内容语义证据：
 
 $$
 E_{\mathrm{cand}}
 =
 E_{\mathrm{dense}}
-\cup E_{\mathrm{bm25}}
-\cup E_{\mathrm{struct}}
+\cup E_{\mathrm{lexical}}
 \cup E_{\mathrm{cohit}}
 \cup E_{\mathrm{rq}}
 \cup E_{\mathrm{bridge}}
 $$
 
-每条边具有特征：
+结构图 \(G_0\) 不进入 \(E_{\mathrm{cand}}\)。previous/next、same section、same page、layout region、table/formula/caption closure 只在 context restoration 阶段使用。每条候选边的特征为：
 
 $$
 \phi_{ij}
@@ -245,47 +254,82 @@ $$
 \left[
 \cos(e_i,e_j),
 \operatorname{BM25}(i,j),
-\operatorname{Struct}(i,j),
 \operatorname{CoHit}(i,j),
-\operatorname{RQ}(i,j),
-\operatorname{Bridge}(i,j)
+\operatorname{LCP}_{RQ}(i,j),
+\operatorname{Residual}_{RQ}(i,j),
+\operatorname{BridgeEvidence}(i,j)
 \right]
 $$
 
-边强度与距离目标形式为：
+RQ 信号是 chunk pair 的直接证据，不是高层簇对底层边的反向保留规则。高层节点不能创建、删除或强制保留底层 chunk edge。
+
+边强度必须先按 edge type 做类型内归一化，再进入统一距离协议。设边类型为 \(t=edge\_type(i,j)\)，原始候选信号为 \(a_{ij}^{(t)}\)，类型内校准函数为 \(\operatorname{Calib}_t\)，则：
 
 $$
-s_{ij}
+\tilde{s}_{ij}^{(t)}
 =
-\sigma(\theta^\top\phi_{ij})
+\operatorname{Calib}_t
+\left(
+a_{ij}^{(t)};
+\operatorname{Stats}_t,
+\operatorname{Protocol}_t
+\right)
+\in(0,1]
 $$
+
+其中 \(\operatorname{Stats}_t\) 包含该 edge type 的分位数、均值/方差、min/max、截断区间或单调校准参数。类型内归一化只保证同一类边的 raw evidence 被压到稳定强度区间，不把不同 edge type 融成全局语义分数。
+
+统一距离目标形式为：
 
 $$
 d_{ij}
 =
--\log(\max(\epsilon,s_{ij}))
+-\log(\max(\epsilon,\tilde{s}_{ij}^{(t)}))
 $$
 
-其中 \(s_{ij}\in(0,1]\) 表示同类算法内可审计的关系强度，\(d_{ij}\) 表示图导航距离；关联越大，距离越小。兼容字段 `weight` 在迁移期必须通过 `protocol_version` 标明语义，active traversal 使用 `distance/raw_strength` 或等价字段。
+其中 \(\tilde{s}_{ij}^{(t)}\in(0,1]\) 表示类型内归一化后的可审计关系强度，\(d_{ij}\) 表示图导航距离；关联越大，距离越小。所有 green / gray / hard stop path distance threshold 都只作用于该统一 distance 语义。兼容字段 `weight` 在迁移期必须通过 `protocol_version` 标明语义，active traversal 使用 `distance/raw_strength` 或等价字段；`edge_type`、原始特征、归一化统计和 support diagnostics 必须保留，禁止退回全局加权混排。
 
 
 
 **架构影响：**
-- 影响对象：fine clusters、mid concept packet、coarse community diagnostics、layered retrieval、bridge expansion、Agent repair 和 graph visualization。
-- 影响方式：关系边把固定 chunk 变成可遍历网络；fine cluster、bridge chunk、concept candidate 和 priority-queue path traversal 都依赖这些边。
-- 传播字段：`chunk_relation_graph_states`、`chunk_relation_edges.edge_type`、`weight`、`distance`、`raw_strength`、`features_json`、`source_algorithm`、`protocol_version`、`rq_path`。
-- 触发条件：embedding text version、vector records、BM25 records、structure hash、RQ settings 或 edge keep policy 变化时，relation state hash 与下游 fine/mid/coarse hash 需要重算。
-- 验收观察点：edge count by type、bridge edge count、degree distribution、distance distribution、RQ edge diagnostics、graph expansion steps 和 traversal contribution。
+- 影响对象：RQ membership diagnostics、mid concept packet、coarse concept packet、layered retrieval、bridge expansion、Agent repair 和 graph visualization。
+- 影响方式：底层关系边把固定 chunk 变成可遍历网络；RQ 提供地址和模糊归属；mid/coarse 节点和边只能从 RQ membership 与底层 chunk relation edge support 投影获得。
+- 传播字段：`chunk_relation_graph_states`、`chunk_relation_edges.edge_type`、`weight`、`distance`、`raw_strength`、`features_json`、`normalization_stats_json`、`source_algorithm`、`protocol_version`、`edge_distance_protocol_hash`、`rq_path`、`rq_membership_score`。
+- 触发条件：embedding text version、vector records、BM25 records、chunk scope、RQ codebook、RQ membership protocol 或 edge keep policy 变化时，relation state hash 与下游 mid/coarse hash 需要重算。
+- 验收观察点：edge count by type、bridge edge count、degree distribution、raw strength distribution by edge type、normalized distance distribution、RQ membership diagnostics、graph expansion steps、path threshold hit distribution 和 traversal contribution。
 
 ### 第 2 层：Mid Concept Graph
 
-目标 \(G_2\) 将 fine graph communities、meet/join/bridge fine nodes 和底层 support chunks 提升成可解释概念。一个 mid concept \(m\) 的定义由 concept packet \(P_m\)、底层 fine edge projection 和 LLM function \(f_{\mathrm{LLM}}\) 给出：
+目标 \(G_2\) 将 RQ L3 prefix packet 投影为可解释 mid concept。设 \(\mathcal{P}_3\) 为 active RQ L3 prefixes，中粒度节点集合为：
 
 $$
-m
+V_M
 =
-f_{\mathrm{LLM}}(P_m)
+\{m_p:p\in\mathcal{P}_3,\ \operatorname{mass}(p)>0\}
 $$
+
+chunk 对 mid node 的归属来自 RQ fuzzy membership：
+
+$$
+\mu_{c,m_p}=\mu_{c,p}
+$$
+
+LLM 不决定 \(V_M\)、\(\mu_{c,m}\) 或 \(E_M\)。LLM 只读取 RQ L3 packet、support chunks、membership diagnostics、底层边分布和结构路径，输出展示短语与面向 LLM 的节点摘要：
+
+```text
+display_terms_json
+summary
+scope_note
+inclusion_criteria_json
+exclusion_criteria_json
+internal_state_json
+support_chunk_ids
+representative_chunk_ids
+boundary_chunk_ids
+outlier_chunk_ids
+bridge_chunk_ids
+grounding_hash
+```
 
 grounded gate 定义为：
 
@@ -295,60 +339,78 @@ $$
 \mathbf{1}\left[
 |S_C(m)|>0
 \land
-|S_F(m)|>0
-\land
 \operatorname{SpanValid}(S_C(m))
+\land
+\operatorname{PacketGrounded}(m)
 \right]
 $$
 
-其中 \(S_C(m)\) 是 support chunks，\(S_F(m)\) 是 support fine clusters，且 \(S_E(m)\) 必须包含形成该概念的 support fine edges 或等价底层 relation evidence。
+mid edge 由底层 chunk relation edges 通过 membership 投影：
+
+$$
+S_{ab}^{C}
+=
+\{(i,j,e)\in E_C:\mu_{i,m_a}>0,\ \mu_{j,m_b}>0,\ e=(i,j)\}
+$$
+
+$$
+\operatorname{support\_strength}(m_a,m_b)
+=
+\sum_{(i,j,e)\in S_{ab}^{C}}
+\mu_{i,m_a}\mu_{j,m_b}s_e
+$$
+
+若 \(S_{ab}^{C}=\varnothing\)，则 active mid edge 不存在。mid edge 的 raw projected distance、calibrated distance、support edge ids 和 normalization diagnostics 必须保存。RQ L3 邻近、共享父前缀或 membership overlap 可以作为投影诊断和入口先验，不能在没有底层 chunk edge support 时创建 active edge。
 
 
 
 **架构影响：**
 - 影响对象：coarse concept graph、concept routing、Layered P&E Agent、context package packing、answer grounding 和前端概念路径展示。
-- 影响方式：mid concept 将 fine graph community 提升为可解释语义地址；mid edge 由 fine edge 投影而来；检索通过 entry selection 和 priority-queue drilldown 从 mid path 回落到 fine nodes 与 support chunks。
-- 传播字段：`mid_concepts`、`mid_concept_memberships`、`mid_concept_edges`、`mid_concept_definitions.support_spans_json`、`support_chunk_ids`、`support_fine_cluster_ids`、`support_fine_edge_ids`、`distance`、`raw_strength_summary`。
-- 触发条件：fine community、fine edge distance、bridge/meet/join nodes、concept packet、LLM definition、grounded gate 或 prompt protocol 变化时，mid concept hash、coarse hash、retrieval trace 和 cache 需要刷新。
-- 验收观察点：concept grounded rate、support span coverage、fine community coverage、membership role 分布、concept edge projection 支撑率和 concept path accuracy。
+- 影响方式：mid concept 与 RQ L3 prefix packet 对齐；mid edge 完全由底层 chunk relation edge support 投影并按 `layer=mid + edge_type` 校准 distance；检索通过 entry selection 和 priority-queue drilldown 从 mid path 下钻到 RQ membership 支撑的 chunk seeds，再进入 chunk relation graph。
+- 传播字段：`mid_concepts`、`mid_concept_memberships`、`mid_concept_edges`、`mid_concept_definitions.support_spans_json`、`display_terms_json`、`summary`、`internal_state_json`、`support_chunk_ids`、`support_rq_prefix`、`support_chunk_edge_ids`、`node_weight`、`projected_distance_raw`、`projected_strength_raw`、`projection_normalization_stats_json`、`edge_projection_protocol_hash`、`distance`、`raw_strength_summary`。
+- 触发条件：RQ L3 prefix membership、bottom chunk edge distance、concept packet、LLM summary protocol、grounded gate 或 prompt protocol 变化时，mid concept hash、coarse hash、retrieval trace 和 cache 需要刷新。
+- 验收观察点：concept grounded rate、support span coverage、RQ L3-to-mid projection coverage、membership role 分布、node summary grounding、node weight diagnostics、concept edge projection 支撑率、projection calibration diagnostics 和 concept path accuracy。
 
 ### 第 3 层：Coarse Concept Graph
 
-目标 \(G_3\) 是 mid concept distance graph 上的高层主题区域。coarse concept 由 mid graph community、boundary/bridge mid concepts、cross-community weak ties 和 LLM grounded definition 共同生成。目标上可使用社区目标函数：
+目标 \(G_3\) 将 RQ L2 prefix packet 投影为高层主题区域。设 \(\mathcal{P}_2\) 为 active RQ L2 prefixes，粗粒度节点集合为：
 
 $$
-Q
+V_K
 =
-\frac{1}{2m}
-\sum_{i,j}
-\left[
-A_{ij}
--\gamma\frac{k_i k_j}{2m}
-\right]
-\mathbf{1}[g_i=g_j]
+\{k_p:p\in\mathcal{P}_2,\ \operatorname{mass}(p)>0\}
 $$
 
-同时保留桥接概念：
+RQ prefix tree 是硬层级：L3 prefix 只有一个 L2 parent，L2 prefix 只有一个 L1 parent；模糊性存在于 membership 上，而不是把一个 prefix node 切成多个父节点。chunk 可以同时对多个 L3/L2/L1 prefixes 具有非零归属分数。coarse membership 由 chunk membership 和 child L3 membership 聚合：
 
 $$
-B(v)
+\mu_{c,k_p}
 =
-\sum_{s\ne t}
-\frac{\sigma_{st}(v)}{\sigma_{st}}
+\mu_{c,p}
 $$
 
-其中 \(B(v)\) 是 betweenness，\(\sigma_{st}\) 是从 \(s\) 到 \(t\) 的最短路径数。
+coarse packet 由 child L3 summaries、support chunk membership、底层 chunk edge projection、boundary/bridge diagnostics、noise/outlier diagnostics 和 structure paths 组成。LLM 输出 `display_terms_json`、`summary`、`scope_note`、`inclusion_criteria_json`、`exclusion_criteria_json` 与 `internal_state_json`，不决定 coarse membership 或 coarse edge。
 
-coarse edge 不是 LLM 直接生成，而是由跨 coarse community 的 mid edges 投影，并保存 support mid edge ids、support fine edge ids、support chunks 与距离聚合结果。
+coarse edge 由底层 chunk relation edges 经 coarse membership 投影：
+
+$$
+S_{ab}^{C}
+=
+\{(i,j,e)\in E_C:\mu_{i,k_a}>0,\ \mu_{j,k_b}>0,\ e=(i,j)\}
+$$
+
+若 \(S_{ab}^{C}=\varnothing\)，则 active coarse edge 不存在。mid edges 可以作为派生诊断和 UI drilldown，不是 coarse edge 的事实源。coarse edge 必须保存 support chunk edge ids、support mid concept ids、raw projected distance、projection calibration diagnostics 与校准后的 active distance。
+
+coarse concept 同样保存同层归一化的 `node_weight`。该权重来自 included mid 数量、support chunk coverage、内部底层边密度、membership stability、bridge state 和 boundary diagnostics，只在 coarse layer 内可比较，用于入口候选辅助、下钻配额和同等路径下的 tie-break，不表示查询相关性。
 
 
 
 **架构影响：**
 - 影响对象：coarse entry selection、mid concept drilldown、cross-document synthesis、Agent coarse jump、graph overview 和 retrieval cache。
-- 影响方式：coarse concept 作为高层入口收缩查询空间；coarse edge 由 mid edge projection 支撑，同时保留 weak ties 与 bridge concepts，避免主题社区切断跨域推理路径。
-- 传播字段：`coarse_concepts`、`coarse_concept_memberships`、`coarse_concept_edges`、`coarse_concept_definitions`、`support_mid_edge_ids`、`support_fine_edge_ids`、`distance`、`bridge_density`、`community_stability`、`coarse_concept_hash`。
-- 触发条件：mid concept hash、mid edge distance、community grouping、coarse definition、bridge diagnostics 或 edge projection protocol 变化时，coarse entry、retrieval trace 和 cache key 需要刷新。
-- 验收观察点：community count、singleton rate、bridge density、coarse-to-mid drilldown path、coarse edge projection support 和 traversal contribution。
+- 影响方式：coarse concept 与 RQ L2 prefix packet 对齐，作为高层入口收缩查询空间；coarse edge 由底层 chunk relation edge support 经 membership 投影并按 `layer=coarse + edge_type` 校准 distance；cross-prefix weak support 与 bridge states 作为诊断保留，避免硬切断跨主题路径；coarse node weight 只提供主题区证据规模和稳定性的同层预算/入口辅助。
+- 传播字段：`coarse_concepts`、`coarse_concept_memberships`、`coarse_concept_edges`、`coarse_concept_definitions`、`display_terms_json`、`summary`、`internal_state_json`、`support_mid_concept_ids`、`support_chunk_edge_ids`、`raw_node_weight`、`node_weight`、`node_weight_diagnostics_json`、`projected_distance_raw`、`projected_strength_raw`、`projection_normalization_stats_json`、`edge_projection_protocol_hash`、`distance`、`bridge_density`、`coarse_concept_hash`。
+- 触发条件：RQ L2 prefix membership、child L3 summaries、bottom chunk edge distance、coarse summary protocol、bridge diagnostics 或 edge projection protocol 变化时，coarse entry、retrieval trace 和 cache key 需要刷新。
+- 验收观察点：RQ L2-to-coarse projection coverage、child L3 coverage、bridge density、coarse node summary grounding、coarse node weight diagnostics、coarse-to-mid drilldown path、coarse edge projection support、projection calibration diagnostics 和 traversal contribution。
 
 ## 跨层对象协议
 
@@ -357,18 +419,17 @@ coarse edge 不是 LLM 直接生成，而是由跨 coarse community 的 mid edge
 ```mermaid
 flowchart LR
     C["Chunk"] --> S["Structure Node"]
-    C --> F["Fine Cluster"]
-    F --> M["Mid Concept"]
-    M --> K["Coarse Concept"]
-    CE["Chunk Relation Edge"] --> FE["Fine Edge"]
-    FE --> ME["Mid Edge"]
-    ME --> KE["Coarse Edge"]
+    C --> RQ["RQ Prefix Membership"]
+    RQ --> M["Mid Concept / RQ L3"]
+    RQ --> K["Coarse Concept / RQ L2"]
+    M --> K
+    CE["Chunk Relation Edge"] --> ME["Mid Edge Projection"]
+    CE --> KE["Coarse Edge Projection"]
     CE --> T
-    FE --> T
     ME --> T
     KE --> T
     C --> T["Retrieval Trace"]
-    F --> T
+    RQ --> T
     M --> T
     K --> T
     T --> CP["Context Package"]
@@ -380,9 +441,10 @@ flowchart LR
 跨层对象协议将每层关系表示为稀疏 membership 矩阵：
 
 $$
-M^{C\to F}_{cf}\in[0,1],\quad
-M^{F\to M}_{fm}\in[0,1],\quad
-M^{M\to K}_{mk}\in[0,1]
+M^{C\to R_3}_{cp}\in[0,1],\quad
+M^{C\to R_2}_{cp}\in[0,1],\quad
+M^{R_3\to M}_{pm}\in\{0,1\},\quad
+M^{R_2\to K}_{pk}\in\{0,1\}
 $$
 
 从 chunk 到 coarse concept 的派生支撑强度为：
@@ -390,10 +452,18 @@ $$
 $$
 M^{C\to K}
 =
-M^{C\to F}M^{F\to M}M^{M\to K}
+M^{C\to R_2}M^{R_2\to K}
 $$
 
-但该乘积只作为路由和解释信号，不能替代 citation span。事实约束为：
+从 chunk 到 mid concept 的派生支撑强度为：
+
+$$
+M^{C\to M}
+=
+M^{C\to R_3}M^{R_3\to M}
+$$
+
+这些 membership 只作为路由、投影和解释信号，不能替代 citation span。事实约束为：
 
 $$
 \operatorname{Fact}(x)
@@ -405,45 +475,91 @@ $$
 
 ### Edge evidence projection
 
-新版四层图还需要边证据投影协议。上层边必须能回到下层边集合：
-
-$$
-E_F(f_a,f_b)
-\Leftarrow
-\{e_{cc}\in E_C: c_i\in f_a,\ c_j\in f_b\}
-$$
+四层图需要边证据投影协议。上层边必须能回到底层 chunk relation edge 集合：
 
 $$
 E_M(m_a,m_b)
 \Leftarrow
-\{e_f\in E_F: f_i\in m_a,\ f_j\in m_b\}
+\{e_{cc}\in E_C:\mu_{c_i,m_a}>0,\ \mu_{c_j,m_b}>0\}
 $$
 
 $$
 E_K(k_a,k_b)
 \Leftarrow
-\{e_m\in E_M: m_i\in k_a,\ m_j\in k_b\}
+\{e_{cc}\in E_C:\mu_{c_i,k_a}>0,\ \mu_{c_j,k_b}>0\}
+$$
+
+mid edge、coarse edge 的存在性由底层 edge support 决定。RQ prefix adjacency、membership overlap、child concept adjacency 和 LLM edge explanation 只能进入 projection diagnostics，不能在没有底层 support chunk edge 时创建 active edge。
+
+$$
+\operatorname{ExistsEdge}(u,v)
+\Rightarrow
+|support\_chunk\_edge\_ids(u,v)|>0
 $$
 
 任意上层边 \(e^l\) 必须保存：
 
 ```text
 distance
+projected_distance_raw
+projected_strength_raw
 raw_strength_summary
+projection_normalization_stats_json
 support_child_edge_ids
+support_chunk_edge_ids
 support_chunk_ids
 edge_type
 source_algorithm
 protocol_version
+edge_projection_protocol_hash
 diagnostics_json
 ```
+
+投影聚合会改变距离分布，因此 mid/coarse edge 不能只保存下层距离聚合值后直接套用阈值。目标协议必须先从下层 normalized distance 聚合得到 raw projected distance，再按 `layer + edge_type` 做投影校准：
+
+$$
+d_{\mathrm{proj}}^{raw}(e^l)
+=
+\operatorname{Agg}_l
+\left(
+\{d(e):e\in support(e^l)\},
+\{support(e)\},
+protocol_l
+\right)
+$$
+
+$$
+s_{\mathrm{proj}}^{raw}(e^l)
+=
+\exp(-d_{\mathrm{proj}}^{raw}(e^l))
+$$
+
+$$
+s_{\mathrm{proj}}(e^l)
+=
+\operatorname{Calib}_{l,t}
+\left(
+s_{\mathrm{proj}}^{raw}(e^l);
+\operatorname{ProjectionStats}_{l,t},
+\operatorname{ProjectionProtocol}_{l,t}
+\right)
+\in(0,1]
+$$
+
+$$
+d(e^l)
+=
+-\log(\max(\epsilon,s_{\mathrm{proj}}(e^l)))
+$$
+
+其中 \(l\in\{mid,coarse\}\)，\(t=edge\_type(e^l)\)。`projected_distance_raw` 和 `projected_strength_raw` 用于诊断；active traversal、green/gray/hard threshold 和 cycle distance reward 使用校准后的 `distance`。该校准不是全局 weighted fusion，也不允许丢弃下层 support ids；它只解决投影聚合后 mid/coarse layer 的距离分布漂移问题，使阈值可按层稳定设置。
 
 投影不允许断链：
 
 $$
 e_K
 \Rightarrow
-\exists e_M,\exists e_F,\exists e_C,\exists c_i,c_j
+\exists e_C,\exists c_i,c_j
 $$
 
 其中最终 evidence chunk 必须能回到 raw span、page range、bbox 或 structure path。
@@ -466,11 +582,10 @@ $$
 chunk_id
 document_version_id
 structure_node_id
-fine_cluster_id
+rq_prefix_id
 mid_concept_id
 coarse_concept_id
 chunk_relation_edge_id
-fine_cluster_edge_id
 mid_concept_edge_id
 coarse_concept_edge_id
 chunk_relation_graph_state_id
@@ -496,7 +611,7 @@ $$
 h_{\mathcal{G}}
 =
 H\left(
-h_C,h_0,h_1,h_F,h_2,h_3,h_{\mathrm{runtime}},h_{\mathrm{agent}}
+h_C,h_0,h_1,h_R,h_2,h_3,h_{\mathrm{runtime}},h_{\mathrm{agent}}
 \right)
 $$
 
@@ -504,9 +619,9 @@ $$
 
 **架构影响：**
 - 影响对象：所有跨层跳转、边证据投影、检索 trace、context package、answer audit、前端图谱 payload 和运维对账脚本。
-- 影响方式：跨层协议提供 id、state、edge support 与 hash 的共同坐标系，使 chunk、fine cluster、mid concept、coarse concept、edge projection、context package 与 citation verification 能在同一审计链中互相定位。
-- 传播字段：`chunk_id`、`fine_cluster_id`、`mid_concept_id`、`coarse_concept_id`、`chunk_relation_edge_id`、`fine_cluster_edge_id`、`mid_concept_edge_id`、`coarse_concept_edge_id`、`context_graph_state_id`、`retrieval_trace_id`、`context_package_id`、`state_hash`。
-- 触发条件：任一层 state id、protocol version、edge distance protocol 或 hash 变化时，下游 API payload、cache key、retrieval trace 和 UI graph view 都应使用新协议坐标。
+- 影响方式：跨层协议提供 id、state、edge support 与 hash 的共同坐标系，使 chunk、RQ prefix membership、mid concept、coarse concept、edge projection、context package 与 citation verification 能在同一审计链中互相定位。
+- 传播字段：`chunk_id`、`rq_prefix_id`、`mid_concept_id`、`coarse_concept_id`、`chunk_relation_edge_id`、`mid_concept_edge_id`、`coarse_concept_edge_id`、`context_graph_state_id`、`retrieval_trace_id`、`context_package_id`、`state_hash`。
+- 触发条件：任一层 state id、protocol version、edge distance protocol 或 hash 变化时，下游 API payload、cache key、retrieval trace 和 UI graph view 都应使用该协议坐标。
 - 验收观察点：跨层 id 不悬空、edge projection 不断链、trace step 可回放、context package 可回到 raw chunk span、answer session 可回到 citation verification。
 
 ## 事实源与派生状态
@@ -722,7 +837,7 @@ $$
 
 
 **架构影响：**
-- 影响对象：contextual index、Qdrant、BM25、chunk relation graph、fine clusters、concept graphs、retrieval trace、context package 和 citation verification。
+- 影响对象：contextual index、Qdrant、BM25、chunk relation graph、RQ membership、concept graphs、retrieval trace、context package 和 citation verification。
 - 影响方式：固定 chunk 定义全系统最小地址单位；结构图定义上下文恢复路径；版本策略决定下游索引、图状态与引用审计是否仍然有效。
 - 传播字段：`chunk_id`、`chunk_version`、`chunk_index`、`char_start`、`char_end`、`token_start`、`token_end`、`text_hash`、`section_path`、`page_range`。
 - 触发条件：chunk size、overlap、tokenizer、parser output、chunk span、document version 或 active chunk scope 变化时，contextual index、relation graph、concept graph 和 cache 都需要刷新或重建。
@@ -826,14 +941,13 @@ $$
 flowchart TB
     CH["Chunks"] --> EMB["Dense Vectors"]
     CH --> BM["BM25 Terms"]
-    CH --> ST["Structure Links"]
-    EMB --> EC["Candidate Edges"]
+    EMB --> RQ["RQ Residual Address"]
+    EMB --> EC["Semantic Candidate Edges"]
     BM --> EC
-    ST --> EC
-    EC --> FUSE["Edge Fusion"]
-    FUSE --> RG["Chunk Relation Graph"]
-    RG --> FC["Fine Clusters"]
-    FC --> RQ["RQ Graph"]
+    RQ --> EC
+    EC --> CAL["Typed Edge Calibration"]
+    CAL --> RG["Independent Chunk Relation Graph"]
+    RG --> PROJ["Mid / Coarse Edge Projection"]
 ```
 
 ### State
@@ -843,35 +957,36 @@ flowchart TB
 $$
 S_1
 =
-(V_C,V_F,E_{CC},E_{CF},E_{FF},h_1,p_1)
+(V_C,E_C,\mathcal{R},\mathcal{M}_R,h_1,p_1)
 $$
 
-其中 \(h_1\) 是 state hash，\(p_1\) 是 protocol version。protocol 是 `chunk_relation_graph_rq_v2`。
+其中 \(E_C\) 是底层 chunk relation edges，\(\mathcal{R}\) 是 RQ prefix address tree，\(\mathcal{M}_R\) 是 chunk 到 RQ prefixes 的 fuzzy membership。\(h_1\) 是 state hash，\(p_1\) 是 protocol version。protocol 是 `chunk_relation_rq_membership_v3`。
 
 目标 state hash：
 
 $$
 h_1
 =
-H(scope(C),stats(E),clusters(F),p_1)
+H(scope(C),stats(E_C),codebook(RQ),stats(\mathcal{M}_R),p_1)
 $$
 
 
 
 ### Edge builder
 
-目标候选边：
+目标候选边只来自内容语义证据：
 
 $$
 E_{\mathrm{cand}}
 =
-E_{\mathrm{prevnext}}
-\cup E_{\mathrm{section}}
-\cup E_{\mathrm{page}}
-\cup E_{\mathrm{dense}}
+E_{\mathrm{dense}}
 \cup E_{\mathrm{lexical}}
+\cup E_{\mathrm{cohit}}
 \cup E_{\mathrm{rq}}
+\cup E_{\mathrm{bridge}}
 $$
+
+结构邻接、同页、同标题、表格闭包、公式闭包和图注闭包属于 Chunk Structure Graph，不进入 relation edge 的创建和保留。它们在 context package 阶段根据 hit chunk 恢复，保证信息不丢失，同时避免把版面关系误写成语义关系。
 
 目标边特征：
 
@@ -879,34 +994,73 @@ $$
 \phi_{ij}
 =
 \left[
-\operatorname{Adj}(i,j),
-\operatorname{SameSec}(i,j),
-\operatorname{SamePage}(i,j),
 \cos(e_i,e_j),
-J(T_i,T_j),
-\operatorname{RQ}(i,j)
+\operatorname{Lex}(i,j),
+\operatorname{CoHit}(i,j),
+\operatorname{LCP}_{RQ}(i,j),
+\operatorname{Res}_{RQ}(i,j),
+\operatorname{Bridge}(i,j)
 \right]
 $$
 
-其中 \(J(T_i,T_j)\) 是 term set Jaccard：
+其中 lexical signal 可以由 BM25 对称分数、term set overlap 或 tokenizer version 下的 normalized lexical affinity 表示：
 
 $$
-J(T_i,T_j)
+\operatorname{Lex}(i,j)
 =
-\frac{|T_i\cap T_j|}{|T_i\cup T_j|}
+\operatorname{Norm}_{lex}
+\left(
+BM25(i\mid j),BM25(j\mid i),J(T_i,T_j)
+\right)
 $$
+
+RQ pair evidence 使用最长公共前缀和最终残差距离：
+
+$$
+\operatorname{LCP}_{RQ}(i,j)
+=
+\max\{l:prefix_l(i)=prefix_l(j)\}
+$$
+
+$$
+\operatorname{RQ}_{ij}
+=
+\frac{\operatorname{LCP}_{RQ}(i,j)}{L}
+\cdot
+\exp\left(
+-\frac{\|r_i^{(L)}-r_j^{(L)}\|_2}{\tau_r}
+\right)
+$$
+
+RQ 只能作为 chunk pair evidence 或 candidate generator。高层 RQ prefix、mid node、coarse node 不能反向决定 \(E_C\) 的边去留。
 
 
 
 ### Graph distance and traversal support
 
-目标关系图不输出孤立图分数，而输出可遍历距离边和路径证据。chunk relation edge 的 active distance：
+目标关系图不输出孤立图分数，而输出可遍历距离边和路径证据。所有进入 active traversal 的边都必须先经过 edge-type normalization。设边 \(e\) 的类型为 \(t\)，原始强度或原始特征摘要为 \(a_e^{(t)}\)，则：
+
+$$
+s_e
+=
+\operatorname{Calib}_t
+\left(
+a_e^{(t)};
+\operatorname{Stats}_t,
+\operatorname{Protocol}_t
+\right)
+\in(0,1]
+$$
+
+类型内校准函数必须单调：原始证据越强，\(s_e\) 越大。可选实现包括 quantile calibration、min/max clipping、z-score sigmoid、isotonic calibration 或 rank-to-strength mapping。chunk relation edge 的 active distance：
 
 $$
 d_e
 =
 -\log(\max(\epsilon,s_e))
 $$
+
+硬路径阈值使用归一化后的累计 distance，而不是 raw score。不同 edge type 不直接相加 raw score；跨类型路径只累计统一 distance，同时保留 `edge_type`、support ids 与 normalization diagnostics 供 LLM gray-zone evaluator 判断路径价值。
 
 候选路径距离：
 
@@ -917,7 +1071,7 @@ D(P)
 +\operatorname{Penalty}(P)
 $$
 
-路径贡献由覆盖面、证据独立性、桥接性和 bounded cycle reward 产生：
+路径贡献由覆盖面、证据独立性、桥接性和 bounded cycle distance reward 产生：
 
 $$
 R(P)
@@ -930,45 +1084,67 @@ $$
 
 active traversal 使用 \(D(P)-R(P)\) 作为优先队列排序的一部分，topological metrics 只作为入口选择和 tie-break prior，不再把 degree 或 PageRank 直接当最终 chunk 分。
 
+底层边写入不接受无 support 的 LLM 推断：
+
+$$
+e_{ij}\in E_C
+\Rightarrow
+\left(
+support\_features(e_{ij})\ne\varnothing
+\land
+protocol(e_{ij})=p_1
+\land
+d_e<\infty
+\right)
+$$
+
+所有边必须保存 typed features、raw strength、calibration stats、support ids、distance、source algorithm、protocol version 和 diagnostics。任意特殊文本形态的局部闭包由 \(G_0\) 恢复；底层关系图只判断两个 chunk 是否存在内容语义近邻关系。
+
 
 
 **架构影响：**
-- 影响对象：fine clusters、RQ prefix clusters、mid concept packet、priority-queue traversal、bridge repair、context package bridge chunks 和 graph diagnostics。
-- 影响方式：relation graph 把 dense、BM25、结构和 RQ 信号统一成可遍历距离边；下游不直接使用孤立 cluster label，而是使用边、membership、path labels 和 convergence diagnostics。
-- 传播字段：`chunk_relation_graph_state_id`、`chunk_relation_edges`、`fine_cluster_memberships`、`fine_cluster_edges`、`edge_type`、`distance`、`raw_strength`、`features_json`、`state_hash`。
-- 触发条件：embedding、BM25、structure mapping、chunk scope、RQ settings 或 relation protocol 变化时，fine clusters、mid concepts、coarse concepts、retrieval trace 和 cache 需要刷新。
-- 验收观察点：relation state ready、edge type 分布、bridge ratio、distance distribution、trace 中 frontier expansion steps、cycle reward 和 diagnostics hash。
+- 影响对象：RQ membership diagnostics、mid concept packet、coarse concept packet、priority-queue traversal、bridge repair、context package bridge chunks 和 graph diagnostics。
+- 影响方式：relation graph 把 dense、lexical、co-hit、RQ pair evidence 和 bridge evidence 统一成可遍历距离边；结构信息只在命中后恢复上下文；mid/coarse 节点和边完全根据底层 chunk edges 与 membership 投影。
+- 传播字段：`chunk_relation_graph_state_id`、`chunk_relation_edges`、`rq_path`、`rq_prefix_memberships`、`edge_type`、`distance`、`raw_strength`、`features_json`、`normalization_stats_json`、`edge_distance_protocol_hash`、`state_hash`。
+- 触发条件：embedding、BM25、chunk scope、RQ codebook、RQ membership protocol 或 relation protocol 变化时，mid concepts、coarse concepts、retrieval trace 和 cache 需要刷新。
+- 验收观察点：relation state ready、edge type 分布、bridge ratio、raw strength distribution by edge type、normalized distance distribution、RQ pair evidence 分布、path threshold hit distribution、trace 中 frontier expansion steps、cycle distance reward 和 diagnostics hash。
 
-## Fine Clusters 与 RQ-KMeans
+## RQ Membership 与 RQ-KMeans
 
 ### 目标架构
 
-Fine layer 是第 1 层关系图的可遍历语义地址层，不承担原文结构职责。原文层次、坐标、previous/next、表格、公式和图注闭包由 Chunk Structure Graph 负责；Fine layer 只表达可复算语义邻域、簇间距离、桥接路径和 chunk membership。
+RQ membership layer 表示 RQ residual address 与 fuzzy membership protocol。它不是独立 active traversal layer，不承担原文结构职责，不通过社区检测决定底层边。原文层次、坐标、previous/next、表格、公式和图注闭包由 Chunk Structure Graph 负责；底层关系由 Chunk Relation Graph 负责；RQ 只定义语义地址、模糊归属、边界/低置信诊断、chunk seed prior 和高层节点投影基础。
 
-目标架构受 [ContextRAG](https://arxiv.org/abs/2605.19735) 的 extraction-free graph construction 启发：底层拓扑不由 LLM 抽实体和关系，而由 embedding、RQ-KMeans、fuzzy FCA / meet-join 节点和共激活边构建。[KG2RAG](https://aclanthology.org/2025.naacl-long.449/) 的 seed expansion / graph organization 思路用于检索阶段：先定位图入口，再沿关系图扩展和组织证据。
+RQ 层级的工程语义固定为：
+
+```text
+RQ L3 prefix -> Mid Concept node
+RQ L2 prefix -> Coarse Concept node
+RQ L1 prefix -> parent prior, route prior, diagnostics
+```
+
+RQ prefix tree 是硬树：每个 L3 prefix 只有一个 L2 parent，每个 L2 prefix 只有一个 L1 parent。模糊性只存在于 membership score：一个 chunk 可以同时归属多个 L3/L2/L1 prefixes；一个 L3 prefix 不会被拆成多个 L2 parent，一个 L2 prefix 不会被拆成多个 L1 parent。
+
+目标架构受 [ContextRAG](https://arxiv.org/abs/2605.19735) 的 extraction-free graph construction 启发：底层拓扑不由 LLM 抽实体和关系，而由可复算 embedding、lexical evidence、RQ pair evidence 和 typed edge calibration 构建。[KG2RAG](https://aclanthology.org/2025.naacl-long.449/) 的 seed expansion / graph organization 思路用于检索阶段：先定位图入口，再沿关系图扩展和组织证据。
 
 ```mermaid
 flowchart TB
     C["Active Chunks"] --> E["Contextual Embeddings"]
-    C --> B["BM25 Terms"]
-    E --> CC["Chunk-Chunk Evidence Edges"]
-    B --> CC
-    CC --> COM["Fine Communities"]
     E --> RQ["RQ-KMeans Paths"]
     RQ --> RP["RQ Prefix Nodes"]
-    COM --> FN["Fine Seed Nodes"]
-    RP --> FN
-    FN --> MEET["Fine Meet Nodes"]
-    FN --> JOIN["Fine Join / Bridge Nodes"]
-    FN --> MEM["Chunk-Fine Membership"]
-    MEET --> FE["Fine-Fine Distance Edges"]
-    JOIN --> FE
-    RP --> FE
+    E --> MEM["Fuzzy Membership"]
+    RP --> MEM
+    MEM --> L3["RQ L3 Mid Packets"]
+    MEM --> L2["RQ L2 Coarse Packets"]
+    C --> CR["Chunk Relation Graph"]
+    CR --> PROJ["Edge Projection"]
+    L3 --> PROJ
+    L2 --> PROJ
 ```
 
 ### Chunk evidence graph
 
-目标第一步是构建 chunk-chunk evidence graph：
+chunk evidence graph 等同于上一节定义的独立 Chunk Relation Graph：
 
 $$
 G_C=(V_C,E_C)
@@ -986,7 +1162,20 @@ E_{\mathrm{dense}}
 \cup E_{\mathrm{bridge}}
 $$
 
-结构边可以作为 evidence feature 或 restoration hint，但不再用于粗糙分词分桶形成主 fine cluster。每条边保存关系强度 \(s_e\in(0,1]\) 与距离 \(d_e\)：
+结构边不作为 evidence feature。每条 chunk relation edge 先保存原始 evidence feature \(a_e^{(t)}\)，再按 edge type \(t\) 归一化为关系强度 \(s_e\in(0,1]\)：
+
+$$
+s_e
+=
+\operatorname{Calib}_t
+\left(
+a_e^{(t)};
+\operatorname{Stats}_t,
+\operatorname{Protocol}_t
+\right)
+$$
+
+再写入距离 \(d_e\)：
 
 $$
 d_e
@@ -994,105 +1183,104 @@ d_e
 -\log(\max(\epsilon,s_e))
 $$
 
-关联越强，\(s_e\) 越大，\(d_e\) 越小。不同 edge type 的 \(s_e\) 只在同类算法内可比较；跨类型导航使用 typed edge、预算、路径证据和 LLM 灰区裁决，不做全局拍脑袋加权。
+关联越强，\(s_e\) 越大，\(d_e\) 越小。不同 edge type 的 raw feature 不直接比较；只有归一化后的 distance 可进入累计路径距离、green/gray/hard stop 阈值和 cycle distance reward。跨类型导航仍保留 typed edge、support ids、路径证据和 LLM 灰区裁决，不做全局拍脑袋加权。
 
-### Fine communities
+### RQ fuzzy memberships
 
-目标 fine nodes 来自底层 evidence graph 的社区和语义地址，而不是 section/text 词频桶。社区目标为：
+RQ fuzzy membership 是 active 归属协议。可视化或诊断层可以报告辅助分组，但不能把分组结果作为 mid/coarse 节点事实源，也不能用分组边反向决定底层 chunk edge。
 
-$$
-\max_{\mathcal{F}}
-\sum_{f\in\mathcal{F}}
-\left[
-\sum_{i,j\in f}w_{ij}
--\gamma
-\sum_{i\in f,j\notin f}w_{ij}
-\right]
-$$
-
-其中 \(w_{ij}\) 是同类型或归一化后可审计的 chunk evidence strength。可选算法包括 Leiden、HDBSCAN、kNN components、RQ prefix grouping 与 co-retrieval communities。
-
-chunk 到 fine node 的 fuzzy membership：
+对第 \(l\) 层 codebook，chunk \(c\) 到 code \(k\) 的距离为：
 
 $$
-\mu_{c,f}
+d_{c,l,k}
 =
-\frac{\exp(-d(e_c,\mu_f)/\tau)}
-{\sum_{f'}\exp(-d(e_c,\mu_{f'})/\tau)}
+\left\|r_c^{(l-1)}-\mu_{l,k}\right\|_2
 $$
 
-目标 fine node 类型：
+soft assignment：
+
+$$
+p_{c,l,k}
+=
+\frac{\exp(-d_{c,l,k}/\tau_l)}
+{\sum_h\exp(-d_{c,l,h}/\tau_l)}
+$$
+
+residual confidence：
+
+$$
+\gamma_c
+=
+\exp(-\rho_c/\tau_r)
+$$
+
+prefix membership：
+
+$$
+\mu_{c,p}
+=
+\gamma_c
+\prod_{l\le depth(p)}
+p_{c,l,q_p^{(l)}}
+$$
+
+membership role 由 \(\mu_{c,p}\)、rank、entropy、residual norm 和边界距离决定：
 
 ```text
-fine_seed:
-  稳定图社区、RQ prefix 或高密度 kNN component。
-
-fine_meet:
-  多个 fine seed / RQ prefix 的高密度交集，表示更窄语义区。
-
-fine_join:
-  多个 fine seed / RQ prefix 的并集或桥接区，表示跨主题通道。
-
-fine_bridge:
-  跨社区弱边集中经过的连接区。
+primary_member
+fuzzy_member
+boundary_member
+bridge_member
+low_confidence_member
+outlier_member
+noise_candidate
 ```
 
+低置信 chunk 不被丢弃；它以低 membership、边界角色或 outlier/noise diagnostics 进入 packet 和 trace。模糊归属改变簇生成和高层投影权重，不额外增加图层。
 
+### RQ prefix diagnostics
 
-### Fine cluster edges
+RQ prefix diagnostics 在 active 架构中不是独立导航边。RQ prefix 之间的 parent-child、sibling、centroid-near 和 overlap diagnostics 只服务于地址解释、entry prior、packet diagnostics 和 UI 展示；active mid/coarse edge 仍必须由底层 chunk relation edge support 投影。
 
-目标保留所有有证据的簇间边，边字段使用距离语义：关联越强，距离越小。Fine edge schema：
+RQ prefix adjacency diagnostics schema：
 
 ```text
-source_fine_id
-target_fine_id
+source_rq_prefix_id
+target_rq_prefix_id
 edge_type
-distance
-raw_strength
-support_chunk_ids
-support_chunk_edge_ids
+diagnostic_strength
+support_membership_mass
+support_chunk_ids_sample
 source_algorithm
 protocol_version
 diagnostics_json
 ```
 
-基础强度：
+diagnostic strength：
 
 $$
-s_{fg}
+d^{diag}_{pq}
 =
-\operatorname{Norm}
+\operatorname{Diag}
 \left(
-\cos(\mu_f,\mu_g),
-\frac{|S_f\cap S_g|}{|S_f\cup S_g|},
-\operatorname{BridgeSupport}(f,g),
-\operatorname{CoActivation}(f,g)
+\operatorname{PrefixRelation}(p,q),
+\operatorname{CentroidDistance}(p,q),
+\operatorname{MembershipOverlap}(p,q),
+\operatorname{ProjectedChunkSupport}(p,q)
 \right)
 $$
 
-距离：
-
-$$
-d_{fg}
-=
--\log(\max(\epsilon,s_{fg}))
-$$
-
-保留的 fine-fine edge types：
+diagnostic edge types：
 
 ```text
 parent_child
 sibling
-meet_of
-join_of
-overlap_bridge
-co_activated
 centroid_near
-rq_parent_child
-rq_sibling
-rq_centroid_near
-rq_overlap_bridge
+membership_overlap
+projected_chunk_support
 ```
+
+这些 diagnostics 不进入 \(D(P)\)，不参与 active graph threshold，不替代 support_chunk_edge_ids。
 
 
 
@@ -1152,35 +1340,40 @@ prefix membership：
 $$
 \mu_{c,p}
 =
-\max
-\left(
-0.2,\min(1,e^{-\rho_c/\tau_r})
-\right)
+\gamma_c
+\prod_{l\le depth(p)}
+p_{c,l,q_p^{(l)}}
 $$
+
+其中 \(\gamma_c=\exp(-\rho_c/\tau_r)\)。membership 不设置人工下限；低 membership 进入 boundary、outlier 或 noise diagnostics。
 
 
 
 ### RQ cluster edges
 
-目标 RQ cluster graph 包含 parent-child、sibling、centroid-near、overlap-bridge：
+RQ cluster graph 不作为 active traversal layer。prefix 关系保存在 address tree 与 diagnostics 中：
 
 $$
-E_F^{rq}
+E_R^{diag}
 =
 E_{\mathrm{parent}}
 \cup E_{\mathrm{sibling}}
 \cup E_{\mathrm{centroid}}
 \cup E_{\mathrm{overlap}}
+\cup E_{\mathrm{projected\_support}}
 $$
 
-目标边类型：
+diagnostic edge types：
 
 ```text
 rq_parent_child
 rq_sibling
 rq_centroid_near
 rq_overlap_bridge
+rq_projected_chunk_support
 ```
+
+其中 `rq_parent_child` 来自 prefix tree，`rq_projected_chunk_support` 来自底层 chunk relation edge support 的投影统计。诊断边不作为 mid/coarse active edge 的存在性条件。
 
 ### RQ chunk edges
 
@@ -1208,7 +1401,7 @@ w_{ij}^{rq}
 \right)
 $$
 
-目标边类型：
+RQ pair evidence 可生成候选 edge type：
 
 ```text
 rq_hierarchy_near
@@ -1216,14 +1409,14 @@ rq_prefix_sibling
 rq_residual_near
 ```
 
-并在 edge features 中保存 `lcp_depth`、`residual_distance`、`rq_weight`、source/target rq path。若某类 RQ edge 没自然产生，会选择 residual 最近 pair 写入 fallback pair，保证 trace 和 UI 中可诊断。
+并在 edge features 中保存 `lcp_depth`、`residual_distance`、`rq_weight`、source/target rq path。若候选边未通过 typed calibration 或 support threshold，不写入 active relation graph；诊断缺口写入 graph diagnostics，不使用 fallback pair 补边。
 
 **架构影响：**
-- 影响对象：mid concept aggregation、coarse community、priority-queue graph traversal、context package bridge restoration、retrieval trace 和前端 fine/RQ 诊断。
-- 影响方式：fine layer 提供可遍历语义地址、距离边、meet/join/bridge 节点和 chunk membership；中粒度节点由 fine communities 聚合；检索从 fine path 回落到 chunks，并由结构图恢复上下文。
-- 传播字段：`fine_clusters`、`fine_cluster_memberships`、`fine_cluster_edges`、`rq_path`、`rq_level`、`rq_path_prefix`、`residual_norm`、`raw_strength`、`distance`、`support_chunk_edge_ids`、`lcp_depth`、`residual_distance`。
-- 触发条件：relation graph hash、embedding vectors、RQ level/codebook、fine community、meet/join induction、bridge support 或 residual diagnostics 变化时，mid concept hash、coarse hash、retrieval trace 和 cache 必须刷新。
-- 验收观察点：fine cluster singleton rate、fine community coverage、meet/join node count、fuzzy membership 数量、RQ path availability、fine edge distance distribution、LCP depth 分布、bridge path coverage 和 traversal frontier diagnostics。
+- 影响对象：mid concept aggregation、coarse concept aggregation、priority-queue graph traversal、context package bridge restoration、retrieval trace 和前端 RQ 诊断。
+- 影响方式：RQ layer 提供 L3/L2/L1 地址、chunk membership、边界/低置信/outlier 诊断和 chunk seed prior；active mid concept 与 RQ L3 prefix packet 对齐，active coarse concept 与 RQ L2 prefix packet 对齐；检索从 mid path 使用 RQ membership 选择 chunk seeds，再进入独立 chunk relation graph 并由结构图恢复上下文。
+- 传播字段：`rq_prefixes`、`rq_prefix_memberships`、`rq_path`、`rq_level`、`rq_path_prefix`、`residual_norm`、`membership_score`、`membership_role`、`lcp_depth`、`residual_distance`、`rq_weight`、`support_chunk_edge_ids`。
+- 触发条件：relation graph hash、embedding vectors、RQ level/codebook、RQ membership protocol、bridge support 或 residual diagnostics 变化时，mid concept hash、coarse hash、retrieval trace 和 cache 必须刷新。
+- 验收观察点：RQ path availability、RQ L3-to-mid projection coverage、RQ L2-to-coarse projection coverage、fuzzy membership 数量、membership role 分布、LCP depth 分布、bridge path coverage、chunk seed quality 和 traversal frontier diagnostics。
 
 ## Mid Concept Graph
 
@@ -1231,48 +1424,85 @@ rq_residual_near
 
 ```mermaid
 flowchart TB
-    FG["Fine Distance Graph"] --> COM["Fine Community Aggregation"]
-    FG --> BR["Fine Bridge / Meet / Join Nodes"]
-    COM --> PACK["Mid Concept Packet"]
+    R3["RQ L3 Prefix Packets"] --> MEM["Membership / Representative Chunks"]
+    R3 --> BR["Boundary / Bridge / Outlier Diagnostics"]
+    R3 --> W["Mid Node Weight"]
+    MEM --> PACK
     BR --> PACK
-    PACK --> LLM["LLM Boundary Definition"]
+    W --> PACK
+    PACK["Mid Concept Packet"] --> LLM["LLM Summary / Boundary Definition"]
     LLM --> GATE["Grounded Gate"]
     GATE --> MC["Mid Concept"]
-    FG --> PROJ["Fine Edge Projection"]
+    CRE["Chunk Relation Edges"] --> PROJ["Bottom Edge Projection"]
     MC --> PROJ
     PROJ --> ME["Mid Concept Distance Edges"]
 ```
 
-### Community aggregation
+### RQ L3 aggregation
 
-目标 mid concept 不再从单个高分 fine cluster 直接生成，而是由 fine graph 中的社区、meet/join 节点和 bridge 区域聚合。设 \(G_F=(V_F,E_F)\)，中粒度候选社区为：
+目标 active mid concept 由 RQ L3 prefix packet 生成。设 \(\mathcal{P}_3\) 为 active RQ L3 prefixes，中粒度候选集合为：
 
 $$
 \mathcal{M}^{cand}
 =
-\operatorname{Community}
+\{m_p:\ p\in\mathcal{P}_3,\ \operatorname{mass}(p)>0\}
+$$
+
+每个候选 \(m_p\) 必须保留：
+
+```text
+support_rq_prefix = rq_l3_prefix
+parent_rq_l2_prefix
+parent_rq_l1_prefix
+representative_chunk_ids
+support_chunk_ids
+core_chunk_ids
+boundary_chunk_ids
+bridge_chunk_ids
+outlier_chunk_ids
+structure_paths
+membership_mass
+membership_entropy
+residual_norm_stats
+raw_node_weight
+node_weight
+node_weight_normalization_scope
+display_terms_json
+summary
+internal_state_json
+```
+
+中粒度节点权重来自 RQ L3 packet 的证据规模、归属清晰度、内部底层边密度、边界比例和摘要置信度：
+
+$$
+w_M^{raw}(m_p)
+=
+\operatorname{Score}
 \left(
-G_F,
-d_F,
-\operatorname{typed\_edges},
-\operatorname{bridge\_protection}
+\log(1+|S_C(p)|),
+\operatorname{mass}(p),
+\operatorname{core\_ratio}(p),
+\operatorname{density}_{E_C}(p),
+1-\operatorname{boundary\_ratio}(p),
+1-\operatorname{outlier\_ratio}(p),
+\operatorname{summary\_confidence}(p)
 \right)
 $$
 
-每个候选 \(M_k^{cand}\subseteq V_F\) 必须保留：
+每个 mid state 内做同层归一化：
 
-```text
-support_fine_node_ids
-support_fine_edge_ids
-bridge_fine_node_ids
-boundary_fine_node_ids
-representative_chunk_ids
-support_chunk_ids
-structure_paths
-rq_path_coverage
-```
+$$
+w_M(m_f)
+=
+\operatorname{LayerNorm}_M
+\left(
+w_M^{raw}(m_f);
+\{w_M^{raw}(m'):m'\in V_M\}
+\right)
+\in[0,1]
+$$
 
-聚合目标不是删除弱边，而是形成上层语义节点，同时保留跨社区弱边和桥接路径。可用社区算法包括 Leiden、HDBSCAN over graph embeddings、k-core constrained community、RQ prefix merging 和 fuzzy FCA meet/join folding。
+其中 `node_weight` 只在 mid layer 内可比较，用于预算控制、展示、入口候选辅助和同等路径下的 tie-break，不表示用户问题相关性，不与 coarse 或 chunk 权重跨层比较，不替代路径搜索，也不能形成“大节点优先”的 active retrieval 规则。
 
 
 
@@ -1284,13 +1514,13 @@ $$
 P_m
 =
 \left(
-F_m,E_m,B_m,\partial F_m,R_m,S_m,Q_m,X_m
+p_3,S_c,S_{core},S_{boundary},S_{bridge},S_{outlier},E_C^{in},E_C^{cross},D_R,W_m,X_m
 \right)
 $$
 
-其中 \(F_m\) 是聚合 fine nodes，\(E_m\) 是社区内 fine edges，\(B_m\) 是 bridge fine nodes，\(\partial F_m\) 是 boundary fine nodes，\(R_m\) 是代表 chunks，\(S_m\) 是 support chunks，\(Q_m\) 是 RQ / meet-join diagnostics，\(X_m\) 是 chunk excerpts 和 source spans。
+其中 \(p_3\) 是 RQ L3 prefix，\(S_c\) 是 membership 支撑 chunk 集合，\(S_{core}\)、\(S_{boundary}\)、\(S_{bridge}\)、\(S_{outlier}\) 是按 membership role 切分的支撑集合，\(E_C^{in}\) 是 L3 内部底层边，\(E_C^{cross}\) 是跨 L3 底层边，\(D_R\) 是 RQ residual 与 membership diagnostics，\(W_m\) 是 node weight diagnostics，\(X_m\) 是 chunk excerpts、source spans 与 structure paths。
 
-packet 字段包括 packet id、fine cluster ids、candidate labels、representative chunk ids、support/bridge counts、support/bridge chunk ids、RQ sampling、chunk excerpts 和 grounding hash。
+packet 字段包括 packet id、RQ L3 prefix、candidate labels、display terms、node summary、node weight、representative chunk ids、support/core/boundary/bridge/outlier counts、membership role distribution、residual diagnostics、chunk excerpts、structure paths 和 grounding hash。
 
 ### LLM 定义
 
@@ -1310,17 +1540,20 @@ $$
 ```text
 canonical_label
 aliases
+display_terms_json
+summary
 definition
 scope_note
 inclusion_criteria
 exclusion_criteria
+internal_state_json
 representative_chunk_ids
 support_chunk_ids
 confidence
 why_this_concept_exists
 ```
 
-LLM 只负责命名、定义、范围、包含/排除标准和证据充分性解释，不负责创建底层边，也不负责决定 chunk 事实。
+LLM 只负责命名、展示短语、摘要、范围、包含/排除标准、内部状态解释和证据充分性解释，不负责创建底层边，不负责决定 chunk membership，不负责决定 chunk 事实，也不能把多个 RQ L3 prefixes 合并成一个 active mid concept。
 
 
 
@@ -1335,9 +1568,13 @@ $$
 \left[
 S_C(m)\ne \varnothing
 \land
-S_C(m)\subseteq support(f)
+\operatorname{RQPrefixLevel}(m)=3
+\land
+S_C(m)\subseteq support(prefix_3(m))
 \land
 \forall c\in S_C(m),\ Span(c)\ne\varnothing
+\land
+\operatorname{SummaryGrounded}(m)
 \right]
 $$
 
@@ -1345,37 +1582,87 @@ $$
 
 ### Concept edges
 
-目标 mid concept edge 由 fine-fine edges 投影而来。若 \(m_a\) 与 \(m_b\) 的 support fine node 集合之间存在至少一条 \(E_F\) 边，则写入 mid edge：
+目标 mid concept edge 由跨 RQ L3 membership 的底层 chunk relation edges 投影而来。若两侧 support chunks 之间存在可审计 \(E_C\) 边，则写入 mid edge：
 
 $$
 E_M
 =
 \left\{
 (m_a,m_b):
-\exists f_i\in F_a,f_j\in F_b,\ (f_i,f_j)\in E_F
+\exists c_i,c_j,\ (c_i,c_j)\in E_C
+\land
+\mu_{c_i,m_a}>0
+\land
+\mu_{c_j,m_b}>0
 \right\}
 $$
 
-中粒度边距离从底层 fine edge 距离聚合：
+中粒度边距离先从底层 chunk relation edge 的 normalized distance 与 membership support 聚合，得到 raw projected distance：
 
 $$
-d_M(m_a,m_b)
+d_{M}^{raw}(m_a,m_b)
 =
 \frac{
-Q_{0.15}\left(\{d_F(f_i,f_j):(f_i,f_j)\in E_F,F_a\leftrightarrow F_b\}\right)
+Q_{0.15}\left(\{d_e:(i,j,e)\in S_{ab}^{C}\}\right)
 }{
 1+\log(1+n_{ab})
 }
 $$
 
-其中 \(Q_{0.15}\) 是低分位距离，避免被单条最小噪声边完全支配；\(n_{ab}\) 是独立 support fine edges 数量，支持越多距离越短。边必须保存：
+其中：
+
+$$
+S_{ab}^{C}
+=
+\{(i,j,e)\in E_C:\mu_{i,m_a}>0,\ \mu_{j,m_b}>0\}
+$$
+
+$$
+n_{ab}
+=
+\sum_{(i,j,e)\in S_{ab}^{C}}
+\mu_{i,m_a}\mu_{j,m_b}
+$$
+
+\(Q_{0.15}\) 是低分位距离，避免被单条最小噪声边完全支配；\(n_{ab}\) 是 membership 加权 support mass，支持越多 raw projected distance 越短。
+
+由于该投影聚合会改变距离分布，active mid edge distance 必须再按 `layer=mid` 与 `edge_type` 做投影校准：
+
+$$
+s_M^{raw}(m_a,m_b)
+=
+\exp(-d_M^{raw}(m_a,m_b))
+$$
+
+$$
+s_M(m_a,m_b)
+=
+\operatorname{Calib}_{mid,t}
+\left(
+s_M^{raw}(m_a,m_b);
+\operatorname{ProjectionStats}_{mid,t},
+\operatorname{ProjectionProtocol}_{mid,t}
+\right)
+$$
+
+$$
+d_M(m_a,m_b)
+=
+-\log(\max(\epsilon,s_M(m_a,m_b)))
+$$
+
+active traversal 使用 \(d_M\)，不是 \(d_M^{raw}\)。边必须保存：
 
 ```text
-support_fine_edge_ids
-support_fine_node_ids
+support_rq_prefix_ids
+support_chunk_edge_ids
 support_chunk_ids
 distance
+projected_distance_raw
+projected_strength_raw
 raw_strength_summary
+projection_normalization_stats_json
+edge_projection_protocol_hash
 edge_type
 diagnostics_json
 ```
@@ -1391,16 +1678,16 @@ same_method_family
 same_evidence_region
 ```
 
-LLM 可以解释边语义，但不能在没有底层 fine edge evidence 时创建 active mid edge。
+LLM 可以解释边语义，但不能在没有底层 chunk relation edge evidence 时创建 active mid edge。RQ prefix sibling、centroid-near、membership overlap 和 L1/L2 parent relation 只进入 diagnostics，不进入 edge existence gate。
 
 
 
 **架构影响：**
-- 影响对象：coarse community grouping、coarse concept definition、concept routing、Agent planning、context package coverage、citation grounding 和 answer synthesis。
-- 影响方式：mid concepts 把 fine graph communities 提升为可解释语义路由；mid edges 是 fine edges 的证据投影；support spans 决定概念能否参与检索、回答和引用验证。
-- 传播字段：`mid_concept_state_id`、`mid_concepts`、`mid_concept_memberships`、`mid_concept_edges`、`mid_concept_definitions`、`support_fine_cluster_ids`、`support_fine_edge_ids`、`support_chunk_ids`、`support_spans_json`、`distance`、`grounding_hash`。
-- 触发条件：fine cluster hash、fine edge distance、bridge nodes、LLM prompt protocol、concept packet、support span 或 grounded gate 变化时，coarse graph、graph traversal trace、context package 和 cache 需要刷新。
-- 验收观察点：mid concept grounded rate、fine community coverage、support chunk coverage、edge support density、distance distribution、concept path accuracy 和 unsupported concept diagnostics。
+- 影响对象：coarse concept aggregation、coarse concept definition、concept routing、Agent planning、context package coverage、citation grounding 和 answer synthesis。
+- 影响方式：mid concepts 与 RQ L3 prefixes 对齐，提供用户可读语义节点、LLM 可读摘要和稳定 chunk seed 集合；mid edges 是底层 chunk relation edges 的 membership 加权投影；support spans 决定概念能否参与检索、回答和引用验证。
+- 传播字段：`mid_concept_state_id`、`mid_concepts`、`mid_concept_memberships`、`mid_concept_edges`、`mid_concept_definitions`、`display_terms_json`、`summary`、`internal_state_json`、`support_rq_prefix_ids`、`support_chunk_edge_ids`、`support_chunk_ids`、`representative_chunk_ids`、`node_weight`、`support_spans_json`、`projected_distance_raw`、`projection_normalization_stats_json`、`edge_projection_protocol_hash`、`distance`、`grounding_hash`。
+- 触发条件：RQ L3 membership hash、bottom chunk edge distance、LLM prompt protocol、concept packet、support span 或 grounded gate 变化时，coarse graph、graph traversal trace、context package 和 cache 需要刷新。
+- 验收观察点：RQ L3-to-mid projection coverage、mid concept grounded rate、node summary grounded rate、support chunk coverage、node weight diagnostics、edge support density、raw projected distance distribution、calibrated mid distance distribution、projection calibration diagnostics、concept path accuracy 和 unsupported concept diagnostics。
 
 ## Coarse Concept Graph
 
@@ -1408,61 +1695,84 @@ LLM 可以解释边语义，但不能在没有底层 fine edge evidence 时创�
 
 ```mermaid
 flowchart TB
-    MG["Mid Concept Distance Graph"] --> COM["Mid Community Detection"]
-    MG --> BR["Bridge / Boundary Mid Concepts"]
-    COM --> PACK["Coarse Packet"]
+    R2["RQ L2 Prefix Packets"] --> CH["Child L3 Mid Summaries"]
+    R2 --> BR["Bridge / Boundary / Outlier Diagnostics"]
+    CE["Chunk Relation Edges"] --> PROJ["Bottom Edge Projection"]
+    CH --> PACK["Coarse Packet"]
     BR --> PACK
-    PACK --> LLM["LLM Definition"]
+    PROJ --> PACK
+    PACK --> LLM["LLM Summary / Definition"]
     LLM --> CC["Coarse Concept"]
-    MG --> PROJ["Mid Edge Projection"]
     CC --> PROJ
-    PROJ --> CE["Coarse Distance Edges"]
+    PROJ --> CEdge["Coarse Distance Edges"]
 ```
 
-### Community grouping
+### RQ L2 grouping
 
-目标 coarse graph 由 mid concept graph 的社区结构、桥接概念、边界概念和弱边共同生成。社区算法必须保留跨社区边，不得把 connected components 直接当 coarse concepts。
-
-$$
-\max_{\mathcal{K}}
-Q(\mathcal{K})
--\lambda_1 Conductance(\mathcal{K})
--\lambda_2 SingletonRate(\mathcal{K})
-+\lambda_3 BridgeRetention(\mathcal{K})
-$$
-
-Conductance：
+目标 coarse graph 由 RQ L2 prefix packets 生成。辅助分组只作为诊断和可视化参考，不决定 active coarse node。设 \(\mathcal{P}_2\) 为 active RQ L2 prefixes：
 
 $$
-\phi(S)
+\mathcal{K}^{cand}
 =
-\frac{cut(S,\bar{S})}
-{\min(vol(S),vol(\bar{S}))}
+\{k_p:p\in\mathcal{P}_2,\operatorname{mass}(p)>0\}
 $$
 
-Bridge retention：
-
-$$
-BridgeRetention(\mathcal{K})
-=
-\frac{
-|\{e=(u,v)\in E_M:\ community(u)\ne community(v),\ e.type\in B\}|
-}{
-|E_M|
-}
-$$
-
-目标 coarse candidate：
+每个 coarse candidate 聚合其 child L3 mid summaries、chunk membership、底层边投影、边界/桥接/outlier 诊断和结构路径：
 
 ```text
+support_rq_l2_prefix
+parent_rq_l1_prefix
+child_rq_l3_prefix_ids
 included_mid_concept_ids
 boundary_mid_concept_ids
 bridge_mid_concept_ids
-support_mid_edge_ids
-cross_community_weak_ties
+outlier_mid_concept_ids
+support_chunk_edge_ids
+cross_prefix_weak_support
 support_chunk_ids
-community_diagnostics
+membership_mass
+membership_entropy
+residual_norm_stats
+raw_node_weight
+node_weight
+node_weight_normalization_scope
+display_terms_json
+summary
+internal_state_json
 ```
+
+粗粒度节点权重来自 RQ L2 packet 的证据覆盖、child L3 质量、内部底层边密度、桥接状态、边界比例和摘要置信度：
+
+$$
+w_K^{raw}(k)
+=
+\operatorname{Score}
+\left(
+\log(1+|L3_k|),
+\log(1+|support(k)|),
+\operatorname{density}_{E_C}(k),
+\operatorname{child\_quality}(k),
+\operatorname{bridge\_state}(k),
+1-\operatorname{boundary\_ratio}(k),
+1-\operatorname{outlier\_ratio}(k),
+\operatorname{summary\_confidence}(k)
+\right)
+$$
+
+每个 coarse state 内做同层归一化：
+
+$$
+w_K(k)
+=
+\operatorname{LayerNorm}_K
+\left(
+w_K^{raw}(k);
+\{w_K^{raw}(k'):k'\in V_K\}
+\right)
+\in[0,1]
+$$
+
+其中 `node_weight` 只在 coarse layer 内可比较，用于 coarse entry 候选辅助、coarse 层 hard interrupt 上限的局部分配、coarse -> mid 下钻配额、overview/survey 类问题的主题覆盖提示和同等路径下的 tie-break；它不表示查询相关性，不与 mid/chunk 权重跨层比较，也不能替代 query-entry 匹配、累计路径距离或 LLM gray-zone decision。
 
 
 
@@ -1474,13 +1784,13 @@ $$
 P_k
 =
 \left(
-M_k,E_k,B_k,W_k
+p_2,M_{child},S_c,E_C^{in},E_C^{cross},B_k,O_k,W_k,N_k
 \right)
 $$
 
-其中 \(M_k\) 是 mid concepts，\(E_k\) 是 mid edges，\(B_k\) 是 bridge concepts，\(W_k\) 是 weak ties。
+其中 \(p_2\) 是 RQ L2 prefix，\(M_{child}\) 是 child RQ L3 mid summaries，\(S_c\) 是 support chunks，\(E_C^{in}\) 是 L2 内部底层边，\(E_C^{cross}\) 是跨 L2 底层边，\(B_k\) 是 bridge diagnostics，\(O_k\) 是 outlier/noise diagnostics，\(W_k\) 是 cross-prefix weak support，\(N_k\) 是 coarse node weight diagnostics。
 
-packet 包含 community id、mid concept id/label/definition/support chunks、bridge concepts 和 grounding hash。
+packet 包含 RQ L2 prefix、child L3 ids、child mid display terms、child summaries、support chunks、bridge concepts、outlier states、raw node weight、normalized node weight、normalization scope、display terms、summary、internal state 和 grounding hash。
 
 ### 写入规则
 
@@ -1497,50 +1807,98 @@ $$
 $$
 support(k)
 =
-\bigcup_{m\in M_k} support(m)
+\{c:\mu_{c,p_2(k)}>0\}
 $$
 
-写入要求 `CoarseConcept`、`CoarseConceptMembership`、`CoarseConceptDefinition`。membership role 为 `bridge` 或 `included`。
+LLM 输出必须包含 `display_terms_json`、`summary`、`scope_note`、`inclusion_criteria_json`、`exclusion_criteria_json` 和 `internal_state_json`。写入要求 `CoarseConcept`、`CoarseConceptMembership`、`CoarseConceptDefinition`。membership role 至少区分 `included`、`boundary`、`bridge`、`outlier` 和 `low_confidence`。
 
 ### Coarse edges
 
-目标 coarse edge 由 mid-mid edges 投影而来。若两个 coarse communities 之间存在 mid edge，则建立 coarse edge：
+目标 coarse edge 由跨 RQ L2 membership 的底层 chunk relation edges 投影而来。若两个 coarse nodes 之间存在底层 support chunk edge，则建立 coarse edge：
 
 $$
 E_K
 =
 \left\{
 (k_a,k_b):
-\exists m_i\in M_a,m_j\in M_b,\ (m_i,m_j)\in E_M
+\exists c_i,c_j,\ (c_i,c_j)\in E_C
+\land
+\mu_{c_i,k_a}>0
+\land
+\mu_{c_j,k_b}>0
 \right\}
 $$
 
-距离聚合：
+距离先从 support chunk relation edges 聚合为 raw projected distance：
+
+$$
+d_K^{raw}(k_a,k_b)
+=
+\frac{
+Q_{0.15}\left(\{d_e:(i,j,e)\in S_{ab}^{C,K}\}\right)
+}{
+1+\log(1+n_{ab}^{C})
+}
+$$
+
+其中：
+
+$$
+S_{ab}^{C,K}
+=
+\{(i,j,e)\in E_C:\mu_{i,k_a}>0,\ \mu_{j,k_b}>0\}
+$$
+
+$$
+n_{ab}^{C}
+=
+\sum_{(i,j,e)\in S_{ab}^{C,K}}
+\mu_{i,k_a}\mu_{j,k_b}
+$$
+
+由于 coarse projection 会改变距离分布，active coarse edge distance 必须按 `layer=coarse` 与 `edge_type` 做投影校准：
+
+$$
+s_K^{raw}(k_a,k_b)
+=
+\exp(-d_K^{raw}(k_a,k_b))
+$$
+
+$$
+s_K(k_a,k_b)
+=
+\operatorname{Calib}_{coarse,t}
+\left(
+s_K^{raw}(k_a,k_b);
+\operatorname{ProjectionStats}_{coarse,t},
+\operatorname{ProjectionProtocol}_{coarse,t}
+\right)
+$$
 
 $$
 d_K(k_a,k_b)
 =
-\frac{
-Q_{0.15}\left(\{d_M(m_i,m_j):(m_i,m_j)\in E_M,M_a\leftrightarrow M_b\}\right)
-}{
-1+\log(1+n_{ab}^{M})
-}
+-\log(\max(\epsilon,s_K(k_a,k_b)))
 $$
 
-其中 \(n_{ab}^{M}\) 是跨 coarse community 的独立 mid edges 数量。粗粒度边必须保存：
+active traversal 使用 \(d_K\)，不是 \(d_K^{raw}\)。粗粒度边必须保存：
 
 ```text
 support_mid_concept_ids
-support_mid_edge_ids
-support_fine_edge_ids
+support_child_mid_edge_ids
+support_chunk_edge_ids
 support_chunk_ids
 distance
+projected_distance_raw
+projected_strength_raw
 raw_strength_summary
+projection_normalization_stats_json
+edge_projection_protocol_hash
 edge_type
-cross_community_weak_ties
+cross_prefix_weak_support
 ```
 
-粗粒度边可以很弱，但不能丢弃。图导航时弱边会因距离大而排在队列后方；若问题需要跨主题或 LLM 判定临界边有价值，仍可被探索。
+粗粒度边可以很弱，但不能丢弃。图导航时弱边会因距离大而排在队列后方；若问题需要跨主题或 LLM 判定临界边有价值，仍可被探索。RQ L2 sibling、shared L1 parent、child mid adjacency 和 membership overlap 只进入 diagnostics；没有底层 support chunk edge 时不能创建 active coarse edge。
 
 
 
@@ -1556,20 +1914,20 @@ Q,\phi,B,stability,singleton\_rate,bridge\_density
 \right)
 $$
 
-coarse diagnostics 必须保存 modularity、conductance、betweenness、bridge density、community stability、singleton rate、cross edge count、internal edge count 和 community count。
+coarse diagnostics 必须保存 RQ L2 coverage、child L3 coverage、membership entropy、residual norm distribution、bridge density、boundary ratio、outlier ratio、cross prefix edge count、internal edge count、raw projected distance distribution 和 projection calibration diagnostics。
 
 **架构影响：**
 - 影响对象：coarse entry selection、mid concept drilldown、cross-document synthesis、Agent coarse jump、retrieval cache、graph overview 和质量诊断。
-- 影响方式：coarse concepts 决定查询先进入哪些高层主题区域；coarse edges 是 mid edges 的投影，保留跨主题弱边和桥接概念，供优先队列图导航探索。
-- 传播字段：`coarse_concept_state_id`、`coarse_concepts`、`coarse_concept_memberships`、`coarse_concept_edges`、`coarse_concept_definitions`、`community_id`、`bridge_mid_concept_ids`、`support_mid_edge_ids`、`distance`、`freshness_hash`。
-- 触发条件：mid concept state、mid edges、community grouping、coarse definition、bridge diagnostics 或 traversal edge protocol 改变时，coarse hash、retrieval trace 和 graph payload 需要刷新。
-- 验收观察点：community diagnostics、bridge density、coarse entry hit rate、coarse-to-mid drilldown path、cross edge count、coarse edge distance distribution 和 traversal frontier contribution。
+- 影响方式：coarse concepts 决定查询先进入哪些 RQ L2 高层主题区域；coarse edges 是底层 chunk relation edges 的 membership 加权投影，保留跨主题弱边和桥接状态，供优先队列图导航探索。
+- 传播字段：`coarse_concept_state_id`、`coarse_concepts`、`coarse_concept_memberships`、`coarse_concept_edges`、`coarse_concept_definitions`、`support_rq_l2_prefix`、`child_rq_l3_prefix_ids`、`bridge_mid_concept_ids`、`support_chunk_edge_ids`、`display_terms_json`、`summary`、`internal_state_json`、`raw_node_weight`、`node_weight`、`node_weight_diagnostics_json`、`projected_distance_raw`、`projection_normalization_stats_json`、`edge_projection_protocol_hash`、`distance`、`freshness_hash`。
+- 触发条件：RQ L2 membership state、child L3 summaries、bottom chunk edges、coarse summary protocol、bridge diagnostics 或 traversal edge protocol 改变时，coarse hash、retrieval trace 和 graph payload 需要刷新。
+- 验收观察点：RQ L2 coverage、child L3 coverage、bridge density、coarse node summary grounding、coarse node weight diagnostics、coarse entry hit rate、coarse-to-mid drilldown path、cross prefix edge count、raw projected coarse distance distribution、calibrated coarse edge distance distribution、projection calibration diagnostics 和 traversal frontier contribution。
 
 ## Layered Retrieval
 
 ### 目标检索链路
 
-目标检索不是全局加权排序，而是分层图导航。系统先选择每层入口节点，再用有预算的多标签优先队列 walk search 在图上探索，最后把收敛路径映射到去重后的 chunk evidence package。
+目标检索不是全局加权排序，而是分层图导航。系统先选择 coarse L2 与 mid L3 入口节点，再用带硬熔断预算的多标签优先队列 walk search 在图上探索；RQ membership/address 不作为额外 active traversal layer，而是作为节点归属、chunk seed selector、模糊边界诊断和灰区路径判断上下文。最后系统把收敛路径映射到去重后的 chunk evidence package。
 
 目标链路：
 
@@ -1580,10 +1938,8 @@ query
 -> priority-queue walk on coarse graph
 -> drill down to mid graph
 -> priority-queue walk on mid graph
--> drill down to fine graph
--> priority-queue walk on fine graph
--> fine membership to chunks
--> bounded chunk relation expansion
+-> use RQ L3 membership to select chunk seeds
+-> priority-queue walk on chunk relation graph
 -> structure restoration
 -> context package
 ```
@@ -1594,9 +1950,8 @@ flowchart TB
     CE --> CQ["Coarse Frontier PQ"]
     CQ --> MD["Drill Down to Mid"]
     MD --> MQ["Mid Frontier PQ"]
-    MQ --> FD["Drill Down to Fine"]
-    FD --> FQ["Fine Frontier PQ"]
-    FQ --> CH["Chunk Membership / Chunk Edges"]
+    MQ --> CS["RQ Membership / Chunk Seed Selection"]
+    CS --> CH["Chunk Relation Frontier PQ"]
     CH --> ST["Structure Restoration"]
     ST --> CP["Context Package"]
 ```
@@ -1605,7 +1960,7 @@ flowchart TB
 
 ### Entry selection
 
-每层起点选择使用三类信号：语义候选、拓扑先验和 LLM 语义判定。拓扑指标是 prior，不是事实源，也不单独决定入口。
+每层起点选择使用三类信号：语义候选、拓扑先验和 LLM 语义判定。active traversal layer 包括 coarse、mid 和 chunk relation graph；RQ membership/address 作为 mid 节点归属、chunk seed selection 和边界诊断输入。拓扑指标是 prior，不是事实源，也不单独决定入口。
 
 节点候选卡片：
 
@@ -1666,6 +2021,45 @@ LLM 只在入口候选灰区或 query facet 难以映射时裁决，输出 typed
 select_entry_nodes(layer, node_ids, reason, expected_evidence, budget)
 ```
 
+mid 下钻到 chunk relation graph 时，RQ L3 membership 负责选择入口 chunk seeds，而不是把 mid 节点下所有 chunks 全量送入 frontier：
+
+```text
+core_member_chunks
+representative_chunks
+boundary_chunks
+bridge_chunks
+query_matched_chunks
+structure_restoration_required_chunks
+```
+
+seed card 必须携带 RQ membership diagnostics：
+
+```text
+rq_l3_prefix_id
+membership_score
+membership_role
+rq_path
+rq_lcp_depth
+bridge_or_boundary_role
+node_weight
+support_edge_ids
+```
+
+节点权重必须按层归一化：
+
+```text
+coarse_node_weight:
+  在 coarse state 内归一化，只比较 coarse nodes。
+
+mid_node_weight:
+  在 mid state 内归一化，只比较 mid nodes。
+
+chunk_seed_weight:
+  在当前候选 seed set 内归一化，只比较同一批 chunk seeds。
+```
+
+权重只能影响 seed quota、局部 expansion cap、context package soft quota、展示大小和同等路径下的 tie-break；不能跨层比较，不能代表查询相关性，不能替代累计路径距离、edge support 或 LLM gray-zone decision。
+
 ### Multi-label priority queue walk
 
 搜索状态是一条路径标签，而不是单个节点：
@@ -1692,6 +2086,22 @@ D(P')
 =
 D(P)+d_e+\operatorname{Penalty}(P,e)
 $$
+
+其中 \(D(P')\) 是从当前 active layer 入口到待探索节点的累计路径距离。导航判断以路径是否有知识价值为核心，预算不参与路径价值排序，只作为硬熔断器。
+
+路径距离分区：
+
+$$
+Zone(P)
+=
+\begin{cases}
+green,&D(P)\le\tau_{\mathrm{green}}\\
+gray,&\tau_{\mathrm{green}}<D(P)\le\tau_{\mathrm{gray}}\\
+hard\_stop,&D(P)>\tau_{\mathrm{hard}}
+\end{cases}
+$$
+
+`green` 路径由 executor 自动继续；`gray` 路径生成 observation packet 交给 LLM evaluator 判断是否仍有探索价值；`hard_stop` 路径直接剪枝，不再展开。
 
 奖励：
 
@@ -1720,6 +2130,30 @@ $$
 
 队列每次弹出 lexicographic minimum state。这样边字段仍保留为距离，环和桥接路径可以通过 bounded reward 提升，但不会出现全局拍脑袋系数混排。
 
+LLM gray-zone evaluator 只处理临界路径，不接管队列排序。输入 observation 必须包含：
+
+```text
+current_layer
+path_distance
+covered_facets
+missing_facets
+new_evidence_roles
+rq_membership_diagnostics
+bridge_or_boundary_reason
+candidate_chunk_span_summary
+drift_risk
+```
+
+LLM 输出 typed decision：
+
+```text
+continue_path
+stop_path_irrelevant
+follow_as_bridge
+drill_down_layer
+request_structure_closure
+```
+
 ### Cycle handling and convergence
 
 不使用节点级 visited 禁止环。环可能表示多条路径收敛到同一概念或证据区域，应转化为贡献。系统使用路径级 / label 级 visited 与 dominance pruning。
@@ -1742,24 +2176,34 @@ $$
 
 则 \(L_b\) 被支配并剪枝。
 
-环奖励递减：
+环奖励按环上累计距离递减。若路径重新到达已访问节点 \(v\)，取从上一次 \(v\) 到当前 \(v\) 的闭环边集合 \(C(P')\)，其距离和为：
+
+$$
+L_{\mathrm{cycle}}(P')
+=
+\sum_{e\in C(P')}d_e
+$$
+
+环奖励：
 
 $$
 G_{\mathrm{cycle}}(P')
 =
-\frac{
-\log(1+\Delta support(P'))
+\mathbf{1}[L_{\mathrm{cycle}}(P')\le\tau_{\mathrm{cycle}}]
 \cdot
-|\Delta edge\_types(P')|
-}{
-(1+visit(node(P')))^2
-}
+\min
+\left(
+B_{\mathrm{cycle}}-R_{\mathrm{cycle}}(P),
+\alpha\log(1+\Delta support(P'))\exp\left(-\frac{L_{\mathrm{cycle}}(P')}{\tau_c}\right)
+\right)
 $$
 
-硬预算保证必停：
+短而强的环表示多条路径收敛到同一证据区，允许有限奖励；长而弱的环不给奖励。环奖励总量仍受 `max_cycle_reward_per_path` 限制。
+
+每个 active layer 使用固定探索预算作为硬打断，预算不参与导航价值判断：
 
 ```text
-max_expansions
+max_expansions_per_layer
 max_depth_per_layer
 max_labels_per_node
 max_edge_reuse
@@ -1774,7 +2218,10 @@ context_package_token_budget
 ```text
 frontier_empty
 hard_budget_hit
-marginal_gain_recent < epsilon
+path_distance_hard_stop
+llm_stop_layer_irrelevant
+llm_stop_layer_sufficient
+llm_drilldown_ready
 all_required_facets_covered
 independent_support_paths >= threshold
 evidence_roles_saturated
@@ -1782,14 +2229,14 @@ frontier_best_key worse than accepted evidence margin
 context_budget_pressure
 ```
 
-LLM evaluator 不负责保证终止，只判断 evidence 是否足够回答：
+LLM evaluator 可以提前停止灰区路径或当前层，但不负责保证终止；硬预算、硬距离阈值、深度和 label 上限保证必停。LLM 判断围绕“继续探索是否还会带来与用户问题有关的新证据”，而不是围绕剩余预算：
 
 ```text
 sufficient
 need_more_same_node
 need_bridge_jump
 need_mid_expansion
-need_fine_drilldown
+need_chunk_expansion
 need_structure_closure
 insufficient_corpus
 ```
@@ -1808,14 +2255,15 @@ support_chunk_union
 cycle_convergence_score
 ```
 
-最终 context package 去重粒度：
+最终 context package 使用基础去重粒度：
 
 ```text
 chunk_id
 citation_span
-same table / formula / caption closure
-same parent section adjacent chunk merge
+document_version_id + char_span
 ```
+
+相同 chunk 只进入 context package 一次；多条路径、多个 RQ membership 或多个概念命中只合并到 contribution summary。结构闭包可以追加上下文窗口，但不把不同 raw spans 做语义合并。
 
 但保留 path summary：
 
@@ -1838,8 +2286,8 @@ $$
 \left(
 Entry_3,Frontier_3,Path_3,
 Entry_2,Frontier_2,Path_2,
-Entry_1,Frontier_1,Path_1,
-C,\mathbf{h},D_{\mathrm{conv}}
+Entry_C,Frontier_C,Path_C,
+D_{\mathrm{rq}},\mathbf{h},D_{\mathrm{conv}}
 \right)
 $$
 
@@ -1852,14 +2300,13 @@ coarse / select_entry_nodes
 coarse / priority_queue_walk
 mid / drill_down_from_coarse
 mid / priority_queue_walk
-fine / drill_down_from_mid
-fine / priority_queue_walk
-chunk / recall_chunks_from_membership
-chunk / bounded_chunk_edge_expansion
+chunk / select_seeds_from_mid_rq_membership
+chunk / priority_queue_walk
+chunk / gray_zone_llm_decision
 structure / restore_context_package
 ```
 
-RQ diagnostics 仍保留为 fine entry 和 path evidence：
+RQ diagnostics 保留为 semantic address、membership diagnostics 和 chunk path evidence：
 
 $$
 D_{\mathrm{rq}}(q,c)
@@ -1875,10 +2322,10 @@ result metadata 与 trace steps 保存 query/candidate RQ path、LCP depth、res
 
 **架构影响：**
 - 影响对象：搜索页结果、QA/Agent retrieval step、context package、citation payload、reward metrics、policy update 和前端检索轨迹。
-- 影响方式：layered retrieval 从加权融合排名改为 coarse/mid/fine/chunk/structure 的路径搜索；trace 必须可回放每个 entry、frontier pop、edge expansion、cycle reward、dominance pruning、收敛判断和 context 去重。
+- 影响方式：layered retrieval 从加权融合排名改为 coarse/mid/chunk/structure 的路径搜索；RQ membership/address 作为语义地址贯穿 mid entry、chunk seed selection、桥接路径解释和灰区 LLM 判停；trace 必须可回放每个 entry、frontier pop、edge expansion、cycle distance reward、gray-zone decision、dominance pruning、收敛判断和 context 去重。
 - 传播字段：`retrieval_trace_id`、`graph_retrieval_steps`、`result_chunk_ids`、`concept_path_json`、`frontier_json`、`path_labels_json`、`convergence_json`、`diagnostics_json`、`runtime_settings_hash`。
-- 触发条件：query facets、relation/fine/mid/coarse hash、edge distance protocol、traversal budget、agent envelope 或 conversation scope 变化时，graph traversal trace 与 cache key 需要刷新。
-- 验收观察点：entry node 选择可解释、frontier expansion count、path convergence score、cycle reward bounded、dominance pruning count、structure restore step、RQ diagnostics、cache hit audit 和 evidence package de-duplication。
+- 触发条件：query facets、relation/RQ/mid/coarse hash、edge distance protocol、traversal budget、agent envelope 或 conversation scope 变化时，graph traversal trace 与 cache key 需要刷新。
+- 验收观察点：entry node 选择可解释、chunk seed quality、frontier expansion count、path convergence score、gray-zone LLM decision audit、cycle distance reward bounded、dominance pruning count、structure restore step、RQ diagnostics、cache hit audit 和 evidence package de-duplication。
 
 ## Layered P&E Agent
 
@@ -1942,11 +2389,11 @@ action space：
 ```text
 activate_coarse_concepts
 route_mid_concepts
-route_fine_clusters
+route_rq_addresses
 select_entry_nodes
 walk_graph_frontier
 drill_down_layer
-follow_ambiguous_edge
+evaluate_gray_zone_path
 recall_chunks
 restore_context_package
 build_context_package
@@ -1954,7 +2401,7 @@ verify_citations
 repair_missing_citation
 repair_concept_gap
 repair_bridge_gap
-repair_formula_context
+repair_structure_context
 ```
 
 目标 action schema：
@@ -1975,13 +2422,13 @@ $$
 \{select\_entry\_nodes,walk\_graph\_frontier,recall\_chunks,restore\_context\_package,verify\_citations\}
 $$
 
-LLM 允许裁决的动作只包括语义入口、临界边和证据充分性：
+LLM 允许裁决的动作只包括语义入口、灰区路径、桥接价值、下钻时机和证据充分性：
 
 ```text
 select_entry_nodes
-follow_edge
-defer_edge
-skip_edge
+continue_path
+stop_path_irrelevant
+follow_as_bridge
 drill_down
 jump_bridge
 stop_and_collect_chunks
@@ -2028,14 +2475,16 @@ $$
 ```text
 coarse_entry_budget
 mid_entry_budget
-fine_entry_budget
+rq_membership_seed_budget
 frontier_expansion_budget
 max_depth_per_layer
 max_labels_per_node
 max_edge_reuse
 max_cycle_reward_per_path
-ambiguous_edge_distance_low
-ambiguous_edge_distance_high
+path_distance_green_threshold
+path_distance_gray_threshold
+path_distance_hard_threshold
+cycle_reward_distance_threshold
 drilldown_budget_per_layer
 chunk_candidate_budget
 structure_restore_budget
@@ -2074,32 +2523,34 @@ answer generator uses context package only
 citation verifier checks raw spans
 ```
 
-灰区边裁决：
+灰区路径裁决：
 
 $$
-Ambiguous(e)
+Gray(P)
 =
 \mathbf{1}
 \left[
-d_e\in[\tau_{strong},\tau_{weak}]
-\lor edge\_type(e)\in E_{semantic\_uncertain}
-\lor crossing\_community(e)
+D(P)\in(\tau_{\mathrm{green}},\tau_{\mathrm{gray}}]
+\lor \exists e\in tail(P): edge\_type(e)\in E_{semantic\_uncertain}
+\lor crossing\_rq\_boundary(P)
 \right]
 $$
 
-当 \(Ambiguous(e)=1\) 时，executor 生成 edge packet：
+其中 \(tail(P)\) 是当前路径最近一次扩展涉及的候选边集合。当 \(Gray(P)=1\) 时，executor 生成 path packet：
 
 ```text
 current_query_facet
 current_node_card
 candidate_neighbor_card
 edge_evidence_summary
-distance
+path_distance
+distance_zone
+rq_membership_diagnostics
+bridge_or_boundary_reason
 support_refs
-remaining_budget
 ```
 
-LLM 只能返回 typed edge decision，executor 再执行。
+LLM 只能返回 typed path decision，executor 再执行。若 \(D(P)>\tau_{\mathrm{hard}}\)，executor 直接剪枝，不询问 LLM。预算只作为每层 hard interrupt，不进入路径价值判断。
 
 
 Repair 触发：
@@ -2112,10 +2563,10 @@ $$
 
 **架构影响：**
 - 影响对象：QA 链路、layered retrieval、context package、answer session、citation verification、repair loop、reward event 和 policy state。
-- 影响方式：Agent 将用户问题、conversation state 和 graph state 转换为 typed traversal actions；validator 决定哪些动作可执行；executor 用优先队列图搜索返回 observations；LLM evaluator 只判断证据是否足够和灰区边是否值得走。
+- 影响方式：Agent 将用户问题、conversation state 和 graph state 转换为 typed traversal actions；validator 决定哪些动作可执行；executor 用优先队列图搜索返回 observations；LLM evaluator 判断证据是否足够、灰区路径是否仍有知识价值以及是否应下钻或走桥。
 - 传播字段：`agent_runs`、`agent_plans`、`agent_actions`、`agent_observations`、`retrieval_traces`、`graph_retrieval_steps`、`context_packages`、`answer_sessions`、`citation_verifications`、`reward_events`、`policy_states`。
 - 触发条件：intent、operating envelope、typed action schema、edge distance protocol、planner prompt、graph convergence failure、citation failure 或 repair budget 变化时，Agent trace 与 answer audit 需要重新生成。
-- 验收观察点：typed action validation pass rate、entry selection accuracy、ambiguous edge decision audit、frontier budget usage、repair success rate、unsupported claim rate 和 reward update 写入。
+- 验收观察点：typed action validation pass rate、entry selection accuracy、gray-zone path decision audit、frontier hard interrupt usage、repair success rate、unsupported claim rate 和 reward update 写入。
 
 ## Context Package 与引用验证
 
@@ -2130,7 +2581,7 @@ E^\star
 \left[
 Rel(E,q)
 +Cov(E)
-+Struct(E)
++Structure(E)
 +Bridge(E)
 -Redundancy(E)
 \right]
@@ -2142,7 +2593,7 @@ $$
 \sum_{e\in E} tokens(e)\le B_{ctx}
 $$
 
-其中 \(P_{\mathrm{accepted}}\) 是 traversal executor 接受的 coarse/mid/fine/chunk path labels。context package 必须去重 chunk 与 citation span，但保留重复路径带来的贡献摘要：
+其中 \(P_{\mathrm{accepted}}\) 是 traversal executor 接受的 coarse/mid/chunk path labels。RQ membership diagnostics 作为 seed selection、bridge explanation 和 gray-zone path decision 的支撑信息进入 path summary。context package 必须去重 chunk 与 citation span，但保留重复路径带来的贡献摘要：
 
 ```text
 selected_chunk_ids
@@ -2208,23 +2659,23 @@ verdict(claim,e)
 \{supported,contradicted,insufficient\}
 $$
 
-citation verification protocol 使用 `structure_plus_llm_entailment_v1`。结构规则先验证 raw span、document version、chunk id、char span、page range、section path、bbox、context package id、retrieval trace id、formula/table closure 和 bridge/context package 归属；LLM entailment judge 只在 context package 内判断 claim 是否被证据蕴含。verdict：
+citation verification protocol 使用 `structure_plus_llm_entailment_v1`。结构规则先验证 raw span、document version、chunk id、char span、page range、section path、bbox、context package id、retrieval trace id、structure closure 和 bridge/context package 归属；LLM entailment judge 只在 context package 内判断 claim 是否被证据蕴含。verdict：
 
 ```text
 supported
 unsupported
 missing_citation
-formula_table_context_missing
+structure_context_missing
 ```
 
 
 
 **架构影响：**
 - 影响对象：answer generation、citation verification、repair loop、reward metrics、policy update、QA audit 和前端证据包展示。
-- 影响方式：context package 是回答生成的唯一证据输入；引用验证把 claim 重新绑定到 raw chunk span，失败时反向触发 repair search、mid expansion、bridge jump 或 formula/table closure。
+- 影响方式：context package 是回答生成的唯一证据输入；引用验证把 claim 重新绑定到 raw chunk span，失败时反向触发 repair search、mid expansion、bridge jump 或 structure closure。
 - 传播字段：`context_package_id`、`retrieval_trace_id`、`chunk_id`、`char_span`、`page_range`、`structure_path`、`citation_verification_id`、`verification_result`。
 - 触发条件：hit chunks、structure context、bridge chunks、token budget、answer claim 或 citation span 变化时，context package 与 verification 必须重新生成。
-- 验收观察点：restored chunk count、previous/next 覆盖、bridge chunk 覆盖、citation pass rate、missing citation 数量和 formula/table context failure 数量。
+- 验收观察点：restored chunk count、previous/next 覆盖、bridge chunk 覆盖、citation pass rate、missing citation 数量和 structure context failure 数量。
 
 ## Conversation State
 
@@ -2271,18 +2722,19 @@ $$
 
 ```text
 edge_distance_protocol
-fine_community_protocol
+rq_membership_protocol
 edge_projection_protocol
 entry_selection_budget
 frontier_expansion_budget
 label_dominance_budget
 cycle_reward_cap
-ambiguous_edge_thresholds
+cycle_reward_distance_threshold
+path_distance_thresholds
 traversal_observation_budget
 context_path_summary_budget
 ```
 
-其中改变 chunking、embedding、relation graph、fine community、edge projection 或 concept graph 的参数属于 `rebuild_required`；改变 entry/frontier/label/cycle/灰区边预算但不改变 active graph 的参数属于 `hot_reloadable`，需要失效检索与 QA cache。
+其中改变 chunking、embedding、relation graph、RQ codebook、RQ membership protocol、edge projection 或 concept graph 的参数属于 `rebuild_required`；改变 entry/frontier/label/cycle/path distance threshold/gray-zone observation cadence 等不改变 active graph 的参数属于 `hot_reloadable`，需要失效检索与 QA cache。预算类参数只作为 hard interrupt，不参与路径价值排序。
 
 ### Hot refresh
 
@@ -2350,13 +2802,13 @@ repair\_success
 \right)
 $$
 
-Policy state 不替代 planner，只提供 traversal priors、constraints、safe arms、灰区阈值和 reward summary。
+Policy state 不替代 planner，只提供 traversal priors、constraints、safe arms、路径灰区阈值建议和 reward summary。
 
 
 
 **架构影响：**
 - 影响对象：chunking、embedding、BM25、graph build、graph traversal、Agent envelope、verification/repair budget、cache、prompt protocol 和 UI interaction。
-- 影响方式：runtime settings 改变工程运行点；profile 只改变交互层；policy 改变动作先验、safe arms、frontier budgets 和灰区阈值，但不替代 planner。
+- 影响方式：runtime settings 改变工程运行点；profile 只改变交互层；policy 改变动作先验、safe arms、frontier hard interrupt 上限和路径灰区阈值建议，但不替代 planner。
 - 传播字段：`runtime_settings_hash`、`agent_operating_envelope_hash`、`policy_state_hash`、`prompt_protocol_hash`、`profile_hash`、Redis runtime version message。
 - 触发条件：hot reloadable 参数触发 cache/singleton 刷新；rebuild required 参数触发 candidate settings、dry-run、shadow rebuild 与 promotion；profile 变化只刷新 prompt/UI/conversation cache。
 - 验收观察点：runtime version publish、Redis broadcast、settings cache clear、profile 不触发 graph rebuild、policy reward history 与 safe arms 可审计。
@@ -2376,7 +2828,7 @@ h_{layer}^{stored}=h_{layer}^{current}
 \right]
 $$
 
-Context graph state 保存 chunk scope、structure、relation、fine、mid、coarse、runtime、agent、policy、prompt protocol、edge distance protocol、edge projection protocol 和 traversal protocol hashes。
+Context graph state 保存 chunk scope、structure、relation、RQ membership/address、mid、coarse、runtime、agent、policy、prompt protocol、edge distance protocol、edge projection protocol 和 traversal protocol hashes。
 
 ### Freshness
 
@@ -2411,7 +2863,7 @@ $$
 **架构影响：**
 - 影响对象：graph stats、search cache、QA cache、context package reuse、front-end freshness display、runtime hot reload 和运维诊断。
 - 影响方式：freshness 用 hash 等式判断状态是否可用；cache key 把 query、filters、graph hashes、runtime hashes 与 prompt hashes 合并，防止跨状态误命中。
-- 传播字段：`context_graph_freshness`、`chunk_scope_hash`、`structure_graph_hash`、`chunk_relation_hash`、`fine_cluster_hash`、`mid_concept_hash`、`coarse_concept_hash`、`edge_distance_protocol_hash`、`edge_projection_protocol_hash`、`traversal_protocol_hash`、`runtime_settings_hash`、`conversation_state_scope_hash`。
+- 传播字段：`context_graph_freshness`、`chunk_scope_hash`、`structure_graph_hash`、`chunk_relation_hash`、`rq_membership_hash`、`mid_concept_hash`、`coarse_concept_hash`、`edge_distance_protocol_hash`、`edge_projection_protocol_hash`、`traversal_protocol_hash`、`runtime_settings_hash`、`conversation_state_scope_hash`。
 - 触发条件：任何 graph state、edge distance protocol、edge projection protocol、traversal budget、runtime settings、policy state、conversation scope 或 prompt protocol 变化时，相关 cache entry 必须失效或重新标注 stale。
 - 验收观察点：stale reasons 完整、hash mismatch 可见、cache hit 带审计信息、hot reload 后检索结果使用新 runtime hash。
 
@@ -2440,7 +2892,7 @@ chunk_structure_edges
 chunk_structure_mappings
 ```
 
-### Relation 与 fine cluster
+### Relation 与 RQ membership
 
 目标关系不变量：
 
@@ -2451,9 +2903,9 @@ source,target\in chunks
 $$
 
 $$
-membership(c,f)
+membership(c,p)
 \Rightarrow
-c\in chunks,\ f\in fine\_clusters
+c\in chunks,\ p\in rq\_prefixes
 $$
 
 目标表：
@@ -2461,9 +2913,9 @@ $$
 ```text
 chunk_relation_graph_states
 chunk_relation_edges
-fine_clusters
-fine_cluster_memberships
-fine_cluster_edges
+rq_prefixes
+rq_prefix_memberships
+rq_prefix_diagnostics
 ```
 
 目标字段闭环：
@@ -2474,36 +2926,41 @@ chunk_relation_edges:
   distance
   raw_strength
   features_json
+  normalization_stats_json
   source_algorithm
   protocol_version
+  edge_distance_protocol_hash
 
-fine_clusters:
-  node_type = fine_seed | fine_meet | fine_join | fine_bridge | rq_prefix
-  rq_level
+rq_prefixes:
+  rq_level = 1 | 2 | 3
   rq_path_prefix
+  parent_rq_prefix_id
+  codebook_version
   diagnostics_json
 
-fine_cluster_memberships:
+rq_prefix_memberships:
   membership_score
   membership_role
   residual_norm
-  support_chunk_edge_ids
-
-fine_cluster_edges:
-  edge_type
-  distance
-  raw_strength
-  support_chunk_ids
-  support_chunk_edge_ids
+  membership_entropy
+  rank
+  top_alternative_prefix_ids
   diagnostics_json
+
+rq_prefix_diagnostics:
+  diagnostic_type
+  diagnostic_strength
+  support_membership_mass
+  support_chunk_ids_sample
+  protocol_version
 ```
 
-目标 relation/fine 不变量：
+目标 relation/RQ 不变量：
 
 $$
-edge_F(f_a,f_b)
+membership(c,p)
 \Rightarrow
-|support\_chunk\_edge\_ids(edge_F)|>0
+\mu_{c,p}\in[0,1]
 $$
 
 $$
@@ -2519,7 +2976,11 @@ $$
 $$
 
 $$
-\forall k\in V_K,\quad support(k)=\bigcup_{m\in M_k}support(m)
+\forall m\in V_M,\quad RQPrefixLevel(m)=3
+$$
+
+$$
+\forall k\in V_K,\quad RQPrefixLevel(k)=2
 $$
 
 目标表：
@@ -2541,34 +3002,67 @@ coarse_concept_definitions
 
 ```text
 mid_concepts:
-  support_fine_cluster_ids
+  support_rq_l3_prefix_id
+  parent_rq_l2_prefix_id
+  parent_rq_l1_prefix_id
   support_chunk_ids
+  support_chunk_edge_ids
   representative_chunk_ids
+  core_chunk_ids
+  boundary_chunk_ids
+  bridge_chunk_ids
+  outlier_chunk_ids
+  display_terms_json
+  summary
+  internal_state_json
+  raw_node_weight
+  node_weight
+  node_weight_normalization_scope
+  node_weight_diagnostics_json
   grounding_hash
 
 mid_concept_edges:
   edge_type
   distance
+  projected_distance_raw
+  projected_strength_raw
   raw_strength_summary
-  support_fine_edge_ids
-  support_fine_node_ids
+  projection_normalization_stats_json
+  edge_projection_protocol_hash
+  support_rq_prefix_ids
+  support_chunk_edge_ids
   support_chunk_ids
   diagnostics_json
 
 coarse_concepts:
+  support_rq_l2_prefix_id
+  parent_rq_l1_prefix_id
+  child_rq_l3_prefix_ids
   included_mid_concept_ids
   bridge_mid_concept_ids
   boundary_mid_concept_ids
+  outlier_mid_concept_ids
+  display_terms_json
+  summary
+  internal_state_json
+  raw_node_weight
+  node_weight
+  node_weight_normalization_scope
+  node_weight_diagnostics_json
   grounding_hash
 
 coarse_concept_edges:
   edge_type
   distance
+  projected_distance_raw
+  projected_strength_raw
   raw_strength_summary
-  support_mid_edge_ids
-  support_fine_edge_ids
+  projection_normalization_stats_json
+  edge_projection_protocol_hash
+  support_child_mid_edge_ids
+  support_chunk_edge_ids
   support_chunk_ids
-  cross_community_weak_ties
+  cross_prefix_weak_support
   diagnostics_json
 ```
 
@@ -2577,13 +3071,13 @@ coarse_concept_edges:
 $$
 edge_M(m_a,m_b)
 \Rightarrow
-|support\_fine\_edge\_ids(edge_M)|>0
+|support\_chunk\_edge\_ids(edge_M)|>0
 $$
 
 $$
 edge_K(k_a,k_b)
 \Rightarrow
-|support\_mid\_edge\_ids(edge_K)|>0
+|support\_chunk\_edge\_ids(edge_K)|>0
 $$
 
 ### Retrieval、QA、Agent、策略
@@ -2649,8 +3143,8 @@ graph_retrieval_steps:
   popped_frontier_state
   expanded_edge_ids
   dominance_pruned_count
-  cycle_reward
-  ambiguous_edge_decisions
+  cycle_distance_reward
+  gray_zone_path_decisions
   stop_reason
 
 context_packages:
@@ -2671,7 +3165,7 @@ agent_actions:
 agent_observations:
   frontier_summary
   evidence_roles
-  remaining_budget
+  hard_interrupt_budget_status
   evaluator_verdict
 ```
 
@@ -2719,14 +3213,15 @@ $$
 
 routers 覆盖 health、knowledge、ingestion、search、sessions/QA、settings 和 maintenance。Layered search 返回 results、audit 和 trace id；context package 和 retrieval steps 可单独读取。
 
-目标 API 必须能表达新版图导航 payload：
+目标 API 必须能表达图导航 payload：
 
 ```text
 graph payload:
   node counts / sampled counts / freshness / hashes
-  fine node_type and membership
+  RQ prefix level and membership
   edge distance / raw_strength / support edge ids
   mid/coarse edge projection support
+  mid/coarse projected_distance_raw and projection calibration stats
 
 search trace payload:
   query facets
@@ -2734,8 +3229,8 @@ search trace payload:
   frontier pops
   expanded edges
   dominance pruning
-  cycle reward
-  ambiguous edge decisions
+  cycle distance reward
+  gray-zone path decisions
   drilldown path
   convergence reason
 
@@ -2758,7 +3253,7 @@ UI
 \{Graph,SearchTrace,ContextPackage,AnswerAudit\}
 $$
 
-图谱层包括 chunk-structure、chunk-relation、fine/relation communities、mid-concepts、coarse-concepts。每层 payload 需要 counts、sampled counts、freshness、hash、grounding、edge distance distribution、projection support 和 traversal contribution。
+图谱层包括 chunk-structure、chunk-relation、RQ membership/address、mid-concepts、coarse-concepts。每层 payload 需要 counts、sampled counts、freshness、hash、grounding、edge distance distribution、projection support、projection calibration diagnostics 和 traversal contribution。
 
 搜索页必须展示：
 
@@ -2767,8 +3262,8 @@ entry node candidates and selected entries
 frontier expansion timeline
 edge distance and support evidence
 dominance pruning count
-cycle reward and convergence score
-drilldown path coarse -> mid -> fine -> chunk
+cycle distance reward and convergence score
+drilldown path coarse -> mid -> chunk
 context package de-duplication result
 ```
 
@@ -2776,7 +3271,7 @@ QA/Agent 页必须展示：
 
 ```text
 typed actions
-ambiguous edge decisions
+gray-zone path decisions
 observations
 evaluator verdicts
 budget usage
@@ -2801,27 +3296,39 @@ $$
 
 脚本验收必须覆盖 rebuild、reconcile、diagnose、evaluate、quality check 和 docker smoke。输出写入 `output/`。
 
-目标脚本必须补齐新版验收工件：
+目标脚本必须补齐验收工件：
 
 ```text
 four_layer_graph_diagnose:
   edge distance distribution
-  fine community coverage
-  meet/join/bridge node counts
+  raw strength distribution by edge type
+  normalization stats by edge type
+  path threshold hit distribution
+  RQ L3-to-mid projection coverage
+  RQ L2-to-coarse projection coverage
+  membership role distribution
   edge projection support density
+  projection calibration stats by layer and edge type
+  raw projected distance distribution for mid/coarse edges
+  calibrated projected distance distribution for mid/coarse edges
   weak tie preservation
+  mid node weight diagnostics
+  coarse node weight diagnostics
+  node weight layer-local normalization
 
 retrieval_trace_evaluate:
   entry selection hit
+  chunk seed quality
   frontier expansion count
   dominance pruning count
-  cycle reward bounded
+  gray-zone path decision audit
+  cycle distance reward bounded
   convergence reason
   context dedupe rate
 
 agent_trace_evaluate:
   typed action validation
-  ambiguous edge decision audit
+  gray-zone path decision audit
   evaluator verdict consistency
   repair path coverage
 ```
@@ -2955,23 +3462,27 @@ structure mapping coverage
 relation edge count by edge_type
 relation edge distance distribution
 bridge edge count
-fine cluster singleton rate
-fine community coverage
-fine meet / join / bridge node counts
+RQ membership coverage
+RQ L3-to-mid projection coverage
+RQ L2-to-coarse projection coverage
 RQ path availability
-RQ cluster edge types
+RQ prefix diagnostics
 edge projection support density
 mid concept grounded rate
-mid edge support_fine_edge_ids coverage
+mid node weight diagnostics
+coarse node weight diagnostics
+node weight layer-local normalization
+mid edge support_chunk_edge_ids coverage
 coarse diagnostics
-coarse edge support_mid_edge_ids coverage
+coarse edge support_chunk_edge_ids coverage
 context graph freshness
 retrieval trace graph steps
+chunk seed quality
 entry selection hit rate
 frontier expansion count
 dominance pruning count
-cycle reward boundedness
-ambiguous edge decision audit
+gray-zone path decision audit
+cycle distance reward boundedness
 convergence stop reason distribution
 context package restore counts
 context package dedupe rate
@@ -2989,7 +3500,7 @@ runtime settings version publish
 - 影响方式：测试把架构不变量转成可执行断言；诊断把 graph quality、edge projection quality、traversal quality、citation quality 和 runtime behavior 转成可比较输出。
 - 传播字段：pytest result、Vitest result、docker smoke output、diagnostics JSON、benchmark logs、retrieval evaluation report、agent trace report、runtime probe report。
 - 触发条件：任何代码、schema、脚本、API、运行参数、edge protocol、traversal protocol 或文档验收边界变化时，对应测试与 `output/` 报告需要更新。
-- 验收观察点：关键路径测试通过、edge projection 不断链、frontier trace 可回放、cycle reward 有界、报告时间戳可追踪、失败项有可行动上下文、真实资料采样不进入仓库、`output/` 不提交。
+- 验收观察点：关键路径测试通过、edge projection 不断链、frontier trace 可回放、cycle distance reward 有界、报告时间戳可追踪、失败项有可行动上下文、真实资料采样不进入仓库、`output/` 不提交。
 
 ## 核心原则
 
@@ -3032,10 +3543,10 @@ $$
 3. 结构图负责原文地图和上下文恢复。
 4. Contextual text 服务 embedding 与 BM25，citation 指向 raw chunk span。
 5. Relation graph 由可复算信号构建。
-6. Fine clusters 是路由区域，不是事实源。
-7. RQ-KMeans 提供残差语义地址、prefix clusters 和 RQ edges。
+6. RQ membership/address 是路由、归属和诊断协议，不是事实源。
+7. RQ-KMeans 提供残差语义地址、L3/L2/L1 prefix membership 和 chunk pair evidence。
 8. Mid concept 必须由 concept packet、support chunks 和 grounded gate 支撑。
-9. Coarse concept 必须由 mid concept community、bridge concepts 和 weak ties 支撑。
+9. Coarse concept 必须由 RQ L2 packet、child L3 summaries、support chunks 和底层 chunk edge projection 支撑。
 10. Layered retrieval 通过入口选择、距离边、优先队列路径搜索、层级下钻和结构恢复完成图导航。
 11. Agent 只能在 typed action space 内规划。
 12. Validator 必须检查 action、预算和 required actions。

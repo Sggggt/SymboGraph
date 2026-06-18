@@ -17,12 +17,17 @@ def test_alembic_upgrade_creates_four_layer_schema(tmp_path, monkeypatch):
     config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path.as_posix()}")
     command.upgrade(config, "head")
     tables = set(inspect(engine).get_table_names())
+    columns = {column["name"] for column in inspect(engine).get_columns("graph_retrieval_steps")}
     assert "chunks" in tables
     assert "chunk_structure_nodes" in tables
     assert "chunk_relation_edges" in tables
-    assert "fine_clusters" in tables
+    assert "rq_prefixes" in tables
     assert "mid_concepts" in tables
     assert "coarse_concepts" in tables
     assert "context_packages" in tables
     assert "evidence_atoms" not in tables
     assert "active_chunks" not in tables
+    assert "cycle_distance_reward" in columns
+    assert "gray_zone_path_decisions_json" in columns
+    assert "cycle_reward" not in columns
+    assert "ambiguous_edge_decisions_json" not in columns

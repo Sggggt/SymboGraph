@@ -58,23 +58,11 @@ def upgrade() -> None:
             sa.Column("diagnostics_json", sa.JSON(), nullable=True),
         ],
     )
-    _add_columns("fine_clusters", [sa.Column("node_type", sa.String(length=64), nullable=True)])
+    _add_columns("rq_prefixes", [sa.Column("node_type", sa.String(length=64), nullable=True)])
     _add_columns(
-        "fine_cluster_memberships",
+        "rq_prefix_memberships",
         [
             sa.Column("membership_role", sa.String(length=64), nullable=True),
-            sa.Column("support_chunk_edge_ids_json", sa.JSON(), nullable=True),
-        ],
-    )
-    _add_columns(
-        "fine_cluster_edges",
-        [
-            sa.Column("distance", sa.Float(), nullable=True),
-            sa.Column("raw_strength", sa.Float(), nullable=True),
-            sa.Column("raw_strength_summary_json", sa.JSON(), nullable=True),
-            sa.Column("features_json", sa.JSON(), nullable=True),
-            sa.Column("source_algorithm", sa.String(length=64), nullable=True),
-            sa.Column("protocol_version", sa.String(length=64), nullable=True),
             sa.Column("support_chunk_edge_ids_json", sa.JSON(), nullable=True),
         ],
     )
@@ -83,8 +71,7 @@ def upgrade() -> None:
         [
             sa.Column("distance", sa.Float(), nullable=True),
             sa.Column("raw_strength_summary_json", sa.JSON(), nullable=True),
-            sa.Column("support_fine_edge_ids_json", sa.JSON(), nullable=True),
-            sa.Column("support_fine_node_ids_json", sa.JSON(), nullable=True),
+            sa.Column("support_rq_prefix_node_ids_json", sa.JSON(), nullable=True),
         ],
     )
     _add_columns(
@@ -92,7 +79,6 @@ def upgrade() -> None:
         [
             sa.Column("distance", sa.Float(), nullable=True),
             sa.Column("raw_strength_summary_json", sa.JSON(), nullable=True),
-            sa.Column("support_fine_edge_ids_json", sa.JSON(), nullable=True),
             sa.Column("support_chunk_ids_json", sa.JSON(), nullable=True),
             sa.Column("cross_community_weak_ties_json", sa.JSON(), nullable=True),
         ],
@@ -135,9 +121,8 @@ def upgrade() -> None:
 
     for table_name, columns in {
         "chunk_relation_edges": ["distance"],
-        "fine_clusters": ["node_type"],
-        "fine_cluster_memberships": ["membership_role"],
-        "fine_cluster_edges": ["distance", "source_algorithm", "protocol_version"],
+        "rq_prefixes": ["node_type"],
+        "rq_prefix_memberships": ["membership_role"],
         "mid_concept_edges": ["distance"],
         "coarse_concept_edges": ["distance"],
         "retrieval_traces": [

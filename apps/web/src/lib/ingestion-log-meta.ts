@@ -19,7 +19,7 @@ export const logEventLabels: Record<string, string> = {
   context_graph_started: "四层上下文图谱开始",
   chunk_structure_completed: "结构图完成",
   chunk_relation_completed: "片段关系图完成",
-  fine_clusters_completed: "Fine/RQ 层完成",
+  rq_prefixes_completed: "RQ membership 层完成",
   mid_concepts_completed: "中粒度概念完成",
   coarse_concepts_completed: "粗粒度概念完成",
   context_graph_completed: "上下文图谱完成",
@@ -56,7 +56,8 @@ export function logVisualTone(item: Pick<IngestionLogEvent, "event" | "stage" | 
     item.event.includes("context_graph") ||
     item.event.includes("chunk_") ||
     item.event.includes("concept") ||
-    item.event.includes("cluster") ||
+    item.event.includes("prefix") ||
+    item.event.includes("membership") ||
     item.event.includes("graph") ||
     item.event.includes("compensation") ||
     item.phase?.includes("context_graph")
@@ -72,7 +73,8 @@ export function graphLogSummary(item: IngestionLogEvent): string | null {
     item.event.includes("context_graph") ||
     item.event.includes("chunk_") ||
     item.event.includes("concept") ||
-    item.event.includes("cluster") ||
+    item.event.includes("prefix") ||
+    item.event.includes("membership") ||
     item.event.includes("graph") ||
     item.event === "file_indexed" ||
     phase.includes("context_graph");
@@ -87,8 +89,7 @@ export function graphLogSummary(item: IngestionLogEvent): string | null {
     "context_graph:starting": "上下文图谱初始化",
     "context_graph:chunk_relation": "片段关系图",
     "context_graph:chunk_relation:chunk_edges": "关系边生成",
-    "context_graph:chunk_relation:fine_clusters": "Fine/RQ 节点",
-    "context_graph:chunk_relation:fine_edges": "Fine/RQ 边",
+    "context_graph:chunk_relation:rq_prefixes": "RQ 前缀与归属",
     "context_graph:mid_concepts": "中粒度概念",
     "context_graph:coarse_concepts": "粗粒度概念",
     "context_graph:context_state": "Context Graph 状态",
@@ -110,7 +111,7 @@ export function graphLogSummary(item: IngestionLogEvent): string | null {
   pushNumber("向量", item.vector_count);
   pushNumber("BM25", item.bm25_record_count);
   pushNumber("关系边", item.relation_edge_count);
-  pushNumber("Fine/RQ", item.fine_cluster_count);
+  pushNumber("RQ membership", item.rq_prefix_count);
   pushNumber("中概念", item.mid_concept_count);
   pushNumber("粗概念", item.coarse_concept_count);
   if (item.context_graph_hash) {
