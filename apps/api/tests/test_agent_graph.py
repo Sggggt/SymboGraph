@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -42,6 +43,36 @@ async def test_citation_verification_normalizes_label_confidence(monkeypatch):
     assert results[0]["confidence"] == 0.85
     assert results[0]["diagnostics"]["llm_entailment_confidence"]["confidence_raw"] == "high"
     assert results[0]["diagnostics"]["llm_entailment_confidence"]["confidence_normalized_from"] == "label"
+
+
+@pytest.mark.asyncio
+async def test_citation_verification_hard_interrupts_slow_judge(monkeypatch):
+    from app.services import agent_graph
+
+    class SlowChatProvider:
+        async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
+            await asyncio.sleep(1)
+            return {"verifications": []}
+
+    monkeypatch.setattr(agent_graph, "ChatProvider", SlowChatProvider)
+    monkeypatch.setattr(agent_graph, "citation_verification_judge_timeout_seconds", lambda verification_budget: 0.01)
+
+    results = await agent_graph.verify_answer_against_context(
+        "Bayesian regression uses a normal likelihood.",
+        [
+            {
+                "citation_index": 1,
+                "chunk_id": "chunk-1",
+                "source_span": {"chunk_id": "chunk-1", "char_span": [0, 42]},
+            }
+        ],
+        [{"chunk_id": "chunk-1", "content": "Bayesian regression uses a normal likelihood."}],
+        verification_budget=1,
+    )
+
+    assert results[0]["verdict"] == "unsupported"
+    assert results[0]["failure_type"] == "verification_model_timeout"
+    assert results[0]["diagnostics"]["llm_entailment_judge"] == "timeout_hard_interrupt"
 
 
 def test_citation_payloads_supported_only_filters_failed_verifications():

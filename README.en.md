@@ -25,7 +25,7 @@ SymboGraph is a local, general-purpose intelligent knowledge base. It uses Four-
 
 ## Product Positioning
 
-SymboGraph is built for local document libraries, course material, technical docs, and research collections that need strict citation, traceable graph retrieval, and inspectable context packaging. PostgreSQL is the source of truth; Qdrant, BM25, and Redis are derived state. Answer facts come only from context packages and raw chunk citation spans.
+SymboGraph is built for local document libraries, course material, technical docs, and research collections that need strict citation, traceable graph retrieval, and inspectable context packaging. PostgreSQL is the source of truth; Qdrant and Redis are active derived/runtime state. Answer facts come only from context packages and raw chunk citation spans.
 
 ## Stack
 
@@ -34,9 +34,8 @@ SymboGraph is built for local document libraries, course material, technical doc
 | Backend | Python 3.13, FastAPI, SQLAlchemy, Alembic, Pydantic |
 | Storage | PostgreSQL 16, Qdrant 1.17.1, Redis 7 |
 | Jobs | Celery, Redis broker |
-| Retrieval | Dense embedding, BM25, chunk relation graph, RQ membership, layered traversal |
+| Retrieval | Dense embedding, dense-only chunk relation graph, RQ membership, staged layered traversal |
 | Models | OpenAI-compatible chat and embedding endpoints |
-| Rerank | Optional Cross-Encoder reranker |
 | Frontend | Next.js 16.2.4, React 19.2.4, TypeScript, TanStack Query, Tailwind CSS, ECharts |
 | Operations | Docker Compose, Python maintenance scripts, pytest, Vitest, ESLint |
 
@@ -47,7 +46,7 @@ source files
 -> parser and layout extractor
 -> fixed token chunks
 -> chunk structure graph
--> contextual embedding and BM25
+-> contextual embedding and vector index
 -> independent chunk relation graph
 -> RQ prefix address tree and fuzzy membership
 -> RQ L3 mid concept graph
@@ -89,18 +88,6 @@ ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 ```
 
-Cross-Encoder reranking is optional and disabled by default:
-
-```env
-RERANKER_ENABLED=true
-RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
-RERANKER_MAX_LENGTH=512
-RERANKER_DEVICE=cpu
-HF_HUB_OFFLINE=1
-```
-
-The Docker image installs the API `[rerank]` extra. The Hugging Face cache is mounted at `data/models/huggingface`; pass `PRELOAD_RERANK_MODEL=true` during image build to bake the model into the image.
-
 ## Quick Start
 
 ```powershell
@@ -124,7 +111,7 @@ Health: http://127.0.0.1:8000/api/health
 | Task queue | `INGESTION_TASK_QUEUE` |
 | Infrastructure | `DATABASE_URL`, `QDRANT_URL`, `QDRANT_COLLECTION`, `REDIS_URL`, `CORS_ORIGINS`, `API_KEYS` |
 | Data roots | `KNOWLEDGE_BASE_NAME`, `DATA_ROOT`, `STORAGE_ROOT`, `INGESTION_ROOT` |
-| Model bridge | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT` |
+| Model bridge | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT`, `MODEL_BRIDGE_ADMIN_TOKEN` |
 | Chat | `OPENAI_API_KEY`, `CHAT_BASE_URL`, `CHAT_RESOLVE_IP`, `CHAT_MODEL` |
 | Embedding | `EMBEDDING_API_KEY`, `EMBEDDING_BASE_URL`, `EMBEDDING_RESOLVE_IP`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_BATCH_SIZE` |
 | Concurrency | `WORKER_CONCURRENCY`, `WORKER_MAX_TASKS_PER_CHILD`, `MODEL_REQUEST_CONCURRENCY`, `MODEL_REQUEST_TIMEOUT_SECONDS` |
@@ -132,8 +119,8 @@ Health: http://127.0.0.1:8000/api/health
 | Chunks and context | `FIXED_CHUNK_SIZE_TOKENS`, `FIXED_CHUNK_OVERLAP_TOKENS`, `CONTEXT_PACKAGE_TOKEN_BUDGET` |
 | Mid concepts | `MID_CONCEPT_EXTRACTION_MAX_MODEL_BATCHES`, `MID_CONCEPT_EXTRACTION_MAX_CANDIDATES_PER_BATCH`, `MID_CONCEPT_EXTRACTION_MAX_TOKENS_PER_BATCH`, `MID_CONCEPT_CANDIDATE_KEEP_THRESHOLD` |
 | RQ-KMeans | `RQ_KMEANS_LEVELS`, `RQ_KMEANS_MAX_K`, `RQ_RESIDUAL_TAU` |
-| Agent envelope | `AGENT_COARSE_ENTRY_BUDGET`, `AGENT_COARSE_JUMP_BUDGET`, `AGENT_MID_ENTRY_BUDGET`, `AGENT_MID_EXPANSION_RADIUS_CAP`, `AGENT_RQ_MEMBERSHIP_SEED_BUDGET`, `AGENT_FRONTIER_EXPANSION_BUDGET`, `AGENT_MAX_DEPTH_PER_LAYER`, `AGENT_MAX_LABELS_PER_NODE`, `AGENT_MAX_EDGE_REUSE`, `AGENT_MAX_CYCLE_REWARD_PER_PATH`, `AGENT_CYCLE_REWARD_DISTANCE_THRESHOLD`, `AGENT_PATH_DISTANCE_GREEN_THRESHOLD`, `AGENT_PATH_DISTANCE_GRAY_THRESHOLD`, `AGENT_PATH_DISTANCE_HARD_THRESHOLD`, `AGENT_DRILLDOWN_BUDGET_PER_LAYER`, `AGENT_CHUNK_CANDIDATE_BUDGET`, `AGENT_STRUCTURE_RESTORE_BUDGET`, `CONTEXT_PATH_SUMMARY_BUDGET`, `AGENT_PLANNING_ROUND_BUDGET`, `AGENT_MAX_TYPED_ACTIONS_PER_ROUND`, `AGENT_REPAIR_ROUND_BUDGET`, `AGENT_VERIFICATION_BUDGET` |
-| Rerank | `RERANKER_ENABLED`, `RERANKER_MODEL`, `RERANKER_MAX_LENGTH`, `RERANKER_DEVICE`, `HF_HUB_OFFLINE` |
+| Dense relation operating point | `DENSE_KNN_K_MIN`, `DENSE_KNN_K_MAX`, `DENSE_REVERSE_B_MIN_BASE`, `DENSE_REVERSE_B_MAX_BASE`, `DENSE_REVERSE_B_MIN_DOC`, `DENSE_REVERSE_B_MAX_DOC`, `DENSE_REVERSE_B_MIN_LANG`, `DENSE_REVERSE_B_MAX_LANG`, `DENSE_MIN_COSINE`, `DENSE_STRONG_COSINE`, `CROSS_DOC_OUT_QUOTA_MIN`, `CROSS_DOC_OUT_QUOTA_MAX`, `CROSS_DOC_MIN_COSINE`, `CROSS_LANGUAGE_OUT_QUOTA_MIN`, `CROSS_LANGUAGE_OUT_QUOTA_MAX`, `CROSS_LANGUAGE_MIN_COSINE` |
+| Agent envelope | `AGENT_COARSE_TOTAL_BUDGET`, `AGENT_MID_PER_COARSE_BUDGET`, `AGENT_MID_TOP_K`, `AGENT_CHUNK_PER_MID_BUDGET`, `AGENT_CHUNK_TOP_K`, `CANDIDATE_POOL_DEDUPE_BUDGET`, `AGENT_MAX_DEPTH_PER_LAYER`, `AGENT_MAX_LABELS_PER_NODE`, `AGENT_MAX_EDGE_REUSE`, `AGENT_MAX_CYCLE_REWARD_PER_PATH`, `AGENT_CYCLE_REWARD_DISTANCE_THRESHOLD`, `AGENT_PATH_DISTANCE_GREEN_THRESHOLD`, `AGENT_PATH_DISTANCE_GRAY_THRESHOLD`, `AGENT_PATH_DISTANCE_HARD_THRESHOLD`, `AGENT_STRUCTURE_RESTORE_BUDGET`, `CONTEXT_PATH_SUMMARY_BUDGET`, `AGENT_PLANNING_ROUND_BUDGET`, `AGENT_MAX_TYPED_ACTIONS_PER_ROUND`, `AGENT_REPAIR_ROUND_BUDGET`, `AGENT_VERIFICATION_BUDGET` |
 | Fallback | `ENABLE_MODEL_FALLBACK`, `ENABLE_DATABASE_FALLBACK` |
 
 ## Verification
@@ -158,8 +145,7 @@ python scripts/check_context_package_quality.py
 python scripts/evaluate_agent_trace.py
 python scripts/check_technical_spec_compliance.py --knowledge-base-name Bayes
 python scripts/reconcile_vector_records.py
-python scripts/reconcile_bm25_records.py
-python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --worker-container course-kg-worker
+python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
 ```
 
 Write scripts default to dry-run or require explicit `--execute`. Generated reports go under `output/`.
@@ -182,6 +168,6 @@ Write scripts default to dry-run or require explicit `--execute`. Generated repo
 - Mid concepts are a one-to-one projection of RQ L3 prefixes, Coarse concepts are a one-to-one projection of RQ L2 prefixes, and upper-layer edges must be projected from bottom chunk relation edge support.
 - QA uses context packages, not raw search results.
 - Citations point to raw chunk spans.
-- Qdrant, BM25, and Redis are derived state and must be rebuildable from PostgreSQL.
+- Qdrant and Redis are active derived/runtime state and must be rebuildable or refreshable from PostgreSQL.
 - Profile affects only prompts, UI labels, and conversation preferences.
 - PostgreSQL, Qdrant, Redis, model endpoints, and no-fallback paths are verified inside the Docker stack.

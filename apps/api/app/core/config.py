@@ -29,10 +29,6 @@ HOT_RELOAD_SETTINGS = {
     "fixed_chunk_overlap_tokens",
     "context_package_token_budget",
     "enable_model_fallback",
-    "reranker_enabled",
-    "reranker_model",
-    "reranker_max_length",
-    "reranker_device",
     "mid_concept_extraction_max_model_batches",
     "mid_concept_extraction_max_candidates_per_batch",
     "mid_concept_extraction_max_tokens_per_batch",
@@ -40,12 +36,27 @@ HOT_RELOAD_SETTINGS = {
     "rq_kmeans_levels",
     "rq_kmeans_max_k",
     "rq_residual_tau",
-    "agent_coarse_entry_budget",
-    "agent_coarse_jump_budget",
-    "agent_mid_entry_budget",
-    "agent_mid_expansion_radius_cap",
-    "agent_rq_membership_seed_budget",
-    "agent_frontier_expansion_budget",
+    "dense_knn_k_min",
+    "dense_knn_k_max",
+    "dense_reverse_b_min_base",
+    "dense_reverse_b_max_base",
+    "dense_reverse_b_min_doc",
+    "dense_reverse_b_max_doc",
+    "dense_reverse_b_min_lang",
+    "dense_reverse_b_max_lang",
+    "dense_min_cosine",
+    "dense_strong_cosine",
+    "cross_doc_out_quota_min",
+    "cross_doc_out_quota_max",
+    "cross_doc_min_cosine",
+    "cross_language_out_quota_min",
+    "cross_language_out_quota_max",
+    "cross_language_min_cosine",
+    "agent_coarse_total_budget",
+    "agent_mid_per_coarse_budget",
+    "agent_mid_top_k",
+    "agent_chunk_per_mid_budget",
+    "agent_chunk_top_k",
     "agent_max_depth_per_layer",
     "agent_max_labels_per_node",
     "agent_max_edge_reuse",
@@ -54,8 +65,7 @@ HOT_RELOAD_SETTINGS = {
     "agent_path_distance_green_threshold",
     "agent_path_distance_gray_threshold",
     "agent_path_distance_hard_threshold",
-    "agent_drilldown_budget_per_layer",
-    "agent_chunk_candidate_budget",
+    "candidate_pool_dedupe_budget",
     "agent_structure_restore_budget",
     "context_path_summary_budget",
     "agent_planning_round_budget",
@@ -120,10 +130,6 @@ class Settings(BaseSettings):
     fixed_chunk_overlap_tokens: int = Field(default=80, ge=0, le=1024)
     context_package_token_budget: int = Field(default=2400, ge=256, le=20000)
     enable_model_fallback: bool = False
-    reranker_enabled: bool = False
-    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    reranker_max_length: int = Field(default=512, ge=64, le=2048)
-    reranker_device: Literal["cpu", "cuda"] = "cpu"
     mid_concept_extraction_max_model_batches: int = Field(default=4, ge=0, le=64)
     mid_concept_extraction_max_candidates_per_batch: int = Field(default=8, ge=1, le=500)
     mid_concept_extraction_max_tokens_per_batch: int = Field(default=2400, ge=500, le=50000)
@@ -131,12 +137,27 @@ class Settings(BaseSettings):
     rq_kmeans_levels: int = Field(default=3, ge=1, le=8)
     rq_kmeans_max_k: int = Field(default=6, ge=1, le=64)
     rq_residual_tau: float = Field(default=0.65, gt=0.0, le=10.0)
-    agent_coarse_entry_budget: int = Field(default=8, ge=1, le=100)
-    agent_coarse_jump_budget: int = Field(default=2, ge=0, le=20)
-    agent_mid_entry_budget: int = Field(default=16, ge=1, le=200)
-    agent_mid_expansion_radius_cap: int = Field(default=2, ge=0, le=8)
-    agent_rq_membership_seed_budget: int = Field(default=16, ge=1, le=500)
-    agent_frontier_expansion_budget: int = Field(default=80, ge=1, le=2000)
+    dense_knn_k_min: int = Field(default=5, ge=1, le=200)
+    dense_knn_k_max: int = Field(default=16, ge=1, le=500)
+    dense_reverse_b_min_base: int = Field(default=2, ge=1, le=200)
+    dense_reverse_b_max_base: int = Field(default=12, ge=1, le=500)
+    dense_reverse_b_min_doc: int = Field(default=1, ge=0, le=200)
+    dense_reverse_b_max_doc: int = Field(default=8, ge=1, le=500)
+    dense_reverse_b_min_lang: int = Field(default=1, ge=0, le=200)
+    dense_reverse_b_max_lang: int = Field(default=8, ge=1, le=500)
+    dense_min_cosine: float = Field(default=0.30, ge=-1.0, le=1.0)
+    dense_strong_cosine: float = Field(default=0.72, ge=-1.0, le=1.0)
+    cross_doc_out_quota_min: int = Field(default=1, ge=0, le=200)
+    cross_doc_out_quota_max: int = Field(default=4, ge=1, le=500)
+    cross_doc_min_cosine: float = Field(default=0.36, ge=-1.0, le=1.0)
+    cross_language_out_quota_min: int = Field(default=1, ge=0, le=200)
+    cross_language_out_quota_max: int = Field(default=4, ge=1, le=500)
+    cross_language_min_cosine: float = Field(default=0.34, ge=-1.0, le=1.0)
+    agent_coarse_total_budget: int = Field(default=8, ge=1, le=200)
+    agent_mid_per_coarse_budget: int = Field(default=8, ge=1, le=500)
+    agent_mid_top_k: int = Field(default=16, ge=1, le=500)
+    agent_chunk_per_mid_budget: int = Field(default=8, ge=1, le=1000)
+    agent_chunk_top_k: int = Field(default=80, ge=1, le=2000)
     agent_max_depth_per_layer: int = Field(default=3, ge=1, le=12)
     agent_max_labels_per_node: int = Field(default=3, ge=1, le=20)
     agent_max_edge_reuse: int = Field(default=2, ge=1, le=20)
@@ -145,15 +166,13 @@ class Settings(BaseSettings):
     agent_path_distance_green_threshold: float = Field(default=0.45, ge=0.0, le=20.0)
     agent_path_distance_gray_threshold: float = Field(default=1.35, ge=0.0, le=20.0)
     agent_path_distance_hard_threshold: float = Field(default=2.4, ge=0.0, le=40.0)
-    agent_drilldown_budget_per_layer: int = Field(default=16, ge=1, le=500)
-    agent_chunk_candidate_budget: int = Field(default=80, ge=1, le=1000)
+    candidate_pool_dedupe_budget: int = Field(default=1000, ge=1, le=20000)
     agent_structure_restore_budget: int = Field(default=16, ge=1, le=200)
     context_path_summary_budget: int = Field(default=32, ge=1, le=500)
     agent_planning_round_budget: int = Field(default=2, ge=1, le=10)
     agent_max_typed_actions_per_round: int = Field(default=8, ge=1, le=50)
     agent_repair_round_budget: int = Field(default=2, ge=0, le=10)
     agent_verification_budget: int = Field(default=8, ge=1, le=100)
-    model_cache_root: Path = Field(default=WORKSPACE_ROOT / "models" / "huggingface")
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -222,7 +241,6 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
     bool_fields = {
         "model_bridge_enabled",
         "enable_model_fallback",
-        "reranker_enabled",
     }
     int_fields = {
         "model_bridge_port",
@@ -233,23 +251,32 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "fixed_chunk_size_tokens",
         "fixed_chunk_overlap_tokens",
         "context_package_token_budget",
-        "reranker_max_length",
         "mid_concept_extraction_max_model_batches",
         "mid_concept_extraction_max_candidates_per_batch",
         "mid_concept_extraction_max_tokens_per_batch",
         "rq_kmeans_levels",
         "rq_kmeans_max_k",
-        "agent_coarse_entry_budget",
-        "agent_coarse_jump_budget",
-        "agent_mid_entry_budget",
-        "agent_mid_expansion_radius_cap",
-        "agent_rq_membership_seed_budget",
-        "agent_frontier_expansion_budget",
+        "dense_knn_k_min",
+        "dense_knn_k_max",
+        "dense_reverse_b_min_base",
+        "dense_reverse_b_max_base",
+        "dense_reverse_b_min_doc",
+        "dense_reverse_b_max_doc",
+        "dense_reverse_b_min_lang",
+        "dense_reverse_b_max_lang",
+        "cross_doc_out_quota_min",
+        "cross_doc_out_quota_max",
+        "cross_language_out_quota_min",
+        "cross_language_out_quota_max",
+        "agent_coarse_total_budget",
+        "agent_mid_per_coarse_budget",
+        "agent_mid_top_k",
+        "agent_chunk_per_mid_budget",
+        "agent_chunk_top_k",
         "agent_max_depth_per_layer",
         "agent_max_labels_per_node",
         "agent_max_edge_reuse",
-        "agent_drilldown_budget_per_layer",
-        "agent_chunk_candidate_budget",
+        "candidate_pool_dedupe_budget",
         "agent_structure_restore_budget",
         "context_path_summary_budget",
         "agent_planning_round_budget",
@@ -260,6 +287,10 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
     float_fields: set[str] = {
         "mid_concept_candidate_keep_threshold",
         "rq_residual_tau",
+        "dense_min_cosine",
+        "dense_strong_cosine",
+        "cross_doc_min_cosine",
+        "cross_language_min_cosine",
         "agent_max_cycle_reward_per_path",
         "agent_cycle_reward_distance_threshold",
         "agent_path_distance_green_threshold",
@@ -283,12 +314,27 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "RQ_KMEANS_LEVELS": "rq_kmeans_levels",
         "RQ_KMEANS_MAX_K": "rq_kmeans_max_k",
         "RQ_RESIDUAL_TAU": "rq_residual_tau",
-        "AGENT_COARSE_ENTRY_BUDGET": "agent_coarse_entry_budget",
-        "AGENT_COARSE_JUMP_BUDGET": "agent_coarse_jump_budget",
-        "AGENT_MID_ENTRY_BUDGET": "agent_mid_entry_budget",
-        "AGENT_MID_EXPANSION_RADIUS_CAP": "agent_mid_expansion_radius_cap",
-        "AGENT_RQ_MEMBERSHIP_SEED_BUDGET": "agent_rq_membership_seed_budget",
-        "AGENT_FRONTIER_EXPANSION_BUDGET": "agent_frontier_expansion_budget",
+        "DENSE_KNN_K_MIN": "dense_knn_k_min",
+        "DENSE_KNN_K_MAX": "dense_knn_k_max",
+        "DENSE_REVERSE_B_MIN_BASE": "dense_reverse_b_min_base",
+        "DENSE_REVERSE_B_MAX_BASE": "dense_reverse_b_max_base",
+        "DENSE_REVERSE_B_MIN_DOC": "dense_reverse_b_min_doc",
+        "DENSE_REVERSE_B_MAX_DOC": "dense_reverse_b_max_doc",
+        "DENSE_REVERSE_B_MIN_LANG": "dense_reverse_b_min_lang",
+        "DENSE_REVERSE_B_MAX_LANG": "dense_reverse_b_max_lang",
+        "DENSE_MIN_COSINE": "dense_min_cosine",
+        "DENSE_STRONG_COSINE": "dense_strong_cosine",
+        "CROSS_DOC_OUT_QUOTA_MIN": "cross_doc_out_quota_min",
+        "CROSS_DOC_OUT_QUOTA_MAX": "cross_doc_out_quota_max",
+        "CROSS_DOC_MIN_COSINE": "cross_doc_min_cosine",
+        "CROSS_LANGUAGE_OUT_QUOTA_MIN": "cross_language_out_quota_min",
+        "CROSS_LANGUAGE_OUT_QUOTA_MAX": "cross_language_out_quota_max",
+        "CROSS_LANGUAGE_MIN_COSINE": "cross_language_min_cosine",
+        "AGENT_COARSE_TOTAL_BUDGET": "agent_coarse_total_budget",
+        "AGENT_MID_PER_COARSE_BUDGET": "agent_mid_per_coarse_budget",
+        "AGENT_MID_TOP_K": "agent_mid_top_k",
+        "AGENT_CHUNK_PER_MID_BUDGET": "agent_chunk_per_mid_budget",
+        "AGENT_CHUNK_TOP_K": "agent_chunk_top_k",
         "AGENT_MAX_DEPTH_PER_LAYER": "agent_max_depth_per_layer",
         "AGENT_MAX_LABELS_PER_NODE": "agent_max_labels_per_node",
         "AGENT_MAX_EDGE_REUSE": "agent_max_edge_reuse",
@@ -297,8 +343,7 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "AGENT_PATH_DISTANCE_GREEN_THRESHOLD": "agent_path_distance_green_threshold",
         "AGENT_PATH_DISTANCE_GRAY_THRESHOLD": "agent_path_distance_gray_threshold",
         "AGENT_PATH_DISTANCE_HARD_THRESHOLD": "agent_path_distance_hard_threshold",
-        "AGENT_DRILLDOWN_BUDGET_PER_LAYER": "agent_drilldown_budget_per_layer",
-        "AGENT_CHUNK_CANDIDATE_BUDGET": "agent_chunk_candidate_budget",
+        "CANDIDATE_POOL_DEDUPE_BUDGET": "candidate_pool_dedupe_budget",
         "AGENT_STRUCTURE_RESTORE_BUDGET": "agent_structure_restore_budget",
         "CONTEXT_PATH_SUMMARY_BUDGET": "context_path_summary_budget",
         "AGENT_PLANNING_ROUND_BUDGET": "agent_planning_round_budget",

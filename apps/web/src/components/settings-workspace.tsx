@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ModelSettingsUpdate, RuntimeIssue, StrategyProfileDetail, StructuredApiErrorBody } from "@course-kg/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -9,6 +9,7 @@ import {
   Bot,
   EyeOff,
   FilePlus2,
+  Info,
   KeyRound,
   Loader2,
   PencilLine,
@@ -69,10 +70,6 @@ type SettingsForm = {
   embedding_api_key: string;
   clear_embedding_api_key: boolean;
   model_bridge_enabled: boolean;
-  reranker_enabled: boolean;
-  reranker_model: string;
-  reranker_max_length: string;
-  reranker_device: "cpu" | "cuda";
   mid_concept_extraction_max_model_batches: string;
   mid_concept_extraction_max_candidates_per_batch: string;
   mid_concept_extraction_max_tokens_per_batch: string;
@@ -80,12 +77,28 @@ type SettingsForm = {
   rq_kmeans_levels: string;
   rq_kmeans_max_k: string;
   rq_residual_tau: string;
-  agent_coarse_entry_budget: string;
-  agent_coarse_jump_budget: string;
-  agent_mid_entry_budget: string;
-  agent_mid_expansion_radius_cap: string;
-  agent_rq_membership_seed_budget: string;
-  agent_frontier_expansion_budget: string;
+  dense_knn_k_min: string;
+  dense_knn_k_max: string;
+  dense_reverse_b_min_base: string;
+  dense_reverse_b_max_base: string;
+  dense_reverse_b_min_doc: string;
+  dense_reverse_b_max_doc: string;
+  dense_reverse_b_min_lang: string;
+  dense_reverse_b_max_lang: string;
+  dense_min_cosine: string;
+  dense_strong_cosine: string;
+  cross_doc_out_quota_min: string;
+  cross_doc_out_quota_max: string;
+  cross_doc_min_cosine: string;
+  cross_language_out_quota_min: string;
+  cross_language_out_quota_max: string;
+  cross_language_min_cosine: string;
+  agent_coarse_total_budget: string;
+  agent_mid_per_coarse_budget: string;
+  agent_mid_top_k: string;
+  agent_chunk_per_mid_budget: string;
+  agent_chunk_top_k: string;
+  candidate_pool_dedupe_budget: string;
   agent_max_depth_per_layer: string;
   agent_max_labels_per_node: string;
   agent_max_edge_reuse: string;
@@ -94,8 +107,6 @@ type SettingsForm = {
   agent_path_distance_green_threshold: string;
   agent_path_distance_gray_threshold: string;
   agent_path_distance_hard_threshold: string;
-  agent_drilldown_budget_per_layer: string;
-  agent_chunk_candidate_budget: string;
   agent_structure_restore_budget: string;
   context_path_summary_budget: string;
   agent_planning_round_budget: string;
@@ -114,6 +125,7 @@ type ErrorDialogState = {
 
 type FieldProps = {
   label: string;
+  description?: string;
   value: string;
   onChange: (value: string) => void;
   type?: "text" | "number" | "password";
@@ -127,6 +139,7 @@ type FieldProps = {
 
 type SwitchRowProps = {
   title: string;
+  tooltip?: string;
   description: string;
   checked: boolean;
   onChange: () => void;
@@ -136,6 +149,74 @@ type SwitchRowProps = {
 
 const inputClass = "h-11 rounded-xl border-white/10 bg-white/[0.04] px-3 text-white placeholder:text-white/28";
 const sectionClass = "rounded-2xl border border-white/10 bg-white/[0.035] p-5";
+const parameterNameClass = "text-xs uppercase tracking-[0.2em] text-cyan-100/46";
+
+export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
+  资料库类型: "标记当前配置档适用的资料库类别，只影响提示词、界面标签和对话偏好，不参与切块、构图或检索参数。",
+  名称: "配置档在设置页和资料库绑定列表里的显示名称，便于区分不同交互风格。",
+  模型桥: "开启后 API 和 worker 容器优先通过本机模型桥访问聊天与向量端点，适合宿主机运行本地模型服务的场景。",
+  聊天基础地址: "OpenAI 兼容聊天接口的 base URL；保存后影响下一次回答生成、Planner、Evaluator 和概念命名调用。",
+  向量基础地址: "Embedding 接口的 base URL；后续解析、重嵌入和图谱重建会用它生成 contextual embedding。",
+  "聊天 DNS 覆盖 IP": "仅对聊天端点使用的 DNS 覆盖；需要固定解析到指定 IP 时填写，留空则使用系统 DNS。",
+  "向量 DNS 覆盖 IP": "仅对向量端点使用的 DNS 覆盖；需要固定解析到指定 IP 时填写，留空则使用系统 DNS。",
+  聊天模型: "用于回答生成、Agent 规划/判停、概念命名和引用辅助判断的聊天模型名称。",
+  向量模型: "用于资料 embedding、dense relation 候选和查询向量的模型名称；改变后已有向量需要显式重解析或重建。",
+  聊天接口密钥: "聊天模型端点的访问密钥。留空会保留已有密钥，页面不会回显真实密钥。",
+  向量接口密钥: "Embedding 端点的访问密钥。留空会保留已有密钥，页面不会回显真实密钥。",
+  清除当前聊天接口密钥: "勾选后保存会删除当前聊天密钥；删除后聊天模型调用会因缺少凭据而失败。",
+  清除当前向量接口密钥: "勾选后保存会删除当前向量密钥；删除后解析、重嵌入和检索向量生成会因缺少凭据而失败。",
+  模型请求并发: "限制同时发起的模型请求数量，用于控制概念生成、Agent 判断和回答生成的吞吐与外部端点压力。",
+  模型超时秒数: "单次模型请求等待上限；超过该时间会快速失败并进入可诊断错误，不做静默降级。",
+  "Embedding 批大小": "每批提交给向量端点的文本数量；较大批次提升吞吐，但会增加单次请求体积和失败重试成本。",
+  "证据包 token 预算": "Context Package 可容纳的证据 token 上限；它约束进入回答生成的唯一证据输入规模。",
+  粗概念总预算: "Layered retrieval 在 coarse 层探索的粗概念节点上限；这是层内 hard interrupt，不是相关性评分。",
+  每个粗概念中概念预算: "对每个已接受粗概念分别下钻的 mid candidate 数量上限，保证逐父节点探索而不是全局裸 top-k。",
+  "中概念 Top K": "所有 mid candidates 合并去重后的层间输出上限；不会绕过 trace、结构恢复或引用验证。",
+  每个中概念片段预算: "对每个已选中概念分别下钻到 chunk candidate 的数量上限，控制底层候选扩展范围。",
+  "片段 Top K": "chunk candidates 合并去重后进入 Context Package 候选的输出上限，不等同于裸向量召回 top-k。",
+  候选去重池预算: "限制跨路径、跨 RQ membership 和跨概念候选合并去重时保留的候选池规模，防止单次检索过载。",
+  每层最大深度: "图遍历在每个层级允许继续扩展的最大深度，避免路径无限扩张。",
+  每节点标签上限: "每个节点参与 dominance pruning 的路径标签数量上限，用来控制同一节点上的重复路径状态。",
+  边复用上限: "同一条图边在单条路径中可被重复使用的次数上限，防止环路反复放大。",
+  "Cycle reward 上限": "同一条路径最多获得的环收敛奖励；奖励只辅助短而强的收敛路径，不能替代证据。",
+  "Cycle reward 距离阈值": "只有总距离足够短的环才会得到收敛奖励，长而弱的环不会提升路径价值。",
+  "路径 green 阈值": "路径距离小于该值时视为可继续的高置信路径，通常不需要 LLM 灰区判停。",
+  "路径 gray 阈值": "路径距离落在 green 与 gray 之间时进入灰区，可由 LLM evaluator 输出 typed decision。",
+  "路径 hard 阈值": "路径距离超过该值时 executor 直接剪枝，不允许 LLM 绕过硬阈值继续扩展。",
+  结构恢复预算: "命中 chunk 后可追加的 previous/next、section 和 bridge-neighbor 上下文数量上限。",
+  路径摘要预算: "Context Package 中可保留的图路径摘要数量上限，用于解释证据从 coarse 到 mid 再到 chunk 的来源。",
+  规划轮次预算: "QA Agent 可进行 Planner/Evaluator 规划的轮次数上限，控制单次任务内的推理成本。",
+  每轮动作上限: "每个规划轮次最多允许的 typed actions 数量，所有动作仍必须通过 validator 和 deterministic executor。",
+  修复轮次预算: "引用缺失、桥接不足或结构上下文不足时允许的 repair loop 次数；耗尽后只能返回已验证部分或证据不足说明。",
+  引用验证预算: "回答后可执行的 citation verification 次数上限，用于把 claim 绑定回 raw chunk span。",
+  固定切块尺寸: "解析时每个稳定 chunk 的目标 token 大小；chunk 是索引和引用地址单位，不假定是完整语义单元。",
+  固定切块重叠: "相邻固定 chunk 之间保留的 token 重叠，用来降低边界截断造成的上下文损失。",
+  向量维度: "Embedding 向量维数，必须与向量模型和 Qdrant collection 一致；改变后需要重嵌入或重建派生索引。",
+  模型批次诊断上限: "构建 mid concept 时最多抽样多少个 LLM 批次做概念诊断；0 表示关闭这类模型诊断。",
+  "每批 L3 前缀数": "每个概念生成批次最多处理的 RQ L3 prefix packet 数量，影响 mid concept 生成吞吐。",
+  "每批概念 token 上限": "单个概念生成批次允许传入模型的 token 上限，防止 prompt 过大。",
+  候选诊断阈值: "mid concept 候选保留诊断的 membership/质量阈值，用于标记低置信候选而不是直接制造事实。",
+  "RQ-KMeans 层数": "残差量化地址树的层数；当前四层图谱用 L3 对齐 mid concept、L2 对齐 coarse concept。",
+  "RQ-KMeans 最大 K": "每层 RQ-KMeans 聚类的最大分支数，影响 RQ prefix 地址空间粒度。",
+  "RQ 残差 Tau": "控制 RQ fuzzy membership 的残差距离温度；值越小，membership 越集中。",
+  "Dense KNN 最小 K": "每个 chunk 生成 dense relation 候选时的最小出边候选数，保障低证据节点仍有基本候选。",
+  "Dense KNN 最大 K": "每个 chunk 生成 dense relation 候选时的最大出边候选数，限制高证据节点扩张。",
+  基础互近邻下限: "普通 dense relation 的反向接纳下限，避免热门 chunk 吞掉全部入边机会。",
+  基础互近邻上限: "普通 dense relation 的反向接纳上限，用于控制同一目标 chunk 的基础入边数量。",
+  跨文档互近邻下限: "跨文档 bridge 候选的反向接纳下限，保证不同文档之间保留必要连接机会。",
+  跨文档互近邻上限: "跨文档 bridge 候选的反向接纳上限，防止跨文档边过度膨胀。",
+  跨语言互近邻下限: "跨语言 bridge 候选的反向接纳下限，保障不同语言资料之间的最小连接机会。",
+  跨语言互近邻上限: "跨语言 bridge 候选的反向接纳上限，防止跨语言边过度膨胀。",
+  "Dense 最小余弦": "dense relation 候选被接受的最低余弦相似度阈值，低于该值不进入 active relation graph。",
+  "Dense 强边余弦": "标记强 dense 语义边的余弦阈值，用于 edge calibration 和路径距离诊断。",
+  跨文档桥最小配额: "每个 chunk 额外尝试保留的跨文档 bridge 出边下限，只提供候选机会，不提升边权。",
+  跨文档桥最大配额: "每个 chunk 额外保留的跨文档 bridge 出边上限，控制跨文档扩展成本。",
+  跨文档桥最小余弦: "跨文档 bridge 候选的最低余弦阈值；达不到阈值不会成为底层关系边。",
+  跨语言桥最小配额: "每个 chunk 额外尝试保留的跨语言 bridge 出边下限，只提供候选机会，不提升边权。",
+  跨语言桥最大配额: "每个 chunk 额外保留的跨语言 bridge 出边上限，控制跨语言扩展成本。",
+  跨语言桥最小余弦: "跨语言 bridge 候选的最低余弦阈值；达不到阈值不会成为底层关系边。",
+  工作进程并发: "Celery worker 启动时的进程并发数；这是服务级参数，保存后需要重启或重建 worker 才会生效。",
+};
 
 function errorDialogFromUnknown(error: unknown): ErrorDialogState {
   const typed = error as Error & { status?: number; structured?: StructuredApiErrorBody };
@@ -212,8 +293,44 @@ function ErrorDialog({ state, onClose }: { state: ErrorDialogState | null; onClo
   );
 }
 
+export function ParameterName({
+  label,
+  description,
+  className = parameterNameClass,
+}: {
+  label: string;
+  description?: string;
+  className?: string;
+}) {
+  const tooltipId = useId();
+  const helpText = description ?? SETTINGS_PARAMETER_HELP[label];
+
+  if (!helpText) {
+    return <span className={className}>{label}</span>;
+  }
+
+  return (
+    <span
+      className={`group relative inline-flex w-fit cursor-help items-center gap-1 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-cyan-200/40 ${className}`}
+      tabIndex={0}
+      aria-describedby={tooltipId}
+    >
+      <span>{label}</span>
+      <Info className="size-3.5 text-cyan-100/45" aria-hidden="true" />
+      <span
+        id={tooltipId}
+        role="tooltip"
+        className="pointer-events-none absolute left-0 top-full z-50 mt-2 w-72 max-w-[calc(100vw-3rem)] rounded-xl border border-cyan-100/20 bg-[#081322]/95 p-3 text-left text-xs font-normal normal-case leading-5 tracking-normal text-cyan-50/82 opacity-0 shadow-2xl shadow-black/30 backdrop-blur transition duration-150 delay-0 group-hover:delay-500 group-hover:opacity-100 group-focus:delay-500 group-focus:opacity-100"
+      >
+        {helpText}
+      </span>
+    </span>
+  );
+}
+
 function SettingField({
   label,
+  description,
   value,
   onChange,
   type = "text",
@@ -226,7 +343,7 @@ function SettingField({
 }: FieldProps) {
   return (
     <label className={`flex flex-col gap-2 ${className ?? ""}`}>
-      <span className="text-xs uppercase tracking-[0.2em] text-cyan-100/46">{label}</span>
+      <ParameterName label={label} description={description} />
       <Input
         type={type}
         min={min}
@@ -251,13 +368,13 @@ function BoundaryNote({ title, children }: { title: string; children: React.Reac
   );
 }
 
-function SwitchRow({ title, description, checked, onChange, disabled, badge }: SwitchRowProps) {
+function SwitchRow({ title, tooltip, description, checked, onChange, disabled, badge }: SwitchRowProps) {
   return (
     <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-white/10 bg-white/[0.035] p-4">
       <div className="min-w-[240px] flex-1">
         <p className="flex flex-wrap items-center gap-2 text-sm font-semibold text-white">
           <SlidersHorizontal className="size-4 text-cyan-100/70" />
-          {title}
+          <ParameterName label={title} description={tooltip} className="text-sm font-semibold normal-case tracking-normal text-white" />
           {badge ? <span className="text-xs font-normal text-cyan-100/45">{badge}</span> : null}
         </p>
         <p className="mt-2 text-sm leading-6 text-white/58">{description}</p>
@@ -964,10 +1081,6 @@ export function SettingsWorkspace() {
       embedding_api_key: "",
       clear_embedding_api_key: false,
       model_bridge_enabled: settingsQuery.data.model_bridge_enabled ?? true,
-      reranker_enabled: settingsQuery.data.reranker_enabled ?? false,
-      reranker_model: settingsQuery.data.reranker_model ?? "cross-encoder/ms-marco-MiniLM-L-6-v2",
-      reranker_max_length: String(settingsQuery.data.reranker_max_length ?? 512),
-      reranker_device: settingsQuery.data.reranker_device === "cuda" ? "cuda" : "cpu",
       mid_concept_extraction_max_model_batches: String(settingsQuery.data.mid_concept_extraction_max_model_batches ?? 4),
       mid_concept_extraction_max_candidates_per_batch: String(settingsQuery.data.mid_concept_extraction_max_candidates_per_batch ?? 8),
       mid_concept_extraction_max_tokens_per_batch: String(settingsQuery.data.mid_concept_extraction_max_tokens_per_batch ?? 2400),
@@ -975,12 +1088,28 @@ export function SettingsWorkspace() {
       rq_kmeans_levels: String(settingsQuery.data.rq_kmeans_levels ?? 3),
       rq_kmeans_max_k: String(settingsQuery.data.rq_kmeans_max_k ?? 6),
       rq_residual_tau: String(settingsQuery.data.rq_residual_tau ?? 0.65),
-      agent_coarse_entry_budget: String(settingsQuery.data.agent_coarse_entry_budget ?? 8),
-      agent_coarse_jump_budget: String(settingsQuery.data.agent_coarse_jump_budget ?? 2),
-      agent_mid_entry_budget: String(settingsQuery.data.agent_mid_entry_budget ?? 16),
-      agent_mid_expansion_radius_cap: String(settingsQuery.data.agent_mid_expansion_radius_cap ?? 2),
-      agent_rq_membership_seed_budget: String(settingsQuery.data.agent_rq_membership_seed_budget ?? 16),
-      agent_frontier_expansion_budget: String(settingsQuery.data.agent_frontier_expansion_budget ?? 80),
+      dense_knn_k_min: String(settingsQuery.data.dense_knn_k_min ?? 5),
+      dense_knn_k_max: String(settingsQuery.data.dense_knn_k_max ?? 24),
+      dense_reverse_b_min_base: String(settingsQuery.data.dense_reverse_b_min_base ?? 2),
+      dense_reverse_b_max_base: String(settingsQuery.data.dense_reverse_b_max_base ?? 8),
+      dense_reverse_b_min_doc: String(settingsQuery.data.dense_reverse_b_min_doc ?? 1),
+      dense_reverse_b_max_doc: String(settingsQuery.data.dense_reverse_b_max_doc ?? 6),
+      dense_reverse_b_min_lang: String(settingsQuery.data.dense_reverse_b_min_lang ?? 1),
+      dense_reverse_b_max_lang: String(settingsQuery.data.dense_reverse_b_max_lang ?? 4),
+      dense_min_cosine: String(settingsQuery.data.dense_min_cosine ?? 0.58),
+      dense_strong_cosine: String(settingsQuery.data.dense_strong_cosine ?? 0.72),
+      cross_doc_out_quota_min: String(settingsQuery.data.cross_doc_out_quota_min ?? 1),
+      cross_doc_out_quota_max: String(settingsQuery.data.cross_doc_out_quota_max ?? 4),
+      cross_doc_min_cosine: String(settingsQuery.data.cross_doc_min_cosine ?? 0.62),
+      cross_language_out_quota_min: String(settingsQuery.data.cross_language_out_quota_min ?? 0),
+      cross_language_out_quota_max: String(settingsQuery.data.cross_language_out_quota_max ?? 3),
+      cross_language_min_cosine: String(settingsQuery.data.cross_language_min_cosine ?? 0.65),
+      agent_coarse_total_budget: String(settingsQuery.data.agent_coarse_total_budget ?? 8),
+      agent_mid_per_coarse_budget: String(settingsQuery.data.agent_mid_per_coarse_budget ?? 6),
+      agent_mid_top_k: String(settingsQuery.data.agent_mid_top_k ?? 16),
+      agent_chunk_per_mid_budget: String(settingsQuery.data.agent_chunk_per_mid_budget ?? 8),
+      agent_chunk_top_k: String(settingsQuery.data.agent_chunk_top_k ?? 40),
+      candidate_pool_dedupe_budget: String(settingsQuery.data.candidate_pool_dedupe_budget ?? 160),
       agent_max_depth_per_layer: String(settingsQuery.data.agent_max_depth_per_layer ?? 3),
       agent_max_labels_per_node: String(settingsQuery.data.agent_max_labels_per_node ?? 3),
       agent_max_edge_reuse: String(settingsQuery.data.agent_max_edge_reuse ?? 2),
@@ -989,8 +1118,6 @@ export function SettingsWorkspace() {
       agent_path_distance_green_threshold: String(settingsQuery.data.agent_path_distance_green_threshold ?? 0.45),
       agent_path_distance_gray_threshold: String(settingsQuery.data.agent_path_distance_gray_threshold ?? 1.35),
       agent_path_distance_hard_threshold: String(settingsQuery.data.agent_path_distance_hard_threshold ?? 2.4),
-      agent_drilldown_budget_per_layer: String(settingsQuery.data.agent_drilldown_budget_per_layer ?? 16),
-      agent_chunk_candidate_budget: String(settingsQuery.data.agent_chunk_candidate_budget ?? 80),
       agent_structure_restore_budget: String(settingsQuery.data.agent_structure_restore_budget ?? 16),
       context_path_summary_budget: String(settingsQuery.data.context_path_summary_budget ?? 32),
       agent_planning_round_budget: String(settingsQuery.data.agent_planning_round_budget ?? 2),
@@ -1021,7 +1148,6 @@ export function SettingsWorkspace() {
   const settings = settingsQuery.data;
   const showApiKeyMask = Boolean(settings?.has_api_key && !apiKeyEditing && !form?.clear_api_key);
   const showEmbeddingApiKeyMask = Boolean(settings?.has_embedding_api_key && !embeddingApiKeyEditing && !form?.clear_embedding_api_key);
-  const crossEncoderStatus = runtimeQuery.data?.reranker;
   const envSynced = Boolean(runtimeQuery.data?.env_sync?.synced);
   const runtimeWarnings = runtimeQuery.data?.warnings ?? [];
   const bridgeStatus = settings?.model_bridge_status;
@@ -1072,10 +1198,6 @@ export function SettingsWorkspace() {
     embedding_api_key: form.embedding_api_key.trim() || null,
     clear_embedding_api_key: form.clear_embedding_api_key,
     model_bridge_enabled: form.model_bridge_enabled,
-    reranker_enabled: form.reranker_enabled,
-    reranker_model: form.reranker_model.trim(),
-    reranker_max_length: parseIntField(form.reranker_max_length),
-    reranker_device: form.reranker_device,
     mid_concept_extraction_max_model_batches: parseIntField(form.mid_concept_extraction_max_model_batches),
     mid_concept_extraction_max_candidates_per_batch: parseIntField(form.mid_concept_extraction_max_candidates_per_batch),
     mid_concept_extraction_max_tokens_per_batch: parseIntField(form.mid_concept_extraction_max_tokens_per_batch),
@@ -1083,12 +1205,28 @@ export function SettingsWorkspace() {
     rq_kmeans_levels: parseIntField(form.rq_kmeans_levels),
     rq_kmeans_max_k: parseIntField(form.rq_kmeans_max_k),
     rq_residual_tau: parseFloatField(form.rq_residual_tau),
-    agent_coarse_entry_budget: parseIntField(form.agent_coarse_entry_budget),
-    agent_coarse_jump_budget: parseIntField(form.agent_coarse_jump_budget),
-    agent_mid_entry_budget: parseIntField(form.agent_mid_entry_budget),
-    agent_mid_expansion_radius_cap: parseIntField(form.agent_mid_expansion_radius_cap),
-    agent_rq_membership_seed_budget: parseIntField(form.agent_rq_membership_seed_budget),
-    agent_frontier_expansion_budget: parseIntField(form.agent_frontier_expansion_budget),
+    dense_knn_k_min: parseIntField(form.dense_knn_k_min),
+    dense_knn_k_max: parseIntField(form.dense_knn_k_max),
+    dense_reverse_b_min_base: parseIntField(form.dense_reverse_b_min_base),
+    dense_reverse_b_max_base: parseIntField(form.dense_reverse_b_max_base),
+    dense_reverse_b_min_doc: parseIntField(form.dense_reverse_b_min_doc),
+    dense_reverse_b_max_doc: parseIntField(form.dense_reverse_b_max_doc),
+    dense_reverse_b_min_lang: parseIntField(form.dense_reverse_b_min_lang),
+    dense_reverse_b_max_lang: parseIntField(form.dense_reverse_b_max_lang),
+    dense_min_cosine: parseFloatField(form.dense_min_cosine),
+    dense_strong_cosine: parseFloatField(form.dense_strong_cosine),
+    cross_doc_out_quota_min: parseIntField(form.cross_doc_out_quota_min),
+    cross_doc_out_quota_max: parseIntField(form.cross_doc_out_quota_max),
+    cross_doc_min_cosine: parseFloatField(form.cross_doc_min_cosine),
+    cross_language_out_quota_min: parseIntField(form.cross_language_out_quota_min),
+    cross_language_out_quota_max: parseIntField(form.cross_language_out_quota_max),
+    cross_language_min_cosine: parseFloatField(form.cross_language_min_cosine),
+    agent_coarse_total_budget: parseIntField(form.agent_coarse_total_budget),
+    agent_mid_per_coarse_budget: parseIntField(form.agent_mid_per_coarse_budget),
+    agent_mid_top_k: parseIntField(form.agent_mid_top_k),
+    agent_chunk_per_mid_budget: parseIntField(form.agent_chunk_per_mid_budget),
+    agent_chunk_top_k: parseIntField(form.agent_chunk_top_k),
+    candidate_pool_dedupe_budget: parseIntField(form.candidate_pool_dedupe_budget),
     agent_max_depth_per_layer: parseIntField(form.agent_max_depth_per_layer),
     agent_max_labels_per_node: parseIntField(form.agent_max_labels_per_node),
     agent_max_edge_reuse: parseIntField(form.agent_max_edge_reuse),
@@ -1097,8 +1235,6 @@ export function SettingsWorkspace() {
     agent_path_distance_green_threshold: parseFloatField(form.agent_path_distance_green_threshold),
     agent_path_distance_gray_threshold: parseFloatField(form.agent_path_distance_gray_threshold),
     agent_path_distance_hard_threshold: parseFloatField(form.agent_path_distance_hard_threshold),
-    agent_drilldown_budget_per_layer: parseIntField(form.agent_drilldown_budget_per_layer),
-    agent_chunk_candidate_budget: parseIntField(form.agent_chunk_candidate_budget),
     agent_structure_restore_budget: parseIntField(form.agent_structure_restore_budget),
     context_path_summary_budget: parseIntField(form.context_path_summary_budget),
     agent_planning_round_budget: parseIntField(form.agent_planning_round_budget),
@@ -1154,6 +1290,8 @@ export function SettingsWorkspace() {
               <StatusPill ok={bridgeHealthy}>模型桥 {bridgeStatusText}</StatusPill>
               <StatusPill ok={envSynced}>{envSynced ? ".env 已同步" : ".env 需检查"}</StatusPill>
               <StatusPill ok={!settings?.enable_model_fallback && !settings?.enable_database_fallback}>回退已禁用</StatusPill>
+              <StatusPill ok={Boolean(settings?.lifecycle?.hot_reloadable?.length)}>热加载 {settings?.lifecycle?.hot_reloadable?.length ?? 0}</StatusPill>
+              <StatusPill ok={Boolean(settings?.lifecycle?.rebuild_required?.length)}>需重建 {settings?.lifecycle?.rebuild_required?.length ?? 0}</StatusPill>
               <StatusPill ok={Boolean(settings?.runtime_settings_version)}>运行时 {settings?.runtime_settings_version ? settings.runtime_settings_version.slice(0, 12) : "等待中"}</StatusPill>
             </div>
 
@@ -1234,7 +1372,7 @@ export function SettingsWorkspace() {
               </div>
               <div className="mt-6 grid gap-4 md:grid-cols-2">
                 <label className="flex flex-col gap-2">
-                  <span className="text-xs uppercase tracking-[0.2em] text-cyan-100/46">聊天接口密钥</span>
+                  <ParameterName label="聊天接口密钥" />
                   <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3">
                     <KeyRound className="size-4 text-cyan-100/58" />
                     <input
@@ -1258,7 +1396,7 @@ export function SettingsWorkspace() {
                 </label>
 
                 <label className="flex flex-col gap-2">
-                  <span className="text-xs uppercase tracking-[0.2em] text-cyan-100/46">向量接口密钥</span>
+                  <ParameterName label="向量接口密钥" />
                   <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3">
                     <KeyRound className="size-4 text-cyan-100/58" />
                     <input
@@ -1295,7 +1433,7 @@ export function SettingsWorkspace() {
                     }}
                     className="size-4 accent-rose-300"
                   />
-                  清除当前聊天接口密钥
+                  <ParameterName label="清除当前聊天接口密钥" className="text-sm font-normal normal-case tracking-normal text-white/70" />
                 </label>
                 <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
                   <input
@@ -1310,7 +1448,7 @@ export function SettingsWorkspace() {
                     }}
                     className="size-4 accent-rose-300"
                   />
-                  清除当前向量接口密钥
+                  <ParameterName label="清除当前向量接口密钥" className="text-sm font-normal normal-case tracking-normal text-white/70" />
                 </label>
               </div>
             </section>
@@ -1325,12 +1463,12 @@ export function SettingsWorkspace() {
                 <SettingField label="模型超时秒数" type="number" min={5} max={600} value={form.model_request_timeout_seconds} onChange={(value) => updateForm("model_request_timeout_seconds", value)} />
                 <SettingField label="Embedding 批大小" type="number" min={1} max={10} value={form.embedding_batch_size} onChange={(value) => updateForm("embedding_batch_size", value)} />
                 <SettingField label="证据包 token 预算" type="number" min={256} max={20000} value={form.context_package_token_budget} onChange={(value) => updateForm("context_package_token_budget", value)} />
-                <SettingField label="粗粒度入口预算" type="number" min={1} max={100} value={form.agent_coarse_entry_budget} onChange={(value) => updateForm("agent_coarse_entry_budget", value)} />
-                <SettingField label="粗粒度跳转预算" type="number" min={0} max={20} value={form.agent_coarse_jump_budget} onChange={(value) => updateForm("agent_coarse_jump_budget", value)} />
-                <SettingField label="中粒度入口预算" type="number" min={1} max={200} value={form.agent_mid_entry_budget} onChange={(value) => updateForm("agent_mid_entry_budget", value)} />
-                <SettingField label="中粒度扩展半径" type="number" min={0} max={8} value={form.agent_mid_expansion_radius_cap} onChange={(value) => updateForm("agent_mid_expansion_radius_cap", value)} />
-                <SettingField label="RQ 归属种子预算" type="number" min={1} max={500} value={form.agent_rq_membership_seed_budget} onChange={(value) => updateForm("agent_rq_membership_seed_budget", value)} />
-                <SettingField label="Frontier 扩展预算" type="number" min={1} max={2000} value={form.agent_frontier_expansion_budget} onChange={(value) => updateForm("agent_frontier_expansion_budget", value)} />
+                <SettingField label="粗概念总预算" type="number" min={1} max={200} value={form.agent_coarse_total_budget} onChange={(value) => updateForm("agent_coarse_total_budget", value)} />
+                <SettingField label="每个粗概念中概念预算" type="number" min={1} max={100} value={form.agent_mid_per_coarse_budget} onChange={(value) => updateForm("agent_mid_per_coarse_budget", value)} />
+                <SettingField label="中概念 Top K" type="number" min={1} max={500} value={form.agent_mid_top_k} onChange={(value) => updateForm("agent_mid_top_k", value)} />
+                <SettingField label="每个中概念片段预算" type="number" min={1} max={200} value={form.agent_chunk_per_mid_budget} onChange={(value) => updateForm("agent_chunk_per_mid_budget", value)} />
+                <SettingField label="片段 Top K" type="number" min={1} max={1000} value={form.agent_chunk_top_k} onChange={(value) => updateForm("agent_chunk_top_k", value)} />
+                <SettingField label="候选去重池预算" type="number" min={1} max={5000} value={form.candidate_pool_dedupe_budget} onChange={(value) => updateForm("candidate_pool_dedupe_budget", value)} />
                 <SettingField label="每层最大深度" type="number" min={1} max={12} value={form.agent_max_depth_per_layer} onChange={(value) => updateForm("agent_max_depth_per_layer", value)} />
                 <SettingField label="每节点标签上限" type="number" min={1} max={20} value={form.agent_max_labels_per_node} onChange={(value) => updateForm("agent_max_labels_per_node", value)} />
                 <SettingField label="边复用上限" type="number" min={1} max={20} value={form.agent_max_edge_reuse} onChange={(value) => updateForm("agent_max_edge_reuse", value)} />
@@ -1339,8 +1477,6 @@ export function SettingsWorkspace() {
                 <SettingField label="路径 green 阈值" type="number" min={0} max={20} step={0.01} value={form.agent_path_distance_green_threshold} onChange={(value) => updateForm("agent_path_distance_green_threshold", value)} />
                 <SettingField label="路径 gray 阈值" type="number" min={0} max={20} step={0.01} value={form.agent_path_distance_gray_threshold} onChange={(value) => updateForm("agent_path_distance_gray_threshold", value)} />
                 <SettingField label="路径 hard 阈值" type="number" min={0} max={40} step={0.01} value={form.agent_path_distance_hard_threshold} onChange={(value) => updateForm("agent_path_distance_hard_threshold", value)} />
-                <SettingField label="每层下钻预算" type="number" min={1} max={500} value={form.agent_drilldown_budget_per_layer} onChange={(value) => updateForm("agent_drilldown_budget_per_layer", value)} />
-                <SettingField label="片段候选预算" type="number" min={1} max={1000} value={form.agent_chunk_candidate_budget} onChange={(value) => updateForm("agent_chunk_candidate_budget", value)} />
                 <SettingField label="结构恢复预算" type="number" min={1} max={200} value={form.agent_structure_restore_budget} onChange={(value) => updateForm("agent_structure_restore_budget", value)} />
                 <SettingField label="路径摘要预算" type="number" min={1} max={500} value={form.context_path_summary_budget} onChange={(value) => updateForm("context_path_summary_budget", value)} />
                 <SettingField label="规划轮次预算" type="number" min={1} max={10} value={form.agent_planning_round_budget} onChange={(value) => updateForm("agent_planning_round_budget", value)} />
@@ -1366,68 +1502,22 @@ export function SettingsWorkspace() {
                 <SettingField label="RQ-KMeans 层数" type="number" min={1} max={8} value={form.rq_kmeans_levels} onChange={(value) => updateForm("rq_kmeans_levels", value)} />
                 <SettingField label="RQ-KMeans 最大 K" type="number" min={1} max={64} value={form.rq_kmeans_max_k} onChange={(value) => updateForm("rq_kmeans_max_k", value)} />
                 <SettingField label="RQ 残差 Tau" type="number" min={0.01} max={10} step={0.01} value={form.rq_residual_tau} onChange={(value) => updateForm("rq_residual_tau", value)} />
-              </div>
-            </section>
-
-            <section className={sectionClass}>
-              <p className="text-sm font-semibold text-white">重排器</p>
-              <BoundaryNote title="生效边界：下一次重排器状态检查或手动调用">
-                保存会清理重排器单例；当前主检索链路没有实际调用 reranker，所以这些参数不会改变默认搜索排序。
-              </BoundaryNote>
-              <div className="mt-5 grid gap-4">
-                <SwitchRow
-                  title="交叉编码器重排"
-                  description="保留为重排器状态和手动调用配置。"
-                  checked={form.reranker_enabled}
-                  onChange={() => updateForm("reranker_enabled", !form.reranker_enabled)}
-                  disabled={saveMutation.isPending}
-                  badge="非主链路"
-                />
-                <div className="rounded-xl border border-fuchsia-200/15 bg-fuchsia-300/[0.055] p-4">
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div>
-                      <p className="text-sm font-semibold text-white">重排器运行状态</p>
-                      <p className="mt-1 text-sm leading-6 text-white/56">当前主检索链路没有实际调用 reranker；这里只反映配置和加载状态。</p>
-                    </div>
-                    <StatusPill ok={Boolean(crossEncoderStatus?.healthy)}>
-                      {crossEncoderStatus?.enabled ? (crossEncoderStatus.healthy ? "已加载" : "已启用") : "已禁用"}
-                    </StatusPill>
-                  </div>
-                  <div className="mt-4 grid gap-3 text-sm text-white/62 md:grid-cols-2">
-                    <div className="rounded-xl border border-white/8 bg-black/10 p-3">
-                      <p className="text-xs uppercase tracking-[0.2em] text-white/38">已配置模型</p>
-                      <p className="mt-2 break-words text-white/78">{form.reranker_model || "无"}</p>
-                    </div>
-                    <div className="rounded-xl border border-white/8 bg-black/10 p-3">
-                      <p className="text-xs uppercase tracking-[0.2em] text-white/38">运行中模型</p>
-                      <p className="mt-2 break-words text-white/78">{crossEncoderStatus?.reported_model ?? crossEncoderStatus?.model ?? "未加载"}</p>
-                    </div>
-                    <div className="rounded-xl border border-white/8 bg-black/10 p-3">
-                      <p className="text-xs uppercase tracking-[0.2em] text-white/38">已配置设备</p>
-                      <p className="mt-2 text-white/78">{form.reranker_device}</p>
-                    </div>
-                    <div className="rounded-xl border border-white/8 bg-black/10 p-3">
-                      <p className="text-xs uppercase tracking-[0.2em] text-white/38">运行中设备</p>
-                      <p className="mt-2 text-white/78">{crossEncoderStatus?.reported_device ?? crossEncoderStatus?.device ?? "未加载"}</p>
-                    </div>
-                  </div>
-                </div>
-                <div className="grid gap-4 md:grid-cols-3">
-                  <SettingField label="重排模型" value={form.reranker_model} onChange={(value) => updateForm("reranker_model", value)} className="md:col-span-2" />
-                  <SettingField label="重排最大长度" type="number" min={64} max={2048} value={form.reranker_max_length} onChange={(value) => updateForm("reranker_max_length", value)} />
-                  <label className="flex flex-col gap-2">
-                    <span className="text-xs uppercase tracking-[0.2em] text-cyan-100/46">重排设备</span>
-                    <select
-                      value={form.reranker_device}
-                      onChange={(event) => updateForm("reranker_device", event.target.value === "cuda" ? "cuda" : "cpu")}
-                      disabled={saveMutation.isPending}
-                      className={inputClass}
-                    >
-                      <option value="cpu" className="bg-[#081126] text-white">cpu</option>
-                      <option value="cuda" className="bg-[#081126] text-white">cuda</option>
-                    </select>
-                  </label>
-                </div>
+                <SettingField label="Dense KNN 最小 K" type="number" min={1} max={200} value={form.dense_knn_k_min} onChange={(value) => updateForm("dense_knn_k_min", value)} />
+                <SettingField label="Dense KNN 最大 K" type="number" min={1} max={500} value={form.dense_knn_k_max} onChange={(value) => updateForm("dense_knn_k_max", value)} />
+                <SettingField label="基础互近邻下限" type="number" min={0} max={200} value={form.dense_reverse_b_min_base} onChange={(value) => updateForm("dense_reverse_b_min_base", value)} />
+                <SettingField label="基础互近邻上限" type="number" min={1} max={500} value={form.dense_reverse_b_max_base} onChange={(value) => updateForm("dense_reverse_b_max_base", value)} />
+                <SettingField label="跨文档互近邻下限" type="number" min={0} max={200} value={form.dense_reverse_b_min_doc} onChange={(value) => updateForm("dense_reverse_b_min_doc", value)} />
+                <SettingField label="跨文档互近邻上限" type="number" min={0} max={500} value={form.dense_reverse_b_max_doc} onChange={(value) => updateForm("dense_reverse_b_max_doc", value)} />
+                <SettingField label="跨语言互近邻下限" type="number" min={0} max={200} value={form.dense_reverse_b_min_lang} onChange={(value) => updateForm("dense_reverse_b_min_lang", value)} />
+                <SettingField label="跨语言互近邻上限" type="number" min={0} max={500} value={form.dense_reverse_b_max_lang} onChange={(value) => updateForm("dense_reverse_b_max_lang", value)} />
+                <SettingField label="Dense 最小余弦" type="number" min={0} max={1} step={0.01} value={form.dense_min_cosine} onChange={(value) => updateForm("dense_min_cosine", value)} />
+                <SettingField label="Dense 强边余弦" type="number" min={0} max={1} step={0.01} value={form.dense_strong_cosine} onChange={(value) => updateForm("dense_strong_cosine", value)} />
+                <SettingField label="跨文档桥最小配额" type="number" min={0} max={200} value={form.cross_doc_out_quota_min} onChange={(value) => updateForm("cross_doc_out_quota_min", value)} />
+                <SettingField label="跨文档桥最大配额" type="number" min={0} max={500} value={form.cross_doc_out_quota_max} onChange={(value) => updateForm("cross_doc_out_quota_max", value)} />
+                <SettingField label="跨文档桥最小余弦" type="number" min={0} max={1} step={0.01} value={form.cross_doc_min_cosine} onChange={(value) => updateForm("cross_doc_min_cosine", value)} />
+                <SettingField label="跨语言桥最小配额" type="number" min={0} max={200} value={form.cross_language_out_quota_min} onChange={(value) => updateForm("cross_language_out_quota_min", value)} />
+                <SettingField label="跨语言桥最大配额" type="number" min={0} max={500} value={form.cross_language_out_quota_max} onChange={(value) => updateForm("cross_language_out_quota_max", value)} />
+                <SettingField label="跨语言桥最小余弦" type="number" min={0} max={1} step={0.01} value={form.cross_language_min_cosine} onChange={(value) => updateForm("cross_language_min_cosine", value)} />
               </div>
             </section>
 

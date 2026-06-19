@@ -5,7 +5,13 @@ from worker_app.bootstrap import API_ROOT  # noqa: F401
 from worker_app.celery_app import celery_app
 from app.db import SessionLocal
 from app.models import KnowledgeBase
-from app.services.ingestion import ingest_file, mark_batch_task_started, run_batch_ingestion, run_uploaded_files_ingestion
+from app.services.ingestion import (
+    ingest_file,
+    mark_batch_task_started,
+    run_batch_ingestion,
+    run_context_graph_rebuild_batch,
+    run_uploaded_files_ingestion,
+)
 from app.services.maintenance import reconcile_policy_state, reconcile_vector_store_sync
 from app.services.runtime_settings import refresh_runtime_settings_if_needed
 from sqlalchemy import select
@@ -33,6 +39,13 @@ def ingest_uploaded_batch(self, batch_id: str, file_paths: list[str], force: boo
     refresh_runtime_settings_if_needed(force=True)
     mark_batch_task_started(batch_id, getattr(self.request, "id", None), "ingest_uploaded_batch")
     return asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths, force=force, full_reparse=full_reparse, execution_mode="celery"))
+
+
+@celery_app.task(name="rebuild_context_graph_batch", bind=True)
+def rebuild_context_graph_batch(self, batch_id: str) -> dict:
+    refresh_runtime_settings_if_needed(force=True)
+    mark_batch_task_started(batch_id, getattr(self.request, "id", None), "rebuild_context_graph_batch")
+    return asyncio.run(run_context_graph_rebuild_batch(batch_id, execution_mode="celery"))
 
 
 @celery_app.task(name="reconcile_vector_store")

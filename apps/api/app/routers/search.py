@@ -11,6 +11,7 @@ from app.models import AgentRun
 from app.schemas import AgentRequest, AgentResponse, QARequest, QAResponse, SearchRequest, SearchResponse, TaskStatusResponse
 from app.services.agent_graph import run_agent, run_to_task_status, stream_agent_events
 from app.services.embeddings import is_degraded_mode
+from app.services.error_sanitizer import external_error_payload, public_exception_message
 from app.services.ingestion import resolve_knowledge_base
 from app.services.retrieval import layered_context_search_chunks_with_audit, search_chunks_with_audit
 
@@ -25,22 +26,16 @@ def get_requested_knowledge_base(db: Session, knowledge_base_id: str | None = No
 
 
 def embedding_failure_payload(exc: Exception) -> dict:
-    return {
-        "code": "search_embedding_failed",
-        "title": "Search embedding request failed",
-        "message": "The query could not be embedded by the configured model API. Retrieval did not fall back to fake or lexical-only results.",
-        "issues": [
-            {
-                "code": "embedding_api_unreachable",
-                "title": "Embedding API is unreachable from the API container",
-                "message": str(exc) or type(exc).__name__,
-                "fix_commands": [
-                    "Check EMBEDDING_BASE_URL and EMBEDDING_RESOLVE_IP in .env.",
-                    "Verify the API container can reach the embedding endpoint.",
-                ],
-            }
+    return external_error_payload(
+        exc,
+        code="search_embedding_failed",
+        title="Search embedding request failed",
+        message="The query could not be embedded by the configured model API. Retrieval did not fall back to fake or lexical-only results.",
+        fix_commands=[
+            "Check EMBEDDING_BASE_URL and EMBEDDING_RESOLVE_IP in .env.",
+            "Verify the API container can reach the embedding endpoint.",
         ],
-    }
+    )
 
 
 @router.post("/search", response_model=SearchResponse)
@@ -69,7 +64,7 @@ async def graph_search(request: SearchRequest, db: Session = Depends(get_db)) ->
         )
     except Exception as exc:
         db.rollback()
-        raise HTTPException(status_code=502, detail={"code": "graph_search_failed", "message": str(exc) or type(exc).__name__}) from exc
+        raise HTTPException(status_code=502, detail={"code": "graph_search_failed", "message": public_exception_message(exc)}) from exc
     db.commit()
     return {"query": request.query, "results": results, "degraded_mode": is_degraded_mode(), "model_audit": audit}
 
@@ -115,7 +110,7 @@ async def qa_stream(request: QARequest) -> StreamingResponse:
             async for event in stream_agent_events(db, agent_request):
                 yield f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
         except Exception as exc:
-            yield f"data: {json.dumps({'type': 'error', 'error': str(exc)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'error': public_exception_message(exc)}, ensure_ascii=False)}\n\n"
         finally:
             db.close()
         yield "data: [DONE]\n\n"

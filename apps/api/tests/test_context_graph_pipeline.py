@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 
 import pytest
@@ -15,7 +16,7 @@ def test_structure_edges_are_rejected_from_active_relation_graph():
 def test_entry_seed_calibration_prevents_zero_distance_route_seeds():
     from app.services.context_graph import calibrated_entry_seed_strength, distance_from_strength
 
-    assert calibrated_entry_seed_strength(1.0, "bm25_entry") == pytest.approx(0.94)
+    assert calibrated_entry_seed_strength(1.0, "dense_entry") == pytest.approx(0.97)
     assert calibrated_entry_seed_strength(1.0, "mid_drilldown_entry") == pytest.approx(0.82)
     assert calibrated_entry_seed_strength(1.0, "coarse_to_mid_drilldown_entry") == pytest.approx(0.72)
     assert distance_from_strength(calibrated_entry_seed_strength(1.0, "mid_drilldown_entry")) > 0.0
@@ -26,10 +27,10 @@ async def test_context_graph_pipeline_builds_all_layers(db_session, populated_co
     from sqlalchemy import func, select
 
     from app.models import (
-        BM25Record,
         Chunk,
         ChunkContextText,
         ChunkRelationEdge,
+        ChunkRelationGraphState,
         ChunkStructureMapping,
         ChunkStructureNode,
         CoarseConcept,
@@ -49,7 +50,6 @@ async def test_context_graph_pipeline_builds_all_layers(db_session, populated_co
     assert db_session.scalar(select(func.count(ChunkStructureMapping.id))) >= 3
     assert db_session.scalar(select(func.count(ChunkContextText.id))) >= 3
     assert db_session.scalar(select(func.count(VectorRecord.id)).where(VectorRecord.knowledge_base_id == kb.id, VectorRecord.vector_status == "ready")) >= 3
-    assert db_session.scalar(select(func.count(BM25Record.id)).where(BM25Record.knowledge_base_id == kb.id, BM25Record.state == "ready")) >= 3
     assert db_session.scalar(select(func.count(ChunkRelationEdge.id)).where(ChunkRelationEdge.knowledge_base_id == kb.id)) >= 2
     assert db_session.scalar(select(func.count(RQPrefix.id)).where(RQPrefix.knowledge_base_id == kb.id)) >= 1
     chunks_with_rq = db_session.scalars(select(Chunk).where(Chunk.knowledge_base_id == kb.id, Chunk.rq_residual_norm.is_not(None))).all()
@@ -64,24 +64,20 @@ async def test_context_graph_pipeline_builds_all_layers(db_session, populated_co
     ]
     assert rq_prefix_memberships
     assert all(row.rq_path for row in rq_prefix_memberships)
-    rq_edges = list(
-        db_session.scalars(
-            select(ChunkRelationEdge).where(
-                ChunkRelationEdge.knowledge_base_id == kb.id,
-                ChunkRelationEdge.edge_type.in_(["rq_hierarchy_near", "rq_prefix_sibling", "rq_residual_near"]),
-            )
-        ).all()
-    )
-    edge_types = {edge.edge_type for edge in rq_edges}
-    assert edge_types
-    assert not any((edge.features_json or {}).get("fallback_pair") for edge in rq_edges)
-    rq_edge = db_session.scalar(select(ChunkRelationEdge).where(ChunkRelationEdge.knowledge_base_id == kb.id, ChunkRelationEdge.edge_type.like("rq_%")))
-    assert rq_edge is not None
-    assert "lcp_depth" in (rq_edge.features_json or {})
-    assert "residual_distance" in (rq_edge.features_json or {})
-    assert rq_edge.source_algorithm == "rq_kmeans"
-    assert rq_edge.protocol_version
-    assert rq_edge.graph_state_hash
+    relation_state = db_session.scalar(select(ChunkRelationGraphState).where(ChunkRelationGraphState.knowledge_base_id == kb.id, ChunkRelationGraphState.state == "active"))
+    assert relation_state is not None
+    assert relation_state.graph_operating_point_hash
+    assert relation_state.edge_type_calibration_protocol_hash
+    assert (relation_state.diagnostics_json or {}).get("rq_pair_edges_active") is False
+    relation_edges = db_session.scalars(select(ChunkRelationEdge).where(ChunkRelationEdge.knowledge_base_id == kb.id)).all()
+    assert relation_edges
+    assert {edge.edge_type for edge in relation_edges}.issubset({"dense_semantic", "dense_cross_document_bridge", "dense_cross_language_bridge"})
+    assert (relation_state.diagnostics_json or {}).get("accepted_edge_types") == dict(Counter(edge.edge_type for edge in relation_edges))
+    assert not any(edge.edge_type.startswith("rq_") for edge in relation_edges)
+    assert all(edge.source_algorithm == "dense_embedding" for edge in relation_edges)
+    assert all(edge.protocol_version and edge.graph_state_hash and edge.edge_distance_protocol_hash for edge in relation_edges)
+    assert all(edge.distance is not None and edge.raw_strength is not None for edge in relation_edges)
+    assert all(edge.is_cross_document is not None and edge.is_cross_language is not None for edge in relation_edges)
     assert all(prefix.parent_rq_prefix_id or int(prefix.rq_level or 0) == 1 for prefix in rq_prefixes)
     graph_payload = graph_layer_payload(db_session, kb.id, "chunk-relation")
     assert graph_payload["full_counts"]["nodes"] >= graph_payload["sampled_counts"]["nodes"]
@@ -91,7 +87,7 @@ async def test_context_graph_pipeline_builds_all_layers(db_session, populated_co
     assert graph_payload["grounding"]["coarse_grounded_rate"] == 1.0
     assert any(node.get("category") == "rq_prefix" for node in graph_payload["nodes"])
     assert any(edge.get("category") == "rq_membership" for edge in graph_payload["edges"])
-    assert any(str(edge.get("category", "")).startswith("rq_") for edge in graph_payload["edges"])
+    assert not any(str(edge.get("category", "")).startswith("rq_") and edge.get("category") != "rq_membership" for edge in graph_payload["edges"])
     l3_prefix_count = db_session.scalar(
         select(func.count(RQPrefix.id)).where(RQPrefix.knowledge_base_id == kb.id, RQPrefix.rq_level == 3, RQPrefix.state == "active")
     )
@@ -134,6 +130,9 @@ async def test_layered_retrieval_writes_trace_and_context_package(db_session, po
     assert result.results
     assert result.audit["retrieval_pipeline"] == "layered_context_graph"
     assert "query_rq_path" in result.audit
+    assert result.audit["stage_queue_count"] >= 0
+    assert result.audit["mid_topk_selected"] >= 0
+    assert result.audit["chunk_topk_selected"] >= 0
     assert result.audit["dominance_pruned_count"] >= 0
     assert result.audit["hard_stop_pruned_count"] >= 0
     assert result.audit["gray_zone_decision_count"] >= result.audit["hard_stop_pruned_count"]
@@ -147,6 +146,9 @@ async def test_layered_retrieval_writes_trace_and_context_package(db_session, po
             assert float(traversal["distance_so_far"]) > 0.0
             assert (item.get("metadata") or {}).get("entry_strengths")
     assert result.trace.id
+    assert result.trace.stage_queues_json
+    assert result.trace.candidate_pools_json
+    assert result.trace.topk_selection_json
     assert db_session.scalar(select(func.count(GraphRetrievalStep.id)).where(GraphRetrievalStep.retrieval_trace_id == result.trace.id)) >= 4
     assert (
         db_session.scalar(select(func.count(GraphRetrievalStep.id)).where(GraphRetrievalStep.retrieval_trace_id == result.trace.id, GraphRetrievalStep.layer == "fine"))
@@ -164,14 +166,17 @@ async def test_layered_retrieval_writes_trace_and_context_package(db_session, po
         )
     )
     assert seed_step is not None
+    assert seed_step.action_type == "select_seeds_from_mid_rq_membership"
+    assert seed_step.selected_topk_ids_json
     assert "query_rq_path" in (seed_step.input_json or {})
-    assert any("lcp_depth" in candidate for candidate in ((seed_step.output_json or {}).get("candidate_rq") or {}).values())
+    assert (seed_step.output_json or {}).get("candidate_count") is not None
     package = build_context_package(db_session, knowledge_base_id=kb.id, query="Markov blanket", trace=result.trace, results=result.results)
     db_session.commit()
     structure_step = db_session.scalar(
         select(GraphRetrievalStep).where(GraphRetrievalStep.retrieval_trace_id == result.trace.id, GraphRetrievalStep.layer == "structure")
     )
     assert structure_step is not None
+    assert structure_step.action_type == "restore_context_package"
     assert (structure_step.output_json or {}).get("context_package_id") == package.id
     assert db_session.get(RetrievalTrace, result.trace.id) is not None
     assert db_session.get(ContextPackage, package.id) is not None

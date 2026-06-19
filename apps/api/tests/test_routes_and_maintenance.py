@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
+import types
 
 import pytest
 
@@ -63,6 +65,44 @@ async def test_search_route_commits_retrieval_trace(db_session, populated_contex
     assert db_session.scalar(select(func.count(GraphRetrievalStep.id)).where(GraphRetrievalStep.retrieval_trace_id == trace_id)) >= 4
 
 
+@pytest.mark.asyncio
+async def test_rebuild_graph_endpoint_queues_worker_batch(monkeypatch, db_session, populated_context_graph):
+    from app.models import IngestionBatch
+    from app.routers import knowledge
+    from app.schemas import RebuildGraphRequest
+
+    kb = populated_context_graph["knowledge_base"]
+    captured: dict[str, object] = {}
+
+    class Settings:
+        ingestion_execution_mode = "celery"
+        ingestion_task_queue = "test-queue"
+        data_root = Path("/tmp/data")
+
+    class FakeTask:
+        def apply_async(self, args, queue):
+            captured["args"] = args
+            captured["queue"] = queue
+            return types.SimpleNamespace(id="task-1")
+
+    fake_worker = types.ModuleType("worker_app")
+    fake_tasks = types.ModuleType("worker_app.tasks")
+    fake_tasks.rebuild_context_graph_batch = FakeTask()
+    monkeypatch.setitem(sys.modules, "worker_app", fake_worker)
+    monkeypatch.setitem(sys.modules, "worker_app.tasks", fake_tasks)
+    monkeypatch.setattr(knowledge, "get_settings", lambda: Settings())
+
+    payload = await knowledge.rebuild_graph_endpoint(RebuildGraphRequest(dry_run=False), kb.id, db_session)
+
+    assert payload["state"] == "queued"
+    assert payload["batch_id"]
+    assert captured == {"args": [payload["batch_id"]], "queue": "test-queue"}
+    batch = db_session.get(IngestionBatch, payload["batch_id"])
+    assert batch is not None
+    assert batch.trigger_source == "graph_rebuild"
+    assert (batch.stats or {}).get("celery_task_name") == "rebuild_context_graph_batch"
+
+
 def test_policy_reconcile_creates_context_graph_policy(db_session, sample_knowledge_base):
     from sqlalchemy import func, select
 
@@ -77,6 +117,40 @@ def test_policy_reconcile_creates_context_graph_policy(db_session, sample_knowle
     assert "bridge_edge_exploration" in policy.weights_json
 
 
+@pytest.mark.asyncio
+async def test_agent_planner_repairs_invalid_json_shape(monkeypatch):
+    from app.services import agent_graph
+
+    class FakePlanner:
+        calls = 0
+
+        async def classify_json(self, system_prompt, user_prompt, fallback=None):
+            self.calls += 1
+            if self.calls == 1:
+                return {"analysis": "not the contract"}
+            return {
+                "typed_actions": [
+                    {
+                        "action_type": "select_entry_nodes",
+                        "target_ids": [],
+                        "reason": "repair retry returned typed actions",
+                        "budget_request": {},
+                        "expected_evidence": {},
+                        "stop_condition": {},
+                    }
+                ]
+            }
+
+    planner = FakePlanner()
+    monkeypatch.setattr(agent_graph, "ChatProvider", lambda: planner)
+
+    actions, raw = await agent_graph.propose_agent_plan("What is a posterior?", [], {"intent": "definition"}, agent_graph.agent_operating_envelope())
+
+    assert planner.calls == 2
+    assert actions[0]["action_type"] == "select_entry_nodes"
+    assert raw["planner_repair"]["attempted"] is True
+
+
 def test_runtime_check_payload_matches_response_schema(monkeypatch):
     from app.schemas import RuntimeCheckResponse
     from app.services import runtime_settings
@@ -86,7 +160,6 @@ def test_runtime_check_payload_matches_response_schema(monkeypatch):
         "env_sync_status",
         lambda: {"synced": True, "missing_keys": [], "extra_keys": [], "deprecated_keys": [], "bom_keys": []},
     )
-    monkeypatch.setattr(runtime_settings, "_reranker_runtime_status", lambda: {"enabled": False, "healthy": False})
     monkeypatch.setattr(runtime_settings, "_check_postgres", lambda: True)
     monkeypatch.setattr(runtime_settings, "_check_qdrant", lambda: True)
     monkeypatch.setattr(runtime_settings, "_check_redis", lambda: True)
@@ -119,7 +192,10 @@ def test_runtime_env_sync_treats_legacy_runtime_keys_as_deprecated(monkeypatch, 
         "RETRIEVAL_LAYER_ENABLED=true\n"
         "RETRIEVAL_CACHE_TTL_SECONDS=120\n"
         "CITATION_VERIFICATION_SAMPLE_MAX=3\n"
-        "GRAPH_OVERVIEW_MAX_NODES=260\n",
+        "GRAPH_OVERVIEW_MAX_NODES=260\n"
+        "RERANKER_ENABLED=true\n"
+        "RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2\n"
+        "HF_HUB_OFFLINE=1\n",
         encoding="utf-8",
     )
     example_path.write_text(
@@ -140,7 +216,10 @@ def test_runtime_env_sync_treats_legacy_runtime_keys_as_deprecated(monkeypatch, 
         "CITATION_VERIFICATION_SAMPLE_MAX",
         "COMMUNITY_LOUVAIN_RESOLUTION",
         "GRAPH_OVERVIEW_MAX_NODES",
+        "HF_HUB_OFFLINE",
         "INGESTION_FILE_CONCURRENCY",
+        "RERANKER_ENABLED",
+        "RERANKER_MODEL",
         "RETRIEVAL_CACHE_TTL_SECONDS",
         "RETRIEVAL_LAYER_ENABLED",
         "SEMANTIC_CHUNKING_ENABLED",
@@ -158,6 +237,9 @@ def test_runtime_env_sync_treats_legacy_runtime_keys_as_deprecated(monkeypatch, 
     assert "RETRIEVAL_CACHE_TTL_SECONDS" not in cleaned
     assert "CITATION_VERIFICATION_SAMPLE_MAX" not in cleaned
     assert "GRAPH_OVERVIEW_MAX_NODES" not in cleaned
+    assert "RERANKER_ENABLED" not in cleaned
+    assert "RERANKER_MODEL" not in cleaned
+    assert "HF_HUB_OFFLINE" not in cleaned
 
 
 def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch):
@@ -169,15 +251,27 @@ def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch)
     monkeypatch.setenv("FIXED_CHUNK_OVERLAP_TOKENS", "80")
     monkeypatch.setenv("CONTEXT_PACKAGE_TOKEN_BUDGET", "2400")
     monkeypatch.setattr(runtime_settings, "current_runtime_settings_version", lambda: "unit-version")
-    monkeypatch.setattr(runtime_settings, "_env_entries", lambda _path: {})
+    monkeypatch.setattr(
+        runtime_settings,
+        "_env_entries",
+        lambda _path: {
+            "FIXED_CHUNK_SIZE_TOKENS": "512",
+            "FIXED_CHUNK_OVERLAP_TOKENS": "80",
+            "CONTEXT_PACKAGE_TOKEN_BUDGET": "2400",
+        },
+    )
 
     payload = runtime_settings.model_settings_payload()
 
     assert payload["fixed_chunk_size_tokens"] == 512
     assert payload["fixed_chunk_overlap_tokens"] == 80
     assert payload["context_package_token_budget"] == 2400
+    assert payload["agent_coarse_total_budget"] > 0
+    assert payload["agent_chunk_top_k"] > 0
+    assert "lifecycle" in payload
     assert "chunk_token_budget" not in payload
     assert "semantic_chunking_enabled" not in payload
+    assert "agent_coarse_entry_budget" not in payload
 
 
 def test_model_settings_payload_keeps_bridge_targets_editable(monkeypatch):
@@ -601,7 +695,6 @@ def test_operations_script_matrix_matches_context_graph_todo():
         "rebuild_coarse_concept_graph.py",
         "rebuild_context_graph_all.py",
         "reconcile_vector_records.py",
-        "reconcile_bm25_records.py",
         "diagnose_context_graph.py",
         "evaluate_layered_retrieval.py",
         "evaluate_agent_trace.py",
@@ -621,7 +714,6 @@ def test_operations_script_matrix_matches_context_graph_todo():
         "rebuild_mid_concept_graph.py",
         "rebuild_coarse_concept_graph.py",
         "rebuild_context_graph_all.py",
-        "reconcile_bm25_records.py",
         "runtime_hot_reload_probe.py",
     ]
     for name in write_scripts:

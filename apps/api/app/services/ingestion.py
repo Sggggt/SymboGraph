@@ -226,6 +226,26 @@ def create_uploaded_files_batch(db: Session, knowledge_base_id: str, file_paths:
     return batch
 
 
+def create_context_graph_rebuild_batch(db: Session, knowledge_base_id: str, *, layers: list[str] | None = None) -> IngestionBatch:
+    batch = IngestionBatch(
+        knowledge_base_id=knowledge_base_id,
+        trigger_source="graph_rebuild",
+        source_root=str(get_settings().data_root),
+        total_files=1,
+        status="queued",
+        stats={
+            "phase": "queued",
+            "maintenance_task": "context_graph_rebuild",
+            "layers": layers or ["chunk-relation", "mid-concepts", "coarse-concepts", "context-graph"],
+            "parse_committed": False,
+        },
+    )
+    db.add(batch)
+    db.commit()
+    db.refresh(batch)
+    return batch
+
+
 def mark_batch_task_started(batch_id: str, task_id: str | None, task_name: str) -> None:
     from app.db import SessionLocal
 
@@ -486,6 +506,86 @@ async def run_batch_ingestion(batch_id: str) -> dict:
             raise RuntimeError(f"Batch {batch_id} not found")
         file_paths = [Path(path) for path in (batch.stats or {}).get("file_paths", [])]
     return await run_uploaded_files_ingestion(batch_id, [str(path) for path in file_paths], execution_mode="celery")
+
+
+async def run_context_graph_rebuild_batch(batch_id: str, *, execution_mode: str = "inline") -> dict:
+    from app.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        batch = db.get(IngestionBatch, batch_id)
+        if batch is None:
+            raise RuntimeError(f"Batch {batch_id} not found")
+        knowledge_base = resolve_knowledge_base(db, batch.knowledge_base_id)
+        batch.status = "extracting_graph"
+        batch.started_at = datetime.utcnow()
+        batch.completed_at = None
+        batch.total_files = 1
+        batch.processed_files = 0
+        batch.success_count = 0
+        batch.failure_count = 0
+        batch.skipped_count = 0
+        batch.worker_id = current_worker_id()
+        batch.heartbeat_at = datetime.utcnow()
+        batch.stats = {
+            **(batch.stats or {}),
+            "phase": "context_graph",
+            "ingestion_execution_mode": execution_mode,
+            "maintenance_task": "context_graph_rebuild",
+            "errors": [],
+        }
+        db.commit()
+        emit_ingestion_log(batch.id, "batch_started", "Context graph rebuild started", maintenance_task="context_graph_rebuild")
+        emit_ingestion_log(batch.id, "context_graph_started", "Building four-layer context graph")
+        context_state = await rebuild_context_graph(db, knowledge_base.id, batch_id=batch.id)
+        graph_stats = dict(context_state.stats_json or {})
+        batch = db.get(IngestionBatch, batch_id)
+        if batch is None:
+            raise RuntimeError(f"Batch {batch_id} disappeared")
+        batch.status = "completed"
+        batch.processed_files = 1
+        batch.success_count = 1
+        batch.failure_count = 0
+        batch.completed_at = datetime.utcnow()
+        batch.worker_id = None
+        batch.heartbeat_at = None
+        batch.stats = {
+            **(batch.stats or {}),
+            "phase": "completed",
+            "graph_stats": graph_stats,
+            "parse_committed": False,
+            "graph_rebuild_committed": True,
+            "context_graph_state_id": context_state.id,
+        }
+        db.commit()
+        emit_ingestion_log(batch.id, "context_graph_completed", "Four-layer context graph is active", **graph_stats)
+        emit_ingestion_log(batch.id, "batch_completed", "Context graph rebuild completed", **graph_stats)
+        return summarize_batch(batch)
+    except Exception as exc:
+        db.rollback()
+        message = exception_message(exc)
+        batch = db.get(IngestionBatch, batch_id)
+        if batch is not None:
+            stats = dict(batch.stats or {})
+            errors = list(stats.get("errors") or [])
+            errors.append({"phase": stats.get("phase") or batch.status, "message": message})
+            batch.status = "failed"
+            batch.last_error = message
+            batch.completed_at = datetime.utcnow()
+            batch.worker_id = None
+            batch.heartbeat_at = None
+            batch.stats = {
+                **stats,
+                "phase": "failed",
+                "errors": errors,
+                "manual_review_required": True,
+                "failed_at": datetime.utcnow().isoformat(),
+            }
+            db.commit()
+            emit_ingestion_log(batch.id, "batch_failed", f"Context graph rebuild failed: {message}", error=message)
+        raise
+    finally:
+        db.close()
 
 
 async def run_uploaded_files_ingestion(

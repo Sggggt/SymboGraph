@@ -23,9 +23,9 @@ describe("agent trace helpers", () => {
   it("labels context graph nodes in Chinese", () => {
     expect(traceNodeLabel("agent_planner")).toBe("智能体规划");
     expect(traceNodeLabel("typed_action_validation")).toBe("动作校验");
-    expect(traceNodeLabel("entry_selection")).toBe("入口选择");
-    expect(traceNodeLabel("layer_drilldown")).toBe("分层下钻");
-    expect(traceNodeLabel("frontier_traversal")).toBe("Frontier 遍历");
+    expect(traceNodeLabel("entry_selection")).toBe("分阶段入口");
+    expect(traceNodeLabel("layer_drilldown")).toBe("逐父下钻");
+    expect(traceNodeLabel("frontier_traversal")).toBe("队列遍历");
     expect(traceNodeLabel("structure_context_restoration")).toBe("结构上下文恢复");
     expect(traceNodeLabel("retrievers")).toBe("片段召回");
   });
@@ -37,7 +37,7 @@ describe("agent trace helpers", () => {
         { node: "frontier_traversal", status: "completed", document_ids: [], scores: {}, duration_ms: 1 },
         { node: "citation_verification", status: "completed", document_ids: [], scores: {}, duration_ms: 1 },
       ]).map((group) => group.label),
-    ).toEqual(["入口选择", "Frontier 遍历", "引用验证"]);
+    ).toEqual(["分阶段入口", "队列遍历", "引用验证"]);
   });
 
   it("summarizes context graph audit scores including RQ path", () => {

@@ -25,7 +25,7 @@ SymboGraph 是一个本地通用智能知识库系统。系统采用 Four-Layer 
 
 ## 产品定位
 
-SymboGraph 面向本地资料库、课程资料、技术文档和研究资料的严格引用问答与图谱检索。系统强调可重建、可审计、可追溯：PostgreSQL 保存事实源，Qdrant、BM25 和 Redis 作为派生状态；答案事实只来自 context package 和 raw chunk citation span。
+SymboGraph 面向本地资料库、课程资料、技术文档和研究资料的严格引用问答与图谱检索。系统强调可重建、可审计、可追溯：PostgreSQL 保存事实源，Qdrant 和 Redis 作为 active 派生或运行态存储；答案事实只来自 context package 和 raw chunk citation span。
 
 适合：
 
@@ -41,9 +41,8 @@ SymboGraph 面向本地资料库、课程资料、技术文档和研究资料的
 | 后端 | Python 3.13, FastAPI, SQLAlchemy, Alembic, Pydantic |
 | 存储 | PostgreSQL 16, Qdrant 1.17.1, Redis 7 |
 | 异步任务 | Celery, Redis broker |
-| 检索 | Dense embedding, BM25, chunk relation graph, RQ membership, layered traversal |
+| 检索 | Dense embedding, dense-only chunk relation graph, RQ membership, staged layered traversal |
 | 模型接口 | OpenAI-compatible chat 和 embedding endpoint |
-| 精排 | Cross-Encoder reranker，可选 |
 | 前端 | Next.js 16.2.4, React 19.2.4, TypeScript, TanStack Query, Tailwind CSS, ECharts |
 | 运维 | Docker Compose, Python maintenance scripts, pytest, Vitest, ESLint |
 
@@ -54,7 +53,7 @@ source files
 -> parser and layout extractor
 -> fixed token chunks
 -> chunk structure graph
--> contextual embedding and BM25
+-> contextual embedding and vector index
 -> independent chunk relation graph
 -> RQ prefix address tree and fuzzy membership
 -> RQ L3 mid concept graph
@@ -68,7 +67,7 @@ source files
 -> reward and policy update
 ```
 
-## 环境配置（Cross-Encoder 可选）
+## 环境配置
 
 首次启动前从模板创建 `.env`：
 
@@ -95,18 +94,6 @@ EMBEDDING_DIMENSIONS=1024
 ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 ```
-
-Cross-Encoder 精排默认关闭。需要启用时：
-
-```env
-RERANKER_ENABLED=true
-RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
-RERANKER_MAX_LENGTH=512
-RERANKER_DEVICE=cpu
-HF_HUB_OFFLINE=1
-```
-
-Docker 镜像安装了 `apps/api` 的 `[rerank]` extra。模型缓存挂载到 `data/models/huggingface`；如果希望构建镜像时预热模型，可传入 `PRELOAD_RERANK_MODEL=true` 构建参数。
 
 ## 快速启动
 
@@ -142,15 +129,15 @@ course-kg-qdrant
 | 任务队列 | `INGESTION_TASK_QUEUE` |
 | 基础设施 | `DATABASE_URL`, `QDRANT_URL`, `QDRANT_COLLECTION`, `REDIS_URL`, `CORS_ORIGINS`, `API_KEYS` |
 | 数据目录 | `KNOWLEDGE_BASE_NAME`, `DATA_ROOT`, `STORAGE_ROOT`, `INGESTION_ROOT` |
-| 模型桥接 | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT` |
+| 模型桥接 | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT`, `MODEL_BRIDGE_ADMIN_TOKEN` |
 | Chat | `OPENAI_API_KEY`, `CHAT_BASE_URL`, `CHAT_RESOLVE_IP`, `CHAT_MODEL` |
 | Embedding | `EMBEDDING_API_KEY`, `EMBEDDING_BASE_URL`, `EMBEDDING_RESOLVE_IP`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_BATCH_SIZE` |
 | 并发与资源 | `WORKER_CONCURRENCY`, `WORKER_MAX_TASKS_PER_CHILD`, `MODEL_REQUEST_CONCURRENCY`, `MODEL_REQUEST_TIMEOUT_SECONDS`, `INGESTION_MEMORY_SOFT_LIMIT_RATIO`, `INGESTION_MEMORY_HARD_LIMIT_RATIO`, `INGESTION_MEMORY_CRITICAL_LIMIT_RATIO` |
 | Chunk 与上下文 | `FIXED_CHUNK_SIZE_TOKENS`, `FIXED_CHUNK_OVERLAP_TOKENS`, `CONTEXT_PACKAGE_TOKEN_BUDGET` |
 | Mid concept | `MID_CONCEPT_EXTRACTION_MAX_MODEL_BATCHES`, `MID_CONCEPT_EXTRACTION_MAX_CANDIDATES_PER_BATCH`, `MID_CONCEPT_EXTRACTION_MAX_TOKENS_PER_BATCH`, `MID_CONCEPT_CANDIDATE_KEEP_THRESHOLD` |
 | RQ-KMeans | `RQ_KMEANS_LEVELS`, `RQ_KMEANS_MAX_K`, `RQ_RESIDUAL_TAU` |
-| Agent envelope | `AGENT_COARSE_ENTRY_BUDGET`, `AGENT_COARSE_JUMP_BUDGET`, `AGENT_MID_ENTRY_BUDGET`, `AGENT_MID_EXPANSION_RADIUS_CAP`, `AGENT_RQ_MEMBERSHIP_SEED_BUDGET`, `AGENT_FRONTIER_EXPANSION_BUDGET`, `AGENT_MAX_DEPTH_PER_LAYER`, `AGENT_MAX_LABELS_PER_NODE`, `AGENT_MAX_EDGE_REUSE`, `AGENT_MAX_CYCLE_REWARD_PER_PATH`, `AGENT_CYCLE_REWARD_DISTANCE_THRESHOLD`, `AGENT_PATH_DISTANCE_GREEN_THRESHOLD`, `AGENT_PATH_DISTANCE_GRAY_THRESHOLD`, `AGENT_PATH_DISTANCE_HARD_THRESHOLD`, `AGENT_DRILLDOWN_BUDGET_PER_LAYER`, `AGENT_CHUNK_CANDIDATE_BUDGET`, `AGENT_STRUCTURE_RESTORE_BUDGET`, `CONTEXT_PATH_SUMMARY_BUDGET`, `AGENT_PLANNING_ROUND_BUDGET`, `AGENT_MAX_TYPED_ACTIONS_PER_ROUND`, `AGENT_REPAIR_ROUND_BUDGET`, `AGENT_VERIFICATION_BUDGET` |
-| 精排 | `RERANKER_ENABLED`, `RERANKER_MODEL`, `RERANKER_MAX_LENGTH`, `RERANKER_DEVICE`, `HF_HUB_OFFLINE` |
+| Dense relation operating point | `DENSE_KNN_K_MIN`, `DENSE_KNN_K_MAX`, `DENSE_REVERSE_B_MIN_BASE`, `DENSE_REVERSE_B_MAX_BASE`, `DENSE_REVERSE_B_MIN_DOC`, `DENSE_REVERSE_B_MAX_DOC`, `DENSE_REVERSE_B_MIN_LANG`, `DENSE_REVERSE_B_MAX_LANG`, `DENSE_MIN_COSINE`, `DENSE_STRONG_COSINE`, `CROSS_DOC_OUT_QUOTA_MIN`, `CROSS_DOC_OUT_QUOTA_MAX`, `CROSS_DOC_MIN_COSINE`, `CROSS_LANGUAGE_OUT_QUOTA_MIN`, `CROSS_LANGUAGE_OUT_QUOTA_MAX`, `CROSS_LANGUAGE_MIN_COSINE` |
+| Agent envelope | `AGENT_COARSE_TOTAL_BUDGET`, `AGENT_MID_PER_COARSE_BUDGET`, `AGENT_MID_TOP_K`, `AGENT_CHUNK_PER_MID_BUDGET`, `AGENT_CHUNK_TOP_K`, `CANDIDATE_POOL_DEDUPE_BUDGET`, `AGENT_MAX_DEPTH_PER_LAYER`, `AGENT_MAX_LABELS_PER_NODE`, `AGENT_MAX_EDGE_REUSE`, `AGENT_MAX_CYCLE_REWARD_PER_PATH`, `AGENT_CYCLE_REWARD_DISTANCE_THRESHOLD`, `AGENT_PATH_DISTANCE_GREEN_THRESHOLD`, `AGENT_PATH_DISTANCE_GRAY_THRESHOLD`, `AGENT_PATH_DISTANCE_HARD_THRESHOLD`, `AGENT_STRUCTURE_RESTORE_BUDGET`, `CONTEXT_PATH_SUMMARY_BUDGET`, `AGENT_PLANNING_ROUND_BUDGET`, `AGENT_MAX_TYPED_ACTIONS_PER_ROUND`, `AGENT_REPAIR_ROUND_BUDGET`, `AGENT_VERIFICATION_BUDGET` |
 | Fallback | `ENABLE_MODEL_FALLBACK`, `ENABLE_DATABASE_FALLBACK` |
 
 ## 验证
@@ -187,8 +174,7 @@ python scripts/check_context_package_quality.py
 python scripts/evaluate_agent_trace.py
 python scripts/check_technical_spec_compliance.py --knowledge-base-name 贝叶斯
 python scripts/reconcile_vector_records.py
-python scripts/reconcile_bm25_records.py
-python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --worker-container course-kg-worker
+python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
 ```
 
 写数据脚本默认提供 dry-run 或要求显式 `--execute`。生成的诊断、benchmark、smoke 输出和验收报告写入 `output/`。
@@ -211,7 +197,7 @@ python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --worker-con
 - Mid concepts 与 RQ L3 prefixes 一一投影，Coarse concepts 与 RQ L2 prefixes 一一投影；上层边必须由底层 chunk relation edge support 投影。
 - QA 只使用 context package，不直接使用裸 search results。
 - Citation 必须指向 raw chunk span。
-- Qdrant、BM25 和 Redis 均为派生状态，必须能从 PostgreSQL 重建。
+- Qdrant 和 Redis 均为 active 派生或运行态存储，必须能从 PostgreSQL 重建或刷新。
 - Profile 只影响 prompt、UI 和对话偏好；工程参数进入 `.env` 或 runtime settings。
 - 涉及 PostgreSQL、Qdrant、Redis、模型接口和无 fallback 的集成路径在 Docker 栈内验证。
-- 不提交 `.env`、本地数据库、模型缓存、`node_modules`、`.next`、`data/`、`output/`。
+- 不提交 `.env`、本地数据库、`node_modules`、`.next`、`data/`、`output/`。

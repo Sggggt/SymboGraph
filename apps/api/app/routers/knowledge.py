@@ -6,8 +6,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.db import get_db
-from app.models import Chunk, Document
+from app.models import Chunk, Document, IngestionBatch
 from app.schemas import (
     CleanupStaleDataResponse,
     ContextPackageResponse,
@@ -22,15 +23,19 @@ from app.schemas import (
     RefreshResponse,
     RetrievalTraceStepsResponse,
 )
-from app.services.context_graph import context_graph_stats, graph_layer_payload, rebuild_context_graph
+from app.services.context_graph import context_graph_stats, graph_layer_payload
 from app.services.ingestion import (
+    create_context_graph_rebuild_batch,
     create_knowledge_base_space,
+    exception_message,
     list_knowledge_base_files,
     list_knowledge_base_summaries,
     remove_knowledge_base_file,
     resolve_knowledge_base,
+    run_context_graph_rebuild_batch,
     summarize_knowledge_base,
 )
+from app.services.ingestion_logs import emit_ingestion_log
 from app.services.maintenance import MaintenanceConflict, cleanup_stale_data, delete_knowledge_base_data
 from app.services.retrieval import get_context_package, get_dashboard_snapshot, get_retrieval_trace_steps
 
@@ -42,6 +47,29 @@ def get_requested_knowledge_base(db: Session, knowledge_base_id: str | None = No
         return resolve_knowledge_base(db, knowledge_base_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def mark_graph_rebuild_enqueued(db: Session, batch: IngestionBatch, task_id: str | None) -> None:
+    stats = dict(batch.stats or {})
+    stats["ingestion_execution_mode"] = "celery"
+    stats["celery_task_name"] = "rebuild_context_graph_batch"
+    if task_id:
+        stats["celery_task_id"] = task_id
+        stats["batch_task_ids"] = sorted({*stats.get("batch_task_ids", []), str(task_id)})
+        stats["task_last_seen_at"] = datetime.utcnow().isoformat()
+    batch.stats = stats
+    db.commit()
+    emit_ingestion_log(batch.id, "batch_queued", "Context graph rebuild queued", celery_task_id=task_id)
+
+
+def mark_graph_rebuild_enqueue_failed(db: Session, batch: IngestionBatch, exc: Exception) -> None:
+    message = f"Failed to enqueue context graph rebuild: {exception_message(exc)}"
+    batch.status = "failed"
+    batch.last_error = message
+    batch.completed_at = datetime.utcnow()
+    batch.stats = {**(batch.stats or {}), "phase": "failed", "enqueue_error": message, "manual_review_required": True}
+    db.commit()
+    emit_ingestion_log(batch.id, "batch_failed", message, error=message)
 
 
 @router.get("/knowledge_bases", response_model=list[KnowledgeBaseSummary])
@@ -170,13 +198,30 @@ async def rebuild_graph_endpoint(
             "dry_run": True,
             "stats": {"active_chunks": active_chunks, "layers": request.layers},
         }
-    context_state = await rebuild_context_graph(db, knowledge_base.id)
-    db.commit()
+    batch = create_context_graph_rebuild_batch(db, knowledge_base.id, layers=[str(layer) for layer in request.layers])
+    if get_settings().ingestion_execution_mode == "inline":
+        summary = await run_context_graph_rebuild_batch(batch.id, execution_mode="inline")
+        return {
+            "batch_id": batch.id,
+            "state": summary.get("state", "completed"),
+            "mode": "four_layer_context_graph",
+            "affected_documents": affected_documents,
+            "dry_run": False,
+            "stats": summary.get("stats", {}),
+        }
+    try:
+        from worker_app.tasks import rebuild_context_graph_batch
+
+        task = rebuild_context_graph_batch.apply_async(args=[batch.id], queue=get_settings().ingestion_task_queue)
+        mark_graph_rebuild_enqueued(db, batch, getattr(task, "id", None))
+    except Exception as exc:
+        mark_graph_rebuild_enqueue_failed(db, batch, exc)
+        raise HTTPException(status_code=503, detail=exception_message(exc)) from exc
     return {
-        "batch_id": context_state.build_batch_id,
-        "state": context_state.status,
+        "batch_id": batch.id,
+        "state": batch.status,
         "mode": "four_layer_context_graph",
         "affected_documents": affected_documents,
         "dry_run": False,
-        "stats": context_state.stats_json or {},
+        "stats": batch.stats or {},
     }

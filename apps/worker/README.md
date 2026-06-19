@@ -8,9 +8,10 @@
 
 | 路径 | 职责 |
 | --- | --- |
-| `celery_app.py` | Celery app 配置。 |
-| `tasks.py` | 导入、解析、图谱重建和维护任务入口。 |
-| `watcher.py` | 文件 watcher 入口。 |
+| `worker_app/celery_app.py` | Celery app 配置。 |
+| `worker_app/tasks.py` | 导入、解析、图谱重建和维护任务入口。 |
+| `worker_app/watcher.py` | 文件 watcher 入口。 |
+| `worker_app/bootstrap.py` | 将 API service layer 加入 Worker 进程 import path。 |
 | `README.md` | 本说明。 |
 
 ## 产品定位
@@ -35,7 +36,7 @@ flowchart LR
     W --> S["API service layer"]
     S --> PG["PostgreSQL"]
     S --> Q["Qdrant"]
-    S --> BM["BM25 records"]
+    S --> V["Vector records"]
     S --> C["Compensation logs"]
 ```
 
@@ -44,7 +45,7 @@ Worker 执行：
 - 文件导入批次。
 - 文件解析与固定 token chunk。
 - Chunk Structure Graph、坐标和映射。
-- Contextual embedding、Qdrant upsert 和 BM25 records。
+- Contextual embedding 和 Qdrant upsert。
 - Chunk Relation Graph、RQ address/membership、RQ L3 Mid Concept Graph、RQ L2 Coarse Concept Graph、Context Graph state。
 - 批次取消、补偿记录、可重试失败和 heartbeat。
 
@@ -78,7 +79,7 @@ course-kg-worker
 | 分类 | 参数 |
 | --- | --- |
 | Celery | `INGESTION_TASK_QUEUE`, `WORKER_CONCURRENCY`, `WORKER_MAX_TASKS_PER_CHILD` |
-| Runtime reload | `REDIS_URL`, `RUNTIME_SETTINGS_VERSION` 相关 Redis broadcast |
+| Runtime reload | `REDIS_URL` 和 Redis runtime settings version broadcast |
 | 资源保护 | `INGESTION_MEMORY_SOFT_LIMIT_RATIO`, `INGESTION_MEMORY_HARD_LIMIT_RATIO`, `INGESTION_MEMORY_CRITICAL_LIMIT_RATIO` |
 | 模型调用 | `MODEL_REQUEST_CONCURRENCY`, `MODEL_REQUEST_TIMEOUT_SECONDS` |
 
@@ -93,7 +94,7 @@ docker exec -w /app/apps/api course-kg-api python -m pytest tests
 ## 运维测试
 
 ```powershell
-python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --worker-container course-kg-worker
+python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
 python scripts/check_runtime_settings_contract.py
 python scripts/runtime_hot_reload_probe.py
 ```

@@ -6,7 +6,7 @@ export const logEventLabels: Record<string, string> = {
   batch_started: "批次开始",
   batch_files: "文件扫描完成",
   file_started: "开始解析文件",
-  file_indexed: "向量与 BM25 已写入",
+  file_indexed: "向量索引已写入",
   file_completed: "文件解析完成",
   file_failed: "文件解析失败",
   file_skipped: "文件跳过",
@@ -85,7 +85,7 @@ export function graphLogSummary(item: IngestionLogEvent): string | null {
   const phaseLabels: Record<string, string> = {
     parsing: "解析",
     chunking: "固定切块",
-    embedding: "向量/BM25",
+    embedding: "向量索引",
     "context_graph:starting": "上下文图谱初始化",
     "context_graph:chunk_relation": "片段关系图",
     "context_graph:chunk_relation:chunk_edges": "关系边生成",
@@ -109,7 +109,6 @@ export function graphLogSummary(item: IngestionLogEvent): string | null {
   };
   pushNumber("片段", item.chunk_count);
   pushNumber("向量", item.vector_count);
-  pushNumber("BM25", item.bm25_record_count);
   pushNumber("关系边", item.relation_edge_count);
   pushNumber("RQ membership", item.rq_prefix_count);
   pushNumber("中概念", item.mid_concept_count);

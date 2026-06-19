@@ -30,7 +30,6 @@ services:
       - ../.env:/app/.env
       - ../.env.example:/app/.env.example:ro
       - ../output:/app/output
-      - ../data/models/huggingface:/app/models/huggingface
       - ../apps/api/app:/app/apps/api/app
       - ../apps/api/migrations:/app/apps/api/migrations
       - ../apps/api/tests:/app/apps/api/tests
@@ -83,7 +82,6 @@ services:
       - ../.env:/app/.env
       - ../.env.example:/app/.env.example:ro
       - ../output:/app/output
-      - ../data/models/huggingface:/app/models/huggingface
       - ../apps/api/app:/app/apps/api/app
       - ../apps/api/migrations:/app/apps/api/migrations
       - ../apps/api/tests:/app/apps/api/tests

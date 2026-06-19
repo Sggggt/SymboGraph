@@ -18,13 +18,6 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("API_KEYS must be configured when APP_ENV=production")
     ensure_schema()
     finalize_interrupted_batches()
-    # 启动时预加载 reranker 模型（避免首次请求时阻塞事件循环导致健康检查失败）
-    if settings.reranker_enabled:
-        try:
-            from app.services.reranker import _load_reranker
-            _load_reranker()
-        except Exception:
-            pass  # 预加载失败不影响启动，首次请求时会重试
     yield
 
 

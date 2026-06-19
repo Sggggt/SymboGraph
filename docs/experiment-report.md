@@ -39,8 +39,8 @@
 
 | 编号 | 系统 | 定位 |
 | --- | --- | --- |
-| S1 | SymboGraph-Full | 完整系统：混合召回、轻量 rerank、parent context、evidence-first agent、课程图谱增强 |
-| S2 | SymboGraph-NoGraph | 无图基线：保留 dense + lexical + rerank + QA，但不使用知识图谱 |
+| S1 | SymboGraph-Full | 历史实验配置：混合召回、轻量候选后处理、parent context、evidence-first agent、课程图谱增强 |
+| S2 | SymboGraph-NoGraph | 历史无图基线：保留 dense + lexical + QA，但不使用知识图谱 |
 | S3 | LightRAG | 轻量 GraphRAG 基线 |
 | S4 | MS-GraphRAG | Microsoft GraphRAG 风格基线 |
 
@@ -90,7 +90,7 @@
 | S1 Full | 108 | 33.68 | 34.58 | 34.06 | 47.59 | 31.76 | 92.50 | 32.59 | 33.37 | 0.05 | 1329.5 |
 | S2 NoGraph | 108 | 32.78 | 33.52 | 33.31 | 44.68 | 30.91 | 92.18 | 31.71 | 32.27 | 0.04 | 929.3 |
 
-S1 在 Ground 和 Overall 上略高于 S2，说明图谱和 evidence-first 编排对检索质量有正向贡献；但两者差异不大，说明 dense + lexical + lightweight rerank 的基础检索能力已经比较稳定。
+S1 在 Ground 和 Overall 上略高于 S2，说明图谱和 evidence-first 编排对检索质量有正向贡献；但两者差异不大，说明当时 dense + lexical 的基础检索能力已经比较稳定。该报告记录的是历史实验，不代表当前 Four-Layer Context Graph RAG 的 active path。
 
 **Synthetic-Answer Track**（S3, S4）：
 
@@ -138,7 +138,7 @@ QA 结论：
 - S1/S2 的 QA Overall 最高（64.17 / 63.33），且 HalluRate 最低（0.17）。S1 的 Noise（89.17）显著高于 S2（71.67），说明 evidence-first agent 和 parent context 对答案纯净度有正向贡献。
 - S3/S4 的 QA 明显低于 S1/S2，核心原因是它们偏 GraphRAG 摘要与图查询，弱于 evidence-first 课程问答；Citation 为 0，说明其输出形态不提供 chunk 级引用。
 - S4 的 HalluRate 高达 0.83，Overall 仅 46.67，GraphRAG 全局摘要容易引入通用知识和弱证据。
-- S1 的 TTFT（136884.7 ms）显著高于 S2（30724.5 ms），说明 evidence-first agent 的多轮检索和重排带来较大首 token 延迟；但 S1 的 PromptTok（76.0）和 TotalTok（284.0）远低于 S2（3187.0 / 4820.0），说明 S1 的生成更精简，输入上下文更聚焦。
+- S1 的 TTFT（136884.7 ms）显著高于 S2（30724.5 ms），说明 evidence-first agent 的多轮检索和候选后处理带来较大首 token 延迟；但 S1 的 PromptTok（76.0）和 TotalTok（284.0）远低于 S2（3187.0 / 4820.0），说明 S1 的生成更精简，输入上下文更聚焦。
 
 ## 4. 图谱评测
 

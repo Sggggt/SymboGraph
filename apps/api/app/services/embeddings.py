@@ -27,6 +27,7 @@ from app.services.strategy_profiles import (
     active_profile_json,
     profile_prompt,
 )
+from app.services.error_sanitizer import ExternalServiceError, public_exception_message, sanitize_error_message
 
 
 class FallbackDisabledError(RuntimeError):
@@ -72,15 +73,12 @@ def is_degraded_mode() -> bool:
 
 
 def _exception_message(exc: Exception) -> str:
-    if isinstance(exc, httpx.HTTPStatusError):
-        try:
-            return exc.response.text or str(exc)
-        except Exception:
-            return str(exc)
-    return str(exc)
+    return public_exception_message(exc)
 
 
 def _is_unsupported_parameter_error(exc: Exception, parameter_name: str) -> bool:
+    if isinstance(exc, ExternalServiceError):
+        return parameter_name.lower() in {item.lower() for item in exc.unsupported_parameters}
     message = _exception_message(exc).lower()
     if parameter_name.lower() not in message:
         return False
@@ -96,6 +94,79 @@ def _is_unsupported_parameter_error(exc: Exception, parameter_name: str) -> bool
             "unrecognized",
             "extra inputs",
         )
+    )
+
+
+UNSUPPORTED_PROVIDER_MARKERS = (
+    "invalidparameter",
+    "invalid parameter",
+    "unsupported",
+    "not support",
+    "not supported",
+    "unknown parameter",
+    "unrecognized",
+    "extra inputs",
+)
+KNOWN_PROVIDER_PARAMETERS = {
+    "dimensions",
+    "response_format",
+    "json_schema",
+    "json_object",
+}
+
+
+def _provider_error_json(text: str) -> dict[str, Any]:
+    try:
+        data = json.loads(text)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    error = data.get("error")
+    return error if isinstance(error, dict) else data
+
+
+def _provider_error_code(text: str) -> str | None:
+    error = _provider_error_json(text)
+    for key in ("code", "type", "param"):
+        value = error.get(key)
+        if isinstance(value, str) and value.strip():
+            return sanitize_error_message(value, fallback="provider_error", max_length=80)
+    return None
+
+
+def _detect_unsupported_parameters(text: str) -> set[str]:
+    lower = text.lower()
+    error = _provider_error_json(text)
+    candidates = set(KNOWN_PROVIDER_PARAMETERS)
+    param = error.get("param")
+    if isinstance(param, str) and param.strip():
+        candidates.add(param.strip().lower())
+    if not any(marker in lower for marker in UNSUPPORTED_PROVIDER_MARKERS):
+        return set()
+    return {parameter for parameter in candidates if parameter.lower() in lower}
+
+
+def _external_provider_error_from_response(response: httpx.Response, *, phase: str) -> ExternalServiceError:
+    body = response.text or ""
+    status_code = response.status_code
+    return ExternalServiceError(
+        service="model_provider",
+        phase=phase,
+        status_code=status_code,
+        error_code=_provider_error_code(body),
+        retryable=status_code == 429 or status_code >= 500,
+        unsupported_parameters=_detect_unsupported_parameters(body),
+    )
+
+
+def _external_provider_error_from_body(body: str, *, phase: str) -> ExternalServiceError:
+    return ExternalServiceError(
+        service="model_provider",
+        phase=phase,
+        error_code=_provider_error_code(body),
+        retryable=None,
+        unsupported_parameters=_detect_unsupported_parameters(body),
     )
 
 
@@ -138,7 +209,7 @@ class EmbeddingProvider:
                 vectors=[self._fake_embedding(text) for text in texts],
                 provider="fake",
                 external_called=True,
-                fallback_reason=f"{type(exc).__name__}: {exc}",
+                fallback_reason=public_exception_message(exc),
             )
 
     async def _openai_compatible_embeddings(self, texts: list[str], text_type: str = "document") -> list[list[float]]:
@@ -256,7 +327,7 @@ class ChatProvider:
                 provider="extractive_fallback",
                 model="local_extractive_template",
                 external_called=True,
-                fallback_reason=f"{type(exc).__name__}: {exc}",
+                fallback_reason=public_exception_message(exc),
             )
 
     async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -514,7 +585,8 @@ class ChatProvider:
                 last_error = exc
                 if not self._is_unsupported_response_format_error(exc):
                     raise
-        raise RuntimeError(f"Chat JSON request failed after response_format fallback: {last_error}")
+        safe_error = public_exception_message(last_error) if last_error else "unknown"
+        raise RuntimeError(f"Chat JSON request failed after response_format fallback: {safe_error}")
 
     def _response_format_candidates(self, response_format: dict[str, Any] | None) -> list[dict[str, Any] | None]:
         if not response_format:
@@ -575,7 +647,7 @@ class ChatProvider:
         raise RuntimeError("Chat response did not contain text content")
 
     def _is_unsupported_structured_output_error(self, exc: Exception) -> bool:
-        message = str(exc).lower()
+        message = _exception_message(exc).lower()
         return "json_schema" in message and any(
             marker in message
             for marker in (
@@ -590,6 +662,9 @@ class ChatProvider:
         )
 
     def _is_unsupported_response_format_error(self, exc: Exception) -> bool:
+        if isinstance(exc, ExternalServiceError):
+            params = {item.lower() for item in exc.unsupported_parameters}
+            return bool(params & {"response_format", "json_schema", "json_object"})
         message = _exception_message(exc).lower()
         if "response_format" not in message and "json_schema" not in message and "json_object" not in message:
             return False
@@ -667,27 +742,26 @@ async def post_openai_compatible_json(
                 async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
                     response = await client.post(url, json=payload, headers=headers)
                     if response.status_code >= 400:
-                        raise httpx.HTTPStatusError(
-                            f"OpenAI-compatible request failed with HTTP {response.status_code}: {response.text}",
-                            request=response.request,
-                            response=response,
-                        )
+                        raise _external_provider_error_from_response(response, phase="http_json")
                     return response.json()
         except Exception as exc:
             last_error = exc
             if attempt >= 3 or not _is_retryable_openai_error(exc):
                 raise
             await asyncio.sleep(float(attempt))
-    raise RuntimeError(f"OpenAI-compatible request failed: {last_error}")
+    safe_error = public_exception_message(last_error) if last_error else "unknown"
+    raise RuntimeError(f"OpenAI-compatible request failed: {safe_error}")
 
 
 def _is_retryable_openai_error(exc: Exception) -> bool:
+    if isinstance(exc, ExternalServiceError):
+        return bool(exc.retryable)
     if isinstance(exc, httpx.HTTPStatusError):
         status_code = exc.response.status_code
         return status_code == 429 or status_code >= 500
     if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
         return True
-    message = str(exc).lower()
+    message = public_exception_message(exc).lower()
     non_retryable_markers = ("invalidparameter", "invalid parameter", "unauthorized", "forbidden", "401", "403")
     if any(marker in message for marker in non_retryable_markers):
         return False
@@ -732,22 +806,26 @@ def _post_json_with_curl_resolve(
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".json", dir=temp_dir) as payload_file:
             json.dump(payload, payload_file, ensure_ascii=False)
             payload_path = payload_file.name
-        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".curl", dir=temp_dir) as config_file:
-            payload_ref = payload_path.replace("\\", "/")
-            config_file.write(f'url = "{url}"\n')
-            config_file.write("request = POST\n")
-            config_file.write(f'connect-timeout = {min(int(timeout), 30)}\n')
-            config_file.write(f'max-time = {int(timeout)}\n')
-            config_file.write(f'resolve = "{parsed.hostname}:{port}:{resolve_ip}"\n')
-            config_file.write(f'header = "Authorization: {headers["Authorization"]}"\n')
-            config_file.write('header = "Content-Type: application/json"\n')
-            config_file.write(f'data-binary = "@{payload_ref}"\n')
-            config_path = config_file.name
+        payload_ref = payload_path.replace("\\", "/")
+        curl_config = "\n".join(
+            [
+                f'url = "{url}"',
+                "request = POST",
+                f"connect-timeout = {min(int(timeout), 30)}",
+                f"max-time = {int(timeout)}",
+                f'resolve = "{parsed.hostname}:{port}:{resolve_ip}"',
+                f'header = "Authorization: {headers["Authorization"]}"',
+                'header = "Content-Type: application/json"',
+                f'data-binary = "@{payload_ref}"',
+                "",
+            ]
+        )
         curl_binary = shutil.which("curl.exe") or shutil.which("curl")
         if not curl_binary:
             raise RuntimeError("curl is required for model RESOLVE_IP requests but was not found")
         result = subprocess.run(
-            [curl_binary, "-sS", "-K", config_path],
+            [curl_binary, "-sS", "-K", "-"],
+            input=curl_config,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -755,10 +833,10 @@ def _post_json_with_curl_resolve(
             timeout=timeout + 10,
         )
         if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or f"curl exited with {result.returncode}")
+            raise RuntimeError(sanitize_error_message(result.stderr.strip(), fallback=f"curl exited with {result.returncode}"))
         data = json.loads(result.stdout)
         if isinstance(data, dict) and data.get("error"):
-            raise RuntimeError(json.dumps(data["error"], ensure_ascii=False))
+            raise _external_provider_error_from_body(json.dumps(data["error"], ensure_ascii=False), phase="curl_resolve_json")
         return data
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

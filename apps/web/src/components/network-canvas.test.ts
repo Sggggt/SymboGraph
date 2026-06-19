@@ -4,7 +4,7 @@ import { buildBaseOption } from "@/components/network-canvas";
 import type { GraphResponse } from "@course-kg/shared";
 
 describe("NetworkCanvas option mapping", () => {
-  it("styles four-layer context graph nodes and RQ edges", () => {
+  it("styles four-layer context graph nodes and dense relation edges", () => {
     const graph: GraphResponse = {
       graph_type: "chunk-relation",
       schema_version: "context_graph_v1",
@@ -19,7 +19,7 @@ describe("NetworkCanvas option mapping", () => {
         { id: "coarse:k1", name: "Coarse concept", category: "coarse_concept", value: 4 },
       ],
       edges: [
-        { source: "chunk:c1", target: "chunk:c2", label: "rq_residual_near", category: "rq_residual_near", weight: 0.8 },
+        { source: "chunk:c1", target: "chunk:c2", label: "dense_semantic", category: "dense_semantic", weight: 0.8 },
         { source: "chunk:c1", target: "rq:p1", label: "rq_leaf", category: "rq_membership", weight: 0.7 },
         { source: "mid:m1", target: "coarse:k1", label: "included_in", category: "concept_relation", weight: 0.7 },
       ],
@@ -33,8 +33,8 @@ describe("NetworkCanvas option mapping", () => {
     expect(data.map((node) => node.category)).toEqual(["chunk", "chunk", "rq_prefix", "mid_concept", "coarse_concept"]);
     expect(data[3].symbolSize).toBeGreaterThan(data[0].symbolSize);
     const links = (series as { links: Array<{ category: string; lineStyle: { type: string; opacity: number } }> }).links;
-    expect(links[0].category).toBe("rq_residual_near");
-    expect(links[0].lineStyle.type).toBe("dashed");
-    expect(links[0].lineStyle.opacity).toBeGreaterThan(links[2].lineStyle.opacity);
+    expect(links[0].category).toBe("dense_semantic");
+    expect(links[0].lineStyle.type).toBe("solid");
+    expect(links[0].lineStyle.opacity).toBeGreaterThan(0);
   });
 });

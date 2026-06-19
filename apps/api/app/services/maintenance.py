@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.models import (
-    BM25Record,
     Chunk,
     ChunkContextText,
     ChunkCoordinate,
@@ -148,7 +147,6 @@ def cleanup_stale_data(
     inactive_chunk_id_filter = inactive_chunk_ids or {"__none__"}
     inactive_document_version_filter = inactive_document_version_ids or {"__none__"}
     stale_records = db.scalars(select(VectorRecord).where(VectorRecord.knowledge_base_id == knowledge_base_id, VectorRecord.chunk_id.in_(inactive_chunk_ids or {"__none__"}))).all()
-    stale_bm25_records = db.scalars(select(BM25Record).where(BM25Record.knowledge_base_id == knowledge_base_id, BM25Record.chunk_id.in_(inactive_chunk_id_filter))).all()
     points_by_collection: dict[str, list[str]] = defaultdict(list)
     for record in stale_records:
         points_by_collection[record.collection_name].append(record.qdrant_point_id)
@@ -192,8 +190,6 @@ def cleanup_stale_data(
                 raise
         if stale_records:
             db.query(VectorRecord).filter(VectorRecord.id.in_([record.id for record in stale_records])).delete(synchronize_session=False)
-        if stale_bm25_records:
-            db.query(BM25Record).filter(BM25Record.id.in_([record.id for record in stale_bm25_records])).delete(synchronize_session=False)
         if delete_inactive_chunks and inactive_chunk_ids:
             db.execute(update(CitationVerification).where(CitationVerification.chunk_id.in_(inactive_chunk_id_filter)).values(chunk_id=None))
             db.query(ChunkRelationEdge).filter(
@@ -219,7 +215,6 @@ def cleanup_stale_data(
         "inactive_document_versions": len(inactive_document_version_ids),
         "inactive_chunk_versions": len(inactive_chunk_version_ids),
         "stale_vector_records": len(stale_records),
-        "stale_bm25_records": len(stale_bm25_records),
         "stale_qdrant_points": sum(len(ids) for ids in points_by_collection.values()),
         "collections": sorted(points_by_collection),
         "delete_inactive_chunks": delete_inactive_chunks,

@@ -132,6 +132,17 @@ export interface ModelAudit {
   retrieval_pipeline?: string | null;
   retrieval_trace_id?: string | null;
   context_package_id?: string | null;
+  coarse_entries?: number;
+  mid_entries?: number;
+  rq_membership_entries?: number;
+  stage_queue_count?: number;
+  mid_topk_selected?: number;
+  chunk_topk_selected?: number;
+  frontier_pops?: number;
+  dominance_pruned_count?: number;
+  hard_stop_pruned_count?: number;
+  gray_zone_decision_count?: number;
+  query_rq_path?: string[] | number[] | null;
   degraded?: boolean;
   degraded_mode?: boolean;
   fallback_used?: boolean;
@@ -280,7 +291,6 @@ export interface CleanupStaleDataResponse {
     collections?: string[];
     applied?: boolean;
     stale_vectors?: number;
-    stale_bm25_records?: number;
     [key: string]: unknown;
   };
 }
@@ -357,11 +367,6 @@ export interface ModelSettingsResponse {
   fixed_chunk_size_tokens?: number;
   fixed_chunk_overlap_tokens?: number;
   context_package_token_budget?: number;
-  reranker_enabled?: boolean;
-  reranker_model?: string;
-  reranker_max_length?: number;
-  reranker_device?: "cpu" | "cuda" | string;
-  reranker_url?: string;
   model_bridge_enabled?: boolean;
   model_bridge_status?: ModelBridgeStatus;
   mid_concept_extraction_max_model_batches?: number;
@@ -371,12 +376,28 @@ export interface ModelSettingsResponse {
   rq_kmeans_levels?: number;
   rq_kmeans_max_k?: number;
   rq_residual_tau?: number;
-  agent_coarse_entry_budget?: number;
-  agent_coarse_jump_budget?: number;
-  agent_mid_entry_budget?: number;
-  agent_mid_expansion_radius_cap?: number;
-  agent_rq_membership_seed_budget?: number;
-  agent_frontier_expansion_budget?: number;
+  dense_knn_k_min?: number;
+  dense_knn_k_max?: number;
+  dense_reverse_b_min_base?: number;
+  dense_reverse_b_max_base?: number;
+  dense_reverse_b_min_doc?: number;
+  dense_reverse_b_max_doc?: number;
+  dense_reverse_b_min_lang?: number;
+  dense_reverse_b_max_lang?: number;
+  dense_min_cosine?: number;
+  dense_strong_cosine?: number;
+  cross_doc_out_quota_min?: number;
+  cross_doc_out_quota_max?: number;
+  cross_doc_min_cosine?: number;
+  cross_language_out_quota_min?: number;
+  cross_language_out_quota_max?: number;
+  cross_language_min_cosine?: number;
+  agent_coarse_total_budget?: number;
+  agent_mid_per_coarse_budget?: number;
+  agent_mid_top_k?: number;
+  agent_chunk_per_mid_budget?: number;
+  agent_chunk_top_k?: number;
+  candidate_pool_dedupe_budget?: number;
   agent_max_depth_per_layer?: number;
   agent_max_labels_per_node?: number;
   agent_max_edge_reuse?: number;
@@ -385,8 +406,6 @@ export interface ModelSettingsResponse {
   agent_path_distance_green_threshold?: number;
   agent_path_distance_gray_threshold?: number;
   agent_path_distance_hard_threshold?: number;
-  agent_drilldown_budget_per_layer?: number;
-  agent_chunk_candidate_budget?: number;
   agent_structure_restore_budget?: number;
   context_path_summary_budget?: number;
   agent_planning_round_budget?: number;
@@ -399,6 +418,14 @@ export interface ModelSettingsResponse {
   has_embedding_api_key?: boolean;
   degraded_mode?: boolean;
   runtime_settings_version?: string | null;
+  lifecycle?: {
+    hot_reloadable?: string[];
+    rebuild_required?: string[];
+    service_recreate_required?: string[];
+    promotion_gate?: Record<string, unknown>;
+    redaction?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
   settings?: Record<string, unknown>;
   runtime_version?: Record<string, unknown>;
 }
@@ -449,10 +476,6 @@ export interface ModelSettingsUpdate {
   fixed_chunk_size_tokens?: number | null;
   fixed_chunk_overlap_tokens?: number | null;
   context_package_token_budget?: number | null;
-  reranker_enabled?: boolean | null;
-  reranker_model?: string | null;
-  reranker_max_length?: number | null;
-  reranker_device?: "cpu" | "cuda" | string | null;
   model_bridge_enabled?: boolean | null;
   mid_concept_extraction_max_model_batches?: number | null;
   mid_concept_extraction_max_candidates_per_batch?: number | null;
@@ -461,12 +484,28 @@ export interface ModelSettingsUpdate {
   rq_kmeans_levels?: number | null;
   rq_kmeans_max_k?: number | null;
   rq_residual_tau?: number | null;
-  agent_coarse_entry_budget?: number | null;
-  agent_coarse_jump_budget?: number | null;
-  agent_mid_entry_budget?: number | null;
-  agent_mid_expansion_radius_cap?: number | null;
-  agent_rq_membership_seed_budget?: number | null;
-  agent_frontier_expansion_budget?: number | null;
+  dense_knn_k_min?: number | null;
+  dense_knn_k_max?: number | null;
+  dense_reverse_b_min_base?: number | null;
+  dense_reverse_b_max_base?: number | null;
+  dense_reverse_b_min_doc?: number | null;
+  dense_reverse_b_max_doc?: number | null;
+  dense_reverse_b_min_lang?: number | null;
+  dense_reverse_b_max_lang?: number | null;
+  dense_min_cosine?: number | null;
+  dense_strong_cosine?: number | null;
+  cross_doc_out_quota_min?: number | null;
+  cross_doc_out_quota_max?: number | null;
+  cross_doc_min_cosine?: number | null;
+  cross_language_out_quota_min?: number | null;
+  cross_language_out_quota_max?: number | null;
+  cross_language_min_cosine?: number | null;
+  agent_coarse_total_budget?: number | null;
+  agent_mid_per_coarse_budget?: number | null;
+  agent_mid_top_k?: number | null;
+  agent_chunk_per_mid_budget?: number | null;
+  agent_chunk_top_k?: number | null;
+  candidate_pool_dedupe_budget?: number | null;
   agent_max_depth_per_layer?: number | null;
   agent_max_labels_per_node?: number | null;
   agent_max_edge_reuse?: number | null;
@@ -475,8 +514,6 @@ export interface ModelSettingsUpdate {
   agent_path_distance_green_threshold?: number | null;
   agent_path_distance_gray_threshold?: number | null;
   agent_path_distance_hard_threshold?: number | null;
-  agent_drilldown_budget_per_layer?: number | null;
-  agent_chunk_candidate_budget?: number | null;
   agent_structure_restore_budget?: number | null;
   context_path_summary_budget?: number | null;
   agent_planning_round_budget?: number | null;
@@ -514,7 +551,6 @@ export interface IngestionLogEvent {
   embedding_fallback_method?: string | null;
   graph_runtime?: string | null;
   vector_count?: number;
-  bm25_record_count?: number;
   chunk_count?: number;
   relation_edge_count?: number;
   rq_prefix_count?: number;
@@ -542,19 +578,6 @@ export interface EnvSyncStatus {
   bom_keys: string[];
 }
 
-export interface RerankerRuntimeStatus {
-  enabled: boolean;
-  device: "cpu" | "cuda" | string;
-  model: string;
-  url: string;
-  reachable: boolean;
-  healthy: boolean;
-  reported_model?: string | null;
-  reported_device?: string | null;
-  model_matches?: boolean | null;
-  device_matches?: boolean | null;
-}
-
 export interface InfrastructureStatus {
   postgres: boolean;
   qdrant: boolean;
@@ -565,7 +588,6 @@ export interface InfrastructureStatus {
 export interface RuntimeCheckResponse {
   ok?: boolean;
   env_sync?: EnvSyncStatus;
-  reranker?: RerankerRuntimeStatus;
   infrastructure?: InfrastructureStatus;
   model_bridge_status?: ModelBridgeStatus;
   blocking_issues?: RuntimeIssue[];
@@ -616,12 +638,14 @@ export interface GraphNode {
   confidence?: number | null;
   support_count?: number | null;
   support_chunk_ids?: string[];
+  support_active_chunk_ids?: string[];
   support_rq_prefix_ids?: string[];
   representative_chunk_ids?: string[];
   included_mid_concept_ids?: string[];
   source_path?: string | null;
   document_id?: string | null;
   document_version_id?: string | null;
+  summary?: string | null;
   snippet?: string | null;
   text?: string | null;
   page_number?: number | null;
@@ -873,5 +897,14 @@ export interface ContextPackageResponse {
 
 export interface RetrievalTraceStepsResponse {
   trace_id: string;
+  query?: string;
+  retrieval_mode?: string;
+  stage_queues?: Record<string, unknown>;
+  candidate_pools?: Record<string, unknown>;
+  topk_selection?: Record<string, unknown>;
+  frontier?: Array<Record<string, unknown>>;
+  path_labels?: Array<Record<string, unknown>>;
+  convergence?: Record<string, unknown>;
+  result_chunk_ids?: string[];
   steps: Array<Record<string, unknown>>;
 }

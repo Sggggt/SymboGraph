@@ -69,7 +69,7 @@ $$
 
 | 收敛项 | 缺口 | 影响模块 | 门禁 | 收敛方向 |
 | --- | --- | --- | --- | --- |
-| 派生状态自动修复 | Qdrant、BM25、Redis 的强一致性主要依赖 compensation logs、reconcile scripts、diagnostics 和 smoke check；尚未形成常驻自动修复调度器。 | `apps/api/app/services/maintenance.py`, `scripts/*reconcile*`, Docker smoke | 外部副作用失败必须写 compensation log 并抛错；对账脚本必须可重复修复。 | 增加可恢复调度器和失败队列消费，不改变 PostgreSQL 事实源边界。 |
+| 派生状态自动修复 | Qdrant、Redis 的强一致性主要依赖 compensation logs、reconcile scripts、diagnostics 和 smoke check；legacy BM25 artifacts 只允许清理或历史诊断。 | `apps/api/app/services/maintenance.py`, `scripts/*reconcile*`, Docker smoke | 外部副作用失败必须写 compensation log 并抛错；对账脚本必须可重复修复；legacy BM25 不影响 active path。 | 增加可恢复调度器和失败队列消费，不改变 PostgreSQL 事实源边界。 |
 | Agent 多轮 P&E | QA 是 single planner round + deterministic traversal + verification-triggered repair；还不是完整多轮 Planner/Evaluator/Replan 闭环。 | `agent_graph.py`, `context_graph.py`, `answer_sessions`, `agent_*` tables | typed action validator、repair budget、citation verification 必须通过；repair budget 耗尽不得无支撑补齐。 | 引入多轮 evaluator/replan 状态机，继续使用同一 typed action schema 和 deterministic executor。 |
 | Policy 优化深度 | policy 是 proxy reward 驱动的 lightweight arm prior，不是完整在线 bandit 或因果评估框架。 | `policy_states`, `reward_events`, runtime settings | policy 不得替代 LLM planner；只能提供 safe arms、预算先验和灰区阈值。 | 增加 posterior 更新、离线评估和安全探索控制，保持 planner 决策边界。 |
 | 会话审计边界 | `qa_sessions` 用于前端对话记忆，`answer_sessions` 用于回答审计，两者仍并存。 | QA API、conversation state、answer audit、前端会话 | 每个 answer 必须能回到 context package、retrieval trace、citation verification 和 reward event。 | 继续收敛到 answer session、context package、citation verification、reward event 的统一审计链，同时保留 conversation transcript 的交互用途。 |
@@ -104,9 +104,9 @@ source files
 -> parser and layout extractor
 -> fixed token chunks
 -> chunk structure graph
--> contextual embedding and BM25
--> RQ-KMeans residual address and fuzzy membership
+-> contextual dense embedding
 -> independent chunk relation graph
+-> RQ-KMeans residual address and fuzzy membership
 -> RQ L3 mid concept graph
 -> mid edge projection calibration
 -> RQ L2 coarse concept graph
@@ -127,12 +127,8 @@ flowchart TB
     P --> S["Chunk Structure Graph"]
     C --> X["Contextual index text"]
     X --> V["Vector records / Qdrant"]
-    X --> B["BM25 records"]
     V --> RQ["RQ address and fuzzy membership"]
-    B --> RQ
     V --> R["Independent Chunk Relation Graph"]
-    B --> R
-    RQ --> R
     RQ --> M["RQ L3 Mid Concept Graph"]
     R --> M
     RQ --> K["RQ L2 Coarse Concept Graph"]
@@ -239,29 +235,131 @@ $$
 $$
 E_{\mathrm{cand}}
 =
-E_{\mathrm{dense}}
-\cup E_{\mathrm{lexical}}
-\cup E_{\mathrm{cohit}}
-\cup E_{\mathrm{rq}}
-\cup E_{\mathrm{bridge}}
+E_{\mathrm{dense\_base}}
+\cup E_{\mathrm{dense\_cross\_doc}}
+\cup E_{\mathrm{dense\_cross\_lang}}
 $$
 
-结构图 \(G_0\) 不进入 \(E_{\mathrm{cand}}\)。previous/next、same section、same page、layout region、table/formula/caption closure 只在 context restoration 阶段使用。每条候选边的特征为：
+结构图 \(G_0\) 不进入 \(E_{\mathrm{cand}}\)。previous/next、same section、same page、layout region、table/formula/caption closure 只在 context restoration 阶段使用。RQ prefix adjacency、membership overlap、LCP 与 residual distance 只进入 diagnostics、seed prior 和 high-layer projection context，不创建、删除或强制保留底层 active chunk edge。BM25、term overlap、lexical co-hit 和 dense+BM25 co-retrieval 不进入 active 构图、active 检索、entry selection、priority key、edge feature、edge calibration 或 active retrieval cache key。
+
+底层候选边由多语言 dense embedding 生成。每个 chunk \(i\) 先在全库向量空间中产生动态出边候选，再额外保留跨文档与跨语言候选通道：
+
+$$
+K_i
+=
+\operatorname{clamp}
+\left(
+K_{\min}+\left\lfloor\log_2(1+m_i)\right\rfloor,
+K_{\min},
+K_{\max}
+\right)
+$$
+
+$$
+Q_i^{doc}
+=
+\operatorname{clamp}
+\left(
+Q^{doc}_{\min}+\left\lfloor\log_2(1+m_i)\right\rfloor,
+Q^{doc}_{\min},
+Q^{doc}_{\max}
+\right)
+$$
+
+$$
+Q_i^{lang}
+=
+\operatorname{clamp}
+\left(
+Q^{lang}_{\min}+\left\lfloor\log_2(1+m_i)\right\rfloor,
+Q^{lang}_{\min},
+Q^{lang}_{\max}
+\right)
+$$
+
+其中 \(K_i\) 是普通 dense 候选出边数，\(Q_i^{doc}\) 是跨文档候选出边数，\(Q_i^{lang}\) 是跨语言候选出边数，\(m_i\) 是由 chunk 质量、语义密度、span 可引用性、node quality 和结构覆盖组成的同层归一化节点证据量。跨文档候选要求 \(document(i)\ne document(j)\)，跨语言候选要求 \(language(i)\ne language(j)\)。bridge quota 只决定候选进入机会，不提升边权，不降低阈值。
+
+每个目标 chunk \(j\) 对不同候选通道分别限制反向入边：
+
+$$
+B_j^{t}
+=
+\operatorname{clamp}
+\left(
+B_{\min}^{t}+\left\lfloor\log_2(1+r_j)\right\rfloor,
+B_{\min}^{t},
+B_{\max}^{t}
+\right),
+\quad
+t\in\{base,doc,lang\}
+$$
+
+其中 \(r_j\) 是由结构覆盖、RQ membership 覆盖、bridge 覆盖、边界稳定度和节点质量组成的同层归一化接纳容量。普通入边、跨文档入边和跨语言入边分开计数，防止热门 chunk 吞掉 bridge 入边。候选边接受条件为：
+
+$$
+\operatorname{accept}_t(i,j)
+=
+\mathbf{1}
+\left[
+\cos(e_i,e_j)\ge\tau_t
+\land
+\left(
+\operatorname{mutual}_t(i,j)
+\lor
+\operatorname{reverseAccepted}_t(i,j)
+\lor
+\cos(e_i,e_j)\ge\tau_{\mathrm{strong}}
+\right)
+\right]
+$$
+
+其中 \(\tau_t\) 按 edge type 设置，\(\tau_{\mathrm{strong}}\) 是强 dense 语义阈值。`dense_cross_language_bridge` 与 `dense_cross_document_bridge` 不要求同 RQ prefix、同 mid 或同 coarse；只要满足 dense 语义与接纳规则，就可以成为跨 prefix 底层 bridge support。若一条边同时跨文档和跨语言，edge type 使用 `dense_cross_language_bridge`，并在 features 中保留 `is_cross_document=true`。
+
+目标 edge types：
+
+```text
+dense_semantic
+dense_cross_document_bridge
+dense_cross_language_bridge
+```
+
+每条候选边的特征为：
 
 $$
 \phi_{ij}
 =
 \left[
 \cos(e_i,e_j),
-\operatorname{BM25}(i,j),
-\operatorname{CoHit}(i,j),
-\operatorname{LCP}_{RQ}(i,j),
-\operatorname{Residual}_{RQ}(i,j),
-\operatorname{BridgeEvidence}(i,j)
+\operatorname{RankScore}_t(i,j),
+\operatorname{Reciprocity}_t(i,j),
+\operatorname{NodeQualityPair}(i,j),
+\operatorname{BridgeFlags}(i,j)
 \right]
 $$
 
-RQ 信号是 chunk pair 的直接证据，不是高层簇对底层边的反向保留规则。高层节点不能创建、删除或强制保留底层 chunk edge。
+边强度由 dense 语义、互近邻/反向接纳、候选排名和节点质量组成。quota 是候选通道，不进入边权：
+
+$$
+\operatorname{semantic}_{ij}^{t}
+=
+\operatorname{clip}
+\left(
+\frac{\cos(e_i,e_j)-\tau_t}{\tau_{\mathrm{strong}}-\tau_t},
+0,
+1
+\right)
+$$
+
+$$
+\operatorname{raw\_strength}_{ij}
+=
+0.75\operatorname{semantic}_{ij}^{t}
++0.15\operatorname{reciprocity}_{ij}^{t}
++0.07\operatorname{rank}_{ij}^{t}
++0.03\operatorname{nodeQualityPair}_{ij}
+$$
+
+跨语言和跨文档 edge 不因 bridge 身份降权；噪声控制由 \(\tau_t\)、互近邻/反向接纳、独立入边 quota 和 edge-type calibration 完成。
 
 边强度必须先按 edge type 做类型内归一化，再进入统一距离协议。设边类型为 \(t=edge\_type(i,j)\)，原始候选信号为 \(a_{ij}^{(t)}\)，类型内校准函数为 \(\operatorname{Calib}_t\)，则：
 
@@ -295,7 +393,7 @@ $$
 - 影响对象：RQ membership diagnostics、mid concept packet、coarse concept packet、layered retrieval、bridge expansion、Agent repair 和 graph visualization。
 - 影响方式：底层关系边把固定 chunk 变成可遍历网络；RQ 提供地址和模糊归属；mid/coarse 节点和边只能从 RQ membership 与底层 chunk relation edge support 投影获得。
 - 传播字段：`chunk_relation_graph_states`、`chunk_relation_edges.edge_type`、`weight`、`distance`、`raw_strength`、`features_json`、`normalization_stats_json`、`source_algorithm`、`protocol_version`、`edge_distance_protocol_hash`、`rq_path`、`rq_membership_score`。
-- 触发条件：embedding text version、vector records、BM25 records、chunk scope、RQ codebook、RQ membership protocol 或 edge keep policy 变化时，relation state hash 与下游 mid/coarse hash 需要重算。
+- 触发条件：embedding text version、vector records、chunk scope、dynamic KNN operating point、bridge quota protocol、RQ codebook、RQ membership protocol 或 edge keep policy 变化时，relation state hash 与下游 mid/coarse hash 需要重算。
 - 验收观察点：edge count by type、bridge edge count、degree distribution、raw strength distribution by edge type、normalized distance distribution、RQ membership diagnostics、graph expansion steps、path threshold hit distribution 和 traversal contribution。
 
 ### 第 2 层：Mid Concept Graph
@@ -366,7 +464,7 @@ $$
 
 **架构影响：**
 - 影响对象：coarse concept graph、concept routing、Layered P&E Agent、context package packing、answer grounding 和前端概念路径展示。
-- 影响方式：mid concept 与 RQ L3 prefix packet 对齐；mid edge 完全由底层 chunk relation edge support 投影并按 `layer=mid + edge_type` 校准 distance；检索通过 entry selection 和 priority-queue drilldown 从 mid path 下钻到 RQ membership 支撑的 chunk seeds，再进入 chunk relation graph。
+- 影响方式：mid concept 与 RQ L3 prefix packet 对齐；mid edge 完全由底层 chunk relation edge support 投影并按 `layer=mid + edge_type` 校准 distance；检索通过 staged traversal 从所有保留的 coarse 父节点逐个下钻收集 mid candidates，合并去重后取 mid top-k，再从选中的 mid 节点逐个下钻到 RQ membership 支撑的 chunk seeds 与 chunk relation graph。
 - 传播字段：`mid_concepts`、`mid_concept_memberships`、`mid_concept_edges`、`mid_concept_definitions.support_spans_json`、`display_terms_json`、`summary`、`internal_state_json`、`support_chunk_ids`、`support_rq_prefix`、`support_chunk_edge_ids`、`node_weight`、`projected_distance_raw`、`projected_strength_raw`、`projection_normalization_stats_json`、`edge_projection_protocol_hash`、`distance`、`raw_strength_summary`。
 - 触发条件：RQ L3 prefix membership、bottom chunk edge distance、concept packet、LLM summary protocol、grounded gate 或 prompt protocol 变化时，mid concept hash、coarse hash、retrieval trace 和 cache 需要刷新。
 - 验收观察点：concept grounded rate、support span coverage、RQ L3-to-mid projection coverage、membership role 分布、node summary grounding、node weight diagnostics、concept edge projection 支撑率、projection calibration diagnostics 和 concept path accuracy。
@@ -407,7 +505,7 @@ coarse concept 同样保存同层归一化的 `node_weight`。该权重来自 in
 
 **架构影响：**
 - 影响对象：coarse entry selection、mid concept drilldown、cross-document synthesis、Agent coarse jump、graph overview 和 retrieval cache。
-- 影响方式：coarse concept 与 RQ L2 prefix packet 对齐，作为高层入口收缩查询空间；coarse edge 由底层 chunk relation edge support 经 membership 投影并按 `layer=coarse + edge_type` 校准 distance；cross-prefix weak support 与 bridge states 作为诊断保留，避免硬切断跨主题路径；coarse node weight 只提供主题区证据规模和稳定性的同层预算/入口辅助。
+- 影响方式：coarse concept 与 RQ L2 prefix packet 对齐，作为高层入口收缩查询空间；coarse edge 由底层 chunk relation edge support 经 membership 投影并按 `layer=coarse + edge_type` 校准 distance；cross-prefix weak support 与 bridge states 作为诊断保留，避免硬切断跨主题路径；coarse node weight 只提供主题区证据规模和稳定性的同层预算/入口辅助，coarse 层不设置 top-k 截断。
 - 传播字段：`coarse_concepts`、`coarse_concept_memberships`、`coarse_concept_edges`、`coarse_concept_definitions`、`display_terms_json`、`summary`、`internal_state_json`、`support_mid_concept_ids`、`support_chunk_edge_ids`、`raw_node_weight`、`node_weight`、`node_weight_diagnostics_json`、`projected_distance_raw`、`projected_strength_raw`、`projection_normalization_stats_json`、`edge_projection_protocol_hash`、`distance`、`bridge_density`、`coarse_concept_hash`。
 - 触发条件：RQ L2 prefix membership、child L3 summaries、bottom chunk edge distance、coarse summary protocol、bridge diagnostics 或 edge projection protocol 变化时，coarse entry、retrieval trace 和 cache key 需要刷新。
 - 验收观察点：RQ L2-to-coarse projection coverage、child L3 coverage、bridge density、coarse node summary grounding、coarse node weight diagnostics、coarse-to-mid drilldown path、coarse edge projection support、projection calibration diagnostics 和 traversal contribution。
@@ -632,7 +730,6 @@ $$
 flowchart TB
     PG["PostgreSQL"] --> VR["Vector Records"]
     VR --> QD["Qdrant Points"]
-    PG --> BM["BM25 Records"]
     PG --> RD["Redis Runtime Version"]
     PG --> AU["Trace / Answer / Citation Audit"]
 ```
@@ -686,21 +783,9 @@ $$
 
 本地检索路径必须在 `VectorRecord.diagnostics_json` 保存 embedding vector，以便本地 layered retrieval 直接计算 dense score。
 
-### BM25
+### Legacy lexical artifacts
 
-BM25 的理论打分为：
-
-$$
-\operatorname{BM25}(q,d)
-=
-\sum_{t\in q}
-IDF(t)
-\cdot
-\frac{f(t,d)(k_1+1)}
-{f(t,d)+k_1(1-b+b\frac{|d|}{avgdl})}
-$$
-
-`BM25Record` 必须保存 contextual text token frequencies；检索时用 `BM25Okapi` 从 ready records 构造 corpus。
+BM25 artifacts 只允许作为 legacy cleanup 或 historical diagnostics。它们不进入 active graph build、active retrieval、entry selection、priority key、edge feature、edge calibration 或 active retrieval cache key。若 legacy BM25 rows 仍存在，维护脚本只能通过 dry-run 和显式 destructive flag 对账或删除；任何产品路径都不得依赖它们保证正确性。
 
 ### Redis
 
@@ -712,14 +797,14 @@ event
 \left(h_{\mathrm{runtime}},\Delta keys,source,timestamp\right)
 $$
 
-`publish_runtime_settings_version()` 必须写入 `runtime_settings_versions`，设置 Redis key，发布 channel message，并清理 settings、cache manager 与 reranker cache。
+`publish_runtime_settings_version()` 必须写入 `runtime_settings_versions`，设置 Redis key，发布 channel message，并清理 settings、cache manager、retriever 与 policy reader 等运行时单例。
 
 **架构影响：**
 - 影响对象：导入、索引、图构建、检索、QA、Agent、runtime settings、缓存、对账脚本和测试验收。
-- 影响方式：PostgreSQL 决定可恢复事实；Qdrant、BM25 与 Redis 只能改变召回效率、运行态协调和热加载，不改变事实来源。
-- 传播字段：`vector_records`、`bm25_records`、`runtime_settings_versions`、`payload_hash`、`collection_name`、`status`、`diagnostics_json`。
+- 影响方式：PostgreSQL 决定可恢复事实；Qdrant 与 Redis 只能改变向量召回效率、运行态协调和热加载，不改变事实来源。legacy BM25 artifacts 不属于 active 可恢复状态。
+- 传播字段：`vector_records`、`runtime_settings_versions`、`payload_hash`、`collection_name`、`status`、`diagnostics_json`。
 - 触发条件：派生索引缺失、payload hash 不一致、runtime version 更新或 Redis broadcast 失败时，相关检索路径应进入重建、刷新或阻断。
-- 验收观察点：Qdrant/BM25 对账通过、runtime publish 可观测、cache miss 行为正确、派生状态能从 PostgreSQL 重建。
+- 验收观察点：Qdrant 对账通过、runtime publish 可观测、cache miss 行为正确、active 派生状态能从 PostgreSQL 重建，legacy BM25 artifacts 不影响 active 检索结果。
 
 ## 解析、固定 Chunk 与结构图
 
@@ -837,7 +922,7 @@ $$
 
 
 **架构影响：**
-- 影响对象：contextual index、Qdrant、BM25、chunk relation graph、RQ membership、concept graphs、retrieval trace、context package 和 citation verification。
+- 影响对象：contextual index、Qdrant、chunk relation graph、RQ membership、concept graphs、retrieval trace、context package 和 citation verification。
 - 影响方式：固定 chunk 定义全系统最小地址单位；结构图定义上下文恢复路径；版本策略决定下游索引、图状态与引用审计是否仍然有效。
 - 传播字段：`chunk_id`、`chunk_version`、`chunk_index`、`char_start`、`char_end`、`token_start`、`token_end`、`text_hash`、`section_path`、`page_range`。
 - 触发条件：chunk size、overlap、tokenizer、parser output、chunk span、document version 或 active chunk scope 变化时，contextual index、relation graph、concept graph 和 cache 都需要刷新或重建。
@@ -855,7 +940,6 @@ flowchart LR
     PG["Page Range"] --> CT
     H["Local Hint"] --> CT
     CT --> EMB["Embedding"]
-    CT --> BM["BM25"]
 ```
 
 目标是分离“索引用文本”和“引用用文本”。定义：
@@ -913,25 +997,16 @@ $$
 
 
 
-### BM25 records
+### Legacy lexical records
 
-目标 lexical index：
-
-$$
-tf_{c,t}
-=
-\sum_{u\in tokenize(x_c^{ctx})}
-\mathbf{1}[u=t]
-$$
-
-`BM25Record` 必须保存 term frequencies、document length、token count、text hash 和 tokenizer version，并可由 chunks 与 chunk context texts 重建。
+目标 active path 不创建、不读取、不校准 BM25 records。历史 lexical records 只允许作为 cleanup、migration input 或 historical diagnostics；它们不能进入 active graph hash、retrieval cache key、candidate generation 或 answer evidence。
 
 **架构影响：**
-- 影响对象：dense recall、BM25 recall、chunk relation graph、RQ path、layered retrieval、rerank、context package packing 和 cache key。
-- 影响方式：contextual text 是 embedding 与 lexical index 的输入；它改变召回分布和关系边候选，但 citation 仍必须指向 raw chunk span。
-- 传播字段：`chunk_context_texts.context_hash`、`embedding_text_version`、`vector_records.payload_hash`、`bm25_records.text_hash`、`tokenizer_version`。
-- 触发条件：contextual prompt、embedding text version、embedding model、BM25 tokenizer 或 context hash 变化时，Qdrant、BM25、relation graph 和 retrieval cache 必须刷新。
-- 验收观察点：vector record ready 率、BM25 record ready 率、embedding dimension 一致、context hash 与 payload hash 对齐、raw span citation 不受 contextual text 改写影响。
+- 影响对象：dense recall、chunk relation graph、RQ path、layered retrieval、context package packing 和 cache key。
+- 影响方式：contextual text 是 embedding 输入；它改变 dense recall 分布和关系边候选，但 citation 仍必须指向 raw chunk span。
+- 传播字段：`chunk_context_texts.context_hash`、`embedding_text_version`、`vector_records.payload_hash`。
+- 触发条件：contextual prompt、embedding text version、embedding model 或 context hash 变化时，Qdrant、relation graph 和 retrieval cache 必须刷新。
+- 验收观察点：vector record ready 率、embedding dimension 一致、context hash 与 payload hash 对齐、raw span citation 不受 contextual text 改写影响。
 
 ## Chunk Relation Graph
 
@@ -940,13 +1015,17 @@ $$
 ```mermaid
 flowchart TB
     CH["Chunks"] --> EMB["Dense Vectors"]
-    CH --> BM["BM25 Terms"]
     EMB --> RQ["RQ Residual Address"]
-    EMB --> EC["Semantic Candidate Edges"]
-    BM --> EC
-    RQ --> EC
+    EMB --> DK["Dense Dynamic KNN"]
+    DK --> EC["Dense Candidate Edges"]
+    EMB --> CD["Cross-document Quota"]
+    EMB --> CL["Cross-language Quota"]
+    CD --> EC
+    CL --> EC
     EC --> CAL["Typed Edge Calibration"]
     CAL --> RG["Independent Chunk Relation Graph"]
+    RQ --> DIAG["RQ Diagnostics / Membership"]
+    DIAG --> PROJ
     RG --> PROJ["Mid / Coarse Edge Projection"]
 ```
 
@@ -967,26 +1046,93 @@ $$
 $$
 h_1
 =
-H(scope(C),stats(E_C),codebook(RQ),stats(\mathcal{M}_R),p_1)
+H(scope(C),stats(E_C),codebook(RQ),stats(\mathcal{M}_R),graph\_operating\_point,\ edge\_calibration,\ p_1)
 $$
 
 
 
 ### Edge builder
 
-目标候选边只来自内容语义证据：
+目标候选边只来自多语言 dense semantic evidence：
 
 $$
 E_{\mathrm{cand}}
 =
-E_{\mathrm{dense}}
-\cup E_{\mathrm{lexical}}
-\cup E_{\mathrm{cohit}}
-\cup E_{\mathrm{rq}}
-\cup E_{\mathrm{bridge}}
+E_{\mathrm{dense\_base}}
+\cup E_{\mathrm{dense\_cross\_doc}}
+\cup E_{\mathrm{dense\_cross\_lang}}
 $$
 
-结构邻接、同页、同标题、表格闭包、公式闭包和图注闭包属于 Chunk Structure Graph，不进入 relation edge 的创建和保留。它们在 context package 阶段根据 hit chunk 恢复，保证信息不丢失，同时避免把版面关系误写成语义关系。
+结构邻接、同页、同标题、表格闭包、公式闭包和图注闭包属于 Chunk Structure Graph，不进入 relation edge 的创建和保留。它们在 context package 阶段根据 hit chunk 恢复，保证信息不丢失，同时避免把版面关系误写成语义关系。BM25、term overlap、lexical co-hit、dense+BM25 co-retrieval 和 RQ pair adjacency 不创建 active chunk relation edge。
+
+目标候选通道：
+
+```text
+base_dense_candidates: top K_i dense neighbors over active chunks
+cross_document_candidates: top Q_i_doc dense neighbors with different document_id
+cross_language_candidates: top Q_i_lang dense neighbors with different language
+```
+
+目标 edge types：
+
+```text
+dense_semantic
+dense_cross_document_bridge
+dense_cross_language_bridge
+```
+
+动态出边配额：
+
+$$
+\begin{aligned}
+K_i
+&=
+\operatorname{clamp}(K_{\min}+\lfloor\log_2(1+m_i)\rfloor,K_{\min},K_{\max})\\
+Q_i^{doc}
+&=
+\operatorname{clamp}(Q^{doc}_{\min}+\lfloor\log_2(1+m_i)\rfloor,Q^{doc}_{\min},Q^{doc}_{\max})\\
+Q_i^{lang}
+&=
+\operatorname{clamp}(Q^{lang}_{\min}+\lfloor\log_2(1+m_i)\rfloor,Q^{lang}_{\min},Q^{lang}_{\max})
+\end{aligned}
+$$
+
+动态反向入边配额：
+
+$$
+\begin{aligned}
+B_j^{base}
+&=
+\operatorname{clamp}(B_{\min}^{base}+\lfloor\log_2(1+r_j)\rfloor,B_{\min}^{base},B_{\max}^{base})\\
+B_j^{doc}
+&=
+\operatorname{clamp}(B_{\min}^{doc}+\lfloor\log_2(1+r_j)\rfloor,B_{\min}^{doc},B_{\max}^{doc})\\
+B_j^{lang}
+&=
+\operatorname{clamp}(B_{\min}^{lang}+\lfloor\log_2(1+r_j)\rfloor,B_{\min}^{lang},B_{\max}^{lang})
+\end{aligned}
+$$
+
+其中 \(m_i\) 表示同层归一化节点证据量，\(r_j\) 表示同层归一化入边接纳容量。二者只参与配额计算和 tie-break diagnostics，不表示 query relevance。普通入边、跨文档入边和跨语言入边分开计数，避免同语言、同文档密集区域挤掉 bridge 候选。
+
+edge-type 接受规则：
+
+$$
+\operatorname{accept}_t(i,j)
+=
+\mathbf{1}
+\left[
+\cos(e_i,e_j)\ge\tau_t
+\land
+\left(
+\operatorname{mutual}_t(i,j)
+\lor
+\operatorname{reverseAccepted}_t(i,j)
+\lor
+\cos(e_i,e_j)\ge\tau_{\mathrm{strong}}
+\right)
+\right]
+$$
 
 目标边特征：
 
@@ -995,44 +1141,112 @@ $$
 =
 \left[
 \cos(e_i,e_j),
-\operatorname{Lex}(i,j),
-\operatorname{CoHit}(i,j),
-\operatorname{LCP}_{RQ}(i,j),
-\operatorname{Res}_{RQ}(i,j),
-\operatorname{Bridge}(i,j)
+\operatorname{RankScore}_t(i,j),
+\operatorname{Reciprocity}_t(i,j),
+\operatorname{NodeQualityPair}(i,j),
+\operatorname{BridgeFlags}(i,j)
 \right]
 $$
 
-其中 lexical signal 可以由 BM25 对称分数、term set overlap 或 tokenizer version 下的 normalized lexical affinity 表示：
+raw strength：
 
 $$
-\operatorname{Lex}(i,j)
+\operatorname{raw\_strength}_{ij}
 =
-\operatorname{Norm}_{lex}
+0.75\operatorname{semantic}_{ij}^{t}
++0.15\operatorname{reciprocity}_{ij}^{t}
++0.07\operatorname{rank}_{ij}^{t}
++0.03\operatorname{nodeQualityPair}_{ij}
+$$
+
+其中：
+
+$$
+\operatorname{semantic}_{ij}^{t}
+=
+\operatorname{clip}
 \left(
-BM25(i\mid j),BM25(j\mid i),J(T_i,T_j)
+\frac{\cos(e_i,e_j)-\tau_t}{\tau_{\mathrm{strong}}-\tau_t},
+0,
+1
 \right)
 $$
 
-RQ pair evidence 使用最长公共前缀和最终残差距离：
+cross-language 和 cross-document edge 不因 bridge 身份额外降权；它们通过独立阈值、独立入边配额、mutual/reverse gate 与 edge-type calibration 控噪。quota 只负责候选召回机会，不进入 raw strength。
+
+### Graph operating point calibration
+
+Dynamic KNN、bridge quota、semantic threshold 与 edge calibration 参数通过 TPE Bayesian Optimization 选择 active operating point。TPE 不直接创建边，不绕过 shadow build、diagnostics、retrieval probe 或 promotion gate；它只在参数空间 \(\Theta_G\) 中选择构图参数：
+
+```text
+K_min, K_max
+B_min_base, B_max_base
+B_min_doc, B_max_doc
+B_min_lang, B_max_lang
+dense_min_cosine
+dense_strong_cosine
+cross_doc_out_quota_min, cross_doc_out_quota_max
+cross_doc_min_cosine
+cross_language_out_quota_min, cross_language_out_quota_max
+cross_language_min_cosine
+edge_type_calibration_protocol
+```
+
+每个 trial 执行：
+
+```text
+sample θ from TPE
+-> shadow build chunk relation graph
+-> graph diagnostics
+-> retrieval probe
+-> citation verification
+-> objective score
+-> promotion gate
+```
+
+硬约束：
 
 $$
-\operatorname{LCP}_{RQ}(i,j)
-=
-\max\{l:prefix_l(i)=prefix_l(j)\}
+\frac{|E_C|}{|V_C|}\le \eta_E,\quad
+isolated\_ratio\le \eta_I,\quad
+\frac{degree_{p95}}{\max(degree_{median},1)}\le \eta_H
 $$
 
 $$
-\operatorname{RQ}_{ij}
-=
-\frac{\operatorname{LCP}_{RQ}(i,j)}{L}
-\cdot
-\exp\left(
--\frac{\|r_i^{(L)}-r_j^{(L)}\|_2}{\tau_r}
-\right)
+citation\_verification\_rate\ge \eta_C,\quad
+retrieval\_latency_{p95}\le \eta_L
 $$
 
-RQ 只能作为 chunk pair evidence 或 candidate generator。高层 RQ prefix、mid node、coarse node 不能反向决定 \(E_C\) 的边去留。
+软目标函数：
+
+$$
+\begin{aligned}
+J(\theta)
+=&
+0.35\cdot evidence\_recall\_proxy
++0.25\cdot citation\_verification\_rate\\
+&+0.15\cdot component\_coverage
++0.10\cdot path\_diversity
++0.10\cdot edge\_precision\_proxy\\
+&+0.05\cdot structure\_restoration\_success
+-0.12\cdot hubness\_penalty\\
+&-0.10\cdot density\_penalty
+-0.06\cdot latency\_penalty
+\end{aligned}
+$$
+
+跨语言质量在当前 operating point 中只作为 lightweight diagnostics，不进入目标函数或 promotion hard gate：
+
+```text
+cross_language_edge_count
+cross_language_edge_ratio
+cross_document_edge_count
+cross_document_edge_ratio
+prefix_language_entropy
+prefix_language_purity
+```
+
+promotion 写入 active graph protocol、edge distance protocol hash、runtime settings hash 与 diagnostics；未通过 hard constraints 的 trial 不得成为 active graph state。
 
 
 
@@ -1103,11 +1317,11 @@ $$
 
 
 **架构影响：**
-- 影响对象：RQ membership diagnostics、mid concept packet、coarse concept packet、priority-queue traversal、bridge repair、context package bridge chunks 和 graph diagnostics。
-- 影响方式：relation graph 把 dense、lexical、co-hit、RQ pair evidence 和 bridge evidence 统一成可遍历距离边；结构信息只在命中后恢复上下文；mid/coarse 节点和边完全根据底层 chunk edges 与 membership 投影。
+- 影响对象：RQ membership diagnostics、mid concept packet、coarse concept packet、staged priority-queue traversal、bridge repair、context package bridge chunks 和 graph diagnostics。
+- 影响方式：relation graph 把 base dense、cross-document dense bridge 和 cross-language dense bridge 统一成可遍历距离边；结构信息只在命中后恢复上下文；RQ membership 只提供地址、seed prior 和 diagnostics；mid/coarse 节点和边完全根据底层 chunk edges 与 membership 投影。
 - 传播字段：`chunk_relation_graph_state_id`、`chunk_relation_edges`、`rq_path`、`rq_prefix_memberships`、`edge_type`、`distance`、`raw_strength`、`features_json`、`normalization_stats_json`、`edge_distance_protocol_hash`、`state_hash`。
-- 触发条件：embedding、BM25、chunk scope、RQ codebook、RQ membership protocol 或 relation protocol 变化时，mid concepts、coarse concepts、retrieval trace 和 cache 需要刷新。
-- 验收观察点：relation state ready、edge type 分布、bridge ratio、raw strength distribution by edge type、normalized distance distribution、RQ pair evidence 分布、path threshold hit distribution、trace 中 frontier expansion steps、cycle distance reward 和 diagnostics hash。
+- 触发条件：embedding、chunk scope、dynamic KNN operating point、bridge quota protocol、TPE calibrated active parameters、RQ codebook、RQ membership protocol 或 relation protocol 变化时，mid concepts、coarse concepts、retrieval trace 和 cache 需要刷新。
+- 验收观察点：relation state ready、edge type 分布、bridge ratio、cross-language edge ratio、cross-document edge ratio、raw strength distribution by edge type、normalized distance distribution、hubness diagnostics、path threshold hit distribution、trace 中 staged frontier expansion steps、cycle distance reward 和 diagnostics hash。
 
 ## RQ Membership 与 RQ-KMeans
 
@@ -1125,7 +1339,7 @@ RQ L1 prefix -> parent prior, route prior, diagnostics
 
 RQ prefix tree 是硬树：每个 L3 prefix 只有一个 L2 parent，每个 L2 prefix 只有一个 L1 parent。模糊性只存在于 membership score：一个 chunk 可以同时归属多个 L3/L2/L1 prefixes；一个 L3 prefix 不会被拆成多个 L2 parent，一个 L2 prefix 不会被拆成多个 L1 parent。
 
-目标架构受 [ContextRAG](https://arxiv.org/abs/2605.19735) 的 extraction-free graph construction 启发：底层拓扑不由 LLM 抽实体和关系，而由可复算 embedding、lexical evidence、RQ pair evidence 和 typed edge calibration 构建。[KG2RAG](https://aclanthology.org/2025.naacl-long.449/) 的 seed expansion / graph organization 思路用于检索阶段：先定位图入口，再沿关系图扩展和组织证据。
+目标架构受 [ContextRAG](https://arxiv.org/abs/2605.19735) 的 extraction-free graph construction 启发：底层拓扑不由 LLM 抽实体和关系，而由可复算 multilingual dense embedding、dynamic KNN、bridge quota 和 typed edge calibration 构建。RQ 提供语义地址、membership、seed prior 和 diagnostics，不创建 active bottom edge。[KG2RAG](https://aclanthology.org/2025.naacl-long.449/) 的 seed expansion / graph organization 思路用于检索阶段：先定位图入口，再沿关系图扩展和组织证据。
 
 ```mermaid
 flowchart TB
@@ -1155,11 +1369,9 @@ $$
 $$
 E_C
 =
-E_{\mathrm{dense}}
-\cup E_{\mathrm{bm25}}
-\cup E_{\mathrm{cohit}}
-\cup E_{\mathrm{rq}}
-\cup E_{\mathrm{bridge}}
+E_{\mathrm{dense\_base}}
+\cup E_{\mathrm{dense\_cross\_doc}}
+\cup E_{\mathrm{dense\_cross\_lang}}
 $$
 
 结构边不作为 evidence feature。每条 chunk relation edge 先保存原始 evidence feature \(a_e^{(t)}\)，再按 edge type \(t\) 归一化为关系强度 \(s_e\in(0,1]\)：
@@ -1375,7 +1587,7 @@ rq_projected_chunk_support
 
 其中 `rq_parent_child` 来自 prefix tree，`rq_projected_chunk_support` 来自底层 chunk relation edge support 的投影统计。诊断边不作为 mid/coarse active edge 的存在性条件。
 
-### RQ chunk edges
+### RQ chunk diagnostics
 
 两个 chunk 的最长公共前缀：
 
@@ -1388,7 +1600,7 @@ l:\ prefix_l(c_i)=prefix_l(c_j)
 \right\}
 $$
 
-RQ edge weight：
+RQ diagnostic weight：
 
 $$
 w_{ij}^{rq}
@@ -1401,7 +1613,7 @@ w_{ij}^{rq}
 \right)
 $$
 
-RQ pair evidence 可生成候选 edge type：
+RQ pair diagnostics 可生成诊断类型：
 
 ```text
 rq_hierarchy_near
@@ -1409,14 +1621,14 @@ rq_prefix_sibling
 rq_residual_near
 ```
 
-并在 edge features 中保存 `lcp_depth`、`residual_distance`、`rq_weight`、source/target rq path。若候选边未通过 typed calibration 或 support threshold，不写入 active relation graph；诊断缺口写入 graph diagnostics，不使用 fallback pair 补边。
+并在 diagnostics 中保存 `lcp_depth`、`residual_distance`、`rq_weight`、source/target rq path。RQ pair diagnostics 不写入 active relation graph，不参与 active edge calibration，不作为 bottom edge existence gate。诊断缺口写入 graph diagnostics，不使用 fallback pair 补边。
 
 **架构影响：**
-- 影响对象：mid concept aggregation、coarse concept aggregation、priority-queue graph traversal、context package bridge restoration、retrieval trace 和前端 RQ 诊断。
-- 影响方式：RQ layer 提供 L3/L2/L1 地址、chunk membership、边界/低置信/outlier 诊断和 chunk seed prior；active mid concept 与 RQ L3 prefix packet 对齐，active coarse concept 与 RQ L2 prefix packet 对齐；检索从 mid path 使用 RQ membership 选择 chunk seeds，再进入独立 chunk relation graph 并由结构图恢复上下文。
+- 影响对象：mid concept aggregation、coarse concept aggregation、staged priority-queue graph traversal、context package bridge restoration、retrieval trace 和前端 RQ 诊断。
+- 影响方式：RQ layer 提供 L3/L2/L1 地址、chunk membership、边界/低置信/outlier 诊断和 chunk seed prior；active mid concept 与 RQ L3 prefix packet 对齐，active coarse concept 与 RQ L2 prefix packet 对齐；检索在 selected mid queue 中逐父节点使用 RQ membership 选择 chunk seeds，再进入独立 chunk relation graph 并由结构图恢复上下文。
 - 传播字段：`rq_prefixes`、`rq_prefix_memberships`、`rq_path`、`rq_level`、`rq_path_prefix`、`residual_norm`、`membership_score`、`membership_role`、`lcp_depth`、`residual_distance`、`rq_weight`、`support_chunk_edge_ids`。
 - 触发条件：relation graph hash、embedding vectors、RQ level/codebook、RQ membership protocol、bridge support 或 residual diagnostics 变化时，mid concept hash、coarse hash、retrieval trace 和 cache 必须刷新。
-- 验收观察点：RQ path availability、RQ L3-to-mid projection coverage、RQ L2-to-coarse projection coverage、fuzzy membership 数量、membership role 分布、LCP depth 分布、bridge path coverage、chunk seed quality 和 traversal frontier diagnostics。
+- 验收观察点：RQ path availability、RQ L3-to-mid projection coverage、RQ L2-to-coarse projection coverage、fuzzy membership 数量、membership role 分布、LCP depth 分布、bridge path coverage、chunk seed quality 和 staged traversal diagnostics。
 
 ## Mid Concept Graph
 
@@ -1921,13 +2133,13 @@ coarse diagnostics 必须保存 RQ L2 coverage、child L3 coverage、membership 
 - 影响方式：coarse concepts 决定查询先进入哪些 RQ L2 高层主题区域；coarse edges 是底层 chunk relation edges 的 membership 加权投影，保留跨主题弱边和桥接状态，供优先队列图导航探索。
 - 传播字段：`coarse_concept_state_id`、`coarse_concepts`、`coarse_concept_memberships`、`coarse_concept_edges`、`coarse_concept_definitions`、`support_rq_l2_prefix`、`child_rq_l3_prefix_ids`、`bridge_mid_concept_ids`、`support_chunk_edge_ids`、`display_terms_json`、`summary`、`internal_state_json`、`raw_node_weight`、`node_weight`、`node_weight_diagnostics_json`、`projected_distance_raw`、`projection_normalization_stats_json`、`edge_projection_protocol_hash`、`distance`、`freshness_hash`。
 - 触发条件：RQ L2 membership state、child L3 summaries、bottom chunk edges、coarse summary protocol、bridge diagnostics 或 traversal edge protocol 改变时，coarse hash、retrieval trace 和 graph payload 需要刷新。
-- 验收观察点：RQ L2 coverage、child L3 coverage、bridge density、coarse node summary grounding、coarse node weight diagnostics、coarse entry hit rate、coarse-to-mid drilldown path、cross prefix edge count、raw projected coarse distance distribution、calibrated coarse edge distance distribution、projection calibration diagnostics 和 traversal frontier contribution。
+- 验收观察点：RQ L2 coverage、child L3 coverage、bridge density、coarse node summary grounding、coarse node weight diagnostics、coarse entry hit rate、coarse-to-mid drilldown path、cross prefix edge count、raw projected coarse distance distribution、calibrated coarse edge distance distribution、projection calibration diagnostics 和 staged traversal contribution。
 
 ## Layered Retrieval
 
 ### 目标检索链路
 
-目标检索不是全局加权排序，而是分层图导航。系统先选择 coarse L2 与 mid L3 入口节点，再用带硬熔断预算的多标签优先队列 walk search 在图上探索；RQ membership/address 不作为额外 active traversal layer，而是作为节点归属、chunk seed selector、模糊边界诊断和灰区路径判断上下文。最后系统把收敛路径映射到去重后的 chunk evidence package。
+目标检索不是全局加权排序，也不是单个全局 frontier 从 coarse、mid、chunk 连续抢占预算，而是分层暂存的图导航。系统先在 coarse graph 内完成粗粒度探索，形成 coarse node queue，暂不下钻 mid；随后逐个 coarse 父节点下钻探索 mid candidates，合并去重后按层内 priority key 取 mid top-k 形成 mid node queue；最后逐个 mid 父节点下钻探索 chunk candidates，合并去重后按层内 priority key 取 chunk top-k 进入 structure restoration 与 context package。RQ membership/address 不作为额外 active traversal layer，而是作为节点归属、chunk seed selector、模糊边界诊断和灰区路径判断上下文。
 
 目标链路：
 
@@ -1936,10 +2148,14 @@ query
 -> query intent and facets
 -> choose coarse entry nodes
 -> priority-queue walk on coarse graph
--> drill down to mid graph
--> priority-queue walk on mid graph
+-> collect coarse node queue
+-> for each coarse node: drill down to mid graph with per-coarse budget
+-> merge and dedupe all mid candidates
+-> rank all mid candidates and keep mid top-k
 -> use RQ L3 membership to select chunk seeds
--> priority-queue walk on chunk relation graph
+-> for each selected mid node: walk chunk relation graph with per-mid budget
+-> merge and dedupe all chunk candidates
+-> rank all chunk candidates and keep chunk top-k
 -> structure restoration
 -> context package
 ```
@@ -1948,11 +2164,15 @@ query
 flowchart TB
     Q["Query + Facets"] --> CE["Coarse Entry Selection"]
     CE --> CQ["Coarse Frontier PQ"]
-    CQ --> MD["Drill Down to Mid"]
-    MD --> MQ["Mid Frontier PQ"]
-    MQ --> CS["RQ Membership / Chunk Seed Selection"]
-    CS --> CH["Chunk Relation Frontier PQ"]
-    CH --> ST["Structure Restoration"]
+    CQ --> CQS["Coarse Node Queue"]
+    CQS --> MD["Per-Coarse Mid Drilldown"]
+    MD --> MP["Merged Mid Candidate Pool"]
+    MP --> MT["Mid Top-K Queue"]
+    MT --> CS["RQ Membership / Chunk Seed Selection"]
+    CS --> CH["Per-Mid Chunk Frontier PQ"]
+    CH --> CP0["Merged Chunk Candidate Pool"]
+    CP0 --> CT["Chunk Top-K Evidence"]
+    CT --> ST["Structure Restoration"]
     ST --> CP["Context Package"]
 ```
 
@@ -1960,7 +2180,7 @@ flowchart TB
 
 ### Entry selection
 
-每层起点选择使用三类信号：语义候选、拓扑先验和 LLM 语义判定。active traversal layer 包括 coarse、mid 和 chunk relation graph；RQ membership/address 作为 mid 节点归属、chunk seed selection 和边界诊断输入。拓扑指标是 prior，不是事实源，也不单独决定入口。
+入口选择使用三类信号：语义候选、拓扑先验和 LLM 语义判定。active traversal layer 包括 coarse、mid 和 chunk relation graph；coarse entry selection 只决定粗粒度探索起点，mid 与 chunk entry 由上一层保留队列逐父节点下钻生成。RQ membership/address 作为 mid 节点归属、chunk seed selection 和边界诊断输入。拓扑指标是 prior，不是事实源，也不单独决定入口。
 
 节点候选卡片：
 
@@ -2021,7 +2241,9 @@ LLM 只在入口候选灰区或 query facet 难以映射时裁决，输出 typed
 select_entry_nodes(layer, node_ids, reason, expected_evidence, budget)
 ```
 
-mid 下钻到 chunk relation graph 时，RQ L3 membership 负责选择入口 chunk seeds，而不是把 mid 节点下所有 chunks 全量送入 frontier：
+coarse 下钻到 mid graph 时，系统对每个 coarse 父节点独立执行局部探索，收集该父节点覆盖的 mid candidates；所有 coarse 父节点完成后，mid candidates 合并去重并按层内 priority key、路径证据和贡献摘要排序，保留 `agent_mid_top_k` 个 mid 节点进入下一层队列。coarse 层不设置 top-k；coarse queue 中的所有保留父节点都获得各自的 mid 下钻预算。
+
+mid 下钻到 chunk relation graph 时，RQ L3 membership 负责选择入口 chunk seeds，而不是把 mid 节点下所有 chunks 全量送入 frontier。系统对每个 selected mid 父节点独立执行局部 chunk 探索；所有 mid 父节点完成后，chunk candidates 合并去重并按层内 priority key、路径证据、citation span 可用性和结构恢复需求排序，保留 `agent_chunk_top_k` 个 chunk 进入 context package：
 
 ```text
 core_member_chunks
@@ -2066,7 +2288,10 @@ chunk_seed_weight:
 
 ```text
 state = {
+  traversal_stage,
   layer,
+  parent_layer,
+  parent_node_id,
   node_id,
   path,
   distance_so_far,
@@ -2087,7 +2312,7 @@ D(P')
 D(P)+d_e+\operatorname{Penalty}(P,e)
 $$
 
-其中 \(D(P')\) 是从当前 active layer 入口到待探索节点的累计路径距离。导航判断以路径是否有知识价值为核心，预算不参与路径价值排序，只作为硬熔断器。
+其中 \(D(P')\) 是从当前 active layer 的当前父节点入口到待探索节点的累计路径距离。导航判断以路径是否有知识价值为核心，预算不参与路径价值排序，只作为硬熔断器。
 
 路径距离分区：
 
@@ -2129,6 +2354,8 @@ depth(P),
 $$
 
 队列每次弹出 lexicographic minimum state。这样边字段仍保留为距离，环和桥接路径可以通过 bounded reward 提升，但不会出现全局拍脑袋系数混排。
+
+优先队列只在当前层或当前父节点的局部探索中决定弹出顺序；不同 coarse 父节点和不同 mid 父节点之间不共享一个会耗尽全局预算的 frontier。层间 candidate pool 的排序也使用同一类 key 与 contribution summary，但排序发生在该层所有父节点探索完成之后。若某层无 hard cap 且所有候选都被完整枚举，优先队列与普通 FIFO 队列得到的最终集合相同；只要存在 per-parent budget、top-k、gray-zone stop、distance threshold 或时间上限，优先队列决定哪些路径先被探索、哪些候选进入层间 top-k。
 
 LLM gray-zone evaluator 只处理临界路径，不接管队列排序。输入 observation 必须包含：
 
@@ -2200,24 +2427,31 @@ $$
 
 短而强的环表示多条路径收敛到同一证据区，允许有限奖励；长而弱的环不给奖励。环奖励总量仍受 `max_cycle_reward_per_path` 限制。
 
-每个 active layer 使用固定探索预算作为硬打断，预算不参与导航价值判断：
+staged traversal 使用分层预算作为硬打断，预算不参与导航价值判断。预算的计数单位是当前目标层的 accepted labels / popped states；edge expansion count、time 和 depth 作为附加安全熔断记录在 diagnostics 中：
 
 ```text
-max_expansions_per_layer
+agent_coarse_total_budget
+agent_mid_per_coarse_budget
+agent_mid_top_k
+agent_chunk_per_mid_budget
+agent_chunk_top_k
 max_depth_per_layer
 max_labels_per_node
 max_edge_reuse
 max_cycle_reward_per_path
-max_candidate_chunks
 max_time_ms
 context_package_token_budget
 ```
+
+粗粒度层使用 `agent_coarse_total_budget` 探索 coarse nodes，生成 coarse node queue，不设置 coarse top-k。中粒度层对 coarse node queue 中的每个父节点分别使用 `agent_mid_per_coarse_budget` 探索 mid candidates；所有 mid candidates 汇总、去重、排序后，使用 `agent_mid_top_k` 形成 mid node queue。底层对 mid node queue 中的每个父节点分别使用 `agent_chunk_per_mid_budget` 探索 chunk candidates；所有 chunk candidates 汇总、去重、排序后，使用 `agent_chunk_top_k` 形成进入 context package 的 hit chunks。`agent_mid_top_k` 与 `agent_chunk_top_k` 是层间输出上限，不是裸向量召回结果，也不能绕过 trace、structure restoration 或 citation verification。
 
 算法收敛条件：
 
 ```text
 frontier_empty
 hard_budget_hit
+per_parent_budget_hit
+layer_top_k_cut
 path_distance_hard_stop
 llm_stop_layer_irrelevant
 llm_stop_layer_sufficient
@@ -2278,15 +2512,15 @@ why_selected:
 
 ### Retrieval trace
 
-目标 trace 是每层入口、frontier、路径、收敛和去重的审计记录：
+目标 trace 是每层入口、局部 frontier、父节点下钻、candidate pool、top-k 截断、路径、收敛和去重的审计记录：
 
 $$
 \tau_q
 =
 \left(
-Entry_3,Frontier_3,Path_3,
-Entry_2,Frontier_2,Path_2,
-Entry_C,Frontier_C,Path_C,
+Entry_3,Frontier_3,Queue_3,Path_3,
+Drilldown_{3\to2},Pool_2,TopK_2,Path_2,
+Drilldown_{2\to C},Pool_C,TopK_C,Path_C,
 D_{\mathrm{rq}},\mathbf{h},D_{\mathrm{conv}}
 \right)
 $$
@@ -2297,11 +2531,13 @@ $$
 
 ```text
 coarse / select_entry_nodes
-coarse / priority_queue_walk
-mid / drill_down_from_coarse
-mid / priority_queue_walk
+coarse / staged_priority_queue_walk
+coarse / collect_node_queue
+mid / drill_down_each_coarse
+mid / merge_dedupe_rank_top_k
 chunk / select_seeds_from_mid_rq_membership
-chunk / priority_queue_walk
+chunk / drill_down_each_mid
+chunk / merge_dedupe_rank_top_k
 chunk / gray_zone_llm_decision
 structure / restore_context_package
 ```
@@ -2322,10 +2558,10 @@ result metadata 与 trace steps 保存 query/candidate RQ path、LCP depth、res
 
 **架构影响：**
 - 影响对象：搜索页结果、QA/Agent retrieval step、context package、citation payload、reward metrics、policy update 和前端检索轨迹。
-- 影响方式：layered retrieval 从加权融合排名改为 coarse/mid/chunk/structure 的路径搜索；RQ membership/address 作为语义地址贯穿 mid entry、chunk seed selection、桥接路径解释和灰区 LLM 判停；trace 必须可回放每个 entry、frontier pop、edge expansion、cycle distance reward、gray-zone decision、dominance pruning、收敛判断和 context 去重。
-- 传播字段：`retrieval_trace_id`、`graph_retrieval_steps`、`result_chunk_ids`、`concept_path_json`、`frontier_json`、`path_labels_json`、`convergence_json`、`diagnostics_json`、`runtime_settings_hash`。
+- 影响方式：layered retrieval 从加权融合排名改为 coarse/mid/chunk/structure 的 staged path search；RQ membership/address 作为语义地址贯穿 mid candidate collection、chunk seed selection、桥接路径解释和灰区 LLM 判停；trace 必须可回放每个 entry、局部 frontier pop、父节点下钻、candidate pool 合并、top-k 截断、edge expansion、cycle distance reward、gray-zone decision、dominance pruning、收敛判断和 context 去重。
+- 传播字段：`retrieval_trace_id`、`graph_retrieval_steps`、`result_chunk_ids`、`concept_path_json`、`frontier_json`、`stage_queues_json`、`candidate_pools_json`、`topk_selection_json`、`path_labels_json`、`convergence_json`、`diagnostics_json`、`runtime_settings_hash`。
 - 触发条件：query facets、relation/RQ/mid/coarse hash、edge distance protocol、traversal budget、agent envelope 或 conversation scope 变化时，graph traversal trace 与 cache key 需要刷新。
-- 验收观察点：entry node 选择可解释、chunk seed quality、frontier expansion count、path convergence score、gray-zone LLM decision audit、cycle distance reward bounded、dominance pruning count、structure restore step、RQ diagnostics、cache hit audit 和 evidence package de-duplication。
+- 验收观察点：entry node 选择可解释、coarse queue 覆盖、per-coarse mid candidate coverage、mid top-k selection audit、per-mid chunk candidate coverage、chunk top-k selection audit、chunk seed quality、frontier expansion count、path convergence score、gray-zone LLM decision audit、cycle distance reward bounded、dominance pruning count、structure restore step、RQ diagnostics、cache hit audit 和 evidence package de-duplication。
 
 ## Layered P&E Agent
 
@@ -2464,8 +2700,8 @@ $$
 B
 =
 \left(
-B_{entry},B_{frontier},B_{depth},B_{labels},B_{edge\_reuse},
-B_{cycle},B_{drilldown},B_{chunk},B_{restore},
+B_{coarse},B_{mid|coarse},K_{mid},B_{chunk|mid},K_{chunk},
+B_{depth},B_{labels},B_{edge\_reuse},B_{cycle},B_{restore},
 B_{context},B_{plan},B_{repair},B_{verify}
 \right)
 $$
@@ -2473,10 +2709,11 @@ $$
 目标字段：
 
 ```text
-coarse_entry_budget
-mid_entry_budget
-rq_membership_seed_budget
-frontier_expansion_budget
+agent_coarse_total_budget
+agent_mid_per_coarse_budget
+agent_mid_top_k
+agent_chunk_per_mid_budget
+agent_chunk_top_k
 max_depth_per_layer
 max_labels_per_node
 max_edge_reuse
@@ -2485,8 +2722,7 @@ path_distance_green_threshold
 path_distance_gray_threshold
 path_distance_hard_threshold
 cycle_reward_distance_threshold
-drilldown_budget_per_layer
-chunk_candidate_budget
+candidate_pool_dedupe_budget
 structure_restore_budget
 context_package_token_budget
 planning_round_budget
@@ -2512,9 +2748,9 @@ $$
 
 ```text
 perceive intent and query facets
-planner selects layer entry policy
+planner selects coarse entry policy
 validator checks ids, schema, budget and allowed edge types
-executor runs multi-label priority queue walk
+executor runs staged multi-label priority queue walk
 executor returns bounded graph observations
 LLM evaluator judges evidence sufficiency
 if insufficient, planner emits typed repair / expansion action
@@ -2550,7 +2786,7 @@ bridge_or_boundary_reason
 support_refs
 ```
 
-LLM 只能返回 typed path decision，executor 再执行。若 \(D(P)>\tau_{\mathrm{hard}}\)，executor 直接剪枝，不询问 LLM。预算只作为每层 hard interrupt，不进入路径价值判断。
+LLM 只能返回 typed path decision，executor 再执行。若 \(D(P)>\tau_{\mathrm{hard}}\)，executor 直接剪枝，不询问 LLM。预算只作为 staged traversal 的层内或逐父节点 hard interrupt，不进入路径价值判断。
 
 
 Repair 触发：
@@ -2563,10 +2799,10 @@ $$
 
 **架构影响：**
 - 影响对象：QA 链路、layered retrieval、context package、answer session、citation verification、repair loop、reward event 和 policy state。
-- 影响方式：Agent 将用户问题、conversation state 和 graph state 转换为 typed traversal actions；validator 决定哪些动作可执行；executor 用优先队列图搜索返回 observations；LLM evaluator 判断证据是否足够、灰区路径是否仍有知识价值以及是否应下钻或走桥。
+- 影响方式：Agent 将用户问题、conversation state 和 graph state 转换为 typed traversal actions；validator 决定哪些动作可执行；executor 用 staged priority queue traversal 返回 observations；LLM evaluator 判断证据是否足够、灰区路径是否仍有知识价值以及是否应继续当前父节点、进入下一层 top-k 队列、执行结构恢复或走桥。
 - 传播字段：`agent_runs`、`agent_plans`、`agent_actions`、`agent_observations`、`retrieval_traces`、`graph_retrieval_steps`、`context_packages`、`answer_sessions`、`citation_verifications`、`reward_events`、`policy_states`。
 - 触发条件：intent、operating envelope、typed action schema、edge distance protocol、planner prompt、graph convergence failure、citation failure 或 repair budget 变化时，Agent trace 与 answer audit 需要重新生成。
-- 验收观察点：typed action validation pass rate、entry selection accuracy、gray-zone path decision audit、frontier hard interrupt usage、repair success rate、unsupported claim rate 和 reward update 写入。
+- 验收观察点：typed action validation pass rate、entry selection accuracy、gray-zone path decision audit、per-parent hard interrupt usage、mid/chunk top-k audit、repair success rate、unsupported claim rate 和 reward update 写入。
 
 ## Context Package 与引用验证
 
@@ -2718,14 +2954,36 @@ $$
 \Theta_{\mathrm{service}}
 $$
 
-`Settings` 包含数据库、Qdrant、Redis、ingestion、模型、embedding、worker、chunk、context package、reranker、mid concept、RQ、Agent budget 和 fallback 参数。目标 settings 还必须显式覆盖：
+`Settings` 包含数据库、Qdrant、Redis、ingestion、模型、embedding、worker、chunk、context package、mid concept、RQ、Agent budget 和 fallback 参数。目标 settings 还必须显式覆盖：
 
 ```text
 edge_distance_protocol
 rq_membership_protocol
 edge_projection_protocol
-entry_selection_budget
-frontier_expansion_budget
+graph_operating_point_protocol
+graph_operating_point_optimizer = tpe
+dense_knn_k_min
+dense_knn_k_max
+dense_reverse_b_min_base
+dense_reverse_b_max_base
+dense_reverse_b_min_doc
+dense_reverse_b_max_doc
+dense_reverse_b_min_lang
+dense_reverse_b_max_lang
+dense_min_cosine
+dense_strong_cosine
+cross_doc_out_quota_min
+cross_doc_out_quota_max
+cross_doc_min_cosine
+cross_language_out_quota_min
+cross_language_out_quota_max
+cross_language_min_cosine
+edge_type_calibration_protocol
+agent_coarse_total_budget
+agent_mid_per_coarse_budget
+agent_mid_top_k
+agent_chunk_per_mid_budget
+agent_chunk_top_k
 label_dominance_budget
 cycle_reward_cap
 cycle_reward_distance_threshold
@@ -2734,7 +2992,7 @@ traversal_observation_budget
 context_path_summary_budget
 ```
 
-其中改变 chunking、embedding、relation graph、RQ codebook、RQ membership protocol、edge projection 或 concept graph 的参数属于 `rebuild_required`；改变 entry/frontier/label/cycle/path distance threshold/gray-zone observation cadence 等不改变 active graph 的参数属于 `hot_reloadable`，需要失效检索与 QA cache。预算类参数只作为 hard interrupt，不参与路径价值排序。
+其中改变 chunking、embedding、dynamic dense KNN、bridge quota、edge type calibration、TPE graph operating point、relation graph、RQ codebook、RQ membership protocol、edge projection 或 concept graph 的参数属于 `rebuild_required`；改变 staged traversal budget、layer top-k、label/cycle/path distance threshold/gray-zone observation cadence 等不改变 active graph 的参数属于 `hot_reloadable`，需要失效检索与 QA cache。预算类参数只作为 hard interrupt 或层间输出上限，不参与路径价值排序。
 
 ### Hot refresh
 
@@ -2754,7 +3012,7 @@ msg
 (h_{\Theta},\Delta keys,source,created\_at)
 $$
 
-本地刷新会清理 settings cache、cache manager 和 reranker cache。
+本地刷新会清理 settings cache、cache manager、retriever 与 policy reader 等运行时单例。
 
 ### Profile
 
@@ -2807,8 +3065,8 @@ Policy state 不替代 planner，只提供 traversal priors、constraints、safe
 
 
 **架构影响：**
-- 影响对象：chunking、embedding、BM25、graph build、graph traversal、Agent envelope、verification/repair budget、cache、prompt protocol 和 UI interaction。
-- 影响方式：runtime settings 改变工程运行点；profile 只改变交互层；policy 改变动作先验、safe arms、frontier hard interrupt 上限和路径灰区阈值建议，但不替代 planner。
+- 影响对象：chunking、embedding、graph build、graph traversal、Agent envelope、verification/repair budget、cache、prompt protocol 和 UI interaction。
+- 影响方式：runtime settings 改变工程运行点；profile 只改变交互层；policy 改变动作先验、safe arms、staged traversal budget 先验和路径灰区阈值建议，但不替代 planner。
 - 传播字段：`runtime_settings_hash`、`agent_operating_envelope_hash`、`policy_state_hash`、`prompt_protocol_hash`、`profile_hash`、Redis runtime version message。
 - 触发条件：hot reloadable 参数触发 cache/singleton 刷新；rebuild required 参数触发 candidate settings、dry-run、shadow rebuild 与 promotion；profile 变化只刷新 prompt/UI/conversation cache。
 - 验收观察点：runtime version publish、Redis broadcast、settings cache clear、profile 不触发 graph rebuild、policy reward history 与 safe arms 可审计。
@@ -2921,6 +3179,14 @@ rq_prefix_diagnostics
 目标字段闭环：
 
 ```text
+chunk_relation_graph_states:
+  state_hash
+  graph_operating_point_hash
+  graph_operating_point_json
+  edge_distance_protocol_hash
+  edge_type_calibration_protocol_hash
+  diagnostics_json
+
 chunk_relation_edges:
   edge_type
   distance
@@ -2930,6 +3196,11 @@ chunk_relation_edges:
   source_algorithm
   protocol_version
   edge_distance_protocol_hash
+  source_language
+  target_language
+  is_cross_document
+  is_cross_language
+  bridge_quota_reason
 
 rq_prefixes:
   rq_level = 1 | 2 | 3
@@ -3104,7 +3375,6 @@ $$
 context_graph_states
 context_graph_freshness
 vector_records
-bm25_records
 retrieval_traces
 graph_retrieval_steps
 context_packages
@@ -3129,6 +3399,9 @@ retrieval_traces:
   query_facets_json
   entry_nodes_json
   frontier_json
+  stage_queues_json
+  candidate_pools_json
+  topk_selection_json
   path_labels_json
   convergence_json
   edge_distance_protocol_hash
@@ -3139,12 +3412,17 @@ retrieval_traces:
 graph_retrieval_steps:
   layer
   action_type
+  parent_layer
+  parent_node_id
   target_ids
   popped_frontier_state
   expanded_edge_ids
+  candidate_pool_ids
+  selected_topk_ids
   dominance_pruned_count
   cycle_distance_reward
   gray_zone_path_decisions
+  per_parent_budget_status
   stop_reason
 
 context_packages:
@@ -3227,6 +3505,10 @@ search trace payload:
   query facets
   selected entry nodes
   frontier pops
+  stage queues
+  per-parent drilldown
+  candidate pools
+  top-k selections
   expanded edges
   dominance pruning
   cycle distance reward
@@ -3260,6 +3542,9 @@ $$
 ```text
 entry node candidates and selected entries
 frontier expansion timeline
+stage queues
+per-parent drilldown budget usage
+candidate pool merge and top-k selection
 edge distance and support evidence
 dominance pruning count
 cycle distance reward and convergence score
@@ -3319,6 +3604,11 @@ four_layer_graph_diagnose:
 retrieval_trace_evaluate:
   entry selection hit
   chunk seed quality
+  coarse queue coverage
+  per-coarse mid candidate coverage
+  mid top-k selection audit
+  per-mid chunk candidate coverage
+  chunk top-k selection audit
   frontier expansion count
   dominance pruning count
   gray-zone path decision audit
@@ -3337,7 +3627,7 @@ agent_trace_evaluate:
 
 **架构影响：**
 - 影响对象：后端编排、前端图谱/搜索/QA 页面、运维脚本、smoke check、preproduction check 和用户可见诊断。
-- 影响方式：API 把持久状态、edge projection、frontier trace 与 context package 转成前端视图；脚本把同一批状态转成可重复验收报告；前端展示决定问题是否能被定位。
+- 影响方式：API 把持久状态、edge projection、staged frontier trace 与 context package 转成前端视图；脚本把同一批状态转成可重复验收报告；前端展示决定问题是否能被定位。
 - 传播字段：API response schema、shared types、`retrieval_trace_id`、`context_package_id`、`frontier_json`、`path_labels_json`、`convergence_json`、graph stats payload、script JSON/report fields。
 - 触发条件：后端 schema、trace shape、edge projection payload、graph stats、context package payload、settings contract 或脚本参数变化时，前端类型、脚本和测试必须同步更新。
 - 验收观察点：typecheck/lint 通过、API contract fixture 对齐、脚本可从仓库根目录执行、报告写入 `output/`、前端能展示四层路径、frontier、edge projection 和证据包。
@@ -3403,7 +3693,7 @@ product path 默认 `ENABLE_MODEL_FALLBACK=false`、`ENABLE_DATABASE_FALLBACK=fa
 
 
 **架构影响：**
-- 影响对象：ingestion、indexing、graph rebuild、runtime settings publish、QA reward write、Qdrant/BM25/Redis side effects 和 destructive scripts。
+- 影响对象：ingestion、indexing、graph rebuild、runtime settings publish、QA reward write、Qdrant/Redis side effects、legacy BM25 cleanup 和 destructive scripts。
 - 影响方式：事务边界决定 PostgreSQL 状态是否可提交；补偿记录决定外部副作用失败后如何恢复；并发上限决定导入、检索和模型调用是否稳定。
 - 传播字段：job state、batch id、compensation logs、status fields、diagnostics_json、runtime settings version、side-effect payload hash。
 - 触发条件：长任务取消、外部写入失败、并发资源耗尽、fallback 开关变化、路径校验失败或密钥状态变化时，流程必须阻断、补偿或降级为可审计错误。
@@ -3479,6 +3769,11 @@ context graph freshness
 retrieval trace graph steps
 chunk seed quality
 entry selection hit rate
+coarse queue coverage
+per-coarse mid candidate coverage
+mid top-k selection audit
+per-mid chunk candidate coverage
+chunk top-k selection audit
 frontier expansion count
 dominance pruning count
 gray-zone path decision audit
@@ -3500,7 +3795,7 @@ runtime settings version publish
 - 影响方式：测试把架构不变量转成可执行断言；诊断把 graph quality、edge projection quality、traversal quality、citation quality 和 runtime behavior 转成可比较输出。
 - 传播字段：pytest result、Vitest result、docker smoke output、diagnostics JSON、benchmark logs、retrieval evaluation report、agent trace report、runtime probe report。
 - 触发条件：任何代码、schema、脚本、API、运行参数、edge protocol、traversal protocol 或文档验收边界变化时，对应测试与 `output/` 报告需要更新。
-- 验收观察点：关键路径测试通过、edge projection 不断链、frontier trace 可回放、cycle distance reward 有界、报告时间戳可追踪、失败项有可行动上下文、真实资料采样不进入仓库、`output/` 不提交。
+- 验收观察点：关键路径测试通过、edge projection 不断链、staged frontier trace 可回放、cycle distance reward 有界、报告时间戳可追踪、失败项有可行动上下文、真实资料采样不进入仓库、`output/` 不提交。
 
 ## 核心原则
 
@@ -3541,13 +3836,13 @@ $$
 1. 技术白皮书以目标架构和目标算法为主，任何实现偏差必须进入诊断脚本或执行计划阻断项，不能作为 active 链路的长期例外。
 2. Chunk 是稳定地址、索引单位和引用单位，不承担完整语义单元假设。
 3. 结构图负责原文地图和上下文恢复。
-4. Contextual text 服务 embedding 与 BM25，citation 指向 raw chunk span。
+4. Contextual text 服务 embedding，citation 指向 raw chunk span。
 5. Relation graph 由可复算信号构建。
 6. RQ membership/address 是路由、归属和诊断协议，不是事实源。
-7. RQ-KMeans 提供残差语义地址、L3/L2/L1 prefix membership 和 chunk pair evidence。
+7. RQ-KMeans 提供残差语义地址、L3/L2/L1 prefix membership、chunk seed prior 和 diagnostics。
 8. Mid concept 必须由 concept packet、support chunks 和 grounded gate 支撑。
 9. Coarse concept 必须由 RQ L2 packet、child L3 summaries、support chunks 和底层 chunk edge projection 支撑。
-10. Layered retrieval 通过入口选择、距离边、优先队列路径搜索、层级下钻和结构恢复完成图导航。
+10. Layered retrieval 通过入口选择、距离边、staged priority queue path search、逐父节点下钻、层间合并去重 top-k 和结构恢复完成图导航。
 11. Agent 只能在 typed action space 内规划。
 12. Validator 必须检查 action、预算和 required actions。
 13. Context package 是答案生成的唯一证据包。
@@ -3555,6 +3850,6 @@ $$
 15. Repair loop 由 verification failure 和 repair budget 触发。
 16. Conversation state 记录对话和任务状态，不替代证据。
 17. Runtime settings 管工程参数，Profile 管交互偏好。
-18. Policy 提供 traversal budget、safe arms、动作先验和灰区阈值，不替代 planner。
-19. PostgreSQL 是事实源，Qdrant、BM25、Redis 是派生或运行态。
+18. Policy 提供 staged traversal budget 先验、safe arms、动作先验和灰区阈值，不替代 planner。
+19. PostgreSQL 是事实源，Qdrant 与 Redis 是 active 派生或运行态；legacy BM25 artifacts 不属于 active path。
 20. 每次检索、回答、验证和 reward 都必须能由 trace、hash 与 id 链路审计。

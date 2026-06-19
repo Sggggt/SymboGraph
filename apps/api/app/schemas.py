@@ -339,17 +339,48 @@ class GraphNode(APIModel):
     id: str
     label: str
     type: str
+    name: str | None = None
+    category: str | None = None
     layer: str | None = None
+    value: float | int | None = None
     score: float | None = None
+    importance_score: float | None = None
+    confidence: float | None = None
+    support_count: int | None = None
+    support_chunk_ids: list[str] = Field(default_factory=list)
+    support_active_chunk_ids: list[str] = Field(default_factory=list)
+    support_rq_prefix_ids: list[str] = Field(default_factory=list)
+    representative_chunk_ids: list[str] = Field(default_factory=list)
+    included_mid_concept_ids: list[str] = Field(default_factory=list)
+    source_path: str | None = None
+    document_id: str | None = None
+    document_version_id: str | None = None
+    summary: str | None = None
+    snippet: str | None = None
+    text: str | None = None
+    page_number: int | None = None
+    page_range: list[int | None] | tuple[int | None, int | None] | None = None
+    section_path: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class GraphEdge(APIModel):
-    id: str
+    id: str | None = None
     source: str
     target: str
+    label: str | None = None
     type: str
+    category: str | None = None
     weight: float | None = None
+    confidence: float | None = None
+    distance: float | None = None
+    raw_strength: float | None = None
+    score: float | None = None
+    support_count: int | None = None
+    support_chunk_ids: list[str] = Field(default_factory=list)
+    relation_source: str | None = None
+    is_bridge: bool | None = None
+    is_inferred: bool | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -420,10 +451,6 @@ class ModelSettingsUpdate(APIModel):
     fixed_chunk_size_tokens: int | None = None
     fixed_chunk_overlap_tokens: int | None = None
     context_package_token_budget: int | None = None
-    reranker_enabled: bool | None = None
-    reranker_model: str | None = None
-    reranker_max_length: int | None = None
-    reranker_device: str | None = None
     mid_concept_extraction_max_model_batches: int | None = None
     mid_concept_extraction_max_candidates_per_batch: int | None = None
     mid_concept_extraction_max_tokens_per_batch: int | None = None
@@ -431,12 +458,28 @@ class ModelSettingsUpdate(APIModel):
     rq_kmeans_levels: int | None = None
     rq_kmeans_max_k: int | None = None
     rq_residual_tau: float | None = None
-    agent_coarse_entry_budget: int | None = None
-    agent_coarse_jump_budget: int | None = None
-    agent_mid_entry_budget: int | None = None
-    agent_mid_expansion_radius_cap: int | None = None
-    agent_rq_membership_seed_budget: int | None = None
-    agent_frontier_expansion_budget: int | None = None
+    dense_knn_k_min: int | None = None
+    dense_knn_k_max: int | None = None
+    dense_reverse_b_min_base: int | None = None
+    dense_reverse_b_max_base: int | None = None
+    dense_reverse_b_min_doc: int | None = None
+    dense_reverse_b_max_doc: int | None = None
+    dense_reverse_b_min_lang: int | None = None
+    dense_reverse_b_max_lang: int | None = None
+    dense_min_cosine: float | None = None
+    dense_strong_cosine: float | None = None
+    cross_doc_out_quota_min: int | None = None
+    cross_doc_out_quota_max: int | None = None
+    cross_doc_min_cosine: float | None = None
+    cross_language_out_quota_min: int | None = None
+    cross_language_out_quota_max: int | None = None
+    cross_language_min_cosine: float | None = None
+    agent_coarse_total_budget: int | None = None
+    agent_mid_per_coarse_budget: int | None = None
+    agent_mid_top_k: int | None = None
+    agent_chunk_per_mid_budget: int | None = None
+    agent_chunk_top_k: int | None = None
+    candidate_pool_dedupe_budget: int | None = None
     agent_max_depth_per_layer: int | None = None
     agent_max_labels_per_node: int | None = None
     agent_max_edge_reuse: int | None = None
@@ -445,8 +488,6 @@ class ModelSettingsUpdate(APIModel):
     agent_path_distance_green_threshold: float | None = None
     agent_path_distance_gray_threshold: float | None = None
     agent_path_distance_hard_threshold: float | None = None
-    agent_drilldown_budget_per_layer: int | None = None
-    agent_chunk_candidate_budget: int | None = None
     agent_structure_restore_budget: int | None = None
     context_path_summary_budget: int | None = None
     agent_planning_round_budget: int | None = None
@@ -457,7 +498,6 @@ class ModelSettingsUpdate(APIModel):
 
 class RuntimeCheckResponse(APIModel):
     env_sync: dict[str, Any] = Field(default_factory=dict)
-    reranker: dict[str, Any] = Field(default_factory=dict)
     infrastructure: dict[str, Any] = Field(default_factory=dict)
     blocking_issues: list[dict[str, Any]] = Field(default_factory=list)
     warnings: list[dict[str, Any]] = Field(default_factory=list)

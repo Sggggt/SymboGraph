@@ -12,6 +12,7 @@ import httpx
 from sqlalchemy import text
 
 from app.core.config import WORKSPACE_ROOT, get_settings
+from app.services.error_sanitizer import public_exception_message, sanitize_error_message
 
 
 ENV_PATH = WORKSPACE_ROOT / ".env"
@@ -48,21 +49,22 @@ DEPRECATED_ENV_KEYS: set[str] = {
     "AGENT_FINE_ENTRY_BUDGET",
     "AGENT_AMBIGUOUS_EDGE_DISTANCE_LOW",
     "AGENT_AMBIGUOUS_EDGE_DISTANCE_HIGH",
+    "AGENT_COARSE_ENTRY_BUDGET",
+    "AGENT_COARSE_JUMP_BUDGET",
+    "AGENT_MID_ENTRY_BUDGET",
+    "AGENT_MID_EXPANSION_RADIUS_CAP",
+    "AGENT_FINE_ADDRESS_SEED_BUDGET",
+    "AGENT_RQ_MEMBERSHIP_SEED_BUDGET",
+    "AGENT_FRONTIER_EXPANSION_BUDGET",
+    "AGENT_DRILLDOWN_BUDGET_PER_LAYER",
+    "AGENT_CHUNK_CANDIDATE_BUDGET",
+    "RERANKER_ENABLED",
+    "RERANKER_MODEL",
+    "RERANKER_MAX_LENGTH",
+    "RERANKER_DEVICE",
+    "HF_HUB_OFFLINE",
 }
 _LAST_RUNTIME_SETTINGS_VERSION: str | None = None
-
-
-def read_env_str(key: str, default: str = "") -> str:
-    """直接从 .env 文件读取字符串值（热加载，绕过 os.environ 缓存）。"""
-    return _env_entries(ENV_PATH).get(key.upper(), default)
-
-
-def read_env_bool(key: str, default: bool = False) -> bool:
-    """直接从 .env 文件读取布尔值（热加载，绕过 os.environ 缓存）。"""
-    value = _env_entries(ENV_PATH).get(key.upper())
-    if value is None:
-        return default
-    return value.lower() in ("true", "1", "yes", "on")
 
 
 def read_env_int(key: str, default: int = 0) -> int:
@@ -84,6 +86,88 @@ def read_env_float(key: str, default: float = 0.0) -> float:
         return float(value)
     except ValueError:
         return default
+
+
+def runtime_lifecycle_payload() -> dict:
+    rebuild_required = [
+        "fixed_chunk_size_tokens",
+        "fixed_chunk_overlap_tokens",
+        "embedding_model",
+        "embedding_dimensions",
+        "dense_knn_k_min",
+        "dense_knn_k_max",
+        "dense_reverse_b_min_base",
+        "dense_reverse_b_max_base",
+        "dense_reverse_b_min_doc",
+        "dense_reverse_b_max_doc",
+        "dense_reverse_b_min_lang",
+        "dense_reverse_b_max_lang",
+        "dense_min_cosine",
+        "dense_strong_cosine",
+        "cross_doc_out_quota_min",
+        "cross_doc_out_quota_max",
+        "cross_doc_min_cosine",
+        "cross_language_out_quota_min",
+        "cross_language_out_quota_max",
+        "cross_language_min_cosine",
+        "rq_kmeans_levels",
+        "rq_kmeans_max_k",
+        "rq_residual_tau",
+        "mid_concept_extraction_max_model_batches",
+        "mid_concept_extraction_max_candidates_per_batch",
+        "mid_concept_extraction_max_tokens_per_batch",
+        "mid_concept_candidate_keep_threshold",
+    ]
+    hot_reloadable = [
+        "chat_base_url",
+        "chat_resolve_ip",
+        "embedding_base_url",
+        "embedding_resolve_ip",
+        "embedding_batch_size",
+        "model_request_concurrency",
+        "model_request_timeout_seconds",
+        "context_package_token_budget",
+        "agent_coarse_total_budget",
+        "agent_mid_per_coarse_budget",
+        "agent_mid_top_k",
+        "agent_chunk_per_mid_budget",
+        "agent_chunk_top_k",
+        "agent_max_depth_per_layer",
+        "agent_max_labels_per_node",
+        "agent_max_edge_reuse",
+        "agent_max_cycle_reward_per_path",
+        "agent_cycle_reward_distance_threshold",
+        "agent_path_distance_green_threshold",
+        "agent_path_distance_gray_threshold",
+        "agent_path_distance_hard_threshold",
+        "candidate_pool_dedupe_budget",
+        "agent_structure_restore_budget",
+        "context_path_summary_budget",
+        "agent_planning_round_budget",
+        "agent_max_typed_actions_per_round",
+        "agent_repair_round_budget",
+        "agent_verification_budget",
+    ]
+    service_recreate_required = [
+        "worker_concurrency",
+        "model_bridge_enabled",
+        "model_bridge_port",
+    ]
+    return {
+        "hot_reloadable": hot_reloadable,
+        "rebuild_required": rebuild_required,
+        "service_recreate_required": service_recreate_required,
+        "candidate_version_required_for": rebuild_required,
+        "promotion_gate": {
+            "required": True,
+            "stages": ["dry_run", "shadow_rebuild", "evaluation", "promotion"],
+            "hard_gates": ["graph_quality", "retrieval_quality", "citation_quality", "failure_rate", "observability"],
+        },
+        "redaction": {
+            "secret_fields": ["openai_api_key", "embedding_api_key", "model_bridge_admin_token", "api_keys"],
+            "payload_exposes_secret_values": False,
+        },
+    }
 
 
 def model_settings_payload() -> dict:
@@ -108,14 +192,9 @@ def model_settings_payload() -> dict:
         "worker_concurrency": settings.worker_concurrency,
         "model_request_concurrency": settings.model_request_concurrency,
         "model_request_timeout_seconds": settings.model_request_timeout_seconds,
-        "fixed_chunk_size_tokens": settings.fixed_chunk_size_tokens,
-        "fixed_chunk_overlap_tokens": settings.fixed_chunk_overlap_tokens,
-        "context_package_token_budget": settings.context_package_token_budget,
-        "reranker_enabled": read_env_bool("RERANKER_ENABLED", settings.reranker_enabled),
-        "reranker_model": read_env_str("RERANKER_MODEL", settings.reranker_model),
-        "reranker_max_length": read_env_int("RERANKER_MAX_LENGTH", settings.reranker_max_length),
-        "reranker_device": read_env_str("RERANKER_DEVICE", settings.reranker_device),
-        "reranker_url": "",
+        "fixed_chunk_size_tokens": read_env_int("FIXED_CHUNK_SIZE_TOKENS", settings.fixed_chunk_size_tokens),
+        "fixed_chunk_overlap_tokens": read_env_int("FIXED_CHUNK_OVERLAP_TOKENS", settings.fixed_chunk_overlap_tokens),
+        "context_package_token_budget": read_env_int("CONTEXT_PACKAGE_TOKEN_BUDGET", settings.context_package_token_budget),
         "mid_concept_extraction_max_model_batches": read_env_int(
             "MID_CONCEPT_EXTRACTION_MAX_MODEL_BATCHES", settings.mid_concept_extraction_max_model_batches
         ),
@@ -129,12 +208,27 @@ def model_settings_payload() -> dict:
         "rq_kmeans_levels": read_env_int("RQ_KMEANS_LEVELS", settings.rq_kmeans_levels),
         "rq_kmeans_max_k": read_env_int("RQ_KMEANS_MAX_K", settings.rq_kmeans_max_k),
         "rq_residual_tau": read_env_float("RQ_RESIDUAL_TAU", settings.rq_residual_tau),
-        "agent_coarse_entry_budget": read_env_int("AGENT_COARSE_ENTRY_BUDGET", settings.agent_coarse_entry_budget),
-        "agent_coarse_jump_budget": read_env_int("AGENT_COARSE_JUMP_BUDGET", settings.agent_coarse_jump_budget),
-        "agent_mid_entry_budget": read_env_int("AGENT_MID_ENTRY_BUDGET", settings.agent_mid_entry_budget),
-        "agent_mid_expansion_radius_cap": read_env_int("AGENT_MID_EXPANSION_RADIUS_CAP", settings.agent_mid_expansion_radius_cap),
-        "agent_rq_membership_seed_budget": read_env_int("AGENT_RQ_MEMBERSHIP_SEED_BUDGET", settings.agent_rq_membership_seed_budget),
-        "agent_frontier_expansion_budget": read_env_int("AGENT_FRONTIER_EXPANSION_BUDGET", settings.agent_frontier_expansion_budget),
+        "dense_knn_k_min": read_env_int("DENSE_KNN_K_MIN", settings.dense_knn_k_min),
+        "dense_knn_k_max": read_env_int("DENSE_KNN_K_MAX", settings.dense_knn_k_max),
+        "dense_reverse_b_min_base": read_env_int("DENSE_REVERSE_B_MIN_BASE", settings.dense_reverse_b_min_base),
+        "dense_reverse_b_max_base": read_env_int("DENSE_REVERSE_B_MAX_BASE", settings.dense_reverse_b_max_base),
+        "dense_reverse_b_min_doc": read_env_int("DENSE_REVERSE_B_MIN_DOC", settings.dense_reverse_b_min_doc),
+        "dense_reverse_b_max_doc": read_env_int("DENSE_REVERSE_B_MAX_DOC", settings.dense_reverse_b_max_doc),
+        "dense_reverse_b_min_lang": read_env_int("DENSE_REVERSE_B_MIN_LANG", settings.dense_reverse_b_min_lang),
+        "dense_reverse_b_max_lang": read_env_int("DENSE_REVERSE_B_MAX_LANG", settings.dense_reverse_b_max_lang),
+        "dense_min_cosine": read_env_float("DENSE_MIN_COSINE", settings.dense_min_cosine),
+        "dense_strong_cosine": read_env_float("DENSE_STRONG_COSINE", settings.dense_strong_cosine),
+        "cross_doc_out_quota_min": read_env_int("CROSS_DOC_OUT_QUOTA_MIN", settings.cross_doc_out_quota_min),
+        "cross_doc_out_quota_max": read_env_int("CROSS_DOC_OUT_QUOTA_MAX", settings.cross_doc_out_quota_max),
+        "cross_doc_min_cosine": read_env_float("CROSS_DOC_MIN_COSINE", settings.cross_doc_min_cosine),
+        "cross_language_out_quota_min": read_env_int("CROSS_LANGUAGE_OUT_QUOTA_MIN", settings.cross_language_out_quota_min),
+        "cross_language_out_quota_max": read_env_int("CROSS_LANGUAGE_OUT_QUOTA_MAX", settings.cross_language_out_quota_max),
+        "cross_language_min_cosine": read_env_float("CROSS_LANGUAGE_MIN_COSINE", settings.cross_language_min_cosine),
+        "agent_coarse_total_budget": read_env_int("AGENT_COARSE_TOTAL_BUDGET", settings.agent_coarse_total_budget),
+        "agent_mid_per_coarse_budget": read_env_int("AGENT_MID_PER_COARSE_BUDGET", settings.agent_mid_per_coarse_budget),
+        "agent_mid_top_k": read_env_int("AGENT_MID_TOP_K", settings.agent_mid_top_k),
+        "agent_chunk_per_mid_budget": read_env_int("AGENT_CHUNK_PER_MID_BUDGET", settings.agent_chunk_per_mid_budget),
+        "agent_chunk_top_k": read_env_int("AGENT_CHUNK_TOP_K", settings.agent_chunk_top_k),
         "agent_max_depth_per_layer": read_env_int("AGENT_MAX_DEPTH_PER_LAYER", settings.agent_max_depth_per_layer),
         "agent_max_labels_per_node": read_env_int("AGENT_MAX_LABELS_PER_NODE", settings.agent_max_labels_per_node),
         "agent_max_edge_reuse": read_env_int("AGENT_MAX_EDGE_REUSE", settings.agent_max_edge_reuse),
@@ -143,8 +237,7 @@ def model_settings_payload() -> dict:
         "agent_path_distance_green_threshold": read_env_float("AGENT_PATH_DISTANCE_GREEN_THRESHOLD", settings.agent_path_distance_green_threshold),
         "agent_path_distance_gray_threshold": read_env_float("AGENT_PATH_DISTANCE_GRAY_THRESHOLD", settings.agent_path_distance_gray_threshold),
         "agent_path_distance_hard_threshold": read_env_float("AGENT_PATH_DISTANCE_HARD_THRESHOLD", settings.agent_path_distance_hard_threshold),
-        "agent_drilldown_budget_per_layer": read_env_int("AGENT_DRILLDOWN_BUDGET_PER_LAYER", settings.agent_drilldown_budget_per_layer),
-        "agent_chunk_candidate_budget": read_env_int("AGENT_CHUNK_CANDIDATE_BUDGET", settings.agent_chunk_candidate_budget),
+        "candidate_pool_dedupe_budget": read_env_int("CANDIDATE_POOL_DEDUPE_BUDGET", settings.candidate_pool_dedupe_budget),
         "agent_structure_restore_budget": read_env_int("AGENT_STRUCTURE_RESTORE_BUDGET", settings.agent_structure_restore_budget),
         "context_path_summary_budget": read_env_int("CONTEXT_PATH_SUMMARY_BUDGET", settings.context_path_summary_budget),
         "agent_planning_round_budget": read_env_int("AGENT_PLANNING_ROUND_BUDGET", settings.agent_planning_round_budget),
@@ -159,6 +252,7 @@ def model_settings_payload() -> dict:
         "has_embedding_api_key": bool(settings.embedding_api_key),
         "model_bridge_status": model_bridge_status,
         "runtime_settings_version": current_runtime_settings_version(),
+        "lifecycle": runtime_lifecycle_payload(),
     }
 
 
@@ -385,7 +479,12 @@ def reload_model_bridge(settings=None, env_entries: dict[str, str] | None = None
             timeout=5.0,
         )
         if response.status_code != 200:
-            return {"attempted": True, "ok": False, "status_code": response.status_code, "error": response.text[:500]}
+            return {
+                "attempted": True,
+                "ok": False,
+                "status_code": response.status_code,
+                "error": sanitize_error_message(f"Model bridge admin reload failed with HTTP {response.status_code}"),
+            }
         payload = response.json()
         return {
             "attempted": True,
@@ -395,7 +494,7 @@ def reload_model_bridge(settings=None, env_entries: dict[str, str] | None = None
             "embedding_target_hash": payload.get("embedding_target_hash"),
         }
     except Exception as exc:
-        return {"attempted": True, "ok": False, "error": str(exc)}
+        return {"attempted": True, "ok": False, "error": public_exception_message(exc)}
 
 
 def current_runtime_settings_version() -> str | None:
@@ -421,10 +520,8 @@ def _local_runtime_refresh(version: str | None = None) -> None:
     get_settings.cache_clear()
     get_settings()
     from app.services.cache_manager import clear_cache_manager
-    from app.services.reranker import clear_reranker_cache
 
     clear_cache_manager()
-    clear_reranker_cache()
     if version is not None:
         _LAST_RUNTIME_SETTINGS_VERSION = version
 
@@ -609,12 +706,6 @@ def _check_model_bridge() -> bool | None:
     return bool(status.get("reachable") and status.get("admin_available") and status.get("config_matches"))
 
 
-def _reranker_runtime_status() -> dict:
-    """检测 CrossEncoder 重排序器的运行时状态（使用单例缓存，不重复加载模型）。"""
-    from app.services.reranker import get_reranker_status
-    return get_reranker_status()
-
-
 def runtime_check_payload() -> dict:
     env_sync = env_sync_status()
     blocking_issues: list[dict] = []
@@ -668,7 +759,6 @@ def runtime_check_payload() -> dict:
             )
     return {
         "env_sync": env_sync,
-        "reranker": _reranker_runtime_status(),
         "infrastructure": infrastructure,
         "model_bridge_status": bridge_status,
         "blocking_issues": blocking_issues,
@@ -695,10 +785,6 @@ def update_model_settings(payload: dict) -> dict:
         "fixed_chunk_size_tokens": "fixed_chunk_size_tokens",
         "fixed_chunk_overlap_tokens": "fixed_chunk_overlap_tokens",
         "context_package_token_budget": "context_package_token_budget",
-        "reranker_enabled": "reranker_enabled",
-        "reranker_model": "reranker_model",
-        "reranker_max_length": "reranker_max_length",
-        "reranker_device": "reranker_device",
         "mid_concept_extraction_max_model_batches": "mid_concept_extraction_max_model_batches",
         "mid_concept_extraction_max_candidates_per_batch": "mid_concept_extraction_max_candidates_per_batch",
         "mid_concept_extraction_max_tokens_per_batch": "mid_concept_extraction_max_tokens_per_batch",
@@ -706,12 +792,28 @@ def update_model_settings(payload: dict) -> dict:
         "rq_kmeans_levels": "rq_kmeans_levels",
         "rq_kmeans_max_k": "rq_kmeans_max_k",
         "rq_residual_tau": "rq_residual_tau",
-        "agent_coarse_entry_budget": "agent_coarse_entry_budget",
-        "agent_coarse_jump_budget": "agent_coarse_jump_budget",
-        "agent_mid_entry_budget": "agent_mid_entry_budget",
-        "agent_mid_expansion_radius_cap": "agent_mid_expansion_radius_cap",
-        "agent_rq_membership_seed_budget": "agent_rq_membership_seed_budget",
-        "agent_frontier_expansion_budget": "agent_frontier_expansion_budget",
+        "dense_knn_k_min": "dense_knn_k_min",
+        "dense_knn_k_max": "dense_knn_k_max",
+        "dense_reverse_b_min_base": "dense_reverse_b_min_base",
+        "dense_reverse_b_max_base": "dense_reverse_b_max_base",
+        "dense_reverse_b_min_doc": "dense_reverse_b_min_doc",
+        "dense_reverse_b_max_doc": "dense_reverse_b_max_doc",
+        "dense_reverse_b_min_lang": "dense_reverse_b_min_lang",
+        "dense_reverse_b_max_lang": "dense_reverse_b_max_lang",
+        "dense_min_cosine": "dense_min_cosine",
+        "dense_strong_cosine": "dense_strong_cosine",
+        "cross_doc_out_quota_min": "cross_doc_out_quota_min",
+        "cross_doc_out_quota_max": "cross_doc_out_quota_max",
+        "cross_doc_min_cosine": "cross_doc_min_cosine",
+        "cross_language_out_quota_min": "cross_language_out_quota_min",
+        "cross_language_out_quota_max": "cross_language_out_quota_max",
+        "cross_language_min_cosine": "cross_language_min_cosine",
+        "agent_coarse_total_budget": "agent_coarse_total_budget",
+        "agent_mid_per_coarse_budget": "agent_mid_per_coarse_budget",
+        "agent_mid_top_k": "agent_mid_top_k",
+        "agent_chunk_per_mid_budget": "agent_chunk_per_mid_budget",
+        "agent_chunk_top_k": "agent_chunk_top_k",
+        "candidate_pool_dedupe_budget": "candidate_pool_dedupe_budget",
         "agent_max_depth_per_layer": "agent_max_depth_per_layer",
         "agent_max_labels_per_node": "agent_max_labels_per_node",
         "agent_max_edge_reuse": "agent_max_edge_reuse",
@@ -720,8 +822,6 @@ def update_model_settings(payload: dict) -> dict:
         "agent_path_distance_green_threshold": "agent_path_distance_green_threshold",
         "agent_path_distance_gray_threshold": "agent_path_distance_gray_threshold",
         "agent_path_distance_hard_threshold": "agent_path_distance_hard_threshold",
-        "agent_drilldown_budget_per_layer": "agent_drilldown_budget_per_layer",
-        "agent_chunk_candidate_budget": "agent_chunk_candidate_budget",
         "agent_structure_restore_budget": "agent_structure_restore_budget",
         "context_path_summary_budget": "context_path_summary_budget",
         "agent_planning_round_budget": "agent_planning_round_budget",
@@ -784,7 +884,6 @@ def update_model_settings(payload: dict) -> dict:
         refreshed_settings = get_settings()
         if refreshed_settings.model_bridge_enabled:
             bridge_reload_result = reload_model_bridge(settings=refreshed_settings, env_entries=_env_entries(ENV_PATH))
-        # 如果 reranker 模型配置发生变化，清除单例缓存以强制重新加载
     if normalized or updates:
         changed_keys = [key.upper() for key in updates]
         if normalized:

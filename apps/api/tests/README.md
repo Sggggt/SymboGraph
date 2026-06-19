@@ -10,6 +10,9 @@
 | --- | --- |
 | `test_context_graph_pipeline.py` | fixed chunk、structure graph、chunk relation/RQ membership、mid/coarse、context package。 |
 | `test_cache_manager.py` | Redis cache miss/no-op 边界，防止进程内缓存替代共享 Redis。 |
+| `test_error_sanitizer.py` | 外部服务错误脱敏，防止 API key、Authorization header 或 provider 原始响应泄露。 |
+| `test_ingestion_logs.py` | 导入日志结构、阶段和状态文案契约。 |
+| `test_model_bridge.py` | 模型桥接配置、reload 和自指向防护。 |
 | `test_routes_and_maintenance.py` | API routes、runtime settings、maintenance 与 reconciliation。 |
 | `test_*.py` | 其他后端回归测试。 |
 | `README.md` | 本测试说明。 |
@@ -21,7 +24,7 @@
 ```text
 fixed token chunks
 -> structure graph
--> contextual embedding/BM25 metadata
+-> contextual embedding/vector metadata
 -> chunk relation/RQ membership
 -> RQ L3 mid graph / RQ L2 coarse graph states
 -> layered retrieval trace

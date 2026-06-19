@@ -8,7 +8,7 @@
 
 | 路径 | 职责 |
 | --- | --- |
-| `docker-compose.yml` | 默认本地生产形态栈。 |
+| `docker-compose.yml` | 默认本地 Docker 栈：API、Worker、Web dev server、PostgreSQL、Redis、Qdrant。 |
 | `README.md` | Compose 运行说明。 |
 
 ## 产品定位
@@ -111,7 +111,7 @@ docker exec -w /app/apps/api course-kg-api python -m pytest tests
 docker compose -f infra/docker-compose.yml logs -f api
 docker compose -f infra/docker-compose.yml logs -f worker
 docker compose -f infra/docker-compose.yml restart api worker
-python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --worker-container course-kg-worker
+python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
 ```
 
 ## 文档

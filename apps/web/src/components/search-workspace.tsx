@@ -165,12 +165,12 @@ function SearchHero({
       <div className="mx-auto flex max-w-5xl flex-col items-center gap-5 text-center">
         <div className="kg-micro-chip rounded-full px-3 py-2 text-xs uppercase tracking-[0.22em]">
           <Radar data-icon="inline-start" />
-          混合检索链路
+          分层图谱检索
         </div>
         <div className="space-y-3">
           <h2 className="glow-text text-4xl font-semibold text-white lg:text-6xl">检索本地上下文图谱</h2>
           <p className="mx-auto max-w-2xl text-sm leading-7 text-cyan-50/58 lg:text-base">
-            稠密向量、BM25、RQ 前缀、RQ-KMeans、中粗概念路由与结构恢复会在这里汇总。
+            Dense 关系图、RQ membership、中粗概念路由、分阶段队列和结构恢复会在这里汇总。
           </p>
         </div>
 
@@ -262,7 +262,7 @@ function SearchFilterBar({
       </div>
       <div className="kg-micro-chip rounded-full px-3 py-2 text-xs">
         <Activity data-icon="inline-start" />
-        {degradedMode ? "依赖链路不完整" : "向量 + BM25 + 图谱"}
+        {degradedMode ? "依赖链路不完整" : "向量 + RQ + 四层图谱"}
       </div>
     </div>
   );
@@ -282,6 +282,9 @@ function SearchTraceSummary({ audit }: { audit?: ModelAudit }) {
       <span className="kg-micro-chip rounded-full px-2.5 py-1">粗粒入口 {auditValue(audit, "coarse_entries")}</span>
       <span className="kg-micro-chip rounded-full px-2.5 py-1">中粒入口 {auditValue(audit, "mid_entries")}</span>
       <span className="kg-micro-chip rounded-full px-2.5 py-1">RQ 入口 {auditValue(audit, "rq_membership_entries")}</span>
+      <span className="kg-micro-chip rounded-full px-2.5 py-1">Stage 队列 {auditValue(audit, "stage_queue_count")}</span>
+      <span className="kg-micro-chip rounded-full px-2.5 py-1">中概念 TopK {auditValue(audit, "mid_topk_selected")}</span>
+      <span className="kg-micro-chip rounded-full px-2.5 py-1">片段 TopK {auditValue(audit, "chunk_topk_selected")}</span>
       <span className="kg-micro-chip rounded-full px-2.5 py-1">Frontier {auditValue(audit, "frontier_pops")}</span>
       <span className="kg-micro-chip rounded-full px-2.5 py-1">支配剪枝 {auditValue(audit, "dominance_pruned_count")}</span>
       <span className="kg-micro-chip rounded-full px-2.5 py-1">硬停剪枝 {auditValue(audit, "hard_stop_pruned_count")}</span>

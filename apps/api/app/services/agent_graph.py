@@ -41,6 +41,7 @@ from app.services.context_graph import (
     runtime_settings_state_hash,
 )
 from app.services.embeddings import ChatProvider, FallbackDisabledError, is_degraded_mode
+from app.services.error_sanitizer import public_exception_message
 from app.services.ingestion import resolve_knowledge_base
 from app.services.chunking import stable_hash
 from app.services.model_output import coerce_confidence
@@ -134,22 +135,25 @@ REQUIRED_TYPED_ACTIONS = ["select_entry_nodes", "walk_graph_frontier", "recall_c
 def _default_budget_for_action(action_type: str, envelope: dict[str, Any]) -> dict[str, int]:
     mapping = {
         "select_entry_nodes": {
-            "coarse_entry_budget": int(envelope.get("coarse_entry_budget") or 0),
-            "mid_entry_budget": int(envelope.get("mid_entry_budget") or 0),
-            "rq_membership_seed_budget": int(envelope.get("rq_membership_seed_budget") or 0),
+            "agent_coarse_total_budget": int(envelope.get("agent_coarse_total_budget") or 0),
         },
         "walk_graph_frontier": {
-            "frontier_expansion_budget": int(envelope.get("frontier_expansion_budget") or 0),
+            "agent_chunk_per_mid_budget": int(envelope.get("agent_chunk_per_mid_budget") or 0),
             "max_depth_per_layer": int(envelope.get("max_depth_per_layer") or 0),
             "max_labels_per_node": int(envelope.get("max_labels_per_node") or 0),
         },
-        "drill_down_layer": {"drilldown_budget_per_layer": int(envelope.get("drilldown_budget_per_layer") or 0)},
+        "drill_down_layer": {
+            "agent_mid_per_coarse_budget": int(envelope.get("agent_mid_per_coarse_budget") or 0),
+            "agent_mid_top_k": int(envelope.get("agent_mid_top_k") or 0),
+            "agent_chunk_per_mid_budget": int(envelope.get("agent_chunk_per_mid_budget") or 0),
+            "agent_chunk_top_k": int(envelope.get("agent_chunk_top_k") or 0),
+        },
         "evaluate_gray_zone_path": {
             "path_distance_green_threshold": float(envelope.get("path_distance_green_threshold") or 0),
             "path_distance_gray_threshold": float(envelope.get("path_distance_gray_threshold") or 0),
             "path_distance_hard_threshold": float(envelope.get("path_distance_hard_threshold") or 0),
         },
-        "recall_chunks": {"chunk_candidate_budget": int(envelope.get("chunk_candidate_budget") or 0)},
+        "recall_chunks": {"agent_chunk_top_k": int(envelope.get("agent_chunk_top_k") or 0)},
         "restore_context_package": {"structure_restore_budget": int(envelope.get("structure_restore_budget") or 0)},
         "build_context_package": {"context_package_token_budget": int(envelope.get("context_package_token_budget") or 0)},
         "verify_citations": {"verification_budget": int(envelope.get("verification_budget") or 0)},
@@ -278,11 +282,45 @@ async def propose_agent_plan(question: str, history: list[dict], query_intent: d
             "required_action_types": REQUIRED_TYPED_ACTIONS,
         }
     )
-    output = await ChatProvider().classify_json(system_prompt=system, user_prompt=user_prompt, fallback=fallback)
+    provider = ChatProvider()
+    planner_errors: list[str] = []
+    try:
+        output = await provider.classify_json(system_prompt=system, user_prompt=user_prompt, fallback=fallback)
+    except Exception as exc:
+        output = {}
+        planner_errors.append(f"initial_request:{public_exception_message(exc)}")
     actions = output.get("typed_actions") if isinstance(output, dict) else None
     if not isinstance(actions, list):
+        repair_system = (
+            f"{system} Your previous response was rejected by the typed action schema. "
+            "Return ONLY a JSON object with key typed_actions. Do not include prose, markdown, analysis, or alternate keys."
+        )
+        repair_prompt = str(
+            {
+                "invalid_response_keys": sorted(output.keys()) if isinstance(output, dict) else [],
+                "required_shape": {"typed_actions": ["typed action objects"]},
+                "required_action_types": REQUIRED_TYPED_ACTIONS,
+                "allowed_action_types": sorted(ALLOWED_TYPED_ACTIONS),
+                "original_request": {
+                    "question": question,
+                    "history": history[-6:],
+                    "query_intent": query_intent,
+                    "operating_envelope": envelope,
+                },
+            }
+        )
+        try:
+            repaired = await provider.classify_json(system_prompt=repair_system, user_prompt=repair_prompt, fallback=fallback)
+            repaired_actions = repaired.get("typed_actions") if isinstance(repaired, dict) else None
+            if isinstance(repaired_actions, list):
+                output = {**repaired, "planner_repair": {"attempted": True, "errors": planner_errors}}
+                actions = repaired_actions
+        except Exception as exc:
+            planner_errors.append(f"repair_request:{public_exception_message(exc)}")
+    if not isinstance(actions, list):
         if not get_settings().enable_model_fallback:
-            raise RuntimeError("Agent planner returned invalid JSON: typed_actions array is required")
+            detail = f" ({'; '.join(planner_errors)})" if planner_errors else ""
+            raise RuntimeError(f"Agent planner returned invalid JSON after repair: typed_actions array is required{detail}")
         actions = fallback["typed_actions"]
     return [action for action in actions if isinstance(action, dict)], output if isinstance(output, dict) else {}
 
@@ -840,6 +878,41 @@ def verify_answer_against_context_rules(answer: str, citations: list[dict], cont
     return results
 
 
+def citation_verification_judge_timeout_seconds(verification_budget: int) -> float:
+    request_timeout = float(get_settings().model_request_timeout_seconds or 60)
+    budget = max(1, int(verification_budget or 1))
+    return max(15.0, min(request_timeout, float(budget * 8), 60.0))
+
+
+def llm_verification_unavailable_results(
+    rule_results: list[dict[str, Any]],
+    *,
+    judge_state: str,
+    failure_type: str,
+    exc: Exception | None = None,
+) -> list[dict[str, Any]]:
+    diagnostics: dict[str, Any] = {
+        "verification_method": "structure_plus_llm_entailment_v1",
+        "llm_entailment_judge": judge_state,
+    }
+    if exc is not None:
+        diagnostics["error"] = public_exception_message(exc)
+        diagnostics["error_type"] = type(exc).__name__
+    return [
+        {
+            **item,
+            "verdict": "unsupported" if item.get("verdict") == "supported" else item.get("verdict"),
+            "failure_type": failure_type if item.get("verdict") == "supported" else item.get("failure_type"),
+            "confidence": min(coerce_confidence(item.get("confidence"), default=0.0)[0], 0.35),
+            "diagnostics": {
+                **(item.get("diagnostics") or {}),
+                **diagnostics,
+            },
+        }
+        for item in rule_results
+    ]
+
+
 async def verify_answer_against_context(answer: str, citations: list[dict], contexts: list[dict], verification_budget: int) -> list[dict[str, Any]]:
     rule_results = verify_answer_against_context_rules(answer, citations, contexts, verification_budget)
     if not citations:
@@ -873,49 +946,41 @@ async def verify_answer_against_context(answer: str, citations: list[dict], cont
         ]
     }
     try:
-        judged = await ChatProvider().classify_json(
-            system_prompt=(
-                "You are a citation entailment judge for a grounded Four-Layer Context Graph RAG system. "
-                "Use only the supplied cited context and source spans. Return JSON with verifications. "
-                "Each verification must include citation_index, verdict (supported, unsupported, contradicted, missing_citation, "
-                "formula_table_context_missing), failure_type, confidence, and reason. Do not use outside knowledge."
+        judged = await asyncio.wait_for(
+            ChatProvider().classify_json(
+                system_prompt=(
+                    "You are a citation entailment judge for a grounded Four-Layer Context Graph RAG system. "
+                    "Use only the supplied cited context and source spans. Return JSON with verifications. "
+                    "Each verification must include citation_index, verdict (supported, unsupported, contradicted, missing_citation, "
+                    "formula_table_context_missing), failure_type, confidence, and reason. Do not use outside knowledge."
+                ),
+                user_prompt=str(judge_payload),
+                fallback=fallback,
             ),
-            user_prompt=str(judge_payload),
-            fallback=fallback,
+            timeout=citation_verification_judge_timeout_seconds(verification_budget),
+        )
+    except TimeoutError as exc:
+        return llm_verification_unavailable_results(
+            rule_results,
+            judge_state="timeout_hard_interrupt",
+            failure_type="verification_model_timeout",
+            exc=exc,
         )
     except FallbackDisabledError as exc:
-        return [
-            {
-                **item,
-                "verdict": "unsupported" if item.get("verdict") == "supported" else item.get("verdict"),
-                "failure_type": "verification_model_unavailable" if item.get("verdict") == "supported" else item.get("failure_type"),
-                "confidence": min(coerce_confidence(item.get("confidence"), default=0.0)[0], 0.35),
-                "diagnostics": {
-                    **(item.get("diagnostics") or {}),
-                    "verification_method": "structure_plus_llm_entailment_v1",
-                    "llm_entailment_judge": "unavailable_fallback_disabled",
-                    "error": str(exc),
-                },
-            }
-            for item in rule_results
-        ]
+        return llm_verification_unavailable_results(
+            rule_results,
+            judge_state="unavailable_fallback_disabled",
+            failure_type="verification_model_unavailable",
+            exc=exc,
+        )
     except Exception as exc:
         if not get_settings().enable_model_fallback:
-            return [
-                {
-                    **item,
-                    "verdict": "unsupported" if item.get("verdict") == "supported" else item.get("verdict"),
-                    "failure_type": "verification_model_unavailable" if item.get("verdict") == "supported" else item.get("failure_type"),
-                    "confidence": min(coerce_confidence(item.get("confidence"), default=0.0)[0], 0.35),
-                    "diagnostics": {
-                        **(item.get("diagnostics") or {}),
-                        "verification_method": "structure_plus_llm_entailment_v1",
-                        "llm_entailment_judge": "error_fallback_disabled",
-                        "error_type": type(exc).__name__,
-                    },
-                }
-                for item in rule_results
-            ]
+            return llm_verification_unavailable_results(
+                rule_results,
+                judge_state="error_fallback_disabled",
+                failure_type="verification_model_unavailable",
+                exc=exc,
+            )
         judged = fallback
     judged_by_index = {
         int(item.get("citation_index") or 0): item
@@ -1268,13 +1333,14 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             run.id,
             "entry_selection",
             input_summary=request.question,
-            output_summary=f"coarse={audit.get('coarse_entries', 0)}, mid={audit.get('mid_entries', 0)}, rq-prefix-address={audit.get('rq_membership_entries', 0)}",
+            output_summary=f"coarse={audit.get('coarse_entries', 0)}, stage-queues={audit.get('stage_queue_count', 0)}",
             document_ids=[item["chunk_id"] for item in search_result.results],
             scores={
                 "retrieval_trace_id": search_result.trace.id,
                 "coarse_entries": audit.get("coarse_entries", 0),
-                "mid_entries": audit.get("mid_entries", 0),
-                "rq_membership_entries": audit.get("rq_membership_entries", 0),
+                "stage_queue_count": audit.get("stage_queue_count", 0),
+                "mid_topk_selected": audit.get("mid_topk_selected", 0),
+                "chunk_topk_selected": audit.get("chunk_topk_selected", 0),
             },
         )
         trace(
@@ -1282,11 +1348,13 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             run.id,
             "layer_drilldown",
             input_summary=f"trace={search_result.trace.id}",
-            output_summary=f"rq-prefix-address seeds={audit.get('rq_membership_entries', 0)}",
+            output_summary=f"mid top-k={audit.get('mid_topk_selected', 0)}, chunk top-k={audit.get('chunk_topk_selected', 0)}",
             document_ids=[item["chunk_id"] for item in search_result.results],
             scores={
                 "retrieval_trace_id": search_result.trace.id,
                 "query_rq_path": audit.get("query_rq_path") or [],
+                "mid_topk_selected": audit.get("mid_topk_selected", 0),
+                "chunk_topk_selected": audit.get("chunk_topk_selected", 0),
             },
         )
         trace(
@@ -1580,8 +1648,9 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             "answer_model_audit": answer_model_audit,
         }
     except Exception as exc:
-        set_run_state(db, run, "failed", error=str(exc))
-        trace(db, run.id, "error", status="failed", output_summary=str(exc), error=str(exc))
+        safe_error = public_exception_message(exc)
+        set_run_state(db, run, "failed", error=safe_error)
+        trace(db, run.id, "error", status="failed", output_summary=safe_error, error=safe_error)
         raise
 
 
@@ -1613,7 +1682,7 @@ async def stream_agent_events(db: Session, request: AgentRequest) -> AsyncGenera
                 yield {"type": "trace", "trace": event}
         response = await task
     except Exception as exc:
-        yield {"type": "error", "error": str(exc)}
+        yield {"type": "error", "error": public_exception_message(exc)}
         return
     finally:
         _unsubscribe_trace(run.id, trace_queue)

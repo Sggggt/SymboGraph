@@ -30,16 +30,6 @@ def main() -> None:
             .where(ChunkRelationGraphState.knowledge_base_id == knowledge_base.id, ChunkRelationGraphState.state == "active")
             .order_by(ChunkRelationGraphState.created_at.desc())
         )
-        rq_edge_counts = {
-            edge_type: db.scalar(
-                select(func.count(ChunkRelationEdge.id)).where(
-                    ChunkRelationEdge.knowledge_base_id == knowledge_base.id,
-                    ChunkRelationEdge.edge_type == edge_type,
-                )
-            )
-            or 0
-            for edge_type in ("rq_hierarchy_near", "rq_prefix_sibling", "rq_residual_near")
-        }
         rq_model = ((relation_state.diagnostics_json or {}).get("rq_kmeans") or {}) if relation_state else {}
         rq = {
             "enabled": bool(rq_model.get("enabled")),
@@ -57,14 +47,13 @@ def main() -> None:
                 .where(RQPrefix.knowledge_base_id == knowledge_base.id, RQPrefixMembership.residual_norm.is_not(None))
             )
             or 0,
-            "edge_counts": rq_edge_counts,
             "pass": bool(relation_state)
             and bool(rq_model.get("enabled"))
-            and all(count > 0 for count in rq_edge_counts.values()),
+            and (db.scalar(select(func.count(RQPrefix.id)).where(RQPrefix.knowledge_base_id == knowledge_base.id, RQPrefix.rq_level.is_not(None))) or 0) > 0,
         }
         relation_state_id = relation_state.id if relation_state else None
         legacy_rq_prefix_edges_table_present = "rq_prefix_edges" in inspect(db.bind).get_table_names()
-        target_relation_edge_counts = {
+        dense_edge_counts = {
             edge_type: (
                 db.scalar(
                     select(func.count(ChunkRelationEdge.id)).where(
@@ -76,14 +65,25 @@ def main() -> None:
                 else 0
             )
             or 0
-            for edge_type in ("co_retrieved",)
+            for edge_type in ("dense_semantic", "dense_cross_document_bridge", "dense_cross_language_bridge")
         }
-        missing_reasons = ((relation_state.diagnostics_json or {}).get("missing_target_relation_edge_type_reasons") or {}) if relation_state else {}
+        forbidden_relation_edge_types = []
+        if relation_state_id:
+            active_dense_edge_types = set(dense_edge_counts)
+            forbidden_relation_edge_types = sorted(
+                row[0]
+                for row in db.execute(
+                    select(ChunkRelationEdge.edge_type)
+                    .where(ChunkRelationEdge.graph_state_id == relation_state_id)
+                    .distinct()
+                ).all()
+                if row[0] not in active_dense_edge_types
+            )
         missing_relation_metrics = (
             db.scalar(
                 select(func.count(ChunkRelationEdge.id)).where(
                     ChunkRelationEdge.graph_state_id == relation_state_id,
-                    (ChunkRelationEdge.distance.is_(None)) | (ChunkRelationEdge.raw_strength.is_(None)),
+                    (ChunkRelationEdge.distance.is_(None)) | (ChunkRelationEdge.raw_strength.is_(None)) | (ChunkRelationEdge.edge_distance_protocol_hash.is_(None)),
                 )
             )
             if relation_state_id
@@ -100,7 +100,8 @@ def main() -> None:
         required_structure_types = {"document", "section", "page", "region", "paragraph"}
         checks = {
             "rq_complete": rq["pass"],
-            "target_relation_edges_present_or_blocked": all(count > 0 or missing_reasons.get(edge_type) for edge_type, count in target_relation_edge_counts.items()),
+            "dense_semantic_edges_present": dense_edge_counts.get("dense_semantic", 0) > 0,
+            "forbidden_relation_edge_types_absent": not forbidden_relation_edge_types,
             "rq_prefix_edges_removed": not legacy_rq_prefix_edges_table_present,
             "relation_metrics_present": missing_relation_metrics == 0,
             "structure_closure_types_present": required_structure_types.issubset(structure_node_types),
@@ -113,8 +114,8 @@ def main() -> None:
             "rq_kmeans": rq,
             "checks": checks,
             "pass": all(checks.values()),
-            "target_relation_edge_counts": target_relation_edge_counts,
-            "missing_target_relation_edge_type_reasons": missing_reasons,
+            "dense_relation_edge_counts": dense_edge_counts,
+            "forbidden_relation_edge_types": forbidden_relation_edge_types,
             "missing_relation_metric_count": missing_relation_metrics,
             "legacy_rq_prefix_edges_table_present": legacy_rq_prefix_edges_table_present,
             "structure_node_types": sorted(structure_node_types),
