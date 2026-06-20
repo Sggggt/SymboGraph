@@ -1233,11 +1233,15 @@ async def record_answer_audit(
 def run_to_task_status(run: AgentRun) -> dict:
     return {
         "run_id": run.id,
+        "session_id": run.session_id,
         "state": run.status,
+        "status": run.status,
         "current_node": run.current_node,
         "retry_count": run.retry_count,
         "route": run.route,
+        "answer": run.final_answer,
         "error": run.error_message,
+        "created_at": run.created_at,
         "started_at": run.started_at,
         "completed_at": run.completed_at,
     }
@@ -1659,12 +1663,31 @@ async def run_agent(db: Session, request: AgentRequest) -> dict:
     return await execute_agent_run(db, request, session, run)
 
 
-async def stream_agent_events(db: Session, request: AgentRequest) -> AsyncGenerator[dict, None]:
+async def _execute_agent_run_and_close(db: Session, request: AgentRequest, session: QASession, run: AgentRun) -> dict:
+    try:
+        return await execute_agent_run(db, request, session, run)
+    finally:
+        db.close()
+
+
+def _consume_detached_task_result(task: asyncio.Task) -> None:
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+
+
+async def stream_agent_events(request: AgentRequest) -> AsyncGenerator[dict, None]:
+    from app.db import SessionLocal
+
+    db = SessionLocal()
     session, run = create_agent_run_context(db, request)
     trace_queue = _subscribe_trace(run.id)
-    task = asyncio.create_task(execute_agent_run(db, request, session, run))
+    task = asyncio.create_task(_execute_agent_run_and_close(db, request, session, run))
+    task.add_done_callback(_consume_detached_task_result)
     response: dict | None = None
     yielded_trace_ids: set[str] = set()
+    detached = False
     try:
         yield {"type": "meta", "run_id": run.id, "session_id": session.id}
         while not task.done():
@@ -1681,12 +1704,17 @@ async def stream_agent_events(db: Session, request: AgentRequest) -> AsyncGenera
                 yielded_trace_ids.add(event["id"])
                 yield {"type": "trace", "trace": event}
         response = await task
+    except asyncio.CancelledError:
+        detached = True
+        raise
     except Exception as exc:
+        if not task.done():
+            task.cancel()
         yield {"type": "error", "error": public_exception_message(exc)}
         return
     finally:
         _unsubscribe_trace(run.id, trace_queue)
-        if not task.done():
+        if not detached and not task.done():
             task.cancel()
     if response is None:
         return

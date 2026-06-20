@@ -69,12 +69,16 @@ Create `.env` from the template:
 Copy-Item .env.example .env
 ```
 
-Configure chat and embedding endpoints:
+Configure chat, graph-build, and embedding endpoints:
 
 ```env
-OPENAI_API_KEY=...
+CHAT_API_KEY=...
 CHAT_BASE_URL=https://your-chat-endpoint/v1
 CHAT_MODEL=your-chat-model
+
+GRAPH_API_KEY=...
+GRAPH_BASE_URL=https://your-graph-endpoint/v1
+GRAPH_MODEL=your-graph-model
 
 EMBEDDING_API_KEY=...
 EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1
@@ -113,7 +117,8 @@ Health: http://127.0.0.1:8000/api/health
 | Infrastructure | `DATABASE_URL`, `QDRANT_URL`, `QDRANT_COLLECTION`, `REDIS_URL`, `CORS_ORIGINS`, `API_KEYS` |
 | Data roots | `KNOWLEDGE_BASE_NAME`, `DATA_ROOT`, `STORAGE_ROOT`, `INGESTION_ROOT` |
 | Model bridge | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT`, `MODEL_BRIDGE_ADMIN_TOKEN` |
-| Chat | `OPENAI_API_KEY`, `CHAT_BASE_URL`, `CHAT_RESOLVE_IP`, `CHAT_MODEL` |
+| Chat | `CHAT_API_KEY`, `CHAT_BASE_URL`, `CHAT_RESOLVE_IP`, `CHAT_MODEL` |
+| Graph build | `GRAPH_API_KEY`, `GRAPH_BASE_URL`, `GRAPH_RESOLVE_IP`, `GRAPH_MODEL` |
 | Embedding | `EMBEDDING_API_KEY`, `EMBEDDING_BASE_URL`, `EMBEDDING_RESOLVE_IP`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_BATCH_SIZE` |
 | Concurrency | `WORKER_CONCURRENCY`, `WORKER_MAX_TASKS_PER_CHILD`, `MODEL_REQUEST_CONCURRENCY`, `MODEL_REQUEST_TIMEOUT_SECONDS` |
 | Resource guards | `INGESTION_MEMORY_SOFT_LIMIT_RATIO`, `INGESTION_MEMORY_HARD_LIMIT_RATIO`, `INGESTION_MEMORY_CRITICAL_LIMIT_RATIO` |

@@ -210,11 +210,17 @@ class AgentResponse(QAResponse):
 
 class TaskStatusResponse(APIModel):
     run_id: str
+    session_id: str | None = None
+    state: str | None = None
     status: str
     current_node: str | None = None
+    retry_count: int | None = None
+    route: str | None = None
     answer: str | None = None
     error: str | None = None
     created_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
     updated_at: datetime | None = None
     trace: list[AgentTraceEventPayload] = Field(default_factory=list)
 
@@ -498,14 +504,23 @@ class ModelSettingsResponse(APIModel):
 
 
 class ModelSettingsUpdate(APIModel):
-    openai_api_key: str | None = None
+    model_config = ConfigDict(extra="forbid")
+
+    chat_api_key: str | None = None
+    clear_chat_api_key: bool | None = None
     chat_base_url: str | None = None
     chat_resolve_ip: str | None = None
+    graph_api_key: str | None = None
+    clear_graph_api_key: bool | None = None
+    graph_base_url: str | None = None
+    graph_resolve_ip: str | None = None
     embedding_base_url: str | None = None
     embedding_resolve_ip: str | None = None
     embedding_api_key: str | None = None
+    clear_embedding_api_key: bool | None = None
     embedding_model: str | None = None
     chat_model: str | None = None
+    graph_model: str | None = None
     embedding_dimensions: int | None = None
     embedding_batch_size: int | None = None
     model_bridge_enabled: bool | None = None

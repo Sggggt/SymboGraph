@@ -3134,7 +3134,7 @@ $$
 \Theta_{\mathrm{service}}
 $$
 
-`Settings` 包含数据库、Qdrant、Redis、ingestion、模型、embedding、worker、chunk、context package、mid concept、RQ、Agent budget 和 fallback 参数。目标 settings 还必须显式覆盖：
+`Settings` 包含数据库、Qdrant、Redis、ingestion、模型、embedding、worker、chunk、context package、mid concept、RQ、Agent budget 和 fallback 参数。模型参数必须隔离为对话模型与图谱构建模型两组：`CHAT_API_KEY`/`CHAT_BASE_URL`/`CHAT_RESOLVE_IP`/`CHAT_MODEL` 只用于 QA 回答、查询感知、Agent planner/evaluator、citation verification 和 Profile 助手；`GRAPH_API_KEY`/`GRAPH_BASE_URL`/`GRAPH_RESOLVE_IP`/`GRAPH_MODEL` 只用于 mid/coarse concept 命名、概念摘要和中粗层双语派生。两组配置不得互相 fallback，也不得共用密钥状态。目标 settings 还必须显式覆盖：
 
 ```text
 edge_distance_protocol
@@ -3184,7 +3184,7 @@ traversal_observation_budget
 context_path_summary_budget
 ```
 
-其中改变 chunking、embedding、dynamic dense KNN、bridge quota、edge type calibration、relation graph、RQ codebook、RQ membership protocol、edge projection 或 concept graph 的参数属于 `rebuild_required`；改变 staged traversal budget、layer top-k、label/cycle/path distance threshold/gray-zone observation cadence 等不改变 active graph 的参数属于 `hot_reloadable`，需要失效检索与 QA cache。`concept_i18n_enabled` 是热加载功能开关：保存后立即控制检索是否使用已有成功翻译文本，并控制下一次构图是否执行双语派生；它不会自动改写已有 active graph。预算类参数只作为 hard interrupt 或层间输出上限，不参与路径价值排序。
+其中改变 chunking、embedding、dynamic dense KNN、bridge quota、edge type calibration、relation graph、RQ codebook、RQ membership protocol、edge projection、graph model endpoint 或 concept graph 的参数属于 `rebuild_required`；改变 chat model endpoint、staged traversal budget、layer top-k、label/cycle/path distance threshold/gray-zone observation cadence 等不改变 active graph 的参数属于 `hot_reloadable`，需要失效检索与 QA cache。`concept_i18n_enabled` 是热加载功能开关：保存后立即控制检索是否使用已有成功翻译文本，并控制下一次构图是否执行双语派生；它不会自动改写已有 active graph。预算类参数只作为 hard interrupt 或层间输出上限，不参与路径价值排序。
 
 TPE settings 分两层处理。`enable_auto_tpe`、`tpe_trial_budget`、`tpe_startup_random_trials`、`tpe_good_quantile_gamma`、`tpe_probe_query_budget`、`tpe_trial_timeout_seconds` 和 `tpe_candidate_pool_size` 是 automatic optimizer envelope，保存后热加载到下一次 graph build 或下一 trial 边界；它们不直接改写 active graph。dense KNN、bridge quota、threshold 和 edge calibration 改变 active graph 语义，必须只在 graph build 阶段由自动 TPE 或版本化默认 theta 选择，并在最终 active bottom relation graph 写入时一次性落库。前端导入页在清理数据库/文件数量附近提供自动 TPE 开关、可折叠 envelope 参数和最近一次 auto TPE run/blocking reason；设置页不提供启动、取消、手动切换或独立手动调参入口。
 
@@ -3882,7 +3882,7 @@ s.t.\quad
 fallback=false,\ secret\notin logs,\ path\subset storage\_root
 $$
 
-product path 默认 `ENABLE_MODEL_FALLBACK=false`、`ENABLE_DATABASE_FALLBACK=false`。Settings payload 只暴露 key 是否存在，不输出密钥。
+product path 默认 `ENABLE_MODEL_FALLBACK=false`、`ENABLE_DATABASE_FALLBACK=false`。Settings payload 只暴露 chat、graph、embedding key 是否存在，不输出密钥。
 
 
 

@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -69,7 +69,7 @@ def validate_embedding_vectors(vectors: list[list[float]], *, expected_count: in
 
 def is_degraded_mode() -> bool:
     settings = get_settings()
-    return not settings.openai_api_key or not settings.embedding_api_key or not settings.embedding_base_url
+    return not settings.chat_api_key or not settings.embedding_api_key or not settings.embedding_base_url
 
 
 def _exception_message(exc: Exception) -> str:
@@ -285,8 +285,16 @@ class ChatCallResult:
 
 
 class ChatProvider:
-    def __init__(self) -> None:
+    def __init__(self, purpose: Literal["chat", "graph"] = "chat") -> None:
         self.settings = get_settings()
+        if purpose not in {"chat", "graph"}:
+            raise ValueError(f"Unknown chat provider purpose: {purpose}")
+        self.purpose = purpose
+        self.api_key = self.settings.graph_api_key if purpose == "graph" else self.settings.chat_api_key
+        self.base_url = self.settings.graph_base_url if purpose == "graph" else self.settings.chat_base_url
+        self.resolve_ip = self.settings.graph_resolve_ip if purpose == "graph" else self.settings.chat_resolve_ip
+        self.model = self.settings.graph_model if purpose == "graph" else self.settings.chat_model
+        self.api_key_env_name = "GRAPH_API_KEY" if purpose == "graph" else "CHAT_API_KEY"
 
     async def answer_question(self, question: str, contexts: list[dict], history: list[dict] | None = None) -> str:
         return (await self.answer_question_with_meta(question, contexts, history)).answer
@@ -296,26 +304,26 @@ class ChatProvider:
             return ChatCallResult(
                 answer=no_context_answer(question),
                 provider="none",
-                model=self.settings.chat_model,
+                model=self.model,
                 external_called=False,
                 fallback_reason="no_contexts",
             )
-        if not self.settings.openai_api_key:
+        if not self.api_key:
             if not self.settings.enable_model_fallback:
-                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
+                raise FallbackDisabledError(f"{self.api_key_env_name} is required because ENABLE_MODEL_FALLBACK is false")
             return ChatCallResult(
                 answer=self._extractive_answer(question, contexts),
                 provider="extractive_fallback",
                 model="local_extractive_template",
                 external_called=False,
-                fallback_reason="missing_openai_api_key",
+                fallback_reason=f"missing_{self.api_key_env_name.lower()}",
             )
         try:
             answer = await self._openai_compatible_chat(question, contexts, history or [], context_quality=context_quality)
             return ChatCallResult(
                 answer=answer,
                 provider="openai_compatible_chat",
-                model=self.settings.chat_model,
+                model=self.model,
                 external_called=True,
                 fallback_reason=None,
             )
@@ -331,14 +339,14 @@ class ChatProvider:
             )
 
     async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
-        if not self.settings.openai_api_key:
+        if not self.api_key:
             if not self.settings.enable_model_fallback:
-                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
+                raise FallbackDisabledError(f"{self.api_key_env_name} is required because ENABLE_MODEL_FALLBACK is false")
             if fallback is None:
-                raise FallbackDisabledError("OPENAI_API_KEY is required (no fallback provided)")
+                raise FallbackDisabledError(f"{self.api_key_env_name} is required (no fallback provided)")
             return fallback
         payload: dict[str, Any] = {
-            "model": self.settings.chat_model,
+            "model": self.model,
             "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
             "temperature": 0.0,
             "response_format": {"type": "json_object"},
@@ -353,13 +361,13 @@ class ChatProvider:
             return fallback
 
     async def rewrite_question(self, question: str, history: list[dict] | None = None) -> str:
-        if not self.settings.openai_api_key:
+        if not self.api_key:
             if not self.settings.enable_model_fallback:
-                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
+                raise FallbackDisabledError(f"{self.api_key_env_name} is required because ENABLE_MODEL_FALLBACK is false")
             return question
         history_text = "\n".join(f"{item.get('role')}: {item.get('content')}" for item in (history or [])[-6:])
         payload: dict[str, Any] = {
-            "model": self.settings.chat_model,
+            "model": self.model,
             "messages": [
                 {
                     "role": "system",
@@ -377,9 +385,9 @@ class ChatProvider:
             return question
 
     async def reflect_answer(self, question: str, answer: str, contexts: list[dict]) -> dict[str, Any]:
-        if not self.settings.openai_api_key:
+        if not self.api_key:
             if not self.settings.enable_model_fallback:
-                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
+                raise FallbackDisabledError(f"{self.api_key_env_name} is required because ENABLE_MODEL_FALLBACK is false")
             return {"has_issue": False, "issue_type": "none", "suggestion": ""}
         context_text = "\n\n".join(
             f"[{i+1}] {ctx.get('document_title', '')}\n{ctx.get('content', '')[:600]}"
@@ -400,7 +408,7 @@ class ChatProvider:
             "Check: 1) Does the answer contain claims not found in the excerpts? 2) Is the question fully answered? 3) Are there contradictions between the answer and excerpts?"
         )
         payload = {
-            "model": self.settings.chat_model,
+            "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -430,9 +438,9 @@ class ChatProvider:
         - needs_graph: whether graph search is likely helpful
         - suggested_strategy: one of global_dense, local_graph, hybrid, community
         """
-        if not self.settings.openai_api_key:
+        if not self.api_key:
             if not self.settings.enable_model_fallback:
-                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
+                raise FallbackDisabledError(f"{self.api_key_env_name} is required because ENABLE_MODEL_FALLBACK is false")
             return {
                 "intent": "unknown",
                 "entities": [],
@@ -462,7 +470,7 @@ class ChatProvider:
             "Analyze this question and output the JSON perception result."
         )
         payload: dict[str, Any] = {
-            "model": self.settings.chat_model,
+            "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -555,20 +563,20 @@ class ChatProvider:
                 ),
             },
         ]
-        payload = {"model": self.settings.chat_model, "messages": messages, "temperature": 0.2}
+        payload = {"model": self.model, "messages": messages, "temperature": 0.2}
         return await self._post_chat_text(payload)
 
     async def _post_chat_text(self, payload: dict[str, Any]) -> str:
         headers = {
-            "Authorization": f"Bearer {self.settings.openai_api_key}",
+            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
         data = await post_openai_compatible_json(
-            f"{self.settings.chat_base_url.rstrip('/')}/chat/completions",
+            f"{self.base_url.rstrip('/')}/chat/completions",
             payload,
             headers,
             timeout=float(self.settings.model_request_timeout_seconds),
-            resolve_ip=self.settings.chat_resolve_ip,
+            resolve_ip=self.resolve_ip,
         )
         return self._normalize_chat_content(data)
 

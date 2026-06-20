@@ -2346,7 +2346,7 @@ async def define_mid_concepts_batch(packets: list[dict[str, Any]]) -> list[dict[
         "inclusion_criteria, exclusion_criteria, representative_chunk_ids, support_chunk_ids, "
         "confidence, and why_this_concept_exists."
     )
-    output = await ChatProvider().classify_json(system_prompt=system, user_prompt=str({"concept_packets": packets}), fallback={"concepts": fallback_concepts})
+    output = await ChatProvider(purpose="graph").classify_json(system_prompt=system, user_prompt=str({"concept_packets": packets}), fallback={"concepts": fallback_concepts})
     raw_concepts = output.get("concepts") if isinstance(output, dict) else None
     if not isinstance(raw_concepts, list):
         if get_settings().enable_model_fallback:
@@ -3068,7 +3068,7 @@ async def define_coarse_concept(packet: dict[str, Any]) -> dict[str, Any]:
         "included_mid_concepts, boundary_concepts, bridge_concepts, cross_community_weak_ties, and confidence."
     )
     try:
-        output = await ChatProvider().classify_json(system_prompt=system, user_prompt=str(packet), fallback=fallback)
+        output = await ChatProvider(purpose="graph").classify_json(system_prompt=system, user_prompt=str(packet), fallback=fallback)
     except FallbackDisabledError:
         raise
     required = {
@@ -3529,7 +3529,7 @@ async def enrich_concepts_i18n(concepts: list[Any], *, layer: str, batch_size: i
             "scope_note_i18n {zh,en}, search_terms_i18n {zh,en arrays}. "
             "Translate technical terms accurately, keep formulas/symbols unchanged, and do not add facts beyond the source text."
         )
-        output = await ChatProvider().classify_json(system_prompt=system, user_prompt=str({"layer": layer, "items": items}), fallback=fallback)
+        output = await ChatProvider(purpose="graph").classify_json(system_prompt=system, user_prompt=str({"layer": layer, "items": items}), fallback=fallback)
         output_items = output.get("items") if isinstance(output, dict) else None
         if not isinstance(output_items, list):
             if settings.enable_model_fallback:
@@ -3599,7 +3599,7 @@ async def enrich_concept_edges_i18n(edges: list[Any], concepts_by_id: dict[str, 
             "relation_label_i18n {zh,en}, explanation_i18n {zh,en}, summary_i18n {zh,en}, search_terms_i18n {zh,en arrays}. "
             "Translate only the relationship wording; keep evidence meaning, formulas, and technical symbols unchanged."
         )
-        output = await ChatProvider().classify_json(system_prompt=system, user_prompt=str({"layer": layer, "items": items}), fallback=fallback)
+        output = await ChatProvider(purpose="graph").classify_json(system_prompt=system, user_prompt=str({"layer": layer, "items": items}), fallback=fallback)
         output_items = output.get("items") if isinstance(output, dict) else None
         if not isinstance(output_items, list):
             if settings.enable_model_fallback:

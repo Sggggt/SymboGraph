@@ -10,9 +10,12 @@ APP_DIR = Path(__file__).resolve().parents[2]
 WORKSPACE_ROOT = APP_DIR.parents[1]
 INVALID_KNOWLEDGE_BASE_DIR_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 HOT_RELOAD_SETTINGS = {
-    "openai_api_key",
+    "chat_api_key",
     "chat_base_url",
     "chat_resolve_ip",
+    "graph_api_key",
+    "graph_base_url",
+    "graph_resolve_ip",
     "embedding_base_url",
     "embedding_resolve_ip",
     "embedding_api_key",
@@ -21,6 +24,7 @@ HOT_RELOAD_SETTINGS = {
     "model_bridge_admin_token",
     "embedding_model",
     "chat_model",
+    "graph_model",
     "embedding_dimensions",
     "embedding_batch_size",
     "model_request_concurrency",
@@ -123,9 +127,12 @@ class Settings(BaseSettings):
     storage_root: Path | None = None
     ingestion_root: Path | None = None
 
-    openai_api_key: str | None = None
+    chat_api_key: str | None = None
     chat_base_url: str = "https://api.openai.com/v1"
     chat_resolve_ip: str | None = None
+    graph_api_key: str | None = None
+    graph_base_url: str = "https://api.openai.com/v1"
+    graph_resolve_ip: str | None = None
     embedding_base_url: str = ""
     embedding_resolve_ip: str | None = None
     embedding_api_key: str | None = None
@@ -134,6 +141,7 @@ class Settings(BaseSettings):
     model_bridge_admin_token: str = "local-model-bridge-admin"
     embedding_model: str = "text-embedding-v4"
     chat_model: str = "qwen-plus"
+    graph_model: str = "qwen-plus"
     embedding_dimensions: int = 1024
     embedding_batch_size: int = Field(default=10, ge=1, le=10)
     worker_concurrency: int = Field(default=3, ge=1, le=32)
@@ -338,6 +346,7 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
     }
     nullable_fields = {
         "chat_resolve_ip",
+        "graph_resolve_ip",
         "embedding_resolve_ip",
     }
     aliases = {
@@ -432,6 +441,8 @@ def _build_settings() -> Settings:
 
     api_chat_base_url = os.getenv("API_CHAT_BASE_URL")
     api_chat_resolve_ip = os.getenv("API_CHAT_RESOLVE_IP")
+    api_graph_base_url = os.getenv("API_GRAPH_BASE_URL")
+    api_graph_resolve_ip = os.getenv("API_GRAPH_RESOLVE_IP")
     model_bridge_enabled = str(env_entries.get("MODEL_BRIDGE_ENABLED") or os.getenv("MODEL_BRIDGE_ENABLED") or "").lower() in {
         "true",
         "1",
@@ -467,6 +478,21 @@ def _build_settings() -> Settings:
         settings.chat_resolve_ip = env_entries.get("CHAT_RESOLVE_IP")
     elif "CHAT_RESOLVE_IP" in os.environ:
         settings.chat_resolve_ip = os.getenv("CHAT_RESOLVE_IP")
+
+    if api_graph_base_url:
+        settings.graph_base_url = api_graph_base_url
+    elif env_entries.get("GRAPH_BASE_URL"):
+        settings.graph_base_url = env_entries["GRAPH_BASE_URL"]
+    elif "GRAPH_BASE_URL" in os.environ:
+        settings.graph_base_url = os.getenv("GRAPH_BASE_URL", "")
+    if api_graph_resolve_ip is not None:
+        settings.graph_resolve_ip = api_graph_resolve_ip
+    elif os.getenv("GRAPH_RESOLVE_IP"):
+        settings.graph_resolve_ip = os.getenv("GRAPH_RESOLVE_IP")
+    elif env_entries.get("GRAPH_RESOLVE_IP") is not None:
+        settings.graph_resolve_ip = env_entries.get("GRAPH_RESOLVE_IP")
+    elif "GRAPH_RESOLVE_IP" in os.environ:
+        settings.graph_resolve_ip = os.getenv("GRAPH_RESOLVE_IP")
 
     # Embedding-specific overrides (no fallback to chat model settings)
     embedding_base_url = env_entries.get("EMBEDDING_BASE_URL") or os.getenv("EMBEDDING_BASE_URL")

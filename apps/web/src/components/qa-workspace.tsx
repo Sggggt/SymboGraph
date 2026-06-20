@@ -28,7 +28,7 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
-import { deleteSession, fetchDashboard, fetchSessionMessages, fetchSessions, streamAnswer } from "@/lib/api";
+import { deleteSession, fetchDashboard, fetchModelSettings, fetchSessionMessages, fetchSessions, fetchTaskStatus, streamAnswer } from "@/lib/api";
 import { contextGraphTraceFallbackSteps, groupTraceEvents, traceAuditSummary, traceNodeLabel } from "@/lib/agent-trace";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
@@ -42,6 +42,13 @@ type ChatTurn = {
   trace?: AgentTraceEventPayload[];
 };
 
+type ActiveStreamState = {
+  runId?: string | null;
+  sessionId?: string | null;
+  question: string;
+  startedAt: string;
+};
+
 const fallbackSuggestions = [
   "总结这批资料最核心的知识结构",
   "结合本地资料解释一个重要概念",
@@ -49,13 +56,13 @@ const fallbackSuggestions = [
   "基于资料引用给我一份阅读路线",
 ];
 
-function answerModelLabel(latestRun: AgentResponse | null): string {
+function answerModelLabel(latestRun: AgentResponse | null, configuredChatModel?: string | null): string {
   const audit = latestRun?.answer_model_audit;
   if (!audit) {
-    return "模型：等待回答";
+    return configuredChatModel ? `模型：${configuredChatModel}` : "模型：未读取";
   }
   if (audit.external_called) {
-    return `模型：${audit.model ?? audit.provider}`;
+    return `模型：${audit.model ?? audit.chat_model ?? audit.provider}`;
   }
   if (audit.skipped_reason === "clarify_route") {
     return "模型：澄清分支未调用";
@@ -91,8 +98,10 @@ function normalizeMessages(messages: Array<Record<string, unknown>>): ChatTurn[]
 
 function ChatHeader({
   latestRun,
+  configuredChatModel,
 }: {
   latestRun: AgentResponse | null;
+  configuredChatModel?: string | null;
 }) {
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-3 px-1">
@@ -103,7 +112,7 @@ function ChatHeader({
       <div className="flex w-full flex-wrap gap-2">
         <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
           <BrainCircuit data-icon="inline-start" />
-          {answerModelLabel(latestRun)}
+          {answerModelLabel(latestRun, configuredChatModel)}
         </span>
       </div>
     </div>
@@ -590,6 +599,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
     queryFn: () => fetchSessions(selectedKnowledgeBaseId),
     enabled: Boolean(selectedKnowledgeBaseId),
   });
+  const modelSettingsQuery = useQuery({ queryKey: ["model-settings"], queryFn: fetchModelSettings });
   const [question, setQuestion] = useLocalStorage(`qa.question.${storageScope}`, "");
   const [activeSessionId, setActiveSessionId] = useLocalStorage<string | null>(`qa.sessionId.${storageScope}`, null);
   const [turns, setTurns] = useLocalStorage<ChatTurn[]>(`qa.turns.${storageScope}`, []);
@@ -597,9 +607,18 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
   const [citations, setCitations] = useLocalStorage<Citation[]>(`qa.citations.${storageScope}`, []);
   const [trace, setTrace] = useLocalStorage<AgentTraceEventPayload[]>(`qa.trace.${storageScope}`, []);
   const [latestRun, setLatestRun] = useLocalStorage<AgentResponse | null>(`qa.latestRun.${storageScope}`, null);
+  const [activeStream, setActiveStream] = useLocalStorage<ActiveStreamState | null>(`qa.activeStream.${storageScope}`, null);
   const [streamError, setStreamError] = useState<string | null>(null);
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [citationsOpen, setCitationsOpen] = useState(false);
+  const activeRunId = activeStream?.runId ?? null;
+  const runStatusQuery = useQuery({
+    queryKey: ["agent-run", activeRunId],
+    queryFn: () => fetchTaskStatus(activeRunId as string),
+    enabled: Boolean(activeRunId),
+    refetchInterval: activeRunId ? 1500 : false,
+    retry: false,
+  });
 
   const askMutation = useMutation({
     mutationFn: async () => {
@@ -612,6 +631,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
       setCitations([]);
       setTrace([]);
       setLatestRun(null);
+      setActiveStream({ question: nextQuestion, startedAt: new Date().toISOString() });
       const nextTraceEvents: AgentTraceEventPayload[] = [];
       setTurns((current) => [...current, { role: "user", content: nextQuestion }]);
       setQuestion("");
@@ -625,6 +645,19 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
             },
             onToken: (token) => setDraftAnswer((current) => `${current}${token}`),
             onCitations: (next) => setCitations(next),
+            onMeta: (meta) => {
+              if (meta.session_id) {
+                setActiveSessionId(meta.session_id);
+              }
+              if (meta.run_id || meta.session_id) {
+                setActiveStream((current) => ({
+                  question: current?.question ?? nextQuestion,
+                  startedAt: current?.startedAt ?? new Date().toISOString(),
+                  runId: meta.run_id ?? current?.runId ?? null,
+                  sessionId: meta.session_id ?? current?.sessionId ?? null,
+                }));
+              }
+            },
             onFinal: (response) => {
               const finalTrace = response.trace.length ? response.trace : nextTraceEvents;
               setLatestRun(response);
@@ -643,17 +676,86 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
                   trace: finalTrace,
                 },
               ]);
+              setActiveStream(null);
               void queryClient.invalidateQueries({ queryKey: ["sessions", selectedKnowledgeBaseId] });
               void queryClient.invalidateQueries({ queryKey: ["session-messages", response.session_id] });
             },
-            onError: (message) => setStreamError(message),
+            onError: (message) => {
+              setStreamError(message);
+              setActiveStream(null);
+            },
           },
         );
       } catch (error) {
         setStreamError(error instanceof Error ? error.message : String(error));
+        setActiveStream(null);
       }
     },
   });
+
+  useEffect(() => {
+    const status = runStatusQuery.data;
+    if (!activeStream || !status) {
+      return;
+    }
+    if (status.session_id) {
+      setActiveSessionId(status.session_id);
+      if (status.session_id !== activeStream.sessionId) {
+        setActiveStream((current) => (current ? { ...current, sessionId: status.session_id } : current));
+      }
+    }
+    if (status.trace?.length) {
+      setTrace(status.trace);
+    }
+    const runState = status.status ?? status.state;
+    if (runState === "completed") {
+      const sessionId = status.session_id ?? activeStream.sessionId;
+      setDraftAnswer("");
+      setActiveStream(null);
+      if (sessionId) {
+        void (async () => {
+          const response = await fetchSessionMessages(sessionId);
+          const nextTurns = normalizeMessages(response.messages);
+          setTurns(nextTurns);
+          const latestAssistant = [...nextTurns].reverse().find((turn) => turn.role === "assistant");
+          setCitations(latestAssistant?.citations ?? []);
+          await queryClient.invalidateQueries({ queryKey: ["sessions", selectedKnowledgeBaseId] });
+          await queryClient.invalidateQueries({ queryKey: ["session-messages", sessionId] });
+        })();
+      } else if (status.answer) {
+        setTurns((current) =>
+          current.some((turn) => turn.run_id === status.run_id && turn.role === "assistant")
+            ? current
+            : [
+                ...current,
+                {
+                  role: "assistant",
+                  content: status.answer ?? "",
+                  run_id: status.run_id,
+                  route: status.route,
+                  trace: status.trace ?? [],
+                },
+              ],
+        );
+      }
+    } else if (runState === "failed") {
+      window.queueMicrotask(() => {
+        setStreamError(status.error ?? "回答生成失败");
+        setActiveStream(null);
+      });
+    }
+  }, [
+    activeStream,
+    queryClient,
+    runStatusQuery.data,
+    selectedKnowledgeBaseId,
+    setActiveSessionId,
+    setActiveStream,
+    setCitations,
+    setDraftAnswer,
+    setTrace,
+    setTurns,
+  ]);
 
   const deleteSessionMutation = useMutation({
     mutationFn: (sessionId: string) => deleteSession(sessionId),
@@ -665,6 +767,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
         setCitations([]);
         setTrace([]);
         setLatestRun(null);
+        setActiveStream(null);
         setQuestion("");
       }
       await queryClient.invalidateQueries({ queryKey: ["sessions", selectedKnowledgeBaseId] });
@@ -672,6 +775,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
   });
 
   const suggestions = useMemo(() => buildKnowledgeBaseSuggestions(dashboardQuery.data?.tree), [dashboardQuery.data?.tree]);
+  const isGenerating = askMutation.isPending || Boolean(activeStream);
 
   if (dashboardQuery.isLoading) {
     return <LoadingBlock rows={4} />;
@@ -685,7 +789,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_0%,rgba(86,217,255,0.11),transparent_34%),radial-gradient(circle_at_88%_20%,rgba(124,92,255,0.11),transparent_30%),linear-gradient(rgba(120,180,255,0.026)_1px,transparent_1px),linear-gradient(90deg,rgba(120,180,255,0.023)_1px,transparent_1px)] bg-[size:auto,auto,48px_48px,48px_48px]" />
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-64 bg-gradient-to-t from-[#030714] via-[#030714]/88 to-transparent" />
       <div className="relative z-10 flex flex-col gap-7">
-        <ChatHeader latestRun={latestRun} />
+        <ChatHeader latestRun={latestRun} configuredChatModel={modelSettingsQuery.data?.chat_model} />
         <ChatActionRail
           onOpenSessions={() => setSessionsOpen(true)}
           onOpenCitations={() => setCitationsOpen(true)}
@@ -696,7 +800,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
           {streamError ? <ErrorBlock message={streamError} /> : null}
           <MessageList
             turns={turns}
-            isGenerating={askMutation.isPending}
+            isGenerating={isGenerating}
             draftAnswer={draftAnswer}
             trace={trace}
             onPickSuggestion={setQuestion}
@@ -709,12 +813,12 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
           value={question}
           onChange={setQuestion}
           onSubmit={() => {
-            if (askMutation.isPending) {
+            if (isGenerating) {
               return;
             }
             askMutation.mutate();
           }}
-          isPending={askMutation.isPending}
+          isPending={isGenerating}
           activeSessionId={activeSessionId}
         />
       </div>
@@ -731,6 +835,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
           setCitations([]);
           setTrace([]);
           setLatestRun(null);
+          setActiveStream(null);
           const response = await fetchSessionMessages(sessionId);
           const nextTurns = normalizeMessages(response.messages);
           setTurns(nextTurns);
@@ -744,9 +849,10 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
           setCitations([]);
           setTrace([]);
           setLatestRun(null);
+          setActiveStream(null);
           setQuestion("");
         }}
-        isPending={askMutation.isPending}
+        isPending={isGenerating}
       />
       <CitationsDrawer open={citationsOpen} onOpenChange={setCitationsOpen} citations={citations} />
     </div>

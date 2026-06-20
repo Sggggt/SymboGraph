@@ -4,10 +4,12 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import AgentRun
+from app.models import AgentRun, AgentTraceEvent
+from app.services.agent_graph import trace_event_to_payload
 from app.schemas import AgentRequest, AgentResponse, QARequest, QAResponse, SearchRequest, SearchResponse, TaskStatusResponse
 from app.services.agent_graph import run_agent, run_to_task_status, stream_agent_events
 from app.services.embeddings import is_degraded_mode
@@ -105,14 +107,11 @@ async def qa_stream(request: QARequest) -> StreamingResponse:
     )
 
     async def event_stream():
-        db = SessionLocal()
         try:
-            async for event in stream_agent_events(db, agent_request):
+            async for event in stream_agent_events(agent_request):
                 yield f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
         except Exception as exc:
             yield f"data: {json.dumps({'type': 'error', 'error': public_exception_message(exc)}, ensure_ascii=False)}\n\n"
-        finally:
-            db.close()
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -130,4 +129,7 @@ def agent_run_status(run_id: str, db: Session = Depends(get_db)) -> dict:
     run = db.get(AgentRun, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Agent run not found")
-    return run_to_task_status(run)
+    payload = run_to_task_status(run)
+    trace_events = db.scalars(select(AgentTraceEvent).where(AgentTraceEvent.run_id == run.id).order_by(AgentTraceEvent.created_at.asc())).all()
+    payload["trace"] = [trace_event_to_payload(event) for event in trace_events]
+    return payload

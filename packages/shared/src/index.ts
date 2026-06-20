@@ -243,14 +243,18 @@ export interface AgentResponse extends QAResponse {
 
 export interface TaskStatusResponse {
   run_id: string;
+  session_id?: string | null;
   state?: AgentRunState | string;
   status?: AgentRunState | string;
   current_node?: string | null;
   retry_count?: number;
   route?: AgentRoute | string | null;
+  answer?: string | null;
   error?: string | null;
+  created_at?: string | null;
   started_at?: string | null;
   completed_at?: string | null;
+  trace?: AgentTraceEventPayload[];
 }
 
 export interface SessionSummary {
@@ -416,13 +420,17 @@ export interface RefreshResponse {
 export interface ModelSettingsResponse {
   provider?: "openai_compatible" | string;
   chat_base_url?: string;
+  graph_base_url?: string;
   embedding_base_url?: string;
   effective_chat_base_url?: string;
+  effective_graph_base_url?: string;
   effective_embedding_base_url?: string;
   chat_resolve_ip?: string | null;
+  graph_resolve_ip?: string | null;
   embedding_resolve_ip?: string | null;
   embedding_model?: string;
   chat_model?: string;
+  graph_model?: string;
   embedding_dimensions?: number;
   embedding_batch_size?: number;
   worker_concurrency?: number;
@@ -491,7 +499,8 @@ export interface ModelSettingsResponse {
   agent_verification_budget?: number;
   enable_model_fallback?: boolean;
   enable_database_fallback?: boolean;
-  has_api_key?: boolean;
+  has_chat_api_key?: boolean;
+  has_graph_api_key?: boolean;
   has_embedding_api_key?: boolean;
   degraded_mode?: boolean;
   runtime_settings_version?: string | null;
@@ -536,15 +545,19 @@ export interface ModelBridgeStatus {
 }
 
 export interface ModelSettingsUpdate {
-  api_key?: string | null;
-  openai_api_key?: string | null;
-  clear_api_key?: boolean;
+  chat_api_key?: string | null;
+  clear_chat_api_key?: boolean;
   chat_base_url?: string | null;
+  graph_base_url?: string | null;
   embedding_base_url?: string | null;
   chat_resolve_ip?: string | null;
+  graph_resolve_ip?: string | null;
   embedding_resolve_ip?: string | null;
   embedding_model?: string | null;
   chat_model?: string | null;
+  graph_model?: string | null;
+  graph_api_key?: string | null;
+  clear_graph_api_key?: boolean;
   embedding_dimensions?: number | null;
   embedding_batch_size?: number | null;
   worker_concurrency?: number | null;

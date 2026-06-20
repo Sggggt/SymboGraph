@@ -45,8 +45,8 @@ def main() -> None:
     shared_response = ts_interface_keys("ModelSettingsResponse")
     shared_update = ts_interface_keys("ModelSettingsUpdate")
     env_keys = env_example_keys()
-    runtime_payload_exemptions = {"openai_api_key", "embedding_api_key", "model_bridge_admin_token", "model_bridge_port"}
-    update_schema_exemptions = {"openai_api_key", "embedding_api_key", "model_bridge_admin_token", "model_bridge_port", "enable_model_fallback"}
+    runtime_payload_exemptions = {"chat_api_key", "graph_api_key", "embedding_api_key", "model_bridge_admin_token", "model_bridge_port"}
+    update_schema_exemptions = {"chat_api_key", "graph_api_key", "embedding_api_key", "model_bridge_admin_token", "model_bridge_port", "enable_model_fallback"}
 
     for key in sorted(hot_reload):
         if key not in settings_fields:

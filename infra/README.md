@@ -52,9 +52,12 @@ Copy-Item .env.example .env
 关键模型配置：
 
 ```env
-OPENAI_API_KEY=...
+CHAT_API_KEY=...
 CHAT_BASE_URL=https://your-chat-endpoint/v1
 CHAT_MODEL=your-chat-model
+GRAPH_API_KEY=...
+GRAPH_BASE_URL=https://your-graph-endpoint/v1
+GRAPH_MODEL=your-graph-model
 EMBEDDING_API_KEY=...
 EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1
 EMBEDDING_MODEL=your-embedding-model
@@ -127,6 +130,6 @@ python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
 - 不绕过 Docker 直接修改生产形态 PostgreSQL、Redis 或 Qdrant。
 - Compose 默认服务名保持 `course-kg-*`。
 - API 容器工作目录是 `/app/apps/api`，脚本挂载到 `/app/scripts`，数据目录挂载到 `/app/data`。
-- 模型桥启用时，容器内客户端地址使用 `host.docker.internal`，宿主机脚本使用 `127.0.0.1`，真实模型 endpoint 仍保存在 `CHAT_BASE_URL`/`EMBEDDING_BASE_URL`。
+- 模型桥启用时，容器内客户端地址使用 `host.docker.internal`，宿主机脚本使用 `127.0.0.1`，真实对话和向量 endpoint 保存在 `CHAT_BASE_URL`/`EMBEDDING_BASE_URL`；图谱构建 endpoint 独立保存在 `GRAPH_BASE_URL`。
 - 日志、smoke 输出和临时报告写入仓库根目录 `output/`。
 - 改动端口、镜像依赖、Celery pool/fork 规模等需要 service recreate 或 rebuild。

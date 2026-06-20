@@ -50,11 +50,11 @@ describe("api client", () => {
   });
 
   it("sends API key headers on JSON requests", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ has_api_key: true }));
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ has_chat_api_key: true }));
     vi.stubGlobal("fetch", fetchMock);
     const { updateModelSettings } = await import("./api");
 
-    await updateModelSettings({ api_key: "new-key", clear_api_key: false });
+    await updateModelSettings({ chat_api_key: "new-key", clear_chat_api_key: false });
 
     expect(fetchMock).toHaveBeenCalledWith(
       "http://api.test/api/settings/model",

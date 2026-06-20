@@ -63,6 +63,7 @@ DEPRECATED_ENV_KEYS: set[str] = {
     "RERANKER_MAX_LENGTH",
     "RERANKER_DEVICE",
     "HF_HUB_OFFLINE",
+    "OPENAI_API_KEY",
 }
 _LAST_RUNTIME_SETTINGS_VERSION: str | None = None
 
@@ -101,6 +102,9 @@ def runtime_lifecycle_payload() -> dict:
         "fixed_chunk_overlap_tokens",
         "embedding_model",
         "embedding_dimensions",
+        "graph_base_url",
+        "graph_resolve_ip",
+        "graph_model",
         "dense_knn_k_min",
         "dense_knn_k_max",
         "dense_reverse_b_min_base",
@@ -184,7 +188,7 @@ def runtime_lifecycle_payload() -> dict:
             "hard_gates": ["edge_density", "isolated_ratio", "hubness", "structure_recovery", "candidate_latency"],
         },
         "redaction": {
-            "secret_fields": ["openai_api_key", "embedding_api_key", "model_bridge_admin_token", "api_keys"],
+            "secret_fields": ["chat_api_key", "graph_api_key", "embedding_api_key", "model_bridge_admin_token", "api_keys"],
             "payload_exposes_secret_values": False,
         },
     }
@@ -194,19 +198,24 @@ def model_settings_payload() -> dict:
     settings = get_settings()
     env_entries = _env_entries(ENV_PATH)
     chat_base_url = env_entries.get("CHAT_BASE_URL", "" if settings.model_bridge_enabled else settings.chat_base_url)
+    graph_base_url = env_entries.get("GRAPH_BASE_URL", settings.graph_base_url)
     embedding_base_url = env_entries.get("EMBEDDING_BASE_URL", "" if settings.model_bridge_enabled else settings.embedding_base_url)
     model_bridge_enabled = settings.model_bridge_enabled or env_entries.get("MODEL_BRIDGE_ENABLED", "false").lower() == "true"
     model_bridge_status = model_bridge_status_payload(settings=settings, env_entries=env_entries)
     return {
         "provider": "openai_compatible",
         "chat_base_url": chat_base_url,
+        "graph_base_url": graph_base_url,
         "embedding_base_url": embedding_base_url,
         "effective_chat_base_url": settings.chat_base_url,
+        "effective_graph_base_url": settings.graph_base_url,
         "effective_embedding_base_url": settings.embedding_base_url,
         "model_bridge_enabled": model_bridge_enabled,
         "chat_resolve_ip": env_entries.get("CHAT_RESOLVE_IP", "" if settings.model_bridge_enabled else (settings.chat_resolve_ip or "")),
+        "graph_resolve_ip": env_entries.get("GRAPH_RESOLVE_IP", settings.graph_resolve_ip or ""),
         "embedding_model": settings.embedding_model,
         "chat_model": settings.chat_model,
+        "graph_model": settings.graph_model,
         "embedding_dimensions": settings.embedding_dimensions,
         "embedding_batch_size": read_env_int("EMBEDDING_BATCH_SIZE", settings.embedding_batch_size),
         "worker_concurrency": settings.worker_concurrency,
@@ -289,8 +298,9 @@ def model_settings_payload() -> dict:
         "concept_i18n_enabled": read_env_bool("CONCEPT_I18N_ENABLED", settings.concept_i18n_enabled),
         "enable_model_fallback": settings.enable_model_fallback,
         "enable_database_fallback": settings.enable_database_fallback,
-        "has_api_key": bool(settings.openai_api_key),
-        "degraded_mode": not settings.openai_api_key or not settings.embedding_api_key or not settings.embedding_base_url,
+        "has_chat_api_key": bool(settings.chat_api_key),
+        "has_graph_api_key": bool(settings.graph_api_key),
+        "degraded_mode": not settings.chat_api_key or not settings.embedding_api_key or not settings.embedding_base_url,
         "embedding_resolve_ip": env_entries.get("EMBEDDING_RESOLVE_IP", "" if settings.model_bridge_enabled else (settings.embedding_resolve_ip or "")),
         "has_embedding_api_key": bool(settings.embedding_api_key),
         "model_bridge_status": model_bridge_status,
@@ -814,12 +824,15 @@ def update_model_settings(payload: dict) -> dict:
     updates: dict[str, str | int | float | bool | None] = {}
     key_map = {
         "chat_base_url": "chat_base_url",
+        "graph_base_url": "graph_base_url",
         "embedding_base_url": "embedding_base_url",
         "model_bridge_enabled": "model_bridge_enabled",
         "chat_resolve_ip": "chat_resolve_ip",
+        "graph_resolve_ip": "graph_resolve_ip",
         "embedding_resolve_ip": "embedding_resolve_ip",
         "embedding_model": "embedding_model",
         "chat_model": "chat_model",
+        "graph_model": "graph_model",
         "embedding_dimensions": "embedding_dimensions",
         "embedding_batch_size": "embedding_batch_size",
         "worker_concurrency": "worker_concurrency",
@@ -890,18 +903,24 @@ def update_model_settings(payload: dict) -> dict:
         if key not in payload:
             continue
         value = payload.get(key)
-        if key in {"chat_resolve_ip", "embedding_resolve_ip"} and (value is None or (isinstance(value, str) and not value.strip())):
+        if key in {"chat_resolve_ip", "graph_resolve_ip", "embedding_resolve_ip"} and (value is None or (isinstance(value, str) and not value.strip())):
             updates[env_key] = ""
         elif key in nullable_setting_keys and value is None:
             updates[env_key] = None
         elif value is not None:
             updates[env_key] = value.strip() if isinstance(value, str) else value
 
-    api_key = payload.get("api_key")
-    if payload.get("clear_api_key"):
-        updates["openai_api_key"] = ""
-    elif isinstance(api_key, str) and api_key.strip():
-        updates["openai_api_key"] = api_key.strip()
+    chat_api_key = payload.get("chat_api_key")
+    if payload.get("clear_chat_api_key"):
+        updates["chat_api_key"] = ""
+    elif isinstance(chat_api_key, str) and chat_api_key.strip():
+        updates["chat_api_key"] = chat_api_key.strip()
+
+    graph_api_key = payload.get("graph_api_key")
+    if payload.get("clear_graph_api_key"):
+        updates["graph_api_key"] = ""
+    elif isinstance(graph_api_key, str) and graph_api_key.strip():
+        updates["graph_api_key"] = graph_api_key.strip()
 
     embedding_api_key = payload.get("embedding_api_key")
     if payload.get("clear_embedding_api_key"):

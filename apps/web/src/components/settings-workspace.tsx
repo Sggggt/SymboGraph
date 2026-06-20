@@ -52,11 +52,14 @@ import {
 
 type SettingsForm = {
   chat_base_url: string;
+  graph_base_url: string;
   embedding_base_url: string;
   chat_resolve_ip: string;
+  graph_resolve_ip: string;
   embedding_resolve_ip: string;
   embedding_model: string;
   chat_model: string;
+  graph_model: string;
   embedding_dimensions: string;
   embedding_batch_size: string;
   worker_concurrency: string;
@@ -66,8 +69,10 @@ type SettingsForm = {
   fixed_chunk_size_tokens: string;
   fixed_chunk_overlap_tokens: string;
   context_package_token_budget: string;
-  api_key: string;
-  clear_api_key: boolean;
+  chat_api_key: string;
+  clear_chat_api_key: boolean;
+  graph_api_key: string;
+  clear_graph_api_key: boolean;
   embedding_api_key: string;
   clear_embedding_api_key: boolean;
   model_bridge_enabled: boolean;
@@ -156,15 +161,20 @@ export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   资料库类型: "标记当前配置档适用的资料库类别，只影响提示词、界面标签和对话偏好，不参与切块、构图或检索参数。",
   名称: "配置档在设置页和资料库绑定列表里的显示名称，便于区分不同交互风格。",
   模型桥: "开启后 API 和 worker 容器优先通过本机模型桥访问聊天与向量端点，适合宿主机运行本地模型服务的场景。",
-  聊天基础地址: "OpenAI 兼容聊天接口的 base URL；保存后影响下一次回答生成、Planner、Evaluator 和概念命名调用。",
+  聊天基础地址: "OpenAI 兼容对话接口的 base URL；只影响下一次问答、检索规划、引用验证和 Profile 助手调用。",
+  图谱基础地址: "OpenAI 兼容图谱构建接口的 base URL；只影响下一次构图中的概念命名、粗概念和双语派生调用。",
   向量基础地址: "Embedding 接口的 base URL；后续解析、重嵌入和图谱重建会用它生成 contextual embedding。",
-  "聊天 DNS 覆盖 IP": "仅对聊天端点使用的 DNS 覆盖；需要固定解析到指定 IP 时填写，留空则使用系统 DNS。",
+  "聊天 DNS 覆盖 IP": "仅对对话端点使用的 DNS 覆盖；需要固定解析到指定 IP 时填写，留空则使用系统 DNS。",
+  "图谱 DNS 覆盖 IP": "仅对图谱构建端点使用的 DNS 覆盖；需要固定解析到指定 IP 时填写，留空则使用系统 DNS。",
   "向量 DNS 覆盖 IP": "仅对向量端点使用的 DNS 覆盖；需要固定解析到指定 IP 时填写，留空则使用系统 DNS。",
-  聊天模型: "用于回答生成、Agent 规划/判停、概念命名和引用辅助判断的聊天模型名称。",
+  聊天模型: "用于回答生成、检索规划、Agent 判停、引用辅助判断和 Profile 助手的对话模型名称。",
+  图谱模型: "用于中概念命名、粗概念生成和中粗层双语派生的图谱构建模型名称。",
   向量模型: "用于资料 embedding、dense relation 候选和查询向量的模型名称；改变后已有向量需要显式重解析或重建。",
-  聊天接口密钥: "聊天模型端点的访问密钥。留空会保留已有密钥，页面不会回显真实密钥。",
+  聊天接口密钥: "对话模型端点的访问密钥。留空会保留已有密钥，页面不会回显真实密钥。",
+  图谱接口密钥: "图谱构建模型端点的访问密钥。它不会复用对话密钥，留空会保留已有图谱密钥。",
   向量接口密钥: "Embedding 端点的访问密钥。留空会保留已有密钥，页面不会回显真实密钥。",
-  清除当前聊天接口密钥: "勾选后保存会删除当前聊天密钥；删除后聊天模型调用会因缺少凭据而失败。",
+  清除当前聊天接口密钥: "勾选后保存会删除当前对话密钥；删除后对话模型调用会因缺少凭据而失败。",
+  清除当前图谱接口密钥: "勾选后保存会删除当前图谱密钥；删除后构图模型调用会因缺少凭据而失败。",
   清除当前向量接口密钥: "勾选后保存会删除当前向量密钥；删除后解析、重嵌入和检索向量生成会因缺少凭据而失败。",
   模型请求并发: "限制同时发起的模型请求数量，用于控制概念生成、Agent 判断和回答生成的吞吐与外部端点压力。",
   模型超时秒数: "单次模型请求等待上限；超过该时间会快速失败并进入可诊断错误，不做静默降级。",
@@ -1054,6 +1064,7 @@ export function SettingsWorkspace() {
   const [form, setForm] = useState<SettingsForm | null>(null);
   const [savedMessage, setSavedMessage] = useState<string | null>(null);
   const [apiKeyEditing, setApiKeyEditing] = useState(false);
+  const [graphApiKeyEditing, setGraphApiKeyEditing] = useState(false);
   const [embeddingApiKeyEditing, setEmbeddingApiKeyEditing] = useState(false);
   const [errorDialog, setErrorDialog] = useState<ErrorDialogState | null>(null);
   const [activeTab, setActiveTab] = useState<"model" | "profile">("model");
@@ -1065,11 +1076,14 @@ export function SettingsWorkspace() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setForm({
       chat_base_url: settingsQuery.data.chat_base_url ?? "",
+      graph_base_url: settingsQuery.data.graph_base_url ?? "",
       embedding_base_url: settingsQuery.data.embedding_base_url ?? "",
       chat_resolve_ip: settingsQuery.data.chat_resolve_ip ?? "",
+      graph_resolve_ip: settingsQuery.data.graph_resolve_ip ?? "",
       embedding_resolve_ip: settingsQuery.data.embedding_resolve_ip ?? "",
       embedding_model: settingsQuery.data.embedding_model ?? "",
       chat_model: settingsQuery.data.chat_model ?? "",
+      graph_model: settingsQuery.data.graph_model ?? "",
       embedding_dimensions: String(settingsQuery.data.embedding_dimensions ?? 1024),
       embedding_batch_size: String(settingsQuery.data.embedding_batch_size ?? 10),
       worker_concurrency: String(settingsQuery.data.worker_concurrency ?? 3),
@@ -1079,8 +1093,10 @@ export function SettingsWorkspace() {
       fixed_chunk_size_tokens: String(settingsQuery.data.fixed_chunk_size_tokens ?? 512),
       fixed_chunk_overlap_tokens: String(settingsQuery.data.fixed_chunk_overlap_tokens ?? 80),
       context_package_token_budget: String(settingsQuery.data.context_package_token_budget ?? 2400),
-      api_key: "",
-      clear_api_key: false,
+      chat_api_key: "",
+      clear_chat_api_key: false,
+      graph_api_key: "",
+      clear_graph_api_key: false,
       embedding_api_key: "",
       clear_embedding_api_key: false,
       model_bridge_enabled: settingsQuery.data.model_bridge_enabled ?? true,
@@ -1129,6 +1145,7 @@ export function SettingsWorkspace() {
       agent_verification_budget: String(settingsQuery.data.agent_verification_budget ?? 8),
     });
     setApiKeyEditing(false);
+    setGraphApiKeyEditing(false);
     setEmbeddingApiKeyEditing(false);
   }, [settingsQuery.data]);
 
@@ -1136,6 +1153,7 @@ export function SettingsWorkspace() {
     mutationFn: (payload: ModelSettingsUpdate) => updateModelSettings(payload),
     onSuccess: async () => {
       setApiKeyEditing(false);
+      setGraphApiKeyEditing(false);
       setEmbeddingApiKeyEditing(false);
       setSavedMessage("已保存");
       window.setTimeout(() => setSavedMessage(null), 1800);
@@ -1149,7 +1167,8 @@ export function SettingsWorkspace() {
   });
 
   const settings = settingsQuery.data;
-  const showApiKeyMask = Boolean(settings?.has_api_key && !apiKeyEditing && !form?.clear_api_key);
+  const showApiKeyMask = Boolean(settings?.has_chat_api_key && !apiKeyEditing && !form?.clear_chat_api_key);
+  const showGraphApiKeyMask = Boolean(settings?.has_graph_api_key && !graphApiKeyEditing && !form?.clear_graph_api_key);
   const showEmbeddingApiKeyMask = Boolean(settings?.has_embedding_api_key && !embeddingApiKeyEditing && !form?.clear_embedding_api_key);
   const envSynced = Boolean(runtimeQuery.data?.env_sync?.synced);
   const runtimeWarnings = runtimeQuery.data?.warnings ?? [];
@@ -1183,11 +1202,14 @@ export function SettingsWorkspace() {
 
   const buildPayload = (): ModelSettingsUpdate => ({
     chat_base_url: form.chat_base_url.trim(),
+    graph_base_url: form.graph_base_url.trim(),
     embedding_base_url: form.embedding_base_url.trim(),
     chat_resolve_ip: form.chat_resolve_ip.trim() || null,
+    graph_resolve_ip: form.graph_resolve_ip.trim() || null,
     embedding_resolve_ip: form.embedding_resolve_ip.trim() || null,
     embedding_model: form.embedding_model.trim(),
     chat_model: form.chat_model.trim(),
+    graph_model: form.graph_model.trim(),
     embedding_dimensions: parseIntField(form.embedding_dimensions),
     embedding_batch_size: parseIntField(form.embedding_batch_size),
     worker_concurrency: parseIntField(form.worker_concurrency),
@@ -1197,8 +1219,10 @@ export function SettingsWorkspace() {
     fixed_chunk_size_tokens: parseIntField(form.fixed_chunk_size_tokens),
     fixed_chunk_overlap_tokens: parseIntField(form.fixed_chunk_overlap_tokens),
     context_package_token_budget: parseIntField(form.context_package_token_budget),
-    api_key: form.api_key.trim() || null,
-    clear_api_key: form.clear_api_key,
+    chat_api_key: form.chat_api_key.trim() || null,
+    clear_chat_api_key: form.clear_chat_api_key,
+    graph_api_key: form.graph_api_key.trim() || null,
+    clear_graph_api_key: form.clear_graph_api_key,
     embedding_api_key: form.embedding_api_key.trim() || null,
     clear_embedding_api_key: form.clear_embedding_api_key,
     model_bridge_enabled: form.model_bridge_enabled,
@@ -1289,7 +1313,8 @@ export function SettingsWorkspace() {
             </div>
 
             <div className="flex flex-wrap gap-2">
-              <StatusPill ok={Boolean(settings?.has_api_key)}>聊天密钥 {settings?.has_api_key ? "已配置" : "未配置"}</StatusPill>
+              <StatusPill ok={Boolean(settings?.has_chat_api_key)}>聊天密钥 {settings?.has_chat_api_key ? "已配置" : "未配置"}</StatusPill>
+              <StatusPill ok={Boolean(settings?.has_graph_api_key)}>图谱密钥 {settings?.has_graph_api_key ? "已配置" : "未配置"}</StatusPill>
               <StatusPill ok={Boolean(settings?.has_embedding_api_key)}>向量密钥 {settings?.has_embedding_api_key ? "已配置" : "未配置"}</StatusPill>
               <StatusPill ok={bridgeHealthy}>模型桥 {bridgeStatusText}</StatusPill>
               <StatusPill ok={envSynced}>{envSynced ? ".env 已同步" : ".env 需检查"}</StatusPill>
@@ -1321,11 +1346,14 @@ export function SettingsWorkspace() {
               <div className="mb-5 flex items-center justify-between gap-3">
                 <div>
                   <p className="text-sm font-semibold text-white">模型连接与密钥</p>
-                  <p className="mt-1 text-sm text-white/52">聊天模型、向量模型、连接地址和接口密钥集中在这里维护。</p>
+                  <p className="mt-1 text-sm text-white/52">对话模型、图谱模型、向量模型、连接地址和接口密钥集中在这里维护。</p>
                 </div>
               </div>
-              <BoundaryNote title="生效边界：下一次请求或下一次模型调用">
-                聊天地址、聊天 DNS、聊天模型、向量地址、向量 DNS、模型桥和密钥保存后会广播运行时版本；已经在执行的模型调用不会中途切换。
+              <BoundaryNote title="生效边界：下一次请求、模型调用或构图任务">
+                对话地址、对话 DNS、对话模型和对话密钥影响下一次问答、检索规划和引用验证；图谱地址、图谱 DNS、图谱模型和图谱密钥影响下一次构图模型调用；已经在执行的模型调用不会中途切换。
+              </BoundaryNote>
+              <BoundaryNote title="图谱模型边界：已有 active 图谱不会自动改写">
+                修改图谱模型 endpoint 只改变后续构图的概念命名、粗概念和双语派生来源；已有 mid/coarse graph 需要显式重建才会更新。
               </BoundaryNote>
               <BoundaryNote title="向量模型边界：已有 active 向量不会自动改写">
                 修改向量模型后只影响后续解析、重嵌入或全量重建任务；已有资料库向量需要显式重新解析或重建。
@@ -1339,6 +1367,7 @@ export function SettingsWorkspace() {
                   </div>
                   <div className="mt-3 grid gap-2 md:grid-cols-2">
                     <p className="min-w-0 break-words">聊天 effective 地址：{settings?.effective_chat_base_url || "未读取"}</p>
+                    <p className="min-w-0 break-words">图谱 effective 地址：{settings?.effective_graph_base_url || "未读取"}</p>
                     <p className="min-w-0 break-words">向量 effective 地址：{settings?.effective_embedding_base_url || "未读取"}</p>
                     <p className="min-w-0 break-words">聊天目标 hash：{bridgeStatus?.chat_target_hash?.slice(0, 12) || "未知"}</p>
                     <p className="min-w-0 break-words">向量目标 hash：{bridgeStatus?.embedding_target_hash?.slice(0, 12) || "未知"}</p>
@@ -1369,10 +1398,13 @@ export function SettingsWorkspace() {
                   badge="下一次调用"
                 />
                 <SettingField label="聊天基础地址" value={form.chat_base_url} onChange={(value) => updateForm("chat_base_url", value)} className="md:col-span-2" />
+                <SettingField label="图谱基础地址" value={form.graph_base_url} onChange={(value) => updateForm("graph_base_url", value)} className="md:col-span-2" />
                 <SettingField label="向量基础地址" value={form.embedding_base_url} onChange={(value) => updateForm("embedding_base_url", value)} className="md:col-span-2" />
                 <SettingField label="聊天 DNS 覆盖 IP" value={form.chat_resolve_ip} onChange={(value) => updateForm("chat_resolve_ip", value)} placeholder="可选，留空使用系统 DNS" />
+                <SettingField label="图谱 DNS 覆盖 IP" value={form.graph_resolve_ip} onChange={(value) => updateForm("graph_resolve_ip", value)} placeholder="可选，留空使用系统 DNS" />
                 <SettingField label="向量 DNS 覆盖 IP" value={form.embedding_resolve_ip} onChange={(value) => updateForm("embedding_resolve_ip", value)} placeholder="可选，留空使用系统 DNS" />
                 <SettingField label="聊天模型" value={form.chat_model} onChange={(value) => updateForm("chat_model", value)} />
+                <SettingField label="图谱模型" value={form.graph_model} onChange={(value) => updateForm("graph_model", value)} />
                 <SettingField label="向量模型" value={form.embedding_model} onChange={(value) => updateForm("embedding_model", value)} />
               </div>
               <div className="mt-6 grid gap-4 md:grid-cols-2">
@@ -1382,16 +1414,40 @@ export function SettingsWorkspace() {
                     <KeyRound className="size-4 text-cyan-100/58" />
                     <input
                       type="password"
-                      value={showApiKeyMask ? "••••••••••••••••" : form.api_key}
+                      value={showApiKeyMask ? "••••••••••••••••" : form.chat_api_key}
                       readOnly={showApiKeyMask}
-                      disabled={form.clear_api_key}
-                      onChange={(event) => updateForm("api_key", event.target.value)}
-                      placeholder={settings?.has_api_key ? "留空则保留当前密钥" : "输入接口密钥"}
+                      disabled={form.clear_chat_api_key}
+                      onChange={(event) => updateForm("chat_api_key", event.target.value)}
+                      placeholder={settings?.has_chat_api_key ? "留空则保留当前对话密钥" : "输入对话接口密钥"}
                       className="h-11 min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-white/30"
                       autoComplete="off"
                     />
                     {showApiKeyMask ? (
                       <button type="button" onClick={() => setApiKeyEditing(true)} className="inline-flex items-center gap-1 rounded-full border border-white/8 px-2.5 py-1 text-xs text-white/55 transition hover:border-cyan-200/24 hover:text-cyan-100">
+                        <PencilLine className="size-3.5" />
+                        修改
+                      </button>
+                    ) : null}
+                    <EyeOff className="size-4 text-white/32" />
+                  </div>
+                </label>
+
+                <label className="flex flex-col gap-2">
+                  <ParameterName label="图谱接口密钥" />
+                  <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3">
+                    <KeyRound className="size-4 text-cyan-100/58" />
+                    <input
+                      type="password"
+                      value={showGraphApiKeyMask ? "••••••••••••••••" : form.graph_api_key}
+                      readOnly={showGraphApiKeyMask}
+                      disabled={form.clear_graph_api_key}
+                      onChange={(event) => updateForm("graph_api_key", event.target.value)}
+                      placeholder={settings?.has_graph_api_key ? "留空则保留当前图谱密钥" : "输入图谱接口密钥"}
+                      className="h-11 min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-white/30"
+                      autoComplete="off"
+                    />
+                    {showGraphApiKeyMask ? (
+                      <button type="button" onClick={() => setGraphApiKeyEditing(true)} className="inline-flex items-center gap-1 rounded-full border border-white/8 px-2.5 py-1 text-xs text-white/55 transition hover:border-cyan-200/24 hover:text-cyan-100">
                         <PencilLine className="size-3.5" />
                         修改
                       </button>
@@ -1428,12 +1484,12 @@ export function SettingsWorkspace() {
                 <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
                   <input
                     type="checkbox"
-                    checked={form.clear_api_key}
+                    checked={form.clear_chat_api_key}
                     onChange={(event) => {
-                      updateForm("clear_api_key", event.target.checked);
+                      updateForm("clear_chat_api_key", event.target.checked);
                       if (event.target.checked) {
                         setApiKeyEditing(false);
-                        updateForm("api_key", "");
+                        updateForm("chat_api_key", "");
                       }
                     }}
                     className="size-4 accent-rose-300"
@@ -1454,6 +1510,21 @@ export function SettingsWorkspace() {
                     className="size-4 accent-rose-300"
                   />
                   <ParameterName label="清除当前向量接口密钥" className="text-sm font-normal normal-case tracking-normal text-white/70" />
+                </label>
+                <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
+                  <input
+                    type="checkbox"
+                    checked={form.clear_graph_api_key}
+                    onChange={(event) => {
+                      updateForm("clear_graph_api_key", event.target.checked);
+                      if (event.target.checked) {
+                        setGraphApiKeyEditing(false);
+                        updateForm("graph_api_key", "");
+                      }
+                    }}
+                    className="size-4 accent-rose-300"
+                  />
+                  <ParameterName label="清除当前图谱接口密钥" className="text-sm font-normal normal-case tracking-normal text-white/70" />
                 </label>
               </div>
             </section>

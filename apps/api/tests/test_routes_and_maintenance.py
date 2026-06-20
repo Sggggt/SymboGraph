@@ -393,6 +393,85 @@ def test_update_model_settings_reloads_model_bridge(monkeypatch, tmp_path):
     assert result["model_bridge_status"]["last_reload"]["ok"] is True
 
 
+def test_update_model_settings_writes_isolated_chat_and_graph_keys(monkeypatch, tmp_path):
+    from app.core import config
+    from app.core.config import get_settings
+    from app.services import runtime_settings
+
+    env_path = tmp_path / ".env"
+    example_path = tmp_path / ".env.example"
+    env_path.write_text(
+        "\n".join(
+            [
+                "CHAT_API_KEY=",
+                "GRAPH_API_KEY=",
+                "CHAT_BASE_URL=https://chat.example.test/v1",
+                "GRAPH_BASE_URL=https://graph.example.test/v1",
+                "CHAT_MODEL=chat-model",
+                "GRAPH_MODEL=graph-model",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    example_path.write_text(env_path.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
+    monkeypatch.setattr(runtime_settings, "ENV_EXAMPLE_PATH", example_path)
+    monkeypatch.setattr(config, "_read_workspace_env", lambda: runtime_settings._env_entries(env_path))
+    monkeypatch.setattr(runtime_settings, "publish_runtime_settings_version", lambda changed_keys, source="api": {"changed_keys": changed_keys, "source": source})
+    get_settings.cache_clear()
+
+    result = runtime_settings.update_model_settings({"chat_api_key": "chat-secret", "graph_api_key": "graph-secret"})
+    env_text = env_path.read_text(encoding="utf-8")
+
+    assert "CHAT_API_KEY=chat-secret" in env_text
+    assert "GRAPH_API_KEY=graph-secret" in env_text
+    assert "OPENAI_API_KEY" not in env_text
+    assert result["has_chat_api_key"] is True
+    assert result["has_graph_api_key"] is True
+
+
+def test_agent_run_status_includes_trace_for_frontend_recovery(db_session, sample_knowledge_base):
+    from app.models import AgentRun, AgentTraceEvent
+    from app.routers.search import agent_run_status
+
+    run = AgentRun(
+        knowledge_base_id=sample_knowledge_base.id,
+        question="recover this run",
+        status="completed",
+        route="layered_context_graph",
+        final_answer="Recovered answer",
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(
+        AgentTraceEvent(
+            run_id=run.id,
+            node="query_understanding",
+            status="completed",
+            output_summary="intent=question",
+            scores={"ok": True},
+        )
+    )
+    db_session.commit()
+
+    payload = agent_run_status(run.id, db_session)
+
+    assert payload["status"] == "completed"
+    assert payload["answer"] == "Recovered answer"
+    assert payload["trace"][0]["node"] == "query_understanding"
+
+
+def test_model_settings_update_rejects_legacy_generic_api_key():
+    from pydantic import ValidationError
+
+    from app.schemas import ModelSettingsUpdate
+
+    assert ModelSettingsUpdate(clear_embedding_api_key=False).clear_embedding_api_key is False
+    with pytest.raises(ValidationError):
+        ModelSettingsUpdate(api_key="legacy-secret")
+
+
 def test_model_bridge_status_blocks_self_target(monkeypatch):
     from app.core.config import get_settings
     from app.services import runtime_settings

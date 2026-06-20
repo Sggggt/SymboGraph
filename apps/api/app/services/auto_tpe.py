@@ -531,7 +531,7 @@ def select_auto_tpe_operating_point(
     base_theta = normalize_theta(fallback_theta)
     if fallback_theta.get("optimizer"):
         base_theta["optimizer"] = str(fallback_theta["optimizer"])
-    previous_theta = _latest_completed_theta(db, knowledge_base_id, settings.chat_model, settings.embedding_model, CURRENT_EMBEDDING_TEXT_VERSION)
+    previous_theta = _latest_completed_theta(db, knowledge_base_id, settings.graph_model, settings.embedding_model, CURRENT_EMBEDDING_TEXT_VERSION)
     if previous_theta:
         base_theta = normalize_theta(previous_theta)
 
@@ -549,7 +549,7 @@ def select_auto_tpe_operating_point(
         chunk_scope_hash=chunk_scope_hash,
         graph_operating_point_protocol="dense_dynamic_knn_bridge_quota_v1",
         protocol_hash=_protocol_hash(),
-        chat_model=settings.chat_model,
+        chat_model=settings.graph_model,
         embedding_model=settings.embedding_model,
         embedding_text_version=CURRENT_EMBEDDING_TEXT_VERSION,
         status="running",
