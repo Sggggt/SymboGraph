@@ -89,6 +89,7 @@ python scripts/destroy_legacy_derived_data.py --execute --confirm-destroy-legacy
 | 分类 | 参数 |
 | --- | --- |
 | 目标选择 | `--knowledge-base-id`, `--knowledge-base-name`, `--query`, `--base-url` |
+| Runtime settings | `ENABLE_AUTO_TPE`, `TPE_TRIAL_BUDGET`, `TPE_STARTUP_RANDOM_TRIALS`, `TPE_GOOD_QUANTILE_GAMMA`, `TPE_PROBE_QUERY_BUDGET`, `TPE_TRIAL_TIMEOUT_SECONDS`, `TPE_CANDIDATE_POOL_SIZE`, `OPERATING_POINT_HARD_GATE_*` |
 | 写入控制 | `--execute`, `--dry-run`, `--confirm-destroy-legacy`, `--delete-inactive-chunks` |
 | Docker smoke | `--base-url`, `--knowledge-base-id`, `--query`, `--wait-batch-id`, `--qa-timeout-seconds` |
 | Migration 管理 | `--container`, `--dry-run`, `upgrade`, `downgrade`, `revision -m` |
@@ -135,5 +136,6 @@ python scripts/run_bayes_chain_acceptance.py --base-url http://127.0.0.1:8000/ap
 - 破坏性 legacy cleanup 必须同时要求 `--execute` 和确认 flag。
 - 报告必须包含目标知识库、写入模式、影响范围和可审计计数。
 - RQ missing edge type 只能记录 diagnostics，不允许用 fallback pair 补边。
+- 自动 TPE 只在 chunk 最高版本递增的图构建中选择底层关系图工作点；脚本不得提供独立人工运行调参或单独切换 active 工作点入口。
 - Mid/Coarse 重建脚本必须保持 RQ L3/L2 投影边界。
-- 不新增依赖个人绝对路径、未声明服务或本地隐藏状态的脚本。
+- 脚本不得依赖个人绝对路径、未声明服务或本地隐藏状态。

@@ -11,7 +11,7 @@
 | `src/app/` | Next.js App Router 页面入口。 |
 | `src/components/app-shell.tsx` | 应用壳层、导航、资料库切换。 |
 | `src/components/overview-dashboard.tsx` | 知识库概览、导入状态和快捷入口。 |
-| `src/components/upload-workspace.tsx` | 上传、全量重新解析、批次状态和中文日志流。 |
+| `src/components/upload-workspace.tsx` | 上传、全量重新解析、批次状态、中文日志流和自动 TPE 参数/状态弹窗。 |
 | `src/components/graph-panel.tsx` | Chunk Structure、Chunk Relations / RQ Membership、Mid Concepts、Coarse Concepts，以及双击节点后的自然语言详情卡片。 |
 | `src/components/search-workspace.tsx` | Layered search、trace、context package 和图路径。 |
 | `src/components/qa-workspace.tsx` | QA、Agent trace、citations、verification 和会话。 |
@@ -46,7 +46,7 @@ apps/web/node_modules/next/dist/docs/
 
 ```text
 dashboard
--> upload / batch log
+-> upload / batch log / automatic TPE controls
 -> graph payload
 -> layered search trace
 -> RQ membership seed diagnostics
@@ -137,4 +137,4 @@ python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
 - 用户可见 trace/log 文案中文优先，底层 JSON key 保持英文协议字段。
 - 前端不保存 API key、Authorization header 或 provider 原始响应。
 - 搜索页不触发完整 Agent P&E；QA 页面才展示 Agent plan/action/observation、verification 和 repair。
-- 图谱页必须展示四层图，Mid 视为 RQ L3 投影，Coarse 视为 RQ L2 投影；右侧详情卡展示自然语言说明、关键数据、证据定位和相邻关系，不暴露旧版细粒度聚类、legacy graph 入口或 raw metadata JSON。
+- 图谱页必须展示四层图，Mid 视为 RQ L3 投影，Coarse 视为 RQ L2 投影；右侧详情卡展示自然语言说明、关键数据、证据定位和相邻关系，不暴露 legacy fine bucket 聚类、legacy graph 入口或 raw metadata JSON。

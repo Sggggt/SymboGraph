@@ -28,7 +28,7 @@ def create_log_stream_token(batch_id: str, ttl_seconds: int = _LOG_TOKEN_TTL_SEC
     expires_at = datetime.utcnow() + timedelta(seconds=ttl_seconds)
     token = secrets.token_urlsafe(32)
     _log_stream_tokens[token] = {"batch_id": batch_id, "expires_at": expires_at}
-    return {"token": token, "expires_at": expires_at}
+    return {"batch_id": batch_id, "token": token, "expires_at": expires_at}
 
 
 def validate_log_stream_token(batch_id: str, token: str | None) -> None:

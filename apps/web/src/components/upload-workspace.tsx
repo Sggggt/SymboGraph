@@ -3,10 +3,24 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
-import type { KnowledgeBaseFileStatus, KnowledgeBaseFileSummary, IngestionLogEvent } from "@course-kg/shared";
-import { AlertCircle, CheckCircle2, Clock3, Database, FileCheck2, Files, LoaderCircle, PanelRightOpen, RefreshCcw, Trash2, UploadCloud, X } from "lucide-react";
+import type { AutoTpeRunSummary, IngestionLogEvent, KnowledgeBaseFileStatus, KnowledgeBaseFileSummary, ModelSettingsUpdate } from "@course-kg/shared";
+import { AlertCircle, CheckCircle2, Clock3, Database, FileCheck2, Files, LoaderCircle, PanelRightOpen, RefreshCcw, SlidersHorizontal, Trash2, UploadCloud, X } from "lucide-react";
 
-import { cancelBatch, cleanupStaleData, createBatchLogToken, fetchBatchStatus, fetchKnowledgeBaseFiles, fetchDashboard, getBatchLogUrl, parseUploadedFiles, removeKnowledgeBaseFile, uploadFile } from "@/lib/api";
+import {
+  cancelBatch,
+  cleanupStaleData,
+  createBatchLogToken,
+  fetchAutoTpeStatus,
+  fetchBatchStatus,
+  fetchKnowledgeBaseFiles,
+  fetchDashboard,
+  fetchModelSettings,
+  getBatchLogUrl,
+  parseUploadedFiles,
+  removeKnowledgeBaseFile,
+  updateModelSettings,
+  uploadFile,
+} from "@/lib/api";
 import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -19,12 +33,95 @@ type UploadedFile = {
   path: string;
 };
 
+type AutoTpeDraft = {
+  tpe_trial_budget: string;
+  tpe_startup_random_trials: string;
+  tpe_good_quantile_gamma: string;
+  tpe_probe_query_budget: string;
+  tpe_trial_timeout_seconds: string;
+  tpe_candidate_pool_size: string;
+  operating_point_hard_gate_max_edge_density: string;
+  operating_point_hard_gate_max_isolated_ratio: string;
+  operating_point_hard_gate_max_hubness_ratio: string;
+  operating_point_hard_gate_min_structure_recovery_rate: string;
+  operating_point_hard_gate_max_candidate_latency_p95_ms: string;
+};
+
+type AutoTpeField = {
+  key: keyof AutoTpeDraft;
+  label: string;
+  min: number;
+  max: number;
+  step?: number;
+  integer?: boolean;
+  fallback: number;
+};
+
+const autoTpeFields: AutoTpeField[] = [
+  { key: "tpe_trial_budget", label: "Trial 预算", min: 1, max: 200, integer: true, fallback: 6 },
+  { key: "tpe_startup_random_trials", label: "随机启动 Trial", min: 1, max: 100, integer: true, fallback: 3 },
+  { key: "tpe_good_quantile_gamma", label: "Good 分位 Gamma", min: 0.01, max: 0.99, step: 0.01, fallback: 0.25 },
+  { key: "tpe_probe_query_budget", label: "Probe 查询预算", min: 1, max: 200, integer: true, fallback: 6 },
+  { key: "tpe_trial_timeout_seconds", label: "Trial 超时秒数", min: 1, max: 3600, integer: true, fallback: 30 },
+  { key: "tpe_candidate_pool_size", label: "候选池大小", min: 1, max: 500, integer: true, fallback: 24 },
+  { key: "operating_point_hard_gate_max_edge_density", label: "边密度上限", min: 0.1, max: 1000, step: 0.1, fallback: 24 },
+  { key: "operating_point_hard_gate_max_isolated_ratio", label: "孤立比例上限", min: 0, max: 1, step: 0.01, fallback: 0.35 },
+  { key: "operating_point_hard_gate_max_hubness_ratio", label: "Hubness 上限", min: 1, max: 1000, step: 0.1, fallback: 12 },
+  { key: "operating_point_hard_gate_min_structure_recovery_rate", label: "结构恢复率下限", min: 0, max: 1, step: 0.01, fallback: 0.25 },
+  { key: "operating_point_hard_gate_max_candidate_latency_p95_ms", label: "候选模拟 P95 毫秒", min: 10, max: 600000, integer: true, fallback: 30000 },
+];
+
+function autoTpeStatusLabel(status?: string | null): string {
+  const labels: Record<string, string> = {
+    skipped: "已跳过",
+    running: "运行中",
+    completed: "已完成",
+    failed: "失败",
+    blocked: "已阻断",
+  };
+  return status ? labels[status] ?? status : "暂无记录";
+}
+
+function autoTpeDraftFromSettings(settings?: Record<string, unknown> | null): AutoTpeDraft {
+  const draft = {} as AutoTpeDraft;
+  for (const field of autoTpeFields) {
+    const raw = settings?.[field.key];
+    draft[field.key] = String(typeof raw === "number" ? raw : field.fallback);
+  }
+  return draft;
+}
+
+function parseAutoTpeNumber(value: string, field: AutoTpeField): number {
+  const parsed = field.integer ? Number.parseInt(value, 10) : Number.parseFloat(value);
+  if (!Number.isFinite(parsed)) {
+    return field.fallback;
+  }
+  const clamped = Math.min(field.max, Math.max(field.min, parsed));
+  return field.integer ? Math.round(clamped) : clamped;
+}
+
+function buildAutoTpePayload(draft: AutoTpeDraft, enabled?: boolean): ModelSettingsUpdate {
+  const payload: ModelSettingsUpdate = {};
+  if (typeof enabled === "boolean") {
+    payload.enable_auto_tpe = enabled;
+  }
+  for (const field of autoTpeFields) {
+    payload[field.key] = parseAutoTpeNumber(draft[field.key], field);
+  }
+  return payload;
+}
+
+function formatAutoTpeObjective(run?: AutoTpeRunSummary | null): string {
+  return typeof run?.best_objective_score === "number" ? run.best_objective_score.toFixed(4) : "无";
+}
+
 const terminalLogEvents = new Set(["batch_completed", "batch_failed", "batch_partial_failed", "batch_skipped", "batch_cancelled", "batch_cancel_failed", "batch_missing"]);
 const failureLogEvents = new Set(["batch_failed", "batch_partial_failed", "batch_cancel_failed", "context_graph_failed", "graph_failed"]);
 const terminalBatchStates = new Set(["completed", "partial_failed", "failed", "skipped", "cancelled", "cancel_failed"]);
 const failureBatchStates = new Set(["partial_failed", "failed", "cancel_failed"]);
 const logStreamMaxRetries = 3;
 const logStreamRetryDelayMs = 1200;
+const logStreamMaxRetryDelayMs = 10000;
 
 const logEventLabels: Record<string, string> = {
   batch_started: "批次开始",
@@ -56,6 +153,7 @@ const logEventLabels: Record<string, string> = {
   batch_skipped: "批次跳过",
   batch_missing: "批次丢失",
   log_stream_retry: "日志重连",
+  log_stream_recovered: "日志恢复",
   log_stream_warning: "日志流告警",
   fixed_chunking: "固定切块",
 };
@@ -216,6 +314,9 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
 
   const [selectedFilePathValues, setSelectedFilePathValues] = useLocalStorage<string[]>(`upload.selectedFilePaths.${storageScope}`, []);
   const [cleanupMessage, setCleanupMessage] = useState<string | null>(null);
+  const [autoTpeMessage, setAutoTpeMessage] = useState<string | null>(null);
+  const [autoTpeExpanded, setAutoTpeExpanded] = useState(false);
+  const [autoTpeDraftOverrides, setAutoTpeDraftOverrides] = useState<Partial<AutoTpeDraft>>({});
   const [cleanupDialog, setCleanupDialog] = useState<"data" | null>(null);
   const [failureDialog, setFailureDialog] = useState<{ title: string; message: string; details?: string | null } | null>(null);
   const [noticeDialog, setNoticeDialog] = useState<{ title: string; message: string } | null>(null);
@@ -235,8 +336,25 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
     queryFn: () => fetchDashboard(selectedKnowledgeBaseId, { includeGraph: false }),
     enabled: Boolean(selectedKnowledgeBaseId),
   });
-  const activeBatchCandidate = batchId ?? dashboardQuery.data?.batch_status?.batch_id ?? null;
-  const isBatchTerminal = dashboardQuery.data?.batch_status?.state && terminalBatchStates.has(dashboardQuery.data.batch_status.state);
+  const modelSettingsQuery = useQuery({ queryKey: ["model-settings"], queryFn: fetchModelSettings });
+  const autoTpeServerDraft = useMemo(
+    () => autoTpeDraftFromSettings(modelSettingsQuery.data as unknown as Record<string, unknown> | null),
+    [modelSettingsQuery.data],
+  );
+  const autoTpeDraft = useMemo(
+    () => ({ ...autoTpeServerDraft, ...autoTpeDraftOverrides }),
+    [autoTpeDraftOverrides, autoTpeServerDraft],
+  );
+  const autoTpeStatusQuery = useQuery({
+    queryKey: ["auto-tpe-status", selectedKnowledgeBaseId],
+    queryFn: () => fetchAutoTpeStatus(selectedKnowledgeBaseId as string),
+    enabled: Boolean(selectedKnowledgeBaseId),
+    refetchInterval: (query) => (query.state.data?.latest_run?.status === "running" ? 2500 : false),
+  });
+  const dashboardBatchStatus = dashboardQuery.data?.batch_status;
+  const dashboardUploadBatchId = dashboardBatchStatus?.batch_id ?? null;
+  const activeBatchCandidate = batchId ?? dashboardUploadBatchId;
+  const isBatchTerminal = dashboardBatchStatus?.state && terminalBatchStates.has(dashboardBatchStatus.state);
   const activeBatchId = activeBatchCandidate && (activeBatchCandidate !== dismissedBatchId || !isBatchTerminal) ? activeBatchCandidate : null;
   const batchQuery = useQuery({
     queryKey: ["batch", selectedKnowledgeBaseId, activeBatchId],
@@ -381,6 +499,25 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
       void queryClient.invalidateQueries({ queryKey: ["graph", selectedKnowledgeBaseId] });
     },
   });
+  const updateAutoTpeSettingsMutation = useMutation({
+    mutationFn: (payload: ModelSettingsUpdate) => updateModelSettings(payload),
+    onSuccess: async (settings) => {
+      queryClient.setQueryData(["model-settings"], settings);
+      setAutoTpeDraftOverrides({});
+      setAutoTpeMessage("自动 TPE 设置已保存；仅下一次 chunk 最高版本号递增时生效。");
+      window.setTimeout(() => setAutoTpeMessage(null), 2400);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["model-settings"] }),
+        queryClient.invalidateQueries({ queryKey: ["auto-tpe-status", selectedKnowledgeBaseId] }),
+      ]);
+    },
+    onError: (error) => {
+      setFailureDialog({
+        title: "自动 TPE 设置保存失败",
+        message: error instanceof Error ? error.message : "后端未返回自动 TPE 设置保存失败详情。",
+      });
+    },
+  });
   const uploadPercent = uploadProgress.total > 0 ? (uploadProgress.completed / uploadProgress.total) * 100 : 0;
   const modelAudit = useMemo(() => {
     const latestEmbeddingAudit = [...logs].reverse().find((item) => item.event === "embedding_audit");
@@ -476,6 +613,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
     const streamBatchId = activeLogBatchId;
     let closed = false;
     let retryCount = 0;
+    let hadConnectionIssue = false;
     let source: EventSource | null = null;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -483,12 +621,60 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
       setLogs((current) => [...current, item].slice(-300));
     };
 
+    const appendConnectionIssue = (message: string, error?: unknown) => {
+      setLogs((current) => {
+        const shouldAppend = retryCount <= logStreamMaxRetries || retryCount % 5 === 0;
+        if (!shouldAppend) {
+          return current;
+        }
+        return [
+          ...current,
+          {
+            timestamp: new Date().toISOString(),
+            event: "log_stream_retry",
+            message,
+            retry_count: retryCount,
+            max_retries: logStreamMaxRetries,
+            error: error instanceof Error ? error.message : typeof error === "undefined" ? undefined : String(error),
+          },
+        ].slice(-300);
+      });
+    };
+
+    const retryLater = () => {
+      retryTimer = setTimeout(() => {
+        void connect();
+      }, Math.min(logStreamRetryDelayMs * Math.max(retryCount, 1), logStreamMaxRetryDelayMs));
+    };
+
+    const markRecovered = () => {
+      const recoveredAfterCurrentIssue = hadConnectionIssue;
+      hadConnectionIssue = false;
+      retryCount = 0;
+      setLogStreamRetryCount(0);
+      setLogs((current) => {
+        const withoutConnectionErrors = current.filter((item) => item.event !== "log_stream_retry");
+        const hadStoredConnectionErrors = withoutConnectionErrors.length !== current.length;
+        if (!recoveredAfterCurrentIssue && !hadStoredConnectionErrors) {
+          return current;
+        }
+        return [
+          ...withoutConnectionErrors,
+          {
+            timestamp: new Date().toISOString(),
+            event: "log_stream_recovered",
+            message: "日志流已恢复，批次真实状态继续以后端批次状态为准。",
+          },
+        ].slice(-300);
+      });
+    };
+
     const closeSource = () => {
       source?.close();
       source = null;
     };
 
-    const connect = async () => {
+    async function connect() {
       if (closed) {
         return;
       }
@@ -500,40 +686,39 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
         if (closed) {
           return;
         }
-        retryCount += 1;
-        setLogStreamRetryCount(retryCount);
-        appendLog({
-          timestamp: new Date().toISOString(),
-          event: "log_stream_retry",
-          message:
-            retryCount <= logStreamMaxRetries
-              ? `日志流授权失败，正在第 ${retryCount}/${logStreamMaxRetries} 次重试。`
-              : `日志流授权失败，已重试 ${logStreamMaxRetries} 次仍未恢复。`,
-          retry_count: retryCount,
-          max_retries: logStreamMaxRetries,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        if (retryCount <= logStreamMaxRetries) {
-          retryTimer = setTimeout(() => {
-            void connect();
-          }, logStreamRetryDelayMs * retryCount);
+        if (isBatchNotFoundError(error)) {
+          appendLog({
+            timestamp: new Date().toISOString(),
+            event: "batch_missing",
+            message: "批次记录不存在，已停止监听该批次日志。",
+            state: "missing",
+          });
+          setActiveLogBatchId(null);
+          setBatchId(null);
+          setDismissedBatchId(streamBatchId);
           return;
         }
-        setFailureDialog({
-          title: "解析日志流授权失败",
-          message: "日志流 token 创建失败，无法继续同步解析进度。请检查 API 鉴权或后端日志。",
-          details: error instanceof Error ? error.message : String(error),
-        });
-        setActiveLogBatchId(null);
+        retryCount += 1;
+        hadConnectionIssue = true;
+        setLogStreamRetryCount(retryCount);
+        appendConnectionIssue(
+          retryCount <= logStreamMaxRetries
+            ? `日志流连接失败，正在第 ${retryCount}/${logStreamMaxRetries} 次重试；这不代表解析批次失败。`
+            : `日志流连接仍未恢复，已重试 ${retryCount} 次；后台批次状态仍在独立刷新。`,
+          error,
+        );
+        retryLater();
         return;
       }
       source = new EventSource(getBatchLogUrl(streamBatchId, token));
+      source.onopen = () => {
+        markRecovered();
+      };
       source.onmessage = (event) => {
         if (closed) {
           return;
         }
-        retryCount = 0;
-        setLogStreamRetryCount(0);
+        markRecovered();
         let rawItem: IngestionLogEvent;
         try {
           rawItem = JSON.parse(event.data) as IngestionLogEvent;
@@ -583,31 +768,17 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
           return;
         }
         retryCount += 1;
+        hadConnectionIssue = true;
         setLogStreamRetryCount(retryCount);
-        appendLog({
-          timestamp: new Date().toISOString(),
-          event: "log_stream_retry",
-          message:
-            retryCount <= logStreamMaxRetries
-              ? `日志流断开，正在第 ${retryCount}/${logStreamMaxRetries} 次重连。`
-              : `日志流断开，已重试 ${logStreamMaxRetries} 次仍未恢复。`,
-          retry_count: retryCount,
-          max_retries: logStreamMaxRetries,
-        });
-        if (retryCount <= logStreamMaxRetries) {
-          retryTimer = setTimeout(() => {
-            void connect();
-          }, logStreamRetryDelayMs * retryCount);
-          return;
-        }
-        setFailureDialog({
-          title: "解析日志流中断",
-          message: "日志流重连失败，任务状态可能仍在后端继续执行。请刷新批次状态或重新打开日志查看最新结果。",
-        });
-        setActiveLogBatchId(null);
+        appendConnectionIssue(
+          retryCount <= logStreamMaxRetries
+            ? `日志流断开，正在第 ${retryCount}/${logStreamMaxRetries} 次重连；这不代表解析批次失败。`
+            : `日志流断开仍未恢复，已重试 ${retryCount} 次；后台批次状态仍在独立刷新。`,
+        );
         void queryClient.invalidateQueries({ queryKey: ["batch", selectedKnowledgeBaseId, streamBatchId] });
+        retryLater();
       };
-    };
+    }
     void connect();
     return () => {
       closed = true;
@@ -674,6 +845,10 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
   );
   const cleanupPending = cleanupStaleDataMutation.isPending;
   const cleanupError = cleanupStaleDataMutation.error as Error | null;
+  const autoTpePending = updateAutoTpeSettingsMutation.isPending;
+  const autoTpeEnabled = Boolean(modelSettingsQuery.data?.enable_auto_tpe);
+  const latestAutoTpeRun = autoTpeStatusQuery.data?.latest_run ?? null;
+  const logButtonBatchId = activeBatchId ?? activeLogBatchId;
   const cleanupTitle = "清理数据库";
   const cleanupDescription = "清理当前资料库的旧版本/陈旧 inactive 数据库记录和 Qdrant 向量，仅保留当前最新版本的有效数据。";
 
@@ -786,22 +961,24 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
               <button
                 type="button"
                 onClick={() => {
-                  if (activeBatchId) {
-                    setActiveLogBatchId(activeBatchId);
+                  if (logButtonBatchId) {
+                    if (activeBatchId) {
+                      setActiveLogBatchId(activeBatchId);
+                    }
                     setLogOpen(true);
                   }
                 }}
-                disabled={!activeBatchId}
+                disabled={!logButtonBatchId}
                 className={cn(
                   "inline-flex items-center gap-2 rounded-full border px-5 py-3 text-sm uppercase tracking-[0.24em] transition disabled:opacity-40",
-                  activeBatchId
+                  logButtonBatchId
                     ? "border-cyan-300/35 bg-cyan-300/10 text-cyan-50 hover:bg-cyan-300/20 hover:text-white"
                     : "border-white/12 text-white/72"
                 )}
-                title={activeBatchId ? "查看实时日志" : "暂无活跃批次"}
+                title={activeBatchId ? "查看实时日志" : activeLogBatchId ? "查看最近一次日志" : "暂无日志"}
               >
                 <PanelRightOpen className="size-4" />
-                {activeBatchId ? "查看实时日志" : "无活跃日志"}
+                {activeBatchId ? "查看实时日志" : activeLogBatchId ? "查看最近日志" : "无活跃日志"}
               </button>
             </div>
             {selectedParseTargetPaths.length > 0 ? (
@@ -812,6 +989,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
               <p className="text-xs uppercase tracking-[0.2em] text-white/36">按住 Shift 并左键点击文件可多选；未选择时解析按钮按原逻辑处理待解析/变更文件。</p>
             )}
             {cleanupMessage ? <p className="text-xs leading-5 text-emerald-100/72">{cleanupMessage}</p> : null}
+            {autoTpeMessage ? <p className="text-xs leading-5 text-cyan-100/72">{autoTpeMessage}</p> : null}
             {cleanupStaleDataMutation.error ? (
               <p className="text-xs leading-5 text-rose-100/72">{(cleanupStaleDataMutation.error as Error).message}</p>
             ) : null}
@@ -915,6 +1093,34 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
             <p className="mt-2 text-sm text-white/50">当前资料库存储文件夹中的文件会统一显示在这里。</p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+            <button
+              type="button"
+              role="switch"
+              aria-checked={autoTpeEnabled}
+              onClick={() => {
+                updateAutoTpeSettingsMutation.mutate(buildAutoTpePayload(autoTpeDraft, !autoTpeEnabled));
+              }}
+              disabled={autoTpePending || modelSettingsQuery.isLoading}
+              className={cn(
+                "inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-[11px] transition disabled:pointer-events-none disabled:opacity-40",
+                autoTpeEnabled
+                  ? "border-cyan-200/35 bg-cyan-300/14 text-cyan-50 hover:border-cyan-200/50"
+                  : "border-white/12 bg-white/[0.04] text-white/58 hover:border-white/22 hover:text-white"
+              )}
+              title="全局热加载开关；只在下一次 chunk 最高版本号递增时运行自动轻量 TPE"
+            >
+              {autoTpePending ? <LoaderCircle className="size-3.5 animate-spin" /> : <SlidersHorizontal className="size-3.5" />}
+              自动 TPE {autoTpeEnabled ? "开" : "关"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setAutoTpeExpanded(true)}
+              className="inline-flex items-center gap-1.5 rounded-full border border-cyan-200/18 bg-cyan-300/[0.055] px-3 py-1.5 text-[11px] text-cyan-50/72 transition hover:border-cyan-200/36 hover:text-white"
+              title="查看自动 TPE envelope 参数和最近一次运行状态"
+            >
+              <SlidersHorizontal className="size-3.5" />
+              参数/状态
+            </button>
             <button
               type="button"
               onClick={() => {
@@ -1073,9 +1279,9 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
               </div>
               <div className="mt-4 grid gap-3 sm:grid-cols-3">
                 {[
-                  { label: "成功", value: visibleBatch?.success_count ?? 0 },
-                  { label: "跳过", value: visibleBatch?.skipped_count ?? 0 },
-                  { label: "失败", value: visibleBatch?.failure_count ?? 0 },
+                  { label: "文件成功", value: visibleBatch?.success_count ?? 0 },
+                  { label: "文件跳过", value: visibleBatch?.skipped_count ?? 0 },
+                  { label: "文件失败", value: visibleBatch?.failure_count ?? 0 },
                 ].map((item) => (
                   <div key={item.label} className="border-l border-white/10 px-4 py-2">
                     <p className="text-xs uppercase tracking-[0.24em] text-white/45">{item.label}</p>
@@ -1102,6 +1308,85 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
         </motion.div>
         </div>
       </section>
+
+      <Dialog open={autoTpeExpanded} onOpenChange={setAutoTpeExpanded}>
+        <DialogContent className="max-h-[calc(100vh-2rem)] w-[min(52rem,calc(100vw-2rem))] overflow-hidden border border-cyan-200/14 bg-[rgba(3,10,22,0.96)] p-0 text-white shadow-[0_30px_90px_rgba(0,0,0,0.48)] backdrop-blur-2xl sm:!max-w-[52rem]">
+          <DialogHeader className="border-b border-cyan-200/10 px-6 py-5">
+            <DialogTitle>自动 TPE 图谱工作点</DialogTitle>
+            <DialogDescription className="text-cyan-50/58">
+              全局热加载开关；开启后只在首次入库产生 v1 或全量重建推进最高 chunk 版本时运行。普通选中文件重解析写回当前最高版本不会触发。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="custom-scrollbar kg-rounded-scrollbar max-h-[calc(100vh-12rem)] overflow-y-auto px-6 py-5">
+            <div className="grid gap-3 text-xs text-white/62 sm:grid-cols-3">
+              <div className="border-l border-cyan-200/18 px-4 py-1.5">
+                <p className="uppercase tracking-[0.22em] text-white/38">开关状态</p>
+                <p className="mt-2 text-base font-semibold text-white">{autoTpeEnabled ? "已开启" : "已关闭"}</p>
+              </div>
+              <div className="border-l border-cyan-200/18 px-4 py-1.5">
+                <p className="uppercase tracking-[0.22em] text-white/38">最近状态</p>
+                <p className="mt-2 text-base font-semibold text-white">{autoTpeStatusLabel(latestAutoTpeRun?.status)}</p>
+              </div>
+              <div className="border-l border-cyan-200/18 px-4 py-1.5">
+                <p className="uppercase tracking-[0.22em] text-white/38">Objective</p>
+                <p className="mt-2 text-base font-semibold text-white">{formatAutoTpeObjective(latestAutoTpeRun)}</p>
+              </div>
+            </div>
+
+            <div className="mt-6 border-t border-white/8 pt-5">
+              <p className="text-xs uppercase tracking-[0.22em] text-cyan-50/52">Envelope 参数</p>
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                {autoTpeFields.map((field) => (
+                  <label key={field.key} className="block">
+                    <span className="text-[11px] uppercase tracking-[0.18em] text-white/42">{field.label}</span>
+                    <input
+                      type="number"
+                      min={field.min}
+                      max={field.max}
+                      step={field.step ?? 1}
+                      value={autoTpeDraft[field.key]}
+                      onChange={(event) => setAutoTpeDraftOverrides((current) => ({ ...current, [field.key]: event.target.value }))}
+                      className="mt-1 h-10 w-full rounded-xl border border-white/10 bg-black/16 px-3 text-sm text-white outline-none transition focus:border-cyan-200/45"
+                    />
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="mt-6 border-t border-white/8 pt-5 text-xs leading-5 text-white/58">
+              <p className="uppercase tracking-[0.22em] text-cyan-50/52">最近一次运行</p>
+              <p className="mt-3">
+                run：{latestAutoTpeRun?.run_id ? shortId(latestAutoTpeRun.run_id) : "暂无"}；版本 {latestAutoTpeRun?.chunk_version ?? "无"}；最佳 trial{" "}
+                {latestAutoTpeRun?.best_trial_id ? shortId(latestAutoTpeRun.best_trial_id) : "无"}。
+              </p>
+              <p className="mt-1">
+                阻断原因：{latestAutoTpeRun?.blocking_reasons?.length ? latestAutoTpeRun.blocking_reasons.join("、") : latestAutoTpeRun?.failure_code ?? "无"}
+              </p>
+              {autoTpeMessage ? <p className="mt-3 text-cyan-50/76">{autoTpeMessage}</p> : null}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap justify-end gap-2 border-t border-white/8 px-6 py-4">
+            <button
+              type="button"
+              onClick={() => setAutoTpeDraftOverrides({})}
+              className="rounded-full border border-white/12 px-4 py-2 text-xs text-white/62 transition hover:text-white"
+            >
+              还原
+            </button>
+            <button
+              type="button"
+              onClick={() => updateAutoTpeSettingsMutation.mutate(buildAutoTpePayload(autoTpeDraft))}
+              disabled={autoTpePending}
+              className="rounded-full border border-cyan-200/25 bg-cyan-300/10 px-4 py-2 text-xs text-cyan-50 transition hover:bg-cyan-300/18 disabled:opacity-50"
+            >
+              {autoTpePending ? <LoaderCircle className="mr-2 inline size-3.5 animate-spin" /> : null}
+              保存自动 TPE 参数
+            </button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* 通用二次确认弹窗 */}
       <Dialog open={confirmDialog !== null} onOpenChange={(open) => !open && setConfirmDialog(null)}>
@@ -1292,7 +1577,9 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
             </p>
             {logStreamRetryCount > 0 ? (
               <p className="mt-2 rounded-full border border-amber-200/14 bg-amber-300/[0.055] px-3 py-2 text-[11px] leading-5 text-amber-50/72">
-                日志流重连 {Math.min(logStreamRetryCount, logStreamMaxRetries)}/{logStreamMaxRetries}
+                {logStreamRetryCount <= logStreamMaxRetries
+                  ? `日志流重连 ${logStreamRetryCount}/${logStreamMaxRetries}`
+                  : `日志流连接异常，已重试 ${logStreamRetryCount} 次，正在后台重连`}
               </p>
             ) : null}
 

@@ -97,6 +97,7 @@ describe("api client", () => {
       worker_concurrency: 3,
       model_request_concurrency: 3,
       model_request_timeout_seconds: 240,
+      concept_i18n_enabled: true,
       embedding_batch_size: 10,
       fixed_chunk_size_tokens: 512,
       fixed_chunk_overlap_tokens: 80,
@@ -137,12 +138,25 @@ describe("api client", () => {
       agent_max_typed_actions_per_round: 8,
       agent_repair_round_budget: 2,
       agent_verification_budget: 8,
+      enable_auto_tpe: false,
+      tpe_trial_budget: 6,
+      tpe_startup_random_trials: 3,
+      tpe_good_quantile_gamma: 0.25,
+      tpe_probe_query_budget: 6,
+      tpe_trial_timeout_seconds: 30,
+      tpe_candidate_pool_size: 24,
+      operating_point_hard_gate_max_edge_density: 24,
+      operating_point_hard_gate_max_isolated_ratio: 0.35,
+      operating_point_hard_gate_max_hubness_ratio: 12,
+      operating_point_hard_gate_min_structure_recovery_rate: 0.25,
+      operating_point_hard_gate_max_candidate_latency_p95_ms: 30000,
     });
 
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
       worker_concurrency: 3,
       model_request_concurrency: 3,
       model_request_timeout_seconds: 240,
+      concept_i18n_enabled: true,
       embedding_batch_size: 10,
       fixed_chunk_size_tokens: 512,
       fixed_chunk_overlap_tokens: 80,
@@ -183,7 +197,32 @@ describe("api client", () => {
       agent_max_typed_actions_per_round: 8,
       agent_repair_round_budget: 2,
       agent_verification_budget: 8,
+      enable_auto_tpe: false,
+      tpe_trial_budget: 6,
+      tpe_startup_random_trials: 3,
+      tpe_good_quantile_gamma: 0.25,
+      tpe_probe_query_budget: 6,
+      tpe_trial_timeout_seconds: 30,
+      tpe_candidate_pool_size: 24,
+      operating_point_hard_gate_max_edge_density: 24,
+      operating_point_hard_gate_max_isolated_ratio: 0.35,
+      operating_point_hard_gate_max_hubness_ratio: 12,
+      operating_point_hard_gate_min_structure_recovery_rate: 0.25,
+      operating_point_hard_gate_max_candidate_latency_p95_ms: 30000,
     });
+  });
+
+  it("fetches readonly automatic TPE status", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ knowledge_base_id: "kb-1", enabled: false, latest_run: null }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetchAutoTpeStatus } = await import("./api");
+
+    await fetchAutoTpeStatus("kb-1");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://api.test/api/knowledge-bases/kb-1/graph-operating-point/auto-tpe/latest",
+      expect.objectContaining({ cache: "no-store", headers: { "X-API-Key": "test-key" } }),
+    );
   });
 
   it("requests context graph status refresh", async () => {
@@ -244,11 +283,11 @@ describe("api client", () => {
   });
 
   it("uses short-lived tokens for batch log EventSource URLs", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ token: "stream-token", expires_at: "2026-05-08T00:00:00Z" }));
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ batch_id: "batch-1", token: "stream-token", expires_at: "2026-05-08T00:00:00Z" }));
     vi.stubGlobal("fetch", fetchMock);
     const { createBatchLogToken, getBatchLogUrl } = await import("./api");
 
-    await expect(createBatchLogToken("batch-1")).resolves.toMatchObject({ token: "stream-token" });
+    await expect(createBatchLogToken("batch-1")).resolves.toMatchObject({ batch_id: "batch-1", token: "stream-token" });
     expect(fetchMock).toHaveBeenCalledWith(
       "http://api.test/api/ingestion/batches/batch-1/log-token",
       expect.objectContaining({ method: "POST", headers: { "X-API-Key": "test-key" } }),

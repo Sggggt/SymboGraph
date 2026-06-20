@@ -38,14 +38,22 @@ export const logEventLabels: Record<string, string> = {
   compensation_started: "补偿开始",
   compensation_completed: "补偿完成",
   log_stream_retry: "日志流重连",
+  log_stream_recovered: "日志流恢复",
   log_stream_warning: "日志流告警",
+  auto_tpe_started: "自动 TPE 开始",
+  auto_tpe_trial_started: "自动 TPE Trial 开始",
+  auto_tpe_trial_completed: "自动 TPE Trial 完成",
+  auto_tpe_trial_blocked: "自动 TPE Trial 阻断",
+  auto_tpe_best_theta_selected: "自动 TPE 最佳参数",
+  auto_tpe_skipped: "自动 TPE 跳过",
+  auto_tpe_failed: "自动 TPE 失败",
 };
 
 export function logEventLabel(event: string): string {
   return logEventLabels[event] ?? `未知事件：${event.replaceAll("_", " ")}`;
 }
 
-export function logVisualTone(item: Pick<IngestionLogEvent, "event" | "stage" | "phase">): LogVisualTone {
+export function logVisualTone(item: Pick<IngestionLogEvent, "event" | "stage" | "phase" | "translation_phase">): LogVisualTone {
   if (item.event.includes("failed") || item.event.includes("cancel_failed")) {
     return "failure";
   }
@@ -59,8 +67,10 @@ export function logVisualTone(item: Pick<IngestionLogEvent, "event" | "stage" | 
     item.event.includes("prefix") ||
     item.event.includes("membership") ||
     item.event.includes("graph") ||
+    item.event.includes("tpe_") ||
     item.event.includes("compensation") ||
-    item.phase?.includes("context_graph")
+    item.phase?.includes("context_graph") ||
+    Boolean(item.translation_phase)
   ) {
     return "graph";
   }
@@ -76,6 +86,7 @@ export function graphLogSummary(item: IngestionLogEvent): string | null {
     item.event.includes("prefix") ||
     item.event.includes("membership") ||
     item.event.includes("graph") ||
+    item.event.includes("tpe_") ||
     item.event === "file_indexed" ||
     phase.includes("context_graph");
   if (!isGraphEvent) {
@@ -96,11 +107,24 @@ export function graphLogSummary(item: IngestionLogEvent): string | null {
     "context_graph:completed": "图谱闭环完成",
     compensating: "清理/补偿",
   };
+  const translationPhaseLabels: Record<string, string> = {
+    concept_i18n: "节点双语派生",
+    edge_i18n: "关系双语派生",
+  };
 
   const parts: string[] = [];
-  const phaseLabel = phaseLabels[phase] ?? phaseLabels[String(item.context_graph_phase ?? "")] ?? null;
+  const contextGraphPhase = item.context_graph_phase ? `context_graph:${item.context_graph_phase}` : "";
+  const phaseLabel = phaseLabels[phase] ?? phaseLabels[contextGraphPhase] ?? null;
   if (phaseLabel) {
     parts.push(`阶段 ${phaseLabel}`);
+  }
+  const translationPhase = item.translation_phase ?? "";
+  const translationLabel = translationPhaseLabels[translationPhase] ?? null;
+  if (translationLabel) {
+    parts.push(`双语 ${translationLabel}`);
+  }
+  if (item.translation_status === "disabled" || item.translation_enabled === false) {
+    parts.push("状态 未启用");
   }
   const pushNumber = (label: string, value: number | undefined) => {
     if (typeof value === "number") {
@@ -113,8 +137,39 @@ export function graphLogSummary(item: IngestionLogEvent): string | null {
   pushNumber("RQ membership", item.rq_prefix_count);
   pushNumber("中概念", item.mid_concept_count);
   pushNumber("粗概念", item.coarse_concept_count);
+  pushNumber("派生项", item.translation_items);
+  pushNumber("已翻译", item.translated_count);
+  pushNumber("回退", item.fallback_count);
+  pushNumber("节点翻译", item.concept_i18n_translated_count);
+  pushNumber("节点回退", item.concept_i18n_fallback_count);
+  pushNumber("关系翻译", item.edge_i18n_translated_count);
+  pushNumber("关系回退", item.edge_i18n_fallback_count);
   if (item.context_graph_hash) {
     parts.push(`哈希 ${item.context_graph_hash.slice(0, 8)}`);
+  }
+  if (item.event.startsWith("auto_tpe_")) {
+    if (typeof item.trial_index === "number") {
+      parts.push(`Trial ${item.trial_index}`);
+    }
+    if (typeof item.objective_score === "number") {
+      parts.push(`Objective ${item.objective_score.toFixed(4)}`);
+    }
+    if (item.theta_hash) {
+      parts.push(`参数 ${item.theta_hash.slice(0, 8)}`);
+    }
+    if (item.probe_set_hash) {
+      parts.push(`Probe ${item.probe_set_hash.slice(0, 8)}`);
+    }
+    if (item.failure_code) {
+      parts.push(`阻断 ${item.failure_code}`);
+    }
+    const hardGate = item.hard_gate && typeof item.hard_gate === "object" ? item.hard_gate : null;
+    if (hardGate) {
+      const failed = Object.entries(hardGate)
+        .filter(([, value]) => typeof value === "object" && value !== null && (value as { passed?: unknown }).passed === false)
+        .map(([key]) => key);
+      parts.push(failed.length ? `Hard gate 未通过 ${failed.join(", ")}` : "Hard gate 通过");
+    }
   }
   return parts.length ? parts.join(" / ") : null;
 }

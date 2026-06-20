@@ -35,6 +35,7 @@ ALLOWED_SUFFIXES = {".pdf", ".ipynb", ".md", ".markdown", ".txt", ".docx", ".ppt
 EXCLUDED_PARTS = {"output", "scripts", ".ipynb_checkpoints", "__pycache__"}
 IGNORED_NAMES = {".ds_store"}
 TERMINAL_STATES = {"completed", "failed", "partial_failed", "skipped", "cancelled", "cancel_failed"}
+ACTIVE_FILE_JOB_STATES = {"queued", "parsing", "chunking", "embedding", "extracting_graph", "processing"}
 
 
 def current_worker_id() -> str:
@@ -44,6 +45,12 @@ def current_worker_id() -> str:
 def exception_message(exc: Exception) -> str:
     message = str(exc).strip()
     return message or f"{exc.__class__.__name__}: {exc!r}"
+
+
+def is_active_file_job(job: IngestionJob) -> bool:
+    if job.status == "queued" and not job.batch_id:
+        return False
+    return job.status in ACTIVE_FILE_JOB_STATES
 
 
 def should_include_file(path: Path) -> bool:
@@ -465,7 +472,7 @@ async def ingest_file(
     db.flush()
     if rebuild_graph:
         refresh_runtime_settings_if_needed()
-        await rebuild_context_graph(db, knowledge_base.id, batch_id=batch_id)
+        await rebuild_context_graph(db, knowledge_base.id, batch_id=batch_id, chunk_version_incremented=chunk_version > (knowledge_base.current_chunk_version or 0))
     if knowledge_base.current_chunk_version < chunk_version:
         knowledge_base.current_chunk_version = chunk_version
     db.commit()
@@ -537,7 +544,7 @@ async def run_context_graph_rebuild_batch(batch_id: str, *, execution_mode: str 
         db.commit()
         emit_ingestion_log(batch.id, "batch_started", "Context graph rebuild started", maintenance_task="context_graph_rebuild")
         emit_ingestion_log(batch.id, "context_graph_started", "Building four-layer context graph")
-        context_state = await rebuild_context_graph(db, knowledge_base.id, batch_id=batch.id)
+        context_state = await rebuild_context_graph(db, knowledge_base.id, batch_id=batch.id, chunk_version_incremented=False)
         graph_stats = dict(context_state.stats_json or {})
         batch = db.get(IngestionBatch, batch_id)
         if batch is None:
@@ -692,7 +699,7 @@ async def run_uploaded_files_ingestion(
             mark_batch_worker_heartbeat(db, batch, phase="context_graph")
             db.commit()
             emit_ingestion_log(batch.id, "context_graph_started", "Building four-layer context graph")
-            context_state = await rebuild_context_graph(db, knowledge_base.id, batch_id=batch.id)
+            context_state = await rebuild_context_graph(db, knowledge_base.id, batch_id=batch.id, chunk_version_incremented=target_version > current_version)
             knowledge_base.current_chunk_version = max(knowledge_base.current_chunk_version or 0, target_version)
             graph_stats = dict(context_state.stats_json or {})
             batch.stats = {**(batch.stats or {}), "graph_stats": graph_stats, "phase": "completed", "parse_committed": True}
@@ -779,7 +786,7 @@ def list_knowledge_base_files(db: Session, knowledge_base_id: str) -> list[dict]
         latest_job = db.scalar(select(IngestionJob).where(IngestionJob.knowledge_base_id == knowledge_base_id, IngestionJob.source_path == path_string).order_by(IngestionJob.updated_at.desc()))
         chunk_count = chunk_counts.get(document.id, 0) if document else 0
         status = "parsed" if chunk_count else "pending"
-        if latest_job and latest_job.status in {"queued", "parsing", "chunking", "embedding", "extracting_graph", "processing"}:
+        if latest_job and is_active_file_job(latest_job):
             status = "parsing"
         elif latest_job and latest_job.status == "failed":
             status = "failed"

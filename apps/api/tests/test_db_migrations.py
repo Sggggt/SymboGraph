@@ -24,6 +24,8 @@ def test_alembic_upgrade_creates_four_layer_schema(tmp_path, monkeypatch):
     trace_columns = {column["name"] for column in inspect(engine).get_columns("retrieval_traces")}
     relation_columns = {column["name"] for column in inspect(engine).get_columns("chunk_relation_edges")}
     relation_state_columns = {column["name"] for column in inspect(engine).get_columns("chunk_relation_graph_states")}
+    auto_tpe_run_columns = {column["name"] for column in inspect(engine).get_columns("auto_tpe_runs")}
+    auto_tpe_trial_columns = {column["name"] for column in inspect(engine).get_columns("auto_tpe_trials")}
     assert "chunks" in tables
     assert "chunk_structure_nodes" in tables
     assert "chunk_relation_edges" in tables
@@ -31,6 +33,10 @@ def test_alembic_upgrade_creates_four_layer_schema(tmp_path, monkeypatch):
     assert "mid_concepts" in tables
     assert "coarse_concepts" in tables
     assert "context_packages" in tables
+    assert "auto_tpe_runs" in tables
+    assert "auto_tpe_trials" in tables
+    assert "tpe_calibration_jobs" not in tables
+    assert "tpe_trials" not in tables
     assert "evidence_atoms" not in tables
     assert "active_chunks" not in tables
     assert "bm25_records" not in tables
@@ -43,4 +49,6 @@ def test_alembic_upgrade_creates_four_layer_schema(tmp_path, monkeypatch):
     assert "ambiguous_edge_decisions_json" not in columns
     assert {"stage_queues_json", "candidate_pools_json", "topk_selection_json"}.issubset(trace_columns)
     assert {"normalization_stats_json", "edge_distance_protocol_hash", "is_cross_document", "is_cross_language"}.issubset(relation_columns)
-    assert {"graph_operating_point_hash", "edge_type_calibration_protocol_hash"}.issubset(relation_state_columns)
+    assert {"graph_operating_point_hash", "edge_type_calibration_protocol_hash", "runtime_settings_hash", "auto_tpe_run_id", "auto_tpe_best_trial_id"}.issubset(relation_state_columns)
+    assert {"status", "chunk_version", "selected_theta_json", "selected_theta_hash", "runtime_settings_hash", "best_trial_id"}.issubset(auto_tpe_run_columns)
+    assert {"sampled_theta_json", "theta_hash", "candidate_adjacency_hash", "hard_gate_json", "objective_score"}.issubset(auto_tpe_trial_columns)

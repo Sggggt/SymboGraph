@@ -62,6 +62,7 @@ type SettingsForm = {
   worker_concurrency: string;
   model_request_concurrency: string;
   model_request_timeout_seconds: string;
+  concept_i18n_enabled: boolean;
   fixed_chunk_size_tokens: string;
   fixed_chunk_overlap_tokens: string;
   context_package_token_budget: string;
@@ -169,6 +170,7 @@ export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   模型超时秒数: "单次模型请求等待上限；超过该时间会快速失败并进入可诊断错误，不做静默降级。",
   "Embedding 批大小": "每批提交给向量端点的文本数量；较大批次提升吞吐，但会增加单次请求体积和失败重试成本。",
   "证据包 token 预算": "Context Package 可容纳的证据 token 上限；它约束进入回答生成的唯一证据输入规模。",
+  中粗层双语派生: "开启后，下一次图谱重建会对 mid/coarse 概念节点和高层概念边额外生成中英双语派生 metadata；关闭时不会产生这部分模型调用成本。",
   粗概念总预算: "Layered retrieval 在 coarse 层探索的粗概念节点上限；这是层内 hard interrupt，不是相关性评分。",
   每个粗概念中概念预算: "对每个已接受粗概念分别下钻的 mid candidate 数量上限，保证逐父节点探索而不是全局裸 top-k。",
   "中概念 Top K": "所有 mid candidates 合并去重后的层间输出上限；不会绕过 trace、结构恢复或引用验证。",
@@ -1073,6 +1075,7 @@ export function SettingsWorkspace() {
       worker_concurrency: String(settingsQuery.data.worker_concurrency ?? 3),
       model_request_concurrency: String(settingsQuery.data.model_request_concurrency ?? 3),
       model_request_timeout_seconds: String(settingsQuery.data.model_request_timeout_seconds ?? 240),
+      concept_i18n_enabled: settingsQuery.data.concept_i18n_enabled ?? false,
       fixed_chunk_size_tokens: String(settingsQuery.data.fixed_chunk_size_tokens ?? 512),
       fixed_chunk_overlap_tokens: String(settingsQuery.data.fixed_chunk_overlap_tokens ?? 80),
       context_package_token_budget: String(settingsQuery.data.context_package_token_budget ?? 2400),
@@ -1190,6 +1193,7 @@ export function SettingsWorkspace() {
     worker_concurrency: parseIntField(form.worker_concurrency),
     model_request_concurrency: parseIntField(form.model_request_concurrency),
     model_request_timeout_seconds: parseIntField(form.model_request_timeout_seconds),
+    concept_i18n_enabled: form.concept_i18n_enabled,
     fixed_chunk_size_tokens: parseIntField(form.fixed_chunk_size_tokens),
     fixed_chunk_overlap_tokens: parseIntField(form.fixed_chunk_overlap_tokens),
     context_package_token_budget: parseIntField(form.context_package_token_budget),
@@ -1290,6 +1294,7 @@ export function SettingsWorkspace() {
               <StatusPill ok={bridgeHealthy}>模型桥 {bridgeStatusText}</StatusPill>
               <StatusPill ok={envSynced}>{envSynced ? ".env 已同步" : ".env 需检查"}</StatusPill>
               <StatusPill ok={!settings?.enable_model_fallback && !settings?.enable_database_fallback}>回退已禁用</StatusPill>
+              <StatusPill ok={!settings?.concept_i18n_enabled}>双语派生 {settings?.concept_i18n_enabled ? "已开启" : "已关闭"}</StatusPill>
               <StatusPill ok={Boolean(settings?.lifecycle?.hot_reloadable?.length)}>热加载 {settings?.lifecycle?.hot_reloadable?.length ?? 0}</StatusPill>
               <StatusPill ok={Boolean(settings?.lifecycle?.rebuild_required?.length)}>需重建 {settings?.lifecycle?.rebuild_required?.length ?? 0}</StatusPill>
               <StatusPill ok={Boolean(settings?.runtime_settings_version)}>运行时 {settings?.runtime_settings_version ? settings.runtime_settings_version.slice(0, 12) : "等待中"}</StatusPill>
@@ -1491,6 +1496,17 @@ export function SettingsWorkspace() {
               <BoundaryNote title="生效边界：新任务会读取，但已有 active 数据不会改变">
                 固定切块、向量维度、RQ-KMeans 和概念批处理参数必须通过重解析或图谱重建，才能影响已有资料库的 chunk、向量、关系图和概念图；L3 到中粒度、L2 到粗粒度始终全量投影。
               </BoundaryNote>
+              <div className="mt-5">
+                <SwitchRow
+                  title="中粗层双语派生"
+                  tooltip={SETTINGS_PARAMETER_HELP["中粗层双语派生"]}
+                  description="默认关闭以避免额外模型成本。开启后下一次图谱重建会生成节点和关系的双语派生 metadata；前端图谱仍展示原字段。"
+                  checked={form.concept_i18n_enabled}
+                  onChange={() => updateForm("concept_i18n_enabled", !form.concept_i18n_enabled)}
+                  disabled={saveMutation.isPending}
+                  badge="热加载 / 下一次重建"
+                />
+              </div>
               <div className="mt-5 grid gap-4 md:grid-cols-4">
                 <SettingField label="固定切块尺寸" type="number" min={128} max={4096} value={form.fixed_chunk_size_tokens} onChange={(value) => updateForm("fixed_chunk_size_tokens", value)} />
                 <SettingField label="固定切块重叠" type="number" min={0} max={1024} value={form.fixed_chunk_overlap_tokens} onChange={(value) => updateForm("fixed_chunk_overlap_tokens", value)} />

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,43 @@ def test_entry_seed_calibration_prevents_zero_distance_route_seeds():
     assert calibrated_entry_seed_strength(1.0, "mid_drilldown_entry") == pytest.approx(0.82)
     assert calibrated_entry_seed_strength(1.0, "coarse_to_mid_drilldown_entry") == pytest.approx(0.72)
     assert distance_from_strength(calibrated_entry_seed_strength(1.0, "mid_drilldown_entry")) > 0.0
+
+
+def test_concept_searchable_text_uses_successful_i18n_only():
+    from app.services.context_graph import concept_searchable_text
+
+    concept = SimpleNamespace(
+        canonical_label="Bayesian Regression",
+        definition="Regression with Bayesian posterior inference.",
+        summary="Bayesian regression summary.",
+        scope_note="Course-level model concept.",
+        aliases_json=["Bayesian linear model"],
+        display_terms_json=[],
+        llm_audit_json={
+            "concept_i18n": {
+                "status": "ok",
+                "label_i18n": {"zh": "贝叶斯回归", "en": "Bayesian Regression"},
+                "definition_i18n": {"zh": "使用后验推断的回归模型。", "en": "Regression with posterior inference."},
+                "summary_i18n": {"zh": "贝叶斯回归摘要。", "en": "Bayesian regression summary."},
+                "scope_note_i18n": {"zh": "课程模型概念。", "en": "Course model concept."},
+                "aliases_i18n": {"zh": ["贝叶斯线性模型"], "en": ["Bayesian linear model"]},
+                "search_terms_i18n": {"zh": ["后验", "回归"], "en": ["posterior", "regression"]},
+            }
+        },
+    )
+
+    disabled_searchable = concept_searchable_text(concept, include_i18n=False)
+    assert "贝叶斯回归" not in disabled_searchable
+    assert "Bayesian Regression" in disabled_searchable
+
+    searchable = concept_searchable_text(concept, include_i18n=True)
+    assert "贝叶斯回归" in searchable
+    assert "后验" in searchable
+
+    concept.llm_audit_json["concept_i18n"]["status"] = "original_text_fallback"
+    fallback_searchable = concept_searchable_text(concept, include_i18n=True)
+    assert "贝叶斯回归" not in fallback_searchable
+    assert "Bayesian Regression" in fallback_searchable
 
 
 @pytest.mark.asyncio

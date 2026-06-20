@@ -9,10 +9,12 @@
 | 路径 | 职责 |
 | --- | --- |
 | `test_context_graph_pipeline.py` | fixed chunk、structure graph、chunk relation/RQ membership、mid/coarse、context package。 |
+| `test_auto_tpe.py` | 自动 TPE sampler、版本递增触发、hard gate 阻断和 active relation graph 绑定。 |
 | `test_cache_manager.py` | Redis cache miss/no-op 边界，防止进程内缓存替代共享 Redis。 |
 | `test_error_sanitizer.py` | 外部服务错误脱敏，防止 API key、Authorization header 或 provider 原始响应泄露。 |
 | `test_ingestion_logs.py` | 导入日志结构、阶段和状态文案契约。 |
 | `test_model_bridge.py` | 模型桥接配置、reload 和自指向防护。 |
+| `test_db_migrations.py` | Alembic schema、自动 TPE 表、旧表清理和 relation graph state 字段。 |
 | `test_routes_and_maintenance.py` | API routes、runtime settings、maintenance 与 reconciliation。 |
 | `test_*.py` | 其他后端回归测试。 |
 | `README.md` | 本测试说明。 |
@@ -25,6 +27,7 @@
 fixed token chunks
 -> structure graph
 -> contextual embedding/vector metadata
+-> automatic TPE bottom relation operating point
 -> chunk relation/RQ membership
 -> RQ L3 mid graph / RQ L2 coarse graph states
 -> layered retrieval trace

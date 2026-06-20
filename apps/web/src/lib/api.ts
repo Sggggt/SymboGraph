@@ -16,6 +16,7 @@
   JobStatusResponse,
   ModelSettingsResponse,
   ModelSettingsUpdate,
+  AutoTpeStatusResponse,
   ParseUploadedFilesRequest,
   QARequest,
   QAResponse,
@@ -460,6 +461,14 @@ export async function fetchJobStatus(jobId: string): Promise<JobStatusResponse> 
 export async function fetchBatchStatus(batchId: string): Promise<IngestionBatchSummary> {
   const response = await fetch(buildApiUrl(`/ingestion/batches/${encodeURIComponent(batchId)}`), { cache: "no-store", headers: authHeaders() });
   return parseResponse<IngestionBatchSummary>(response);
+}
+
+export async function fetchAutoTpeStatus(knowledgeBaseId: string): Promise<AutoTpeStatusResponse> {
+  const response = await fetch(buildApiUrl(`/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/graph-operating-point/auto-tpe/latest`), {
+    cache: "no-store",
+    headers: authHeaders(),
+  });
+  return parseResponse<AutoTpeStatusResponse>(response);
 }
 
 export async function fetchTaskStatus(runId: string): Promise<TaskStatusResponse> {

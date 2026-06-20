@@ -15,6 +15,7 @@
 | `app/core/config.py` | `.env`、runtime settings 和配置边界。 |
 | `app/services/ingestion.py` | 导入、解析、版本、取消和重建编排。 |
 | `app/services/context_graph.py` | 结构图、独立关系图、RQ address/membership、L3/L2 concept projection、layered retrieval 和 context package。 |
+| `app/services/auto_tpe.py` | chunk 最高版本递增时的自动 TPE 底层关系图工作点选择、trial 诊断和只读状态。 |
 | `app/services/agent_graph.py` | QA、typed action、Agent trace、citation verification 和 reward/policy audit。 |
 | `app/services/retrieval.py` | Layered search facade。 |
 | `app/services/runtime_settings.py` | `.env` 写入、Redis version broadcast、热加载。 |
@@ -46,6 +47,7 @@ upload / source files
 -> fixed token chunks
 -> chunk structure graph
 -> contextual embedding and vector index
+-> optional automatic TPE operating point selection on chunk-version increments
 -> independent chunk relation graph
 -> RQ prefix address tree and fuzzy membership
 -> RQ L3 mid concept graph / RQ L2 coarse concept graph
@@ -58,7 +60,7 @@ upload / source files
 
 ## 环境配置
 
-API 从仓库根目录 `.env` 和 `apps/api/.env` 读取配置。Docker Compose 会把服务端连接改成容器网络地址：
+API 从仓库根目录 `.env` 和 `apps/api/.env` 读取配置。Docker Compose 使用容器网络地址作为服务端连接：
 
 ```text
 DATABASE_URL=postgresql+psycopg://postgres:postgres@postgres:5432/symbograph
@@ -104,6 +106,8 @@ Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health
 | 模型桥接 | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT`, `MODEL_BRIDGE_ADMIN_TOKEN` |
 | Chunk / graph | `FIXED_CHUNK_SIZE_TOKENS`, `FIXED_CHUNK_OVERLAP_TOKENS`, `RQ_KMEANS_LEVELS`, `RQ_KMEANS_MAX_K`, `RQ_RESIDUAL_TAU` |
 | Dense relation operating point | `DENSE_KNN_K_MIN`, `DENSE_KNN_K_MAX`, `DENSE_REVERSE_B_MIN_BASE`, `DENSE_REVERSE_B_MAX_BASE`, `DENSE_REVERSE_B_MIN_DOC`, `DENSE_REVERSE_B_MAX_DOC`, `DENSE_REVERSE_B_MIN_LANG`, `DENSE_REVERSE_B_MAX_LANG`, `DENSE_MIN_COSINE`, `DENSE_STRONG_COSINE`, `CROSS_DOC_OUT_QUOTA_MIN`, `CROSS_DOC_OUT_QUOTA_MAX`, `CROSS_DOC_MIN_COSINE`, `CROSS_LANGUAGE_OUT_QUOTA_MIN`, `CROSS_LANGUAGE_OUT_QUOTA_MAX`, `CROSS_LANGUAGE_MIN_COSINE` |
+| Auto TPE operating point | `ENABLE_AUTO_TPE`, `TPE_TRIAL_BUDGET`, `TPE_STARTUP_RANDOM_TRIALS`, `TPE_GOOD_QUANTILE_GAMMA`, `TPE_PROBE_QUERY_BUDGET`, `TPE_TRIAL_TIMEOUT_SECONDS`, `TPE_CANDIDATE_POOL_SIZE` |
+| Operating point hard gate | `OPERATING_POINT_HARD_GATE_MAX_EDGE_DENSITY`, `OPERATING_POINT_HARD_GATE_MAX_ISOLATED_RATIO`, `OPERATING_POINT_HARD_GATE_MAX_HUBNESS_RATIO`, `OPERATING_POINT_HARD_GATE_MIN_STRUCTURE_RECOVERY_RATE`, `OPERATING_POINT_HARD_GATE_MAX_CANDIDATE_LATENCY_P95_MS` |
 | Agent envelope | `AGENT_COARSE_TOTAL_BUDGET`, `AGENT_MID_PER_COARSE_BUDGET`, `AGENT_MID_TOP_K`, `AGENT_CHUNK_PER_MID_BUDGET`, `AGENT_CHUNK_TOP_K`, `CANDIDATE_POOL_DEDUPE_BUDGET`, `AGENT_PATH_DISTANCE_GREEN_THRESHOLD`, `AGENT_PATH_DISTANCE_GRAY_THRESHOLD`, `AGENT_PATH_DISTANCE_HARD_THRESHOLD`, `AGENT_REPAIR_ROUND_BUDGET`, `AGENT_VERIFICATION_BUDGET` |
 | 运行边界 | `ENABLE_MODEL_FALLBACK`, `ENABLE_DATABASE_FALLBACK`, `MODEL_REQUEST_CONCURRENCY`, `MODEL_REQUEST_TIMEOUT_SECONDS` |
 

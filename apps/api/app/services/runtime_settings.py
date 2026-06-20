@@ -88,6 +88,13 @@ def read_env_float(key: str, default: float = 0.0) -> float:
         return default
 
 
+def read_env_bool(key: str, default: bool = False) -> bool:
+    value = _env_entries(ENV_PATH).get(key.upper())
+    if value is None:
+        return default
+    return value.strip().lower() in {"true", "1", "yes", "on"}
+
+
 def runtime_lifecycle_payload() -> dict:
     rebuild_required = [
         "fixed_chunk_size_tokens",
@@ -126,6 +133,19 @@ def runtime_lifecycle_payload() -> dict:
         "embedding_batch_size",
         "model_request_concurrency",
         "model_request_timeout_seconds",
+        "concept_i18n_enabled",
+        "enable_auto_tpe",
+        "tpe_trial_budget",
+        "tpe_startup_random_trials",
+        "tpe_good_quantile_gamma",
+        "tpe_probe_query_budget",
+        "tpe_trial_timeout_seconds",
+        "tpe_candidate_pool_size",
+        "operating_point_hard_gate_max_edge_density",
+        "operating_point_hard_gate_max_isolated_ratio",
+        "operating_point_hard_gate_max_hubness_ratio",
+        "operating_point_hard_gate_min_structure_recovery_rate",
+        "operating_point_hard_gate_max_candidate_latency_p95_ms",
         "context_package_token_budget",
         "agent_coarse_total_budget",
         "agent_mid_per_coarse_budget",
@@ -158,10 +178,10 @@ def runtime_lifecycle_payload() -> dict:
         "rebuild_required": rebuild_required,
         "service_recreate_required": service_recreate_required,
         "candidate_version_required_for": rebuild_required,
-        "promotion_gate": {
-            "required": True,
-            "stages": ["dry_run", "shadow_rebuild", "evaluation", "promotion"],
-            "hard_gates": ["graph_quality", "retrieval_quality", "citation_quality", "failure_rate", "observability"],
+        "operating_point_gate": {
+            "required": False,
+            "stages": ["automatic_lightweight_tpe", "single_active_relation_graph_write"],
+            "hard_gates": ["edge_density", "isolated_ratio", "hubness", "structure_recovery", "candidate_latency"],
         },
         "redaction": {
             "secret_fields": ["openai_api_key", "embedding_api_key", "model_bridge_admin_token", "api_keys"],
@@ -224,6 +244,28 @@ def model_settings_payload() -> dict:
         "cross_language_out_quota_min": read_env_int("CROSS_LANGUAGE_OUT_QUOTA_MIN", settings.cross_language_out_quota_min),
         "cross_language_out_quota_max": read_env_int("CROSS_LANGUAGE_OUT_QUOTA_MAX", settings.cross_language_out_quota_max),
         "cross_language_min_cosine": read_env_float("CROSS_LANGUAGE_MIN_COSINE", settings.cross_language_min_cosine),
+        "enable_auto_tpe": read_env_bool("ENABLE_AUTO_TPE", settings.enable_auto_tpe),
+        "tpe_trial_budget": read_env_int("TPE_TRIAL_BUDGET", settings.tpe_trial_budget),
+        "tpe_startup_random_trials": read_env_int("TPE_STARTUP_RANDOM_TRIALS", settings.tpe_startup_random_trials),
+        "tpe_good_quantile_gamma": read_env_float("TPE_GOOD_QUANTILE_GAMMA", settings.tpe_good_quantile_gamma),
+        "tpe_probe_query_budget": read_env_int("TPE_PROBE_QUERY_BUDGET", settings.tpe_probe_query_budget),
+        "tpe_trial_timeout_seconds": read_env_int("TPE_TRIAL_TIMEOUT_SECONDS", settings.tpe_trial_timeout_seconds),
+        "tpe_candidate_pool_size": read_env_int("TPE_CANDIDATE_POOL_SIZE", settings.tpe_candidate_pool_size),
+        "operating_point_hard_gate_max_edge_density": read_env_float(
+            "OPERATING_POINT_HARD_GATE_MAX_EDGE_DENSITY", settings.operating_point_hard_gate_max_edge_density
+        ),
+        "operating_point_hard_gate_max_isolated_ratio": read_env_float(
+            "OPERATING_POINT_HARD_GATE_MAX_ISOLATED_RATIO", settings.operating_point_hard_gate_max_isolated_ratio
+        ),
+        "operating_point_hard_gate_max_hubness_ratio": read_env_float(
+            "OPERATING_POINT_HARD_GATE_MAX_HUBNESS_RATIO", settings.operating_point_hard_gate_max_hubness_ratio
+        ),
+        "operating_point_hard_gate_min_structure_recovery_rate": read_env_float(
+            "OPERATING_POINT_HARD_GATE_MIN_STRUCTURE_RECOVERY_RATE", settings.operating_point_hard_gate_min_structure_recovery_rate
+        ),
+        "operating_point_hard_gate_max_candidate_latency_p95_ms": read_env_int(
+            "OPERATING_POINT_HARD_GATE_MAX_CANDIDATE_LATENCY_P95_MS", settings.operating_point_hard_gate_max_candidate_latency_p95_ms
+        ),
         "agent_coarse_total_budget": read_env_int("AGENT_COARSE_TOTAL_BUDGET", settings.agent_coarse_total_budget),
         "agent_mid_per_coarse_budget": read_env_int("AGENT_MID_PER_COARSE_BUDGET", settings.agent_mid_per_coarse_budget),
         "agent_mid_top_k": read_env_int("AGENT_MID_TOP_K", settings.agent_mid_top_k),
@@ -244,6 +286,7 @@ def model_settings_payload() -> dict:
         "agent_max_typed_actions_per_round": read_env_int("AGENT_MAX_TYPED_ACTIONS_PER_ROUND", settings.agent_max_typed_actions_per_round),
         "agent_repair_round_budget": read_env_int("AGENT_REPAIR_ROUND_BUDGET", settings.agent_repair_round_budget),
         "agent_verification_budget": read_env_int("AGENT_VERIFICATION_BUDGET", settings.agent_verification_budget),
+        "concept_i18n_enabled": read_env_bool("CONCEPT_I18N_ENABLED", settings.concept_i18n_enabled),
         "enable_model_fallback": settings.enable_model_fallback,
         "enable_database_fallback": settings.enable_database_fallback,
         "has_api_key": bool(settings.openai_api_key),
@@ -782,6 +825,8 @@ def update_model_settings(payload: dict) -> dict:
         "worker_concurrency": "worker_concurrency",
         "model_request_concurrency": "model_request_concurrency",
         "model_request_timeout_seconds": "model_request_timeout_seconds",
+        "concept_i18n_enabled": "concept_i18n_enabled",
+        "enable_auto_tpe": "enable_auto_tpe",
         "fixed_chunk_size_tokens": "fixed_chunk_size_tokens",
         "fixed_chunk_overlap_tokens": "fixed_chunk_overlap_tokens",
         "context_package_token_budget": "context_package_token_budget",
@@ -808,6 +853,17 @@ def update_model_settings(payload: dict) -> dict:
         "cross_language_out_quota_min": "cross_language_out_quota_min",
         "cross_language_out_quota_max": "cross_language_out_quota_max",
         "cross_language_min_cosine": "cross_language_min_cosine",
+        "tpe_trial_budget": "tpe_trial_budget",
+        "tpe_startup_random_trials": "tpe_startup_random_trials",
+        "tpe_good_quantile_gamma": "tpe_good_quantile_gamma",
+        "tpe_probe_query_budget": "tpe_probe_query_budget",
+        "tpe_trial_timeout_seconds": "tpe_trial_timeout_seconds",
+        "tpe_candidate_pool_size": "tpe_candidate_pool_size",
+        "operating_point_hard_gate_max_edge_density": "operating_point_hard_gate_max_edge_density",
+        "operating_point_hard_gate_max_isolated_ratio": "operating_point_hard_gate_max_isolated_ratio",
+        "operating_point_hard_gate_max_hubness_ratio": "operating_point_hard_gate_max_hubness_ratio",
+        "operating_point_hard_gate_min_structure_recovery_rate": "operating_point_hard_gate_min_structure_recovery_rate",
+        "operating_point_hard_gate_max_candidate_latency_p95_ms": "operating_point_hard_gate_max_candidate_latency_p95_ms",
         "agent_coarse_total_budget": "agent_coarse_total_budget",
         "agent_mid_per_coarse_budget": "agent_mid_per_coarse_budget",
         "agent_mid_top_k": "agent_mid_top_k",

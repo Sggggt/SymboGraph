@@ -76,6 +76,18 @@ ANSWER_PROMPT_PROTOCOL_VERSION = "context_graph_answer_v1"
 EDGE_DISTANCE_PROTOCOL_VERSION = "edge_distance_log_raw_strength_v1"
 EDGE_PROJECTION_PROTOCOL_VERSION = "edge_projection_support_ids_v1"
 TRAVERSAL_PROTOCOL_VERSION = "staged_layered_traversal_v2"
+CONCEPT_I18N_PROTOCOL_VERSION = "concept_i18n_bilingual_v1"
+
+
+@dataclass(frozen=True)
+class RelationEdgeCandidate:
+    source_chunk_id: str
+    target_chunk_id: str
+    edge_type: str
+    raw_strength: float
+    distance: float
+    features_json: dict[str, Any]
+    is_bridge: bool = False
 
 
 async def gather_bounded(items: list[Any], limit: int, fn: Any, on_result: Any | None = None) -> list[Any]:
@@ -920,30 +932,61 @@ def vector_for_chunk(db: Session, chunk_id: str) -> list[float]:
     return [float(value) for value in vector if isinstance(value, (int, float))]
 
 
-async def rebuild_context_graph(db: Session, knowledge_base_id: str, *, batch_id: str | None = None) -> ContextGraphState:
+async def rebuild_context_graph(
+    db: Session,
+    knowledge_base_id: str,
+    *,
+    batch_id: str | None = None,
+    state_scope: str = "active",
+    operating_point: dict[str, Any] | None = None,
+    shadow_metadata: dict[str, Any] | None = None,
+    emit_heartbeats: bool = True,
+    chunk_version_incremented: bool = False,
+) -> ContextGraphState:
     chunks = list(db.scalars(active_chunks_query(knowledge_base_id)).all())
     if not chunks:
         raise RuntimeError("Cannot rebuild context graph without current chunks")
-    context_graph_batch_heartbeat(batch_id, "starting", {"chunks": len(chunks)})
-    deactivate_derived_states(db, knowledge_base_id)
-    context_graph_batch_heartbeat(batch_id, "chunk_relation", {"chunks": len(chunks)})
-    relation_state = build_chunk_relation_graph(db, knowledge_base_id, chunks, batch_id=batch_id)
-    context_graph_batch_heartbeat(batch_id, "mid_concepts", dict(relation_state.stats_json or {}))
-    mid_state = await build_mid_concept_graph(db, knowledge_base_id, relation_state, batch_id=batch_id)
-    context_graph_batch_heartbeat(
-        batch_id,
-        "coarse_concepts",
-        {
-            "mid_concepts": (mid_state.stats_json or {}).get("mid_concept_count"),
-            "projected_rq_l3_prefixes": (mid_state.stats_json or {}).get("projected_rq_l3_prefixes"),
-            "mid_edge_count": (mid_state.stats_json or {}).get("mid_edge_count"),
-        },
+    if state_scope not in {"active", "shadow"}:
+        raise ValueError(f"Unsupported context graph state scope: {state_scope}")
+    heartbeat_batch_id = batch_id if emit_heartbeats else None
+    previous_relation_state = latest_relation_state(db, knowledge_base_id) if state_scope == "active" else None
+    if emit_heartbeats:
+        context_graph_batch_heartbeat(batch_id, "starting", {"chunks": len(chunks)})
+    if state_scope == "active":
+        deactivate_derived_states(db, knowledge_base_id)
+    if emit_heartbeats:
+        context_graph_batch_heartbeat(batch_id, "chunk_relation", {"chunks": len(chunks)})
+    relation_state = build_chunk_relation_graph(
+        db,
+        knowledge_base_id,
+        chunks,
+        batch_id=heartbeat_batch_id,
+        state_scope=state_scope,
+        operating_point=operating_point,
+        previous_operating_point=dict(previous_relation_state.graph_operating_point_json or {}) if previous_relation_state else None,
+        auto_tpe_enabled_for_version=state_scope == "active" and chunk_version_incremented,
+        shadow_metadata=shadow_metadata,
     )
-    coarse_state = await build_coarse_concept_graph(db, knowledge_base_id, mid_state, batch_id=batch_id)
-    context_graph_batch_heartbeat(batch_id, "context_state", dict(coarse_state.diagnostics_json or {}))
-    context_state = write_context_graph_state(db, knowledge_base_id, relation_state, mid_state, coarse_state, chunks)
+    if emit_heartbeats:
+        context_graph_batch_heartbeat(batch_id, "mid_concepts", dict(relation_state.stats_json or {}))
+    mid_state = await build_mid_concept_graph(db, knowledge_base_id, relation_state, batch_id=heartbeat_batch_id, state_scope=state_scope, shadow_metadata=shadow_metadata)
+    if emit_heartbeats:
+        context_graph_batch_heartbeat(
+            batch_id,
+            "coarse_concepts",
+            {
+                "mid_concepts": (mid_state.stats_json or {}).get("mid_concept_count"),
+                "projected_rq_l3_prefixes": (mid_state.stats_json or {}).get("projected_rq_l3_prefixes"),
+                "mid_edge_count": (mid_state.stats_json or {}).get("mid_edge_count"),
+            },
+        )
+    coarse_state = await build_coarse_concept_graph(db, knowledge_base_id, mid_state, batch_id=heartbeat_batch_id, state_scope=state_scope, shadow_metadata=shadow_metadata)
+    if emit_heartbeats:
+        context_graph_batch_heartbeat(batch_id, "context_state", dict(coarse_state.diagnostics_json or {}))
+    context_state = write_context_graph_state(db, knowledge_base_id, relation_state, mid_state, coarse_state, chunks, state_scope=state_scope, shadow_metadata=shadow_metadata)
     db.flush()
-    context_graph_batch_heartbeat(batch_id, "completed", dict(context_state.stats_json or {}))
+    if emit_heartbeats:
+        context_graph_batch_heartbeat(batch_id, "completed", dict(context_state.stats_json or {}))
     return context_state
 
 
@@ -952,27 +995,98 @@ def context_graph_batch_heartbeat(batch_id: str | None, phase: str, metrics: dic
         return
     from app.db import SessionLocal
     from app.models import IngestionBatch
+    from app.services.ingestion_logs import emit_ingestion_log
 
-    with SessionLocal() as session:
-        batch = session.get(IngestionBatch, batch_id)
-        if batch is None:
-            return
-        now = datetime.utcnow()
-        stats = dict(batch.stats or {})
-        stats["phase"] = "context_graph"
-        stats["context_graph_phase"] = phase
-        stats["context_graph_heartbeat_at"] = now.isoformat()
-        if metrics is not None:
-            stats["context_graph_metrics"] = metrics
-        batch.stats = stats
-        batch.heartbeat_at = now
-        session.commit()
+    metrics_payload = dict(metrics or {})
+    try:
+        with SessionLocal() as session:
+            batch = session.get(IngestionBatch, batch_id)
+            if batch is None:
+                return
+            now = datetime.utcnow()
+            stats = dict(batch.stats or {})
+            stats["phase"] = "context_graph"
+            stats["context_graph_phase"] = phase
+            stats["context_graph_heartbeat_at"] = now.isoformat()
+            if metrics is not None:
+                stats["context_graph_metrics"] = metrics_payload
+            batch.stats = stats
+            batch.heartbeat_at = now
+            session.commit()
+    except Exception:
+        pass
+    reserved_log_keys = {"batch_id", "event", "log_id", "message", "phase", "timestamp", "context_graph_phase"}
+    log_payload = {key: value for key, value in metrics_payload.items() if key not in reserved_log_keys}
+    log_payload["phase"] = f"context_graph:{phase}"
+    log_payload["context_graph_phase"] = phase
+    emit_ingestion_log(batch_id, "batch_graph_progress", context_graph_heartbeat_message(phase, metrics_payload), **log_payload)
 
 
-def build_chunk_relation_graph(db: Session, knowledge_base_id: str, chunks: list[Chunk], *, batch_id: str | None = None) -> ChunkRelationGraphState:
+def context_graph_heartbeat_message(phase: str, metrics: dict[str, Any]) -> str:
+    phase_labels = {
+        "starting": "上下文图谱初始化",
+        "chunk_relation": "片段关系图",
+        "chunk_relation:chunk_edges": "关系边生成",
+        "chunk_relation:rq_prefixes": "RQ 前缀与归属",
+        "mid_concepts": "中粒度概念",
+        "coarse_concepts": "粗粒度概念",
+        "context_state": "Context Graph 状态",
+        "completed": "图谱闭环完成",
+    }
+    translation_labels = {
+        "concept_i18n": "节点双语派生",
+        "edge_i18n": "关系双语派生",
+    }
+    phase_label = phase_labels.get(phase, phase.replace("_", " "))
+    translation_phase = metrics.get("translation_phase")
+    if isinstance(translation_phase, str) and translation_phase:
+        translation_label = translation_labels.get(translation_phase, translation_phase.replace("_", " "))
+        item_count = metrics.get("translation_items")
+        item_suffix = f"，{item_count} 项" if isinstance(item_count, (int, float)) else ""
+        if metrics.get("translation_status") == "disabled" or metrics.get("translation_enabled") is False:
+            skip_suffix = f" {item_count} 项" if isinstance(item_count, (int, float)) else ""
+            return f"{phase_label}：{translation_label}已关闭，跳过{skip_suffix}"
+        return f"{phase_label}：{translation_label}{item_suffix}"
+    return f"{phase_label}：进度更新"
+
+
+def build_chunk_relation_graph(
+    db: Session,
+    knowledge_base_id: str,
+    chunks: list[Chunk],
+    *,
+    batch_id: str | None = None,
+    state_scope: str = "active",
+    operating_point: dict[str, Any] | None = None,
+    previous_operating_point: dict[str, Any] | None = None,
+    auto_tpe_enabled_for_version: bool = False,
+    shadow_metadata: dict[str, Any] | None = None,
+) -> ChunkRelationGraphState:
     scope_hash = compute_chunk_scope_hash(chunks)
     vectors = {chunk.id: vector_for_chunk(db, chunk.id) for chunk in chunks}
-    operating_point = dense_graph_operating_point()
+    tpe_context: dict[str, Any] = {}
+    if operating_point is None:
+        fallback_operating_point = previous_operating_point or dense_graph_operating_point()
+        if state_scope == "active":
+            from app.services.auto_tpe import select_auto_tpe_operating_point
+
+            operating_point, tpe_context = select_auto_tpe_operating_point(
+                db,
+                knowledge_base_id,
+                chunks,
+                vectors,
+                fallback_operating_point=fallback_operating_point,
+                batch_id=batch_id,
+                chunk_version_incremented=auto_tpe_enabled_for_version,
+            )
+        else:
+            operating_point = fallback_operating_point
+    state_diagnostics = dict(shadow_metadata or {})
+    if tpe_context:
+        state_diagnostics["auto_tpe"] = tpe_context
+    if state_scope == "shadow":
+        state_diagnostics["shadow_scope"] = True
+    runtime_hash = stable_hash(runtime_settings_snapshot())
     graph_state = ChunkRelationGraphState(
         knowledge_base_id=knowledge_base_id,
         chunk_version=max(chunk.chunk_version for chunk in chunks),
@@ -984,10 +1098,13 @@ def build_chunk_relation_graph(db: Session, knowledge_base_id: str, chunks: list
         relation_protocol_version=RELATION_PROTOCOL_VERSION,
         edge_distance_protocol_hash=edge_distance_protocol_hash(),
         edge_type_calibration_protocol_hash=edge_type_calibration_protocol_hash(),
+        runtime_settings_hash=runtime_hash,
+        auto_tpe_run_id=tpe_context.get("run_id"),
+        auto_tpe_best_trial_id=tpe_context.get("best_trial_id"),
         active_chunk_ids_json=[chunk.id for chunk in chunks],
         stats_json={},
-        diagnostics_json={},
-        state="active",
+        diagnostics_json=state_diagnostics,
+        state=state_scope,
     )
     db.add(graph_state)
     db.flush()
@@ -1012,6 +1129,10 @@ def build_chunk_relation_graph(db: Session, knowledge_base_id: str, chunks: list
     graph_state.state_hash = stable_hash({"scope": scope_hash, "stats": stats, "rq_prefixes": [prefix.id for prefix in rq_prefixes], "operating_point": operating_point})
     for edge in edges.values():
         edge.graph_state_hash = graph_state.state_hash
+    if tpe_context.get("run_id"):
+        from app.services.auto_tpe import mark_auto_tpe_relation_state
+
+        mark_auto_tpe_relation_state(db, str(tpe_context["run_id"]), graph_state.id)
     return graph_state
 
 
@@ -1039,7 +1160,7 @@ def dense_graph_operating_point() -> dict[str, Any]:
     settings = get_settings()
     return {
         "protocol": "dense_dynamic_knn_bridge_quota_v1",
-        "optimizer": "tpe_shadow_operating_point_ready",
+        "optimizer": "auto_tpe_lightweight_or_default",
         "dense_knn_k_min": int(settings.dense_knn_k_min),
         "dense_knn_k_max": int(settings.dense_knn_k_max),
         "dense_reverse_b_min_base": int(settings.dense_reverse_b_min_base),
@@ -1147,18 +1268,52 @@ def add_chunk_relation_edge(
     return edge
 
 
-def add_relation_edges(
+def _upsert_relation_candidate(
+    candidates: dict[tuple[str, str, str], RelationEdgeCandidate],
+    source_chunk_id: str,
+    target_chunk_id: str,
+    edge_type: str,
+    raw_strength: float,
+    features: dict[str, Any],
+    *,
+    is_bridge: bool = False,
+) -> None:
+    if source_chunk_id == target_chunk_id:
+        return
+    left, right = sorted([source_chunk_id, target_chunk_id])
+    key = (left, right, edge_type)
+    strength = normalized_strength(raw_strength)
+    existing = candidates.get(key)
+    if existing is not None:
+        merged_strength = max(existing.raw_strength, strength)
+        candidates[key] = RelationEdgeCandidate(
+            source_chunk_id=left,
+            target_chunk_id=right,
+            edge_type=edge_type,
+            raw_strength=merged_strength,
+            distance=distance_from_strength(merged_strength),
+            features_json={**existing.features_json, **features},
+            is_bridge=existing.is_bridge or is_bridge,
+        )
+        return
+    candidates[key] = RelationEdgeCandidate(
+        source_chunk_id=left,
+        target_chunk_id=right,
+        edge_type=edge_type,
+        raw_strength=strength,
+        distance=distance_from_strength(strength),
+        features_json=features,
+        is_bridge=is_bridge,
+    )
+
+
+def relation_edge_candidates(
     db: Session,
-    graph_state: ChunkRelationGraphState,
     chunks: list[Chunk],
     vectors: dict[str, list[float]],
-    edges: dict[tuple[str, str, str], ChunkRelationEdge],
-) -> None:
-    def add(source: Chunk, target: Chunk, edge_type: str, weight: float, features: dict | None = None, *, is_bridge: bool = False) -> None:
-        add_chunk_relation_edge(db, graph_state, source.id, target.id, edge_type, weight, features, edges, is_bridge=is_bridge)
-
+    operating_point: dict[str, Any],
+) -> tuple[dict[tuple[str, str, str], RelationEdgeCandidate], dict[str, Any]]:
     documents = {doc.id: doc for doc in db.scalars(select(Document).where(Document.id.in_({chunk.document_id for chunk in chunks}))).all()}
-    operating_point = dict(graph_state.graph_operating_point_json or dense_graph_operating_point())
     strong_threshold = float(operating_point.get("dense_strong_cosine") or 0.72)
     type_thresholds = {
         "dense_semantic": float(operating_point.get("dense_min_cosine") or 0.30),
@@ -1185,6 +1340,7 @@ def add_relation_edges(
     chunk_by_id = {chunk.id: chunk for chunk in chunks}
     mass_by_id = {chunk.id: node_mass(chunk) for chunk in chunks}
     candidate_intents: dict[tuple[str, str, str], dict[str, Any]] = {}
+    candidates: dict[tuple[str, str, str], RelationEdgeCandidate] = {}
 
     def channel_for(source: Chunk, target: Chunk, *, requested_type: str | None = None) -> str:
         source_language = language_for(source)
@@ -1233,8 +1389,8 @@ def add_relation_edges(
                 ],
             ),
         ]
-        for requested_type, limit, candidates in channels:
-            for score, target in candidates[:limit]:
+        for requested_type, limit, channel_candidates in channels:
+            for score, target in channel_candidates[:limit]:
                 edge_type = channel_for(source, target, requested_type=requested_type)
                 key = (source.id, target.id, edge_type)
                 existing = candidate_intents.get(key)
@@ -1272,9 +1428,10 @@ def add_relation_edges(
         is_cross_document = source.document_id != target.document_id
         is_cross_language = language_for(source) != "unknown" and language_for(target) != "unknown" and language_for(source) != language_for(target)
         bridge_reason = "cross_language_dense_quota" if edge_type == "dense_cross_language_bridge" else "cross_document_dense_quota" if edge_type == "dense_cross_document_bridge" else None
-        add(
-            source,
-            target,
+        _upsert_relation_candidate(
+            candidates,
+            source.id,
+            target.id,
             edge_type,
             raw_strength,
             {
@@ -1302,25 +1459,53 @@ def add_relation_edges(
         inbound_counts[inbound_key] += 1
         accepted_types[edge_type] += 1
 
+    diagnostics: dict[str, Any] = {}
     if chunks and not accepted_types:
-        graph_state.diagnostics_json = {
-            **(graph_state.diagnostics_json or {}),
-            "dense_relation_graph_blocked": {
-                "reason": "no_dense_candidate_passed_thresholds",
-                "candidate_count": len(candidate_intents),
-                "thresholds": type_thresholds,
-            },
+        diagnostics["dense_relation_graph_blocked"] = {
+            "reason": "no_dense_candidate_passed_thresholds",
+            "candidate_count": len(candidate_intents),
+            "thresholds": type_thresholds,
         }
-    final_edge_types = Counter(edge.edge_type for edge in edges.values())
+    final_edge_types = Counter(candidate.edge_type for candidate in candidates.values())
+    diagnostics.update(
+        {
+            "structure_edges_active_in_relation_graph": False,
+            "structure_context_restore_source": "chunk_structure_graph",
+            "relation_edge_protocol": "dense_only",
+            "rq_pair_edges_active": False,
+            "rq_pair_diagnostics_only": True,
+            "accepted_edge_types": dict(final_edge_types),
+            "accepted_edge_attempts": dict(accepted_types),
+            "candidate_intent_count": len(candidate_intents),
+        }
+    )
+    return candidates, diagnostics
+
+
+def add_relation_edges(
+    db: Session,
+    graph_state: ChunkRelationGraphState,
+    chunks: list[Chunk],
+    vectors: dict[str, list[float]],
+    edges: dict[tuple[str, str, str], ChunkRelationEdge],
+) -> None:
+    operating_point = dict(graph_state.graph_operating_point_json or dense_graph_operating_point())
+    candidates, diagnostics = relation_edge_candidates(db, chunks, vectors, operating_point)
+    for candidate in candidates.values():
+        add_chunk_relation_edge(
+            db,
+            graph_state,
+            candidate.source_chunk_id,
+            candidate.target_chunk_id,
+            candidate.edge_type,
+            candidate.raw_strength,
+            candidate.features_json,
+            edges,
+            is_bridge=candidate.is_bridge,
+        )
     graph_state.diagnostics_json = {
         **(graph_state.diagnostics_json or {}),
-        "structure_edges_active_in_relation_graph": False,
-        "structure_context_restore_source": "chunk_structure_graph",
-        "relation_edge_protocol": "dense_only",
-        "rq_pair_edges_active": False,
-        "rq_pair_diagnostics_only": True,
-        "accepted_edge_types": dict(final_edge_types),
-        "accepted_edge_attempts": dict(accepted_types),
+        **diagnostics,
     }
     db.flush()
 
@@ -1520,12 +1705,13 @@ def build_rq_kmeans_clusters_and_edges(
             representative_chunk_ids_json=representatives,
             support_chunk_ids_json=member_ids,
             bridge_chunk_ids_json=[chunk_id for chunk_id in member_ids if chunk_id in bridge_chunk_ids],
+            state=graph_state.state,
             stats_json={
                 "member_count": len(member_ids),
                 "residual_norm_mean": round(sum(residual_norms) / max(len(residual_norms), 1), 6),
                 "residual_norm_max": round(max(residual_norms or [0.0]), 6),
             },
-            diagnostics_json={"source": "rq_kmeans", "residual_mean_vector": residual_mean},
+            diagnostics_json={"source": "rq_kmeans", "residual_mean_vector": residual_mean, **({"shadow_scope": True} if graph_state.state == "shadow" else {})},
         )
         db.add(cluster)
         db.flush()
@@ -1858,9 +2044,17 @@ STOP_TERMS = {
 }
 
 
-async def build_mid_concept_graph(db: Session, knowledge_base_id: str, relation_state: ChunkRelationGraphState, *, batch_id: str | None = None) -> MidConceptState:
+async def build_mid_concept_graph(
+    db: Session,
+    knowledge_base_id: str,
+    relation_state: ChunkRelationGraphState,
+    *,
+    batch_id: str | None = None,
+    state_scope: str = "active",
+    shadow_metadata: dict[str, Any] | None = None,
+) -> MidConceptState:
     settings = get_settings()
-    all_prefixes = list(db.scalars(select(RQPrefix).where(RQPrefix.graph_state_id == relation_state.id, RQPrefix.state == "active")).all())
+    all_prefixes = list(db.scalars(select(RQPrefix).where(RQPrefix.graph_state_id == relation_state.id, RQPrefix.state == state_scope)).all())
     clusters = [prefix for prefix in all_prefixes if int(prefix.rq_level or 0) == RQ_LEVELS]
     if all_prefixes and not clusters:
         available_levels = sorted({int(prefix.rq_level or 0) for prefix in all_prefixes})
@@ -1874,8 +2068,8 @@ async def build_mid_concept_graph(db: Session, knowledge_base_id: str, relation_
         grounding_hash=grounding_hash,
         prompt_protocol_version=MID_CONCEPT_PROMPT_VERSION,
         stats_json={},
-        diagnostics_json={},
-        state="active",
+        diagnostics_json={**(shadow_metadata or {}), **({"shadow_scope": True} if state_scope == "shadow" else {})},
+        state=state_scope,
     )
     db.add(state)
     db.flush()
@@ -1926,10 +2120,33 @@ async def build_mid_concept_graph(db: Session, knowledge_base_id: str, relation_
             "mid_concepts",
             {"completed_llm_batches": batch_index, "llm_batches": total_batches, "created_mid_concepts": len(concepts)},
         )
+    concept_i18n_metrics = {
+        "translation_phase": "concept_i18n",
+        "translation_items": len(concepts),
+        "translation_enabled": settings.concept_i18n_enabled,
+    }
+    if settings.concept_i18n_enabled:
+        context_graph_batch_heartbeat(batch_id, "mid_concepts", concept_i18n_metrics)
+        concept_i18n_stats = await enrich_concepts_i18n(concepts, layer="mid")
+    else:
+        context_graph_batch_heartbeat(batch_id, "mid_concepts", {**concept_i18n_metrics, "translation_status": "disabled"})
+        concept_i18n_stats = disabled_concept_i18n_stats(len(concepts), layer="mid", target="concept")
     normalize_concept_node_weights(concepts, "mid_concept_state")
     build_mid_concept_edges(db, state, concepts)
     db.flush()
     mid_edges = list(db.scalars(select(MidConceptEdge).where(MidConceptEdge.concept_state_id == state.id)).all())
+    edge_i18n_metrics = {
+        "translation_phase": "edge_i18n",
+        "translation_items": len(mid_edges),
+        "translation_enabled": settings.concept_i18n_enabled,
+    }
+    if settings.concept_i18n_enabled:
+        context_graph_batch_heartbeat(batch_id, "mid_concepts", edge_i18n_metrics)
+        edge_i18n_stats = await enrich_concept_edges_i18n(mid_edges, {concept.id: concept for concept in concepts}, layer="mid")
+    else:
+        context_graph_batch_heartbeat(batch_id, "mid_concepts", {**edge_i18n_metrics, "translation_status": "disabled"})
+        edge_i18n_stats = disabled_concept_i18n_stats(len(mid_edges), layer="mid", target="edge")
+    db.flush()
     supported_mid_edges = sum(1 for edge in mid_edges if edge.support_chunk_edge_ids_json or edge.support_relation_edge_ids_json)
     stats = {
         "mid_concept_count": len(concepts),
@@ -1941,9 +2158,13 @@ async def build_mid_concept_graph(db: Session, knowledge_base_id: str, relation_
         "projected_rq_l3_prefixes": len(concepts),
         "rq_l3_to_mid_projection_coverage": round(len(concepts) / max(len(clusters), 1), 6) if clusters else 1.0,
         "llm_batches": len(packet_batches),
+        "concept_i18n_enabled": bool(settings.concept_i18n_enabled),
+        "concept_i18n_translated_count": concept_i18n_stats.get("translated_count", 0),
+        "edge_i18n_translated_count": edge_i18n_stats.get("translated_count", 0),
     }
     state.stats_json = stats
     state.diagnostics_json = {
+        **(state.diagnostics_json or {}),
         "candidate_keep_threshold_ignored_for_coverage": settings.mid_concept_candidate_keep_threshold,
         "configured_max_model_batches_ignored_for_coverage": settings.mid_concept_extraction_max_model_batches,
         "max_candidates_per_batch": settings.mid_concept_extraction_max_candidates_per_batch,
@@ -1952,6 +2173,8 @@ async def build_mid_concept_graph(db: Session, knowledge_base_id: str, relation_
         "target_leaf_level": target_leaf_level,
         "l3_available": bool(clusters) or not all_prefixes,
         "edge_projection_protocol": EDGE_PROJECTION_PROTOCOL_VERSION,
+        "concept_i18n": concept_i18n_stats,
+        "edge_i18n": edge_i18n_stats,
     }
     state.state_hash = stable_hash({"concepts": [concept.id for concept in concepts], "stats": stats, "diagnostics": state.diagnostics_json})
     return state
@@ -2019,6 +2242,7 @@ def write_mid_concept_from_output(
             "confidence": confidence_diagnostics,
         },
         grounding_hash=stable_hash({"cluster": cluster.id, "chunks": support_chunks}),
+        state=state.state,
     )
     db.add(concept)
     db.flush()
@@ -2310,15 +2534,23 @@ def build_mid_concept_edges(db: Session, state: MidConceptState, concepts: list[
             )
 
 
-async def build_coarse_concept_graph(db: Session, knowledge_base_id: str, mid_state: MidConceptState, *, batch_id: str | None = None) -> CoarseConceptState:
-    mid_concepts = list(db.scalars(select(MidConcept).where(MidConcept.concept_state_id == mid_state.id, MidConcept.state == "active")).all())
+async def build_coarse_concept_graph(
+    db: Session,
+    knowledge_base_id: str,
+    mid_state: MidConceptState,
+    *,
+    batch_id: str | None = None,
+    state_scope: str = "active",
+    shadow_metadata: dict[str, Any] | None = None,
+) -> CoarseConceptState:
+    mid_concepts = list(db.scalars(select(MidConcept).where(MidConcept.concept_state_id == mid_state.id, MidConcept.state == state_scope)).all())
     mid_edges = list(db.scalars(select(MidConceptEdge).where(MidConceptEdge.concept_state_id == mid_state.id)).all())
     l2_prefixes = list(
         db.scalars(
             select(RQPrefix)
             .where(
                 RQPrefix.graph_state_id == mid_state.chunk_relation_graph_state_id,
-                RQPrefix.state == "active",
+                RQPrefix.state == state_scope,
                 RQPrefix.rq_level == 2,
             )
             .order_by(RQPrefix.rq_prefix_key.asc())
@@ -2329,7 +2561,7 @@ async def build_coarse_concept_graph(db: Session, knowledge_base_id: str, mid_st
     for child in db.scalars(
         select(RQPrefix).where(
             RQPrefix.graph_state_id == mid_state.chunk_relation_graph_state_id,
-            RQPrefix.state == "active",
+            RQPrefix.state == state_scope,
             RQPrefix.rq_level == 3,
             RQPrefix.parent_rq_prefix_id.is_not(None),
         )
@@ -2344,8 +2576,8 @@ async def build_coarse_concept_graph(db: Session, knowledge_base_id: str, mid_st
         grounding_hash=grounding_hash,
         prompt_protocol_version=COARSE_CONCEPT_PROMPT_VERSION,
         stats_json={},
-        diagnostics_json={},
-        state="active",
+        diagnostics_json={**(shadow_metadata or {}), **({"shadow_scope": True} if state_scope == "shadow" else {})},
+        state=state_scope,
     )
     db.add(state)
     db.flush()
@@ -2427,7 +2659,8 @@ async def build_coarse_concept_graph(db: Session, knowledge_base_id: str, mid_st
             }
         )
 
-    model_concurrency = get_settings().model_request_concurrency
+    settings = get_settings()
+    model_concurrency = settings.model_request_concurrency
     context_graph_batch_heartbeat(
         batch_id,
         "coarse_concepts",
@@ -2515,6 +2748,7 @@ async def build_coarse_concept_graph(db: Session, knowledge_base_id: str, mid_st
                 "confidence": confidence_diagnostics,
             },
             grounding_hash=stable_hash({"rq_l2_prefix": l2_prefix.id, "mid": mid_ids, "chunks": support_chunks}),
+            state=state.state,
         )
         db.add(coarse)
         db.flush()
@@ -2535,6 +2769,17 @@ async def build_coarse_concept_graph(db: Session, knowledge_base_id: str, mid_st
                 )
         )
         coarse_concepts.append(coarse)
+    concept_i18n_metrics = {
+        "translation_phase": "concept_i18n",
+        "translation_items": len(coarse_concepts),
+        "translation_enabled": settings.concept_i18n_enabled,
+    }
+    if settings.concept_i18n_enabled:
+        context_graph_batch_heartbeat(batch_id, "coarse_concepts", concept_i18n_metrics)
+        concept_i18n_stats = await enrich_concepts_i18n(coarse_concepts, layer="coarse")
+    else:
+        context_graph_batch_heartbeat(batch_id, "coarse_concepts", {**concept_i18n_metrics, "translation_status": "disabled"})
+        concept_i18n_stats = disabled_concept_i18n_stats(len(coarse_concepts), layer="coarse", target="concept")
     normalize_concept_node_weights(coarse_concepts, "coarse_concept_state")
     chunk_edges = list(
         db.scalars(select(ChunkRelationEdge).where(ChunkRelationEdge.graph_state_id == mid_state.chunk_relation_graph_state_id)).all()
@@ -2631,6 +2876,18 @@ async def build_coarse_concept_graph(db: Session, knowledge_base_id: str, mid_st
             )
     db.flush()
     coarse_edges = list(db.scalars(select(CoarseConceptEdge).where(CoarseConceptEdge.coarse_state_id == state.id)).all())
+    edge_i18n_metrics = {
+        "translation_phase": "edge_i18n",
+        "translation_items": len(coarse_edges),
+        "translation_enabled": settings.concept_i18n_enabled,
+    }
+    if settings.concept_i18n_enabled:
+        context_graph_batch_heartbeat(batch_id, "coarse_concepts", edge_i18n_metrics)
+        edge_i18n_stats = await enrich_concept_edges_i18n(coarse_edges, {concept.id: concept for concept in coarse_concepts}, layer="coarse")
+    else:
+        context_graph_batch_heartbeat(batch_id, "coarse_concepts", {**edge_i18n_metrics, "translation_status": "disabled"})
+        edge_i18n_stats = disabled_concept_i18n_stats(len(coarse_edges), layer="coarse", target="edge")
+    db.flush()
     supported_coarse_edges = sum(1 for edge in coarse_edges if edge.support_chunk_edge_ids_json)
     stats = {
         "coarse_concept_count": len(coarse_concepts),
@@ -2642,10 +2899,14 @@ async def build_coarse_concept_graph(db: Session, knowledge_base_id: str, mid_st
         "coarse_edge_support_chunk_edge_coverage": round(supported_coarse_edges / max(len(coarse_edges), 1), 6) if coarse_edges else 1.0,
         "bridge_concept_count": sum(len(item.bridge_mid_concept_ids_json or []) for item in coarse_concepts),
         "singleton_rate": round(sum(1 for item in coarse_concepts if len(item.included_mid_concept_ids_json or []) <= 1) / max(len(coarse_concepts), 1), 6),
+        "concept_i18n_enabled": bool(settings.concept_i18n_enabled),
+        "concept_i18n_translated_count": concept_i18n_stats.get("translated_count", 0),
+        "edge_i18n_translated_count": edge_i18n_stats.get("translated_count", 0),
     }
     community_diagnostics = coarse_community_diagnostics(mid_concepts, mid_edges, [community for _prefix, community in communities])
     state.stats_json = stats
     state.diagnostics_json = {
+        **(state.diagnostics_json or {}),
         "community_detection": "rq_l2_prefix_projection_v1",
         "legacy_label_bucket_active": False,
         "connected_components_used_as_final": False,
@@ -2653,8 +2914,10 @@ async def build_coarse_concept_graph(db: Session, knowledge_base_id: str, mid_st
         "projected_rq_l2_prefix_ids": [prefix.id for prefix, _community in communities],
         **community_diagnostics,
         "bridge_density": round(stats["bridge_concept_count"] / max(stats["mid_concept_count"], 1), 6),
+        "concept_i18n": concept_i18n_stats,
+        "edge_i18n": edge_i18n_stats,
     }
-    state.state_hash = stable_hash({"coarse": [concept.id for concept in coarse_concepts], "stats": stats})
+    state.state_hash = stable_hash({"coarse": [concept.id for concept in coarse_concepts], "stats": stats, "diagnostics": state.diagnostics_json})
     return state
 
 
@@ -2832,6 +3095,9 @@ def write_context_graph_state(
     mid_state: MidConceptState,
     coarse_state: CoarseConceptState,
     chunks: list[Chunk],
+    *,
+    state_scope: str = "active",
+    shadow_metadata: dict[str, Any] | None = None,
 ) -> ContextGraphState:
     structure_hash = stable_hash(
         [
@@ -2854,6 +3120,8 @@ def write_context_graph_state(
             "coarse": coarse_state.state_hash,
             "runtime_settings": runtime_settings_state_hash(),
             "agent_operating_envelope": agent_operating_envelope_state_hash(),
+            "state_scope": state_scope,
+            "shadow_metadata": shadow_metadata or {},
         }
     )
     state = ContextGraphState(
@@ -2878,8 +3146,8 @@ def write_context_graph_state(
             "mid_concepts": db.scalar(select(func.count(MidConcept.id)).where(MidConcept.concept_state_id == mid_state.id)) or 0,
             "coarse_concepts": db.scalar(select(func.count(CoarseConcept.id)).where(CoarseConcept.coarse_state_id == coarse_state.id)) or 0,
         },
-        diagnostics_json={"protocol": CONTEXT_GRAPH_PROTOCOL_VERSION},
-        state="active",
+        diagnostics_json={**(shadow_metadata or {}), "protocol": CONTEXT_GRAPH_PROTOCOL_VERSION, **({"shadow_scope": True} if state_scope == "shadow" else {})},
+        state=state_scope,
     )
     db.add(state)
     db.flush()
@@ -3011,7 +3279,7 @@ def select_coarse_entries(db: Session, knowledge_base_id: str, query_facets: dic
         return {}
     concepts = db.scalars(select(CoarseConcept).where(CoarseConcept.coarse_state_id == state.id, CoarseConcept.state == "active")).all()
     envelope = agent_operating_envelope()
-    scores = _text_entry_score({concept.id: f"{concept.canonical_label} {concept.definition}" for concept in concepts}, query_facets["terms"], top_n=envelope["agent_coarse_total_budget"])
+    scores = _text_entry_score({concept.id: concept_searchable_text(concept) for concept in concepts}, query_facets["terms"], top_n=envelope["agent_coarse_total_budget"])
     if scores or not concepts:
         return scores
     supported = sorted(
@@ -3028,7 +3296,7 @@ def select_mid_entries(db: Session, knowledge_base_id: str, query_facets: dict[s
         return {}
     concepts = list(db.scalars(select(MidConcept).where(MidConcept.concept_state_id == state.id, MidConcept.state == "active")).all())
     envelope = agent_operating_envelope()
-    scores = _text_entry_score({concept.id: f"{concept.canonical_label} {concept.definition}" for concept in concepts}, query_facets["terms"], top_n=envelope["agent_mid_top_k"])
+    scores = _text_entry_score({concept.id: concept_searchable_text(concept) for concept in concepts}, query_facets["terms"], top_n=envelope["agent_mid_top_k"])
     coarse_ids = set(coarse_entries)
     if coarse_ids:
         coarse_concepts = db.scalars(select(CoarseConcept).where(CoarseConcept.id.in_(coarse_ids))).all()
@@ -3096,6 +3364,278 @@ def _text_entry_score(text_by_id: dict[str, str], query_terms: list[str], *, top
         if overlap:
             scored.append((item_id, min(1.0, overlap / max(len(query_set), 1))))
     return dict(sorted(scored, key=lambda item: item[1], reverse=True)[:top_n])
+
+
+def _chunked(items: list[Any], size: int) -> list[list[Any]]:
+    width = max(1, int(size or 1))
+    return [items[index : index + width] for index in range(0, len(items), width)]
+
+
+def _language_map(raw: Any, fallback_text: str = "") -> dict[str, str]:
+    payload = raw if isinstance(raw, dict) else {}
+    return {
+        "zh": str(payload.get("zh") or fallback_text or "").strip(),
+        "en": str(payload.get("en") or fallback_text or "").strip(),
+    }
+
+
+def _language_list_map(raw: Any, fallback_items: list[str] | None = None) -> dict[str, list[str]]:
+    payload = raw if isinstance(raw, dict) else {}
+
+    def values_for(key: str) -> list[str]:
+        values = payload.get(key)
+        if not isinstance(values, list):
+            values = fallback_items or []
+        return [str(value).strip() for value in values if str(value).strip()]
+
+    return {"zh": values_for("zh"), "en": values_for("en")}
+
+
+def concept_i18n_payload(concept: Any) -> dict[str, Any]:
+    payload = (getattr(concept, "llm_audit_json", None) or {}).get("concept_i18n")
+    return payload if isinstance(payload, dict) else {}
+
+
+def concept_searchable_text(concept: Any, *, include_i18n: bool | None = None) -> str:
+    if include_i18n is None:
+        include_i18n = bool(get_settings().concept_i18n_enabled)
+    fields: list[str] = [
+        str(getattr(concept, "canonical_label", "") or ""),
+        str(getattr(concept, "definition", "") or ""),
+        str(getattr(concept, "summary", "") or ""),
+        str(getattr(concept, "scope_note", "") or ""),
+        *[str(item) for item in (getattr(concept, "aliases_json", None) or [])],
+        *[str(item) for item in (getattr(concept, "display_terms_json", None) or [])],
+    ]
+    i18n = concept_i18n_payload(concept)
+    if include_i18n and i18n.get("status") == "ok":
+        for key in ("label_i18n", "definition_i18n", "summary_i18n", "scope_note_i18n"):
+            value = i18n.get(key)
+            if isinstance(value, dict):
+                fields.extend(str(item) for item in value.values())
+        for key in ("aliases_i18n", "search_terms_i18n"):
+            value = i18n.get(key)
+            if isinstance(value, dict):
+                for items in value.values():
+                    if isinstance(items, list):
+                        fields.extend(str(item) for item in items)
+    return " ".join(field for field in fields if field)
+
+
+def disabled_concept_i18n_stats(item_count: int, *, layer: str, target: str) -> dict[str, Any]:
+    return {
+        "protocol_version": CONCEPT_I18N_PROTOCOL_VERSION,
+        "enabled": False,
+        "status": "disabled",
+        "layer": layer,
+        f"{target}_count": item_count,
+        "translated_count": 0,
+        "fallback_count": 0,
+    }
+
+
+def _concept_i18n_fallback(concept: Any, layer: str) -> dict[str, Any]:
+    label = str(getattr(concept, "canonical_label", "") or "")
+    definition = str(getattr(concept, "definition", "") or "")
+    summary = str(getattr(concept, "summary", "") or definition)
+    scope_note = str(getattr(concept, "scope_note", "") or "")
+    aliases = [str(item) for item in (getattr(concept, "aliases_json", None) or [])]
+    return {
+        "id": getattr(concept, "id", None),
+        "layer": layer,
+        "protocol_version": CONCEPT_I18N_PROTOCOL_VERSION,
+        "status": "original_text_fallback",
+        "label_i18n": {"zh": label, "en": label},
+        "aliases_i18n": {"zh": aliases, "en": aliases},
+        "definition_i18n": {"zh": definition, "en": definition},
+        "summary_i18n": {"zh": summary, "en": summary},
+        "scope_note_i18n": {"zh": scope_note, "en": scope_note},
+        "search_terms_i18n": {"zh": [], "en": []},
+    }
+
+
+def _edge_i18n_fallback(edge: Any, source_label: str, target_label: str, layer: str) -> dict[str, Any]:
+    explanation = str(getattr(edge, "explanation", "") or "")
+    relation = f"{source_label} -> {target_label}"
+    return {
+        "id": getattr(edge, "id", None),
+        "layer": layer,
+        "protocol_version": CONCEPT_I18N_PROTOCOL_VERSION,
+        "status": "original_text_fallback",
+        "relation_label_i18n": {"zh": relation, "en": relation},
+        "explanation_i18n": {"zh": explanation, "en": explanation},
+        "summary_i18n": {"zh": explanation, "en": explanation},
+        "search_terms_i18n": {"zh": [], "en": []},
+    }
+
+
+def _normalize_concept_i18n_item(raw: dict[str, Any], concept: Any, layer: str, *, fallback_status: str | None = None) -> dict[str, Any]:
+    fallback = _concept_i18n_fallback(concept, layer)
+    status = str(raw.get("status") or fallback_status or "ok")
+    return {
+        "id": getattr(concept, "id", None),
+        "layer": layer,
+        "protocol_version": CONCEPT_I18N_PROTOCOL_VERSION,
+        "status": status,
+        "label_i18n": _language_map(raw.get("label_i18n"), str(getattr(concept, "canonical_label", "") or "")),
+        "aliases_i18n": _language_list_map(raw.get("aliases_i18n"), list(getattr(concept, "aliases_json", None) or [])),
+        "definition_i18n": _language_map(raw.get("definition_i18n"), str(getattr(concept, "definition", "") or "")),
+        "summary_i18n": _language_map(raw.get("summary_i18n"), str(getattr(concept, "summary", "") or getattr(concept, "definition", "") or "")),
+        "scope_note_i18n": _language_map(raw.get("scope_note_i18n"), str(getattr(concept, "scope_note", "") or "")),
+        "search_terms_i18n": _language_list_map(raw.get("search_terms_i18n"), []),
+        "fallback_source": fallback["status"] if status != "ok" else None,
+    }
+
+
+def _normalize_edge_i18n_item(raw: dict[str, Any], edge: Any, source_label: str, target_label: str, layer: str, *, fallback_status: str | None = None) -> dict[str, Any]:
+    fallback = _edge_i18n_fallback(edge, source_label, target_label, layer)
+    status = str(raw.get("status") or fallback_status or "ok")
+    return {
+        "id": getattr(edge, "id", None),
+        "layer": layer,
+        "protocol_version": CONCEPT_I18N_PROTOCOL_VERSION,
+        "status": status,
+        "relation_label_i18n": _language_map(raw.get("relation_label_i18n"), f"{source_label} -> {target_label}"),
+        "explanation_i18n": _language_map(raw.get("explanation_i18n"), str(getattr(edge, "explanation", "") or "")),
+        "summary_i18n": _language_map(raw.get("summary_i18n"), str(getattr(edge, "explanation", "") or "")),
+        "search_terms_i18n": _language_list_map(raw.get("search_terms_i18n"), []),
+        "fallback_source": fallback["status"] if status != "ok" else None,
+    }
+
+
+async def enrich_concepts_i18n(concepts: list[Any], *, layer: str, batch_size: int = 12) -> dict[str, Any]:
+    if not concepts:
+        return {"protocol_version": CONCEPT_I18N_PROTOCOL_VERSION, "enabled": True, "concept_count": 0, "translated_count": 0}
+    settings = get_settings()
+    batches = _chunked(concepts, batch_size)
+
+    async def translate_batch(batch: list[Any]) -> list[dict[str, Any]]:
+        items = [
+            {
+                "id": concept.id,
+                "label": concept.canonical_label,
+                "aliases": concept.aliases_json or [],
+                "definition": concept.definition,
+                "summary": concept.summary,
+                "scope_note": concept.scope_note,
+            }
+            for concept in batch
+        ]
+        fallback = {"items": [_concept_i18n_fallback(concept, layer) for concept in batch]}
+        system = (
+            "You translate derived concept metadata for a grounded Four-Layer Context Graph RAG system. "
+            "Return strict JSON with an items array. For every input item, preserve id and provide: "
+            "label_i18n {zh,en}, aliases_i18n {zh,en arrays}, definition_i18n {zh,en}, summary_i18n {zh,en}, "
+            "scope_note_i18n {zh,en}, search_terms_i18n {zh,en arrays}. "
+            "Translate technical terms accurately, keep formulas/symbols unchanged, and do not add facts beyond the source text."
+        )
+        output = await ChatProvider().classify_json(system_prompt=system, user_prompt=str({"layer": layer, "items": items}), fallback=fallback)
+        output_items = output.get("items") if isinstance(output, dict) else None
+        if not isinstance(output_items, list):
+            if settings.enable_model_fallback:
+                output_items = fallback["items"]
+            else:
+                raise RuntimeError(f"{layer} concept i18n provider returned invalid JSON; missing items array")
+        by_id = {str(item.get("id")): item for item in output_items if isinstance(item, dict) and item.get("id")}
+        normalized: list[dict[str, Any]] = []
+        for concept in batch:
+            raw = by_id.get(str(concept.id))
+            if raw is None:
+                if not settings.enable_model_fallback:
+                    raise RuntimeError(f"{layer} concept i18n provider omitted concept {concept.id}")
+                raw = _concept_i18n_fallback(concept, layer)
+            normalized.append(_normalize_concept_i18n_item(raw, concept, layer))
+        return normalized
+
+    translated_batches = await gather_bounded(batches, settings.model_request_concurrency, translate_batch)
+    payloads = [payload for batch in translated_batches for payload in batch]
+    payload_by_id = {payload["id"]: payload for payload in payloads}
+    for concept in concepts:
+        concept.llm_audit_json = {
+            **(concept.llm_audit_json or {}),
+            "concept_i18n": payload_by_id.get(concept.id, _concept_i18n_fallback(concept, layer)),
+        }
+    translated_count = sum(1 for payload in payloads if payload.get("status") == "ok")
+    return {
+        "protocol_version": CONCEPT_I18N_PROTOCOL_VERSION,
+        "enabled": True,
+        "concept_count": len(concepts),
+        "translated_count": translated_count,
+        "fallback_count": len(concepts) - translated_count,
+        "hash": stable_hash(payloads),
+    }
+
+
+async def enrich_concept_edges_i18n(edges: list[Any], concepts_by_id: dict[str, Any], *, layer: str, batch_size: int = 16) -> dict[str, Any]:
+    if not edges:
+        return {"protocol_version": CONCEPT_I18N_PROTOCOL_VERSION, "enabled": True, "edge_count": 0, "translated_count": 0}
+    settings = get_settings()
+    batches = _chunked(edges, batch_size)
+
+    def edge_labels(edge: Any) -> tuple[str, str]:
+        source = concepts_by_id.get(getattr(edge, "source_concept_id", ""))
+        target = concepts_by_id.get(getattr(edge, "target_concept_id", ""))
+        return str(getattr(source, "canonical_label", "") or ""), str(getattr(target, "canonical_label", "") or "")
+
+    async def translate_batch(batch: list[Any]) -> list[dict[str, Any]]:
+        items = []
+        fallbacks = []
+        for edge in batch:
+            source_label, target_label = edge_labels(edge)
+            items.append(
+                {
+                    "id": edge.id,
+                    "source_label": source_label,
+                    "target_label": target_label,
+                    "edge_type": edge.edge_type,
+                    "explanation": edge.explanation,
+                }
+            )
+            fallbacks.append(_edge_i18n_fallback(edge, source_label, target_label, layer))
+        fallback = {"items": fallbacks}
+        system = (
+            "You translate derived concept-edge metadata for a grounded Four-Layer Context Graph RAG system. "
+            "Return strict JSON with an items array. For every input item, preserve id and provide: "
+            "relation_label_i18n {zh,en}, explanation_i18n {zh,en}, summary_i18n {zh,en}, search_terms_i18n {zh,en arrays}. "
+            "Translate only the relationship wording; keep evidence meaning, formulas, and technical symbols unchanged."
+        )
+        output = await ChatProvider().classify_json(system_prompt=system, user_prompt=str({"layer": layer, "items": items}), fallback=fallback)
+        output_items = output.get("items") if isinstance(output, dict) else None
+        if not isinstance(output_items, list):
+            if settings.enable_model_fallback:
+                output_items = fallback["items"]
+            else:
+                raise RuntimeError(f"{layer} edge i18n provider returned invalid JSON; missing items array")
+        by_id = {str(item.get("id")): item for item in output_items if isinstance(item, dict) and item.get("id")}
+        normalized: list[dict[str, Any]] = []
+        for edge in batch:
+            source_label, target_label = edge_labels(edge)
+            raw = by_id.get(str(edge.id))
+            if raw is None:
+                if not settings.enable_model_fallback:
+                    raise RuntimeError(f"{layer} edge i18n provider omitted edge {edge.id}")
+                raw = _edge_i18n_fallback(edge, source_label, target_label, layer)
+            normalized.append(_normalize_edge_i18n_item(raw, edge, source_label, target_label, layer))
+        return normalized
+
+    translated_batches = await gather_bounded(batches, settings.model_request_concurrency, translate_batch)
+    payloads = [payload for batch in translated_batches for payload in batch]
+    payload_by_id = {payload["id"]: payload for payload in payloads}
+    for edge in edges:
+        source_label, target_label = edge_labels(edge)
+        edge.diagnostics_json = {
+            **(edge.diagnostics_json or {}),
+            "edge_i18n": payload_by_id.get(edge.id, _edge_i18n_fallback(edge, source_label, target_label, layer)),
+        }
+    translated_count = sum(1 for payload in payloads if payload.get("status") == "ok")
+    return {
+        "protocol_version": CONCEPT_I18N_PROTOCOL_VERSION,
+        "enabled": True,
+        "edge_count": len(edges),
+        "translated_count": translated_count,
+        "fallback_count": len(edges) - translated_count,
+        "hash": stable_hash(payloads),
+    }
 
 
 def _edge_raw_strength(edge: Any) -> float:
@@ -3459,7 +3999,7 @@ def execute_priority_queue_traversal(
         if coarse_state
         else []
     )
-    coarse_text = {concept.id: f"{concept.canonical_label} {concept.definition}" for concept in coarse_concepts}
+    coarse_text = {concept.id: concept_searchable_text(concept) for concept in coarse_concepts}
     coarse_edges = list(db.scalars(select(CoarseConceptEdge).where(CoarseConceptEdge.coarse_state_id == coarse_state.id)).all()) if coarse_state else []
     layer_walks["coarse"] = execute_layer_priority_walk(
         layer="coarse",
@@ -3489,7 +4029,7 @@ def execute_priority_queue_traversal(
     )
     mid_by_id = {concept.id: concept for concept in mid_concepts}
     coarse_by_id = {concept.id: concept for concept in coarse_concepts}
-    mid_text = {concept.id: f"{concept.canonical_label} {concept.definition} {concept.scope_note}" for concept in mid_concepts}
+    mid_text = {concept.id: concept_searchable_text(concept) for concept in mid_concepts}
     accepted_coarse_ids = list(layer_walks["coarse"].get("accepted_nodes") or []) or list(coarse_entries.keys())[: int(envelope["agent_coarse_total_budget"])]
     mid_candidate_scores: dict[str, float] = {}
     for coarse_id in accepted_coarse_ids:

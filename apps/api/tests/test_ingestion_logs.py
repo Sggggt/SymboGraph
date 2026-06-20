@@ -5,7 +5,8 @@ from datetime import datetime
 
 def test_ingestion_logs_are_persisted_and_replayed(db_session, sample_knowledge_base):
     from app.models import IngestionBatch
-    from app.services.ingestion_logs import emit_ingestion_log, list_ingestion_logs, subscribe_ingestion_logs, unsubscribe_ingestion_logs
+    from app.schemas import BatchLogTokenResponse
+    from app.services.ingestion_logs import create_log_stream_token, emit_ingestion_log, list_ingestion_logs, subscribe_ingestion_logs, unsubscribe_ingestion_logs
 
     batch = IngestionBatch(
         knowledge_base_id=sample_knowledge_base.id,
@@ -26,3 +27,7 @@ def test_ingestion_logs_are_persisted_and_replayed(db_session, sample_knowledge_
         assert history[-1]["event"] == "batch_completed"
     finally:
         unsubscribe_ingestion_logs(batch.id, subscriber)
+    token_payload = create_log_stream_token(batch.id)
+    validated = BatchLogTokenResponse.model_validate(token_payload)
+    assert validated.batch_id == batch.id
+    assert validated.token

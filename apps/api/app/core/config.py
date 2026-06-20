@@ -29,6 +29,7 @@ HOT_RELOAD_SETTINGS = {
     "fixed_chunk_overlap_tokens",
     "context_package_token_budget",
     "enable_model_fallback",
+    "concept_i18n_enabled",
     "mid_concept_extraction_max_model_batches",
     "mid_concept_extraction_max_candidates_per_batch",
     "mid_concept_extraction_max_tokens_per_batch",
@@ -52,6 +53,18 @@ HOT_RELOAD_SETTINGS = {
     "cross_language_out_quota_min",
     "cross_language_out_quota_max",
     "cross_language_min_cosine",
+    "enable_auto_tpe",
+    "tpe_trial_budget",
+    "tpe_startup_random_trials",
+    "tpe_good_quantile_gamma",
+    "tpe_probe_query_budget",
+    "tpe_trial_timeout_seconds",
+    "tpe_candidate_pool_size",
+    "operating_point_hard_gate_max_edge_density",
+    "operating_point_hard_gate_max_isolated_ratio",
+    "operating_point_hard_gate_max_hubness_ratio",
+    "operating_point_hard_gate_min_structure_recovery_rate",
+    "operating_point_hard_gate_max_candidate_latency_p95_ms",
     "agent_coarse_total_budget",
     "agent_mid_per_coarse_budget",
     "agent_mid_top_k",
@@ -130,6 +143,7 @@ class Settings(BaseSettings):
     fixed_chunk_overlap_tokens: int = Field(default=80, ge=0, le=1024)
     context_package_token_budget: int = Field(default=2400, ge=256, le=20000)
     enable_model_fallback: bool = False
+    concept_i18n_enabled: bool = False
     mid_concept_extraction_max_model_batches: int = Field(default=4, ge=0, le=64)
     mid_concept_extraction_max_candidates_per_batch: int = Field(default=8, ge=1, le=500)
     mid_concept_extraction_max_tokens_per_batch: int = Field(default=2400, ge=500, le=50000)
@@ -153,6 +167,18 @@ class Settings(BaseSettings):
     cross_language_out_quota_min: int = Field(default=1, ge=0, le=200)
     cross_language_out_quota_max: int = Field(default=4, ge=1, le=500)
     cross_language_min_cosine: float = Field(default=0.34, ge=-1.0, le=1.0)
+    enable_auto_tpe: bool = False
+    tpe_trial_budget: int = Field(default=6, ge=1, le=200)
+    tpe_startup_random_trials: int = Field(default=3, ge=1, le=100)
+    tpe_good_quantile_gamma: float = Field(default=0.25, gt=0.0, lt=1.0)
+    tpe_probe_query_budget: int = Field(default=6, ge=1, le=200)
+    tpe_trial_timeout_seconds: int = Field(default=30, ge=1, le=3600)
+    tpe_candidate_pool_size: int = Field(default=24, ge=1, le=500)
+    operating_point_hard_gate_max_edge_density: float = Field(default=24.0, gt=0.0, le=1000.0)
+    operating_point_hard_gate_max_isolated_ratio: float = Field(default=0.35, ge=0.0, le=1.0)
+    operating_point_hard_gate_max_hubness_ratio: float = Field(default=12.0, ge=1.0, le=1000.0)
+    operating_point_hard_gate_min_structure_recovery_rate: float = Field(default=0.25, ge=0.0, le=1.0)
+    operating_point_hard_gate_max_candidate_latency_p95_ms: int = Field(default=30000, ge=10, le=600000)
     agent_coarse_total_budget: int = Field(default=8, ge=1, le=200)
     agent_mid_per_coarse_budget: int = Field(default=8, ge=1, le=500)
     agent_mid_top_k: int = Field(default=16, ge=1, le=500)
@@ -241,6 +267,8 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
     bool_fields = {
         "model_bridge_enabled",
         "enable_model_fallback",
+        "concept_i18n_enabled",
+        "enable_auto_tpe",
     }
     int_fields = {
         "model_bridge_port",
@@ -268,6 +296,12 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "cross_doc_out_quota_max",
         "cross_language_out_quota_min",
         "cross_language_out_quota_max",
+        "tpe_trial_budget",
+        "tpe_startup_random_trials",
+        "tpe_probe_query_budget",
+        "tpe_trial_timeout_seconds",
+        "tpe_candidate_pool_size",
+        "operating_point_hard_gate_max_candidate_latency_p95_ms",
         "agent_coarse_total_budget",
         "agent_mid_per_coarse_budget",
         "agent_mid_top_k",
@@ -291,6 +325,11 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "dense_strong_cosine",
         "cross_doc_min_cosine",
         "cross_language_min_cosine",
+        "tpe_good_quantile_gamma",
+        "operating_point_hard_gate_max_edge_density",
+        "operating_point_hard_gate_max_isolated_ratio",
+        "operating_point_hard_gate_max_hubness_ratio",
+        "operating_point_hard_gate_min_structure_recovery_rate",
         "agent_max_cycle_reward_per_path",
         "agent_cycle_reward_distance_threshold",
         "agent_path_distance_green_threshold",
@@ -307,6 +346,7 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "FIXED_CHUNK_SIZE_TOKENS": "fixed_chunk_size_tokens",
         "FIXED_CHUNK_OVERLAP_TOKENS": "fixed_chunk_overlap_tokens",
         "CONTEXT_PACKAGE_TOKEN_BUDGET": "context_package_token_budget",
+        "CONCEPT_I18N_ENABLED": "concept_i18n_enabled",
         "MID_CONCEPT_EXTRACTION_MAX_MODEL_BATCHES": "mid_concept_extraction_max_model_batches",
         "MID_CONCEPT_EXTRACTION_MAX_CANDIDATES_PER_BATCH": "mid_concept_extraction_max_candidates_per_batch",
         "MID_CONCEPT_EXTRACTION_MAX_TOKENS_PER_BATCH": "mid_concept_extraction_max_tokens_per_batch",
@@ -330,6 +370,18 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "CROSS_LANGUAGE_OUT_QUOTA_MIN": "cross_language_out_quota_min",
         "CROSS_LANGUAGE_OUT_QUOTA_MAX": "cross_language_out_quota_max",
         "CROSS_LANGUAGE_MIN_COSINE": "cross_language_min_cosine",
+        "ENABLE_AUTO_TPE": "enable_auto_tpe",
+        "TPE_TRIAL_BUDGET": "tpe_trial_budget",
+        "TPE_STARTUP_RANDOM_TRIALS": "tpe_startup_random_trials",
+        "TPE_GOOD_QUANTILE_GAMMA": "tpe_good_quantile_gamma",
+        "TPE_PROBE_QUERY_BUDGET": "tpe_probe_query_budget",
+        "TPE_TRIAL_TIMEOUT_SECONDS": "tpe_trial_timeout_seconds",
+        "TPE_CANDIDATE_POOL_SIZE": "tpe_candidate_pool_size",
+        "OPERATING_POINT_HARD_GATE_MAX_EDGE_DENSITY": "operating_point_hard_gate_max_edge_density",
+        "OPERATING_POINT_HARD_GATE_MAX_ISOLATED_RATIO": "operating_point_hard_gate_max_isolated_ratio",
+        "OPERATING_POINT_HARD_GATE_MAX_HUBNESS_RATIO": "operating_point_hard_gate_max_hubness_ratio",
+        "OPERATING_POINT_HARD_GATE_MIN_STRUCTURE_RECOVERY_RATE": "operating_point_hard_gate_min_structure_recovery_rate",
+        "OPERATING_POINT_HARD_GATE_MAX_CANDIDATE_LATENCY_P95_MS": "operating_point_hard_gate_max_candidate_latency_p95_ms",
         "AGENT_COARSE_TOTAL_BUDGET": "agent_coarse_total_budget",
         "AGENT_MID_PER_COARSE_BUDGET": "agent_mid_per_coarse_budget",
         "AGENT_MID_TOP_K": "agent_mid_top_k",

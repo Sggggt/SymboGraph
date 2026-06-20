@@ -46,6 +46,41 @@ async def test_knowledge_base_summary_includes_active_graph_state(db_session, po
     assert validated.can_full_reparse is True
 
 
+def test_uploaded_staging_job_is_listed_as_pending_until_batch_starts(db_session, sample_knowledge_base):
+    from app.core.config import get_settings
+    from app.services.ingestion import create_job, create_uploaded_files_batch, list_knowledge_base_files, register_uploaded_file
+
+    storage_root = get_settings().knowledge_base_paths_for_name(sample_knowledge_base.name)["storage_root"]
+    storage_root.mkdir(parents=True, exist_ok=True)
+    source_path = storage_root / "complex-network.md"
+    source_path.write_text("# Complex network\n\nA source waiting for parse.\n", encoding="utf-8")
+
+    document, upload_job = register_uploaded_file(db_session, sample_knowledge_base, source_path)
+    assert upload_job.status == "queued"
+    assert upload_job.batch_id is None
+
+    files = list_knowledge_base_files(db_session, sample_knowledge_base.id)
+    uploaded_item = next(item for item in files if item["source_path"] == str(source_path))
+    assert uploaded_item["document_id"] == document.id
+    assert uploaded_item["status"] == "pending"
+    assert uploaded_item["batch_id"] is None
+
+    batch = create_uploaded_files_batch(db_session, sample_knowledge_base.id, [source_path])
+    create_job(
+        db_session,
+        knowledge_base_id=sample_knowledge_base.id,
+        document_id=document.id,
+        trigger_source="upload",
+        batch_id=batch.id,
+        source_path=str(source_path),
+    )
+
+    files = list_knowledge_base_files(db_session, sample_knowledge_base.id)
+    batched_item = next(item for item in files if item["source_path"] == str(source_path))
+    assert batched_item["status"] == "parsing"
+    assert batched_item["batch_id"] == batch.id
+
+
 @pytest.mark.asyncio
 async def test_search_route_commits_retrieval_trace(db_session, populated_context_graph):
     from sqlalchemy import func, select
@@ -266,6 +301,7 @@ def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch)
     assert payload["fixed_chunk_size_tokens"] == 512
     assert payload["fixed_chunk_overlap_tokens"] == 80
     assert payload["context_package_token_budget"] == 2400
+    assert payload["concept_i18n_enabled"] is False
     assert payload["agent_coarse_total_budget"] > 0
     assert payload["agent_chunk_top_k"] > 0
     assert "lifecycle" in payload
@@ -348,10 +384,12 @@ def test_update_model_settings_reloads_model_bridge(monkeypatch, tmp_path):
     monkeypatch.setattr(runtime_settings, "reload_model_bridge", fake_reload_model_bridge)
     get_settings.cache_clear()
 
-    result = runtime_settings.update_model_settings({"embedding_base_url": "https://embedding.example.test/v2"})
+    result = runtime_settings.update_model_settings({"embedding_base_url": "https://embedding.example.test/v2", "concept_i18n_enabled": True})
 
     assert reload_calls
     assert reload_calls[-1]["EMBEDDING_BASE_URL"] == "https://embedding.example.test/v2"
+    assert reload_calls[-1]["CONCEPT_I18N_ENABLED"] == "true"
+    assert result["concept_i18n_enabled"] is True
     assert result["model_bridge_status"]["last_reload"]["ok"] is True
 
 
@@ -513,6 +551,7 @@ def test_celery_owned_batches_are_not_finalized_on_api_restart():
 def test_context_graph_heartbeat_updates_batch_stats(db_session, sample_knowledge_base):
     from app.models import IngestionBatch
     from app.services.context_graph import context_graph_batch_heartbeat
+    from app.services.ingestion_logs import list_ingestion_logs
 
     batch = IngestionBatch(
         knowledge_base_id=sample_knowledge_base.id,
@@ -531,6 +570,27 @@ def test_context_graph_heartbeat_updates_batch_stats(db_session, sample_knowledg
     assert batch.stats["phase"] == "context_graph"
     assert batch.stats["context_graph_phase"] == "mid_concepts"
     assert batch.stats["context_graph_metrics"]["relation_edges"] == 3
+    logs = list_ingestion_logs(batch.id)
+    assert logs[-1]["event"] == "batch_graph_progress"
+    assert logs[-1]["message"] == "中粒度概念：进度更新"
+    assert logs[-1]["phase"] == "context_graph:mid_concepts"
+    assert logs[-1]["relation_edges"] == 3
+    context_graph_batch_heartbeat(batch.id, "coarse_concepts", {"translation_phase": "edge_i18n", "translation_items": 12})
+    db_session.refresh(batch)
+    logs = list_ingestion_logs(batch.id)
+    assert logs[-1]["message"] == "粗粒度概念：关系双语派生，12 项"
+    assert logs[-1]["phase"] == "context_graph:coarse_concepts"
+    assert logs[-1]["translation_phase"] == "edge_i18n"
+    assert logs[-1]["translation_items"] == 12
+    context_graph_batch_heartbeat(
+        batch.id,
+        "coarse_concepts",
+        {"translation_phase": "concept_i18n", "translation_items": 4, "translation_enabled": False, "translation_status": "disabled"},
+    )
+    logs = list_ingestion_logs(batch.id)
+    assert logs[-1]["message"] == "粗粒度概念：节点双语派生已关闭，跳过 4 项"
+    assert logs[-1]["translation_enabled"] is False
+    assert logs[-1]["translation_status"] == "disabled"
 
 
 def test_cleanup_stale_data_deletes_inactive_chunk_versions_only_with_explicit_flag(db_session, sample_knowledge_base):

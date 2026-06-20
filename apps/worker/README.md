@@ -34,6 +34,8 @@ flowchart LR
     API["API enqueue"] --> R["Redis broker"]
     R --> W["course-kg-worker"]
     W --> S["API service layer"]
+    S --> T["Auto TPE operating point"]
+    T --> PG
     S --> PG["PostgreSQL"]
     S --> Q["Qdrant"]
     S --> V["Vector records"]
@@ -46,6 +48,7 @@ Worker 执行：
 - 文件解析与固定 token chunk。
 - Chunk Structure Graph、坐标和映射。
 - Contextual embedding 和 Qdrant upsert。
+- chunk 最高版本递增时的自动 TPE 底层关系图工作点选择。
 - Chunk Relation Graph、RQ address/membership、RQ L3 Mid Concept Graph、RQ L2 Coarse Concept Graph、Context Graph state。
 - 批次取消、补偿记录、可重试失败和 heartbeat。
 

@@ -310,8 +310,72 @@ export interface RebuildGraphResponse {
   stats?: Record<string, unknown>;
 }
 
+export interface AutoTpeTrialSummary {
+  trial_id: string;
+  run_id: string;
+  trial_index: number;
+  status: string;
+  theta_hash?: string | null;
+  sampler_state_hash?: string | null;
+  candidate_adjacency_hash?: string | null;
+  probe_set_hash?: string | null;
+  objective_score?: number | null;
+  hard_gate?: Record<string, unknown>;
+  objective_components?: Record<string, unknown>;
+  failure_code?: string | null;
+  diagnostics?: Record<string, unknown>;
+  started_at?: string | null;
+  finished_at?: string | null;
+}
+
+export interface AutoTpeRunSummary {
+  run_id: string;
+  knowledge_base_id: string;
+  batch_id?: string | null;
+  chunk_relation_graph_state_id?: string | null;
+  chunk_version: number;
+  chunk_scope_hash?: string | null;
+  graph_operating_point_protocol?: string | null;
+  protocol_hash?: string | null;
+  chat_model?: string | null;
+  embedding_model?: string | null;
+  embedding_text_version?: string | null;
+  status: string;
+  trigger_reason?: string | null;
+  trial_budget?: number;
+  startup_random_trials?: number;
+  good_quantile_gamma?: number | null;
+  probe_query_budget?: number;
+  candidate_pool_size?: number;
+  best_trial_id?: string | null;
+  best_objective_score?: number | null;
+  selected_theta_hash?: string | null;
+  selected_theta?: Record<string, unknown>;
+  sampler_state_hash?: string | null;
+  probe_set_hash?: string | null;
+  hard_gate?: Record<string, unknown>;
+  objective_components?: Record<string, unknown>;
+  last_error?: string | null;
+  failure_code?: string | null;
+  blocking_reasons?: string[];
+  runtime_settings_hash?: string | null;
+  diagnostics?: Record<string, unknown>;
+  trials?: AutoTpeTrialSummary[];
+  created_at?: string | null;
+  updated_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+export interface AutoTpeStatusResponse {
+  knowledge_base_id: string;
+  current_chunk_version?: number;
+  enabled?: boolean;
+  latest_run?: AutoTpeRunSummary | null;
+}
+
 export interface BatchLogTokenResponse {
-  batch_id?: string;
+  batch_id: string;
   token: string;
   expires_at: string;
 }
@@ -364,6 +428,7 @@ export interface ModelSettingsResponse {
   worker_concurrency?: number;
   model_request_concurrency?: number;
   model_request_timeout_seconds?: number;
+  concept_i18n_enabled?: boolean;
   fixed_chunk_size_tokens?: number;
   fixed_chunk_overlap_tokens?: number;
   context_package_token_budget?: number;
@@ -392,6 +457,18 @@ export interface ModelSettingsResponse {
   cross_language_out_quota_min?: number;
   cross_language_out_quota_max?: number;
   cross_language_min_cosine?: number;
+  enable_auto_tpe?: boolean;
+  tpe_trial_budget?: number;
+  tpe_startup_random_trials?: number;
+  tpe_good_quantile_gamma?: number;
+  tpe_probe_query_budget?: number;
+  tpe_trial_timeout_seconds?: number;
+  tpe_candidate_pool_size?: number;
+  operating_point_hard_gate_max_edge_density?: number;
+  operating_point_hard_gate_max_isolated_ratio?: number;
+  operating_point_hard_gate_max_hubness_ratio?: number;
+  operating_point_hard_gate_min_structure_recovery_rate?: number;
+  operating_point_hard_gate_max_candidate_latency_p95_ms?: number;
   agent_coarse_total_budget?: number;
   agent_mid_per_coarse_budget?: number;
   agent_mid_top_k?: number;
@@ -422,7 +499,7 @@ export interface ModelSettingsResponse {
     hot_reloadable?: string[];
     rebuild_required?: string[];
     service_recreate_required?: string[];
-    promotion_gate?: Record<string, unknown>;
+    operating_point_gate?: Record<string, unknown>;
     redaction?: Record<string, unknown>;
     [key: string]: unknown;
   };
@@ -473,6 +550,7 @@ export interface ModelSettingsUpdate {
   worker_concurrency?: number | null;
   model_request_concurrency?: number | null;
   model_request_timeout_seconds?: number | null;
+  concept_i18n_enabled?: boolean | null;
   fixed_chunk_size_tokens?: number | null;
   fixed_chunk_overlap_tokens?: number | null;
   context_package_token_budget?: number | null;
@@ -500,6 +578,18 @@ export interface ModelSettingsUpdate {
   cross_language_out_quota_min?: number | null;
   cross_language_out_quota_max?: number | null;
   cross_language_min_cosine?: number | null;
+  enable_auto_tpe?: boolean | null;
+  tpe_trial_budget?: number | null;
+  tpe_startup_random_trials?: number | null;
+  tpe_good_quantile_gamma?: number | null;
+  tpe_probe_query_budget?: number | null;
+  tpe_trial_timeout_seconds?: number | null;
+  tpe_candidate_pool_size?: number | null;
+  operating_point_hard_gate_max_edge_density?: number | null;
+  operating_point_hard_gate_max_isolated_ratio?: number | null;
+  operating_point_hard_gate_max_hubness_ratio?: number | null;
+  operating_point_hard_gate_min_structure_recovery_rate?: number | null;
+  operating_point_hard_gate_max_candidate_latency_p95_ms?: number | null;
   agent_coarse_total_budget?: number | null;
   agent_mid_per_coarse_budget?: number | null;
   agent_mid_top_k?: number | null;
@@ -559,8 +649,28 @@ export interface IngestionLogEvent {
   context_graph_hash?: string | null;
   context_graph_state_id?: string | null;
   context_graph_phase?: string | null;
+  context_graph_metrics?: Record<string, unknown>;
+  translation_phase?: string | null;
+  translation_items?: number;
+  translation_enabled?: boolean;
+  translation_status?: string | null;
+  translated_count?: number;
+  fallback_count?: number;
+  concept_i18n_translated_count?: number;
+  concept_i18n_fallback_count?: number;
+  edge_i18n_translated_count?: number;
+  edge_i18n_fallback_count?: number;
   retry_count?: number;
   max_retries?: number;
+  job_id?: string | null;
+  trial_id?: string | null;
+  trial_index?: number;
+  theta_hash?: string | null;
+  objective_score?: number | null;
+  hard_gate?: Record<string, unknown>;
+  failure_code?: string | null;
+  probe_set_hash?: string | null;
+  reasons?: string[];
 }
 
 export interface RuntimeIssue {

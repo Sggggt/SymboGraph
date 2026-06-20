@@ -335,6 +335,70 @@ class RebuildGraphResponse(APIModel):
     stats: dict[str, Any] = Field(default_factory=dict)
 
 
+class AutoTpeTrialSummary(APIModel):
+    trial_id: str
+    run_id: str
+    trial_index: int
+    status: str
+    theta_hash: str | None = None
+    sampler_state_hash: str | None = None
+    candidate_adjacency_hash: str | None = None
+    probe_set_hash: str | None = None
+    objective_score: float | None = None
+    hard_gate: dict[str, Any] = Field(default_factory=dict)
+    objective_components: dict[str, Any] = Field(default_factory=dict)
+    failure_code: str | None = None
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class AutoTpeRunSummary(APIModel):
+    run_id: str
+    knowledge_base_id: str
+    batch_id: str | None = None
+    chunk_relation_graph_state_id: str | None = None
+    chunk_version: int
+    chunk_scope_hash: str | None = None
+    graph_operating_point_protocol: str | None = None
+    protocol_hash: str | None = None
+    chat_model: str | None = None
+    embedding_model: str | None = None
+    embedding_text_version: str | None = None
+    status: str
+    trigger_reason: str | None = None
+    trial_budget: int = 0
+    startup_random_trials: int = 0
+    good_quantile_gamma: float | None = None
+    probe_query_budget: int = 0
+    candidate_pool_size: int = 0
+    best_trial_id: str | None = None
+    best_objective_score: float | None = None
+    selected_theta_hash: str | None = None
+    selected_theta: dict[str, Any] = Field(default_factory=dict)
+    sampler_state_hash: str | None = None
+    probe_set_hash: str | None = None
+    hard_gate: dict[str, Any] = Field(default_factory=dict)
+    objective_components: dict[str, Any] = Field(default_factory=dict)
+    last_error: str | None = None
+    failure_code: str | None = None
+    blocking_reasons: list[str] = Field(default_factory=list)
+    runtime_settings_hash: str | None = None
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
+    trials: list[AutoTpeTrialSummary] = Field(default_factory=list)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class AutoTpeStatusResponse(APIModel):
+    knowledge_base_id: str
+    current_chunk_version: int = 0
+    enabled: bool = False
+    latest_run: AutoTpeRunSummary | None = None
+
+
 class GraphNode(APIModel):
     id: str
     label: str
@@ -448,6 +512,7 @@ class ModelSettingsUpdate(APIModel):
     worker_concurrency: int | None = None
     model_request_concurrency: int | None = None
     model_request_timeout_seconds: int | None = None
+    concept_i18n_enabled: bool | None = None
     fixed_chunk_size_tokens: int | None = None
     fixed_chunk_overlap_tokens: int | None = None
     context_package_token_budget: int | None = None
@@ -474,6 +539,18 @@ class ModelSettingsUpdate(APIModel):
     cross_language_out_quota_min: int | None = None
     cross_language_out_quota_max: int | None = None
     cross_language_min_cosine: float | None = None
+    enable_auto_tpe: bool | None = None
+    tpe_trial_budget: int | None = None
+    tpe_startup_random_trials: int | None = None
+    tpe_good_quantile_gamma: float | None = None
+    tpe_probe_query_budget: int | None = None
+    tpe_trial_timeout_seconds: int | None = None
+    tpe_candidate_pool_size: int | None = None
+    operating_point_hard_gate_max_edge_density: float | None = None
+    operating_point_hard_gate_max_isolated_ratio: float | None = None
+    operating_point_hard_gate_max_hubness_ratio: float | None = None
+    operating_point_hard_gate_min_structure_recovery_rate: float | None = None
+    operating_point_hard_gate_max_candidate_latency_p95_ms: int | None = None
     agent_coarse_total_budget: int | None = None
     agent_mid_per_coarse_budget: int | None = None
     agent_mid_top_k: int | None = None

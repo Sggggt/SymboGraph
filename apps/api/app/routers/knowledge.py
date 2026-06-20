@@ -22,6 +22,7 @@ from app.schemas import (
     RebuildGraphResponse,
     RefreshResponse,
     RetrievalTraceStepsResponse,
+    AutoTpeStatusResponse,
 )
 from app.services.context_graph import context_graph_stats, graph_layer_payload
 from app.services.ingestion import (
@@ -38,6 +39,7 @@ from app.services.ingestion import (
 from app.services.ingestion_logs import emit_ingestion_log
 from app.services.maintenance import MaintenanceConflict, cleanup_stale_data, delete_knowledge_base_data
 from app.services.retrieval import get_context_package, get_dashboard_snapshot, get_retrieval_trace_steps
+from app.services.auto_tpe import latest_auto_tpe_status
 
 router = APIRouter()
 
@@ -225,3 +227,12 @@ async def rebuild_graph_endpoint(
         "dry_run": False,
         "stats": batch.stats or {},
     }
+
+
+@router.get("/knowledge-bases/{knowledge_base_id}/graph-operating-point/auto-tpe/latest", response_model=AutoTpeStatusResponse)
+def get_auto_tpe_latest_status(knowledge_base_id: str, db: Session = Depends(get_db)) -> dict:
+    get_requested_knowledge_base(db, knowledge_base_id)
+    try:
+        return latest_auto_tpe_status(db, knowledge_base_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc

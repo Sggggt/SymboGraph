@@ -19,7 +19,7 @@ describe("settings parameter help", () => {
   });
 
   it("keeps active runtime and graph parameters documented without legacy BM25 wording", () => {
-    for (const label of ["模型请求并发", "片段 Top K", "跨文档桥最小配额", "引用验证预算", "工作进程并发"]) {
+    for (const label of ["模型请求并发", "中粗层双语派生", "片段 Top K", "跨文档桥最小配额", "引用验证预算", "工作进程并发"]) {
       expect(SETTINGS_PARAMETER_HELP[label]).toBeTruthy();
     }
 

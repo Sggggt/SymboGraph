@@ -1176,7 +1176,21 @@ cross-language 和 cross-document edge 不因 bridge 身份额外降权；它们
 
 ### Graph operating point calibration
 
-Dynamic KNN、bridge quota、semantic threshold 与 edge calibration 参数通过 TPE Bayesian Optimization 选择 active operating point。TPE 不直接创建边，不绕过 shadow build、diagnostics、retrieval probe 或 promotion gate；它只在参数空间 \(\Theta_G\) 中选择构图参数：
+Dynamic KNN、reverse quota、bridge quota、semantic threshold 与 edge calibration 参数通过自动 TPE Bayesian Optimization 选择 active bottom relation graph 的 operating point。TPE 是构图阶段的轻量数值优化器，不是独立产品入口；它不调用 LLM，不重新 embedding，不构建 mid concepts，不构建 coarse concepts，也不生成任何临时候选持久图谱。
+
+TPE 的触发只由运行环境和构图批次决定：
+
+```text
+ENABLE_AUTO_TPE=true:
+  仅当本批次推进知识库最高 chunk version 时，在 chunk/vector ready 后、写 active chunk relation graph 前自动运行轻量 TPE。
+
+ENABLE_AUTO_TPE=false:
+  使用当前 active operating point；若不存在，则使用版本化默认 operating point。
+```
+
+触发锁定为 chunk 最高版本号递增：空库首次成功解析产生 v1 时可以运行；全量重建成功推进到 vN+1 时可以运行；普通选中文件重解析、同版本补解析、普通搜索、QA、Agent、导入页/设置页保存和日志抽屉打开都不得触发 TPE。前端导入页提供全局热加载开关、envelope 参数和最近一次 auto TPE run 只读状态；开启开关本身不 retroactive 触发当前版本调参，必须等待下一次最高 chunk version 递增。
+
+TPE 只在底层关系图参数空间 \(\Theta_G\) 中选择构图常数：
 
 ```text
 K_min, K_max
@@ -1192,17 +1206,122 @@ cross_language_min_cosine
 edge_type_calibration_protocol
 ```
 
+一个 operating point 记为：
+
+```text
+θ = {
+  graph_operating_point_protocol,
+  edge_distance_protocol,
+  edge_type_calibration_protocol,
+  dense_knn,
+  reverse_quota,
+  bridge_quota,
+  type_thresholds,
+  calibration_params
+}
+```
+
+`θ` 的每个字段必须可序列化、可 hash、可落库、可回放。`dense_knn` 控制 base dense candidate fan-out；`reverse_quota` 控制按 edge type 分桶的入边接受上限；`bridge_quota` 只控制 cross-document 和 cross-language candidate 进入机会；`type_thresholds` 控制不同 edge type 的最小 cosine 与 strong cosine gate；`calibration_params` 控制 raw feature 到 typed strength/distance 的单调校准。任何 sampled `θ` 若违反 `min <= max`、阈值区间、quota 上限、protocol version 或 settings lifecycle 约束，必须在 trial preflight 阶段判为 invalid，不得进入 candidate adjacency simulation。
+
+TPE 使用已完成 trial 的目标值把参数样本切分为 good set 与 bad set。设 \(y=J(\theta)\)，\(y^\*\) 为前 \(\gamma\) 分位的目标值，目标越大越好：
+
+$$
+l(\theta)=p(\theta\mid y\ge y^\*),\quad
+g(\theta)=p(\theta\mid y<y^\*)
+$$
+
+采样阶段优先选择最大化 \(\frac{l(\theta)}{g(\theta)}\) 的候选点；当 trial 数不足 `tpe_startup_random_trials` 时使用有界随机采样填充初始观测。TPE 只优化 bottom relation graph operating point，不参与在线 query scoring，不替代 staged traversal priority queue，也不改变 node weight 语义。
+
 每个 trial 执行：
 
 ```text
 sample θ from TPE
--> shadow build chunk relation graph
--> graph diagnostics
--> retrieval probe
--> citation verification
+-> theta preflight
+-> in-memory candidate adjacency simulation
+-> bottom graph diagnostics
+-> lightweight probe metrics
+-> hard gate
 -> objective score
--> promotion gate
+-> update TPE observations
 ```
+
+trial 的输入只能来自当前构图批次已经确定的事实源：
+
+```text
+active chunk scope
+current chunk embeddings
+chunk structure graph
+document/language metadata
+RQ codebook inputs if already available for this build stage
+previous active operating point or versioned default theta
+```
+
+trial 不写 `chunk_relation_graph_states`，不写 `chunk_relation_edges`，不写 RQ prefix，不写 mid/coarse，不写 Qdrant，不写 Redis active cache。trial 只能产生内存邻接表和可审计指标；批次失败或取消时不会留下可被 active retrieval 读取的半成品图。
+
+自动 TPE 架构图：
+
+```mermaid
+flowchart TB
+    A["Graph Build Batch"] --> B["Active Chunks + Existing Embeddings"]
+    B --> C["Bottom Relation Candidate Pool"]
+    C --> S["TPE Sampler"]
+    S --> TH["Sampled theta"]
+    TH --> PF["Theta Preflight"]
+    PF -->|invalid| BT["Blocked Trial Metrics"]
+    PF -->|valid| SIM["In-Memory Candidate Adjacency"]
+    SIM --> GD["Bottom Graph Diagnostics"]
+    GD --> OBJ["Hard Gates + Objective"]
+    OBJ --> S
+    OBJ --> BEST["Best Valid theta"]
+    BEST --> AR["Write Active Chunk Relation Graph Once"]
+    AR --> RQ["Build RQ Membership"]
+    RQ --> MID["Build Mid Concepts Once"]
+    MID --> COARSE["Build Coarse Concepts Once"]
+    AR --> CI["Invalidate Relation / Retrieval / QA Cache"]
+```
+
+trial 必须形成可审计记录，但记录的是轻量仿真结果，不是持久候选图状态：
+
+```text
+tpe_trials:
+  trial_id
+  knowledge_base_id
+  build_batch_id
+  chunk_scope_hash
+  embedding_model
+  embedding_text_version
+  sampled_theta_json
+  theta_hash
+  sampler_state_hash
+  probe_set_hash
+  candidate_adjacency_hash
+  diagnostics_json
+  hard_gate_json
+  objective_components_json
+  objective_score
+  status
+  failure_code
+  started_at
+  finished_at
+```
+
+`candidate_adjacency_hash` 由 candidate edge ids、edge type、raw strength、typed gate decision 和 θ hash 计算。trial 失败、取消或超时必须保留 failure code、blocking reason 和可重试边界；不得静默退回固定参数并标记成功。若所有 trial 均失败，构图批次必须使用上一版 active operating point 或版本化默认 theta，并在 batch diagnostics 中记录 `auto_tpe_status=failed_or_skipped`，不得把失败 trial 写成成功优化。
+
+自动 TPE 由 graph build worker 在 bottom relation graph 阶段执行。worker 必须在 TPE 开始前和每个 trial 边界刷新 runtime settings version；长 trial 内不得继续读取已经撤销的开关。取消批次时，TPE 必须在当前 trial 边界停止；如果单个 trial 内部执行时间超过 `tpe_trial_timeout_seconds`，该 trial 失败并进入下一 trial 或终止批次。
+
+日志流必须把 TPE 作为构图阶段子事件展示，而不是伪装成文件解析进度：
+
+```text
+auto_tpe_started
+auto_tpe_trial_started
+auto_tpe_trial_completed
+auto_tpe_trial_blocked
+auto_tpe_best_theta_selected
+auto_tpe_skipped
+auto_tpe_failed
+```
+
+这些事件只描述自动 operating point 选择，不表示 mid/coarse 已完成。前端只在导入页提供自动 TPE 开关、envelope 参数和最近 run 状态；设置页不得提供 TPE 开关、参数入口、独立运行优化器或单独切换图谱参数的按钮。
 
 硬约束：
 
@@ -1213,9 +1332,11 @@ isolated\_ratio\le \eta_I,\quad
 $$
 
 $$
-citation\_verification\_rate\ge \eta_C,\quad
-retrieval\_latency_{p95}\le \eta_L
+structure\_recovery\_rate\ge \eta_S,\quad
+candidate\_latency_{p95}\le \eta_L
 $$
+
+硬约束的阈值来自 active evaluation policy 或 runtime settings 中的 versioned gate profile。任一 hard gate 失败时，trial 的 `status=blocked`，可记录 objective components 供诊断，但不得成为 best theta。`candidate_latency_p95` 是 candidate adjacency 构造、probe expansion 和指标计算的本地耗时，不包括 LLM latency；如果 embedding model、embedding text version 或 chunk scope 变化，旧 trial 只能作为 historical diagnostics，不能跨 scope 复用。
 
 软目标函数：
 
@@ -1223,19 +1344,59 @@ $$
 \begin{aligned}
 J(\theta)
 =&
-0.35\cdot evidence\_recall\_proxy
-+0.25\cdot citation\_verification\_rate\\
-&+0.15\cdot component\_coverage
-+0.10\cdot path\_diversity
-+0.10\cdot edge\_precision\_proxy\\
-&+0.05\cdot structure\_restoration\_success
--0.12\cdot hubness\_penalty\\
-&-0.10\cdot density\_penalty
--0.06\cdot latency\_penalty
+0.26\cdot evidence\_recall\_proxy
++0.18\cdot structure\_recovery\_rate\\
+&+0.16\cdot component\_coverage
++0.12\cdot edge\_precision\_proxy\\
+&+0.10\cdot bridge\_opportunity\_coverage
++0.08\cdot path\_diversity\\
+&-0.12\cdot hubness\_penalty
+-0.10\cdot density\_penalty\\
+&-0.06\cdot latency\_penalty
 \end{aligned}
 $$
 
-跨语言质量在当前 operating point 中只作为 lightweight diagnostics，不进入目标函数或 promotion hard gate：
+目标函数组件定义如下：
+
+```text
+evidence_recall_proxy:
+  probe chunk 或 expected support chunk 在 candidate adjacency 中可被 1-2 跳触达的比例。
+  expected support 可以来自人工 probe、上一版 verified citation spans、
+  或结构邻近的 positive support set；不得来自 LLM 无支撑猜测。
+
+structure_recovery_rate:
+  candidate adjacency 能恢复 previous/next、same section、same page、
+  table/formula/caption/code closure 周边证据的比例。
+  这些结构边不进入 active relation graph，只作为恢复能力评估。
+
+component_coverage:
+  active chunks、document ids、语言桶和候选 RQ prefix 输入被非孤立覆盖的加权比例。
+
+edge_precision_proxy:
+  抽样 candidate relation edges 中 mutual/reverse/strong gate、typed threshold、
+  support feature 和结构可回溯性均通过的比例。
+
+bridge_opportunity_coverage:
+  cross-document 与 cross-language candidate 在独立 quota 内获得候选机会的比例。
+  它只评估机会覆盖，不奖励 bridge 边无约束增多。
+
+path_diversity:
+  probe expansion 在 document、language、edge type 和 candidate RQ prefix 上的归一化熵。
+  它奖励多证据覆盖，不奖励无支撑跳边。
+
+hubness_penalty:
+  degree_p95、degree_median、top hub share 与 edge type imbalance 的归一化惩罚。
+
+density_penalty:
+  |E_C|/|V_C| 超过目标密度区间后的惩罚。
+
+latency_penalty:
+  candidate adjacency simulation p95 和 probe expansion p95 超过预算后的惩罚。
+```
+
+所有组件必须保存原始分子、分母、采样数量、probe set hash 和计算协议版本。没有足够 probe 时，自动 TPE 必须标记为 `insufficient_evaluation` 并回退到上一版 active/default theta；不得调用 LLM 临时补 probe。
+
+跨语言质量在当前 operating point 中作为 lightweight diagnostics 和 bridge opportunity 组件的一部分，不作为单独 hard gate：
 
 ```text
 cross_language_edge_count
@@ -1246,7 +1407,22 @@ prefix_language_entropy
 prefix_language_purity
 ```
 
-promotion 写入 active graph protocol、edge distance protocol hash、runtime settings hash 与 diagnostics；未通过 hard constraints 的 trial 不得成为 active graph state。
+TPE 结束后只选择 best valid theta；真正写入 active 图谱发生一次，且只写 bottom relation graph。随后 RQ、mid concepts 和 coarse concepts 基于最终 active bottom relation graph 派生一次。mid/coarse 的 LLM 生成、双语派生、摘要和 projection calibration 不进入 TPE trial，也不参与 TPE objective。
+
+最终 active relation graph 写入必须原子保存：
+
+```text
+graph_operating_point_hash
+graph_operating_point_json
+edge_distance_protocol_hash
+edge_type_calibration_protocol_hash
+runtime_settings_hash
+auto_tpe_run_id
+auto_tpe_best_trial_id
+diagnostics_json
+```
+
+如果 active relation graph 写入失败，当前批次失败并保持上一版 active graph state 不变；TPE run 保留为 failed diagnostics。成功写入后必须失效 relation graph、mid/coarse graph、retrieval trace、context package、QA 和 Agent 相关 cache；下游 mid/coarse projection 必须基于最终 active relation graph 重新计算。
 
 
 
@@ -2445,6 +2621,10 @@ context_package_token_budget
 
 粗粒度层使用 `agent_coarse_total_budget` 探索 coarse nodes，生成 coarse node queue，不设置 coarse top-k。中粒度层对 coarse node queue 中的每个父节点分别使用 `agent_mid_per_coarse_budget` 探索 mid candidates；所有 mid candidates 汇总、去重、排序后，使用 `agent_mid_top_k` 形成 mid node queue。底层对 mid node queue 中的每个父节点分别使用 `agent_chunk_per_mid_budget` 探索 chunk candidates；所有 chunk candidates 汇总、去重、排序后，使用 `agent_chunk_top_k` 形成进入 context package 的 hit chunks。`agent_mid_top_k` 与 `agent_chunk_top_k` 是层间输出上限，不是裸向量召回结果，也不能绕过 trace、structure restoration 或 citation verification。
 
+中粗层派生双语路由文本：`concept_i18n_enabled` 是热加载 Runtime Settings，环境键为 `CONCEPT_I18N_ENABLED`，默认关闭。关闭时 mid/coarse concept graph 不执行 `concept_i18n_bilingual_v1`，不调用模型、不写成功翻译 metadata，只在 diagnostics/log 中记录 `status=disabled`；开启后，mid/coarse concept graph 在节点和边写入后执行 `concept_i18n_bilingual_v1` 派生翻译，覆盖 concept label、aliases、definition、summary、scope note 以及高层概念边 explanation。翻译结果只作为可重建的派生 metadata 保存；只有开关开启且翻译 `status=ok` 时，才用于 coarse/mid entry selection 的 searchable text 扩展。翻译结果不能覆盖 `canonical_label`、`definition`、`summary`、`scope_note`、edge `explanation`、support ids、distance、projection stats 或 citation payload。前端图谱页默认继续展示 canonical source fields；回答生成和引用验证仍只能依赖 context package 与 raw chunk span。
+
+派生双语路由文本必须进入 concept state diagnostics/hash：当 `concept_i18n_enabled`、`concept_i18n_bilingual_v1` 输出、失败状态或协议版本变化时，mid/coarse concept hash、context graph hash、retrieval trace 和相关 cache key 必须随之变化。若翻译模型不可用，只能记录 `status=unavailable` 或 fallback 状态；fallback 原文不得伪装为成功翻译，也不得作为事实证据或 citation 来源。
+
 算法收敛条件：
 
 ```text
@@ -2962,6 +3142,18 @@ rq_membership_protocol
 edge_projection_protocol
 graph_operating_point_protocol
 graph_operating_point_optimizer = tpe
+enable_auto_tpe
+tpe_trial_budget
+tpe_startup_random_trials
+tpe_good_quantile_gamma
+tpe_probe_query_budget
+tpe_trial_timeout_seconds
+tpe_candidate_pool_size
+operating_point_hard_gate_max_edge_density
+operating_point_hard_gate_max_isolated_ratio
+operating_point_hard_gate_max_hubness_ratio
+operating_point_hard_gate_min_structure_recovery_rate
+operating_point_hard_gate_max_candidate_latency_p95_ms
 dense_knn_k_min
 dense_knn_k_max
 dense_reverse_b_min_base
@@ -2992,7 +3184,9 @@ traversal_observation_budget
 context_path_summary_budget
 ```
 
-其中改变 chunking、embedding、dynamic dense KNN、bridge quota、edge type calibration、TPE graph operating point、relation graph、RQ codebook、RQ membership protocol、edge projection 或 concept graph 的参数属于 `rebuild_required`；改变 staged traversal budget、layer top-k、label/cycle/path distance threshold/gray-zone observation cadence 等不改变 active graph 的参数属于 `hot_reloadable`，需要失效检索与 QA cache。预算类参数只作为 hard interrupt 或层间输出上限，不参与路径价值排序。
+其中改变 chunking、embedding、dynamic dense KNN、bridge quota、edge type calibration、relation graph、RQ codebook、RQ membership protocol、edge projection 或 concept graph 的参数属于 `rebuild_required`；改变 staged traversal budget、layer top-k、label/cycle/path distance threshold/gray-zone observation cadence 等不改变 active graph 的参数属于 `hot_reloadable`，需要失效检索与 QA cache。`concept_i18n_enabled` 是热加载功能开关：保存后立即控制检索是否使用已有成功翻译文本，并控制下一次构图是否执行双语派生；它不会自动改写已有 active graph。预算类参数只作为 hard interrupt 或层间输出上限，不参与路径价值排序。
+
+TPE settings 分两层处理。`enable_auto_tpe`、`tpe_trial_budget`、`tpe_startup_random_trials`、`tpe_good_quantile_gamma`、`tpe_probe_query_budget`、`tpe_trial_timeout_seconds` 和 `tpe_candidate_pool_size` 是 automatic optimizer envelope，保存后热加载到下一次 graph build 或下一 trial 边界；它们不直接改写 active graph。dense KNN、bridge quota、threshold 和 edge calibration 改变 active graph 语义，必须只在 graph build 阶段由自动 TPE 或版本化默认 theta 选择，并在最终 active bottom relation graph 写入时一次性落库。前端导入页在清理数据库/文件数量附近提供自动 TPE 开关、可折叠 envelope 参数和最近一次 auto TPE run/blocking reason；设置页不提供启动、取消、手动切换或独立手动调参入口。
 
 ### Hot refresh
 
@@ -3068,7 +3262,7 @@ Policy state 不替代 planner，只提供 traversal priors、constraints、safe
 - 影响对象：chunking、embedding、graph build、graph traversal、Agent envelope、verification/repair budget、cache、prompt protocol 和 UI interaction。
 - 影响方式：runtime settings 改变工程运行点；profile 只改变交互层；policy 改变动作先验、safe arms、staged traversal budget 先验和路径灰区阈值建议，但不替代 planner。
 - 传播字段：`runtime_settings_hash`、`agent_operating_envelope_hash`、`policy_state_hash`、`prompt_protocol_hash`、`profile_hash`、Redis runtime version message。
-- 触发条件：hot reloadable 参数触发 cache/singleton 刷新；rebuild required 参数触发 candidate settings、dry-run、shadow rebuild 与 promotion；profile 变化只刷新 prompt/UI/conversation cache。
+- 触发条件：hot reloadable 参数触发 cache/singleton 刷新；rebuild required 参数只在 graph build 阶段通过 automatic TPE simulation 或版本化默认 theta 进入 active relation graph 一次性写入；profile 变化只刷新 prompt/UI/conversation cache。
 - 验收观察点：runtime version publish、Redis broadcast、settings cache clear、profile 不触发 graph rebuild、policy reward history 与 safe arms 可审计。
 
 ## Freshness、缓存与热加载

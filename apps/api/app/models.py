@@ -276,6 +276,9 @@ class ChunkRelationGraphState(Base):
     relation_protocol_version: Mapped[str] = mapped_column(String(64), default="chunk_relation_graph_v1", index=True)
     edge_distance_protocol_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     edge_type_calibration_protocol_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    runtime_settings_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    auto_tpe_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    auto_tpe_best_trial_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     active_chunk_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     stats_json: Mapped[dict] = mapped_column(JSON, default=dict)
     diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -834,6 +837,74 @@ class RuntimeSettingsVersion(Base):
     changed_keys_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     source: Mapped[str] = mapped_column(String(64), default="api", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class AutoTpeRun(TimestampMixin, Base):
+    __tablename__ = "auto_tpe_runs"
+    __table_args__ = (
+        Index("ix_auto_tpe_runs_scope", "knowledge_base_id", "chunk_version", "chat_model", "embedding_model", "embedding_text_version"),
+        Index("ix_auto_tpe_runs_kb_status", "knowledge_base_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    batch_id: Mapped[str | None] = mapped_column(ForeignKey("ingestion_batches.id", ondelete="SET NULL"), nullable=True, index=True)
+    chunk_relation_graph_state_id: Mapped[str | None] = mapped_column(ForeignKey("chunk_relation_graph_states.id", ondelete="SET NULL"), nullable=True, index=True)
+    chunk_version: Mapped[int] = mapped_column(Integer, index=True)
+    chunk_scope_hash: Mapped[str] = mapped_column(String(64), index=True)
+    graph_operating_point_protocol: Mapped[str] = mapped_column(String(64), index=True)
+    protocol_hash: Mapped[str] = mapped_column(String(64), index=True)
+    chat_model: Mapped[str] = mapped_column(String(128), index=True)
+    embedding_model: Mapped[str] = mapped_column(String(128), index=True)
+    embedding_text_version: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    trigger_reason: Mapped[str] = mapped_column(String(128), default="chunk_version_incremented", index=True)
+    trial_budget: Mapped[int] = mapped_column(Integer, default=0)
+    startup_random_trials: Mapped[int] = mapped_column(Integer, default=0)
+    good_quantile_gamma: Mapped[float] = mapped_column(Float, default=0.25)
+    probe_query_budget: Mapped[int] = mapped_column(Integer, default=0)
+    candidate_pool_size: Mapped[int] = mapped_column(Integer, default=0)
+    best_trial_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    best_objective_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    selected_theta_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    selected_theta_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    sampler_state_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    probe_set_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    hard_gate_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    objective_components_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    blocking_reasons_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    runtime_settings_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    failure_code: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AutoTpeTrial(Base):
+    __tablename__ = "auto_tpe_trials"
+    __table_args__ = (
+        UniqueConstraint("run_id", "trial_index", name="uq_auto_tpe_trial_run_index"),
+        Index("ix_auto_tpe_trials_run_status", "run_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    run_id: Mapped[str] = mapped_column(ForeignKey("auto_tpe_runs.id", ondelete="CASCADE"), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    trial_index: Mapped[int] = mapped_column(Integer, index=True)
+    sampled_theta_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    theta_hash: Mapped[str] = mapped_column(String(64), index=True)
+    sampler_state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    candidate_adjacency_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    probe_set_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    hard_gate_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    objective_components_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    objective_score: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    failure_code: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class IngestionBatch(TimestampMixin, Base):
