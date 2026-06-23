@@ -23,6 +23,7 @@ describe("settings parameter help", () => {
       expect(SETTINGS_PARAMETER_HELP[label]).toBeTruthy();
     }
 
+    expect(SETTINGS_PARAMETER_HELP["LLM 双语查询面"]).toBeTruthy();
     expect(Object.values(SETTINGS_PARAMETER_HELP).join("\n")).not.toContain("BM25");
   });
 });

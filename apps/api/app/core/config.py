@@ -34,6 +34,7 @@ HOT_RELOAD_SETTINGS = {
     "context_package_token_budget",
     "enable_model_fallback",
     "concept_i18n_enabled",
+    "query_facet_bilingual_enabled",
     "mid_concept_extraction_max_model_batches",
     "mid_concept_extraction_max_candidates_per_batch",
     "mid_concept_extraction_max_tokens_per_batch",
@@ -152,6 +153,7 @@ class Settings(BaseSettings):
     context_package_token_budget: int = Field(default=2400, ge=256, le=20000)
     enable_model_fallback: bool = False
     concept_i18n_enabled: bool = False
+    query_facet_bilingual_enabled: bool = False
     mid_concept_extraction_max_model_batches: int = Field(default=4, ge=0, le=64)
     mid_concept_extraction_max_candidates_per_batch: int = Field(default=8, ge=1, le=500)
     mid_concept_extraction_max_tokens_per_batch: int = Field(default=2400, ge=500, le=50000)
@@ -276,6 +278,7 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "model_bridge_enabled",
         "enable_model_fallback",
         "concept_i18n_enabled",
+        "query_facet_bilingual_enabled",
         "enable_auto_tpe",
     }
     int_fields = {
@@ -356,6 +359,7 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "FIXED_CHUNK_OVERLAP_TOKENS": "fixed_chunk_overlap_tokens",
         "CONTEXT_PACKAGE_TOKEN_BUDGET": "context_package_token_budget",
         "CONCEPT_I18N_ENABLED": "concept_i18n_enabled",
+        "QUERY_FACET_BILINGUAL_ENABLED": "query_facet_bilingual_enabled",
         "MID_CONCEPT_EXTRACTION_MAX_MODEL_BATCHES": "mid_concept_extraction_max_model_batches",
         "MID_CONCEPT_EXTRACTION_MAX_CANDIDATES_PER_BATCH": "mid_concept_extraction_max_candidates_per_batch",
         "MID_CONCEPT_EXTRACTION_MAX_TOKENS_PER_BATCH": "mid_concept_extraction_max_tokens_per_batch",

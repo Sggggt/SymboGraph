@@ -22,6 +22,7 @@ async def test_propose_query_facets_validates_llm_packet(monkeypatch):
             }
 
     monkeypatch.setattr(agent_graph, "ChatProvider", FacetChatProvider)
+    monkeypatch.setattr(agent_graph, "get_settings", lambda: SimpleNamespace(query_facet_bilingual_enabled=False, enable_model_fallback=False))
 
     facets = await agent_graph.propose_query_facets(
         "\u7ed9\u6211\u914d\u7f6e\u6a21\u578b\u7684\u5177\u4f53\u7b97\u6cd5\u6b65\u9aa4",
@@ -36,6 +37,41 @@ async def test_propose_query_facets_validates_llm_packet(monkeypatch):
     assert "\u7ed9" not in facets["required_facets"]
     assert "chunk_ids" not in facets
     assert "document_ids" not in facets
+    assert facets["diagnostics"]["bilingual_query_facets_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_propose_query_facets_can_request_bilingual_aliases(monkeypatch):
+    from app.services import agent_graph
+
+    captured: dict[str, str] = {}
+
+    class BilingualFacetChatProvider:
+        async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
+            captured["system_prompt"] = system_prompt
+            captured["user_prompt"] = user_prompt
+            return {
+                "domain_facets": [{"facet": "\u7a7a\u95f4\u7f51\u7edc", "aliases": ["spatial network", "spatial networks"]}],
+                "procedure_facets": [{"facet": "\u5e73\u9762\u7f51\u7edc\u6307\u6807", "aliases": ["planar network metrics"]}],
+                "drop_terms": ["\u4ec0\u4e48\u662f"],
+                "answer_shape": "definition",
+            }
+
+    monkeypatch.setattr(agent_graph, "ChatProvider", BilingualFacetChatProvider)
+    monkeypatch.setattr(agent_graph, "get_settings", lambda: SimpleNamespace(query_facet_bilingual_enabled=True, enable_model_fallback=False))
+
+    facets = await agent_graph.propose_query_facets(
+        "\u4ec0\u4e48\u662f\u7a7a\u95f4\u7f51\u7edc\uff0c\u5b83\u6709\u54ea\u4e9b\u6307\u6807",
+        [],
+        {"intent": "definition"},
+    )
+
+    assert facets["diagnostics"]["bilingual_query_facets_enabled"] is True
+    assert "Chinese and English" in captured["system_prompt"]
+    assert "bilingual_query_facets_enabled" in captured["user_prompt"]
+    assert "spatial" in facets["terms"]
+    assert "network" in facets["terms"]
+    assert "planar" in facets["terms"]
 
 
 @pytest.mark.asyncio

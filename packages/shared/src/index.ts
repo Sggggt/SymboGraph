@@ -439,6 +439,7 @@ export interface ModelSettingsResponse {
   model_request_concurrency?: number;
   model_request_timeout_seconds?: number;
   concept_i18n_enabled?: boolean;
+  query_facet_bilingual_enabled?: boolean;
   fixed_chunk_size_tokens?: number;
   fixed_chunk_overlap_tokens?: number;
   context_package_token_budget?: number;
@@ -566,6 +567,7 @@ export interface ModelSettingsUpdate {
   model_request_concurrency?: number | null;
   model_request_timeout_seconds?: number | null;
   concept_i18n_enabled?: boolean | null;
+  query_facet_bilingual_enabled?: boolean | null;
   fixed_chunk_size_tokens?: number | null;
   fixed_chunk_overlap_tokens?: number | null;
   context_package_token_budget?: number | null;

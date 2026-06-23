@@ -302,6 +302,7 @@ def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch)
     assert payload["fixed_chunk_overlap_tokens"] == 80
     assert payload["context_package_token_budget"] == 2400
     assert payload["concept_i18n_enabled"] is False
+    assert payload["query_facet_bilingual_enabled"] is False
     assert payload["agent_coarse_total_budget"] > 0
     assert payload["agent_chunk_top_k"] > 0
     assert "lifecycle" in payload
@@ -384,12 +385,20 @@ def test_update_model_settings_reloads_model_bridge(monkeypatch, tmp_path):
     monkeypatch.setattr(runtime_settings, "reload_model_bridge", fake_reload_model_bridge)
     get_settings.cache_clear()
 
-    result = runtime_settings.update_model_settings({"embedding_base_url": "https://embedding.example.test/v2", "concept_i18n_enabled": True})
+    result = runtime_settings.update_model_settings(
+        {
+            "embedding_base_url": "https://embedding.example.test/v2",
+            "concept_i18n_enabled": True,
+            "query_facet_bilingual_enabled": True,
+        }
+    )
 
     assert reload_calls
     assert reload_calls[-1]["EMBEDDING_BASE_URL"] == "https://embedding.example.test/v2"
     assert reload_calls[-1]["CONCEPT_I18N_ENABLED"] == "true"
+    assert reload_calls[-1]["QUERY_FACET_BILINGUAL_ENABLED"] == "true"
     assert result["concept_i18n_enabled"] is True
+    assert result["query_facet_bilingual_enabled"] is True
     assert result["model_bridge_status"]["last_reload"]["ok"] is True
 
 

@@ -528,6 +528,7 @@ class ModelSettingsUpdate(APIModel):
     model_request_concurrency: int | None = None
     model_request_timeout_seconds: int | None = None
     concept_i18n_enabled: bool | None = None
+    query_facet_bilingual_enabled: bool | None = None
     fixed_chunk_size_tokens: int | None = None
     fixed_chunk_overlap_tokens: int | None = None
     context_package_token_budget: int | None = None

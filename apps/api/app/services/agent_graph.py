@@ -283,24 +283,35 @@ async def perceive_query_intent(question: str, history: list[dict] | None = None
 
 async def propose_query_facets(question: str, history: list[dict] | None, query_intent: dict[str, Any]) -> dict[str, Any]:
     fallback_marker = {"_fallback_query_facets": True}
+    bilingual_enabled = bool(get_settings().query_facet_bilingual_enabled)
     system = (
         "You are the query facet extractor for a Four-Layer Context Graph RAG executor. "
         "Return ONLY a JSON object. You may identify domain facets, procedure facets, aliases/search terms, "
         "constraints, answer_shape, and drop_terms. Do not choose documents, chunks, node ids, citations, or facts. "
-        "The executor will validate this packet and use it only as retrieval priority metadata."
+        "The executor will validate this packet and use it only as retrieval priority metadata. "
+        + (
+            "For each explicit domain or procedure facet, include standard Chinese and English technical aliases when a bilingual corpus might use either language."
+            if bilingual_enabled
+            else "Only include aliases when they are explicit or standard technical synonyms."
+        )
     )
     user_prompt = str(
         {
             "question": question,
             "history": (history or [])[-6:],
             "query_intent": query_intent,
+            "bilingual_query_facets_enabled": bilingual_enabled,
             "required_json_shape": {
                 "domain_facets": ["main concepts explicitly requested by the user"],
                 "procedure_facets": ["algorithm/procedure/formula aspects requested by the user"],
                 "alias_facets": [
                     {
                         "facet": "canonical query facet",
-                        "aliases": ["standard bilingual or technical aliases useful for retrieval"],
+                        "aliases": [
+                            "standard Chinese and English aliases useful for retrieval"
+                            if bilingual_enabled
+                            else "standard technical aliases useful for retrieval"
+                        ],
                     }
                 ],
                 "constraint_facets": ["scope, comparison target, time, source, or modality constraints"],
@@ -321,8 +332,11 @@ async def propose_query_facets(question: str, history: list[dict] | None, query_
             raise
         raw = fallback_marker
     if not isinstance(raw, dict) or raw.get("_fallback_query_facets"):
-        return query_facets_for_search(question, None, query_intent)
-    return query_facets_for_search(question, raw, query_intent)
+        facets = query_facets_for_search(question, None, query_intent)
+    else:
+        facets = query_facets_for_search(question, raw, query_intent)
+    facets.setdefault("diagnostics", {})["bilingual_query_facets_enabled"] = bilingual_enabled
+    return facets
 
 
 async def propose_agent_plan(question: str, history: list[dict], query_intent: dict[str, Any], envelope: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:

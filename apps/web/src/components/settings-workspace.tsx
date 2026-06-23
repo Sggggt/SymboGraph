@@ -66,6 +66,7 @@ type SettingsForm = {
   model_request_concurrency: string;
   model_request_timeout_seconds: string;
   concept_i18n_enabled: boolean;
+  query_facet_bilingual_enabled: boolean;
   fixed_chunk_size_tokens: string;
   fixed_chunk_overlap_tokens: string;
   context_package_token_budget: string;
@@ -181,6 +182,7 @@ export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   "Embedding 批大小": "每批提交给向量端点的文本数量；较大批次提升吞吐，但会增加单次请求体积和失败重试成本。",
   "证据包 token 预算": "Context Package 可容纳的证据 token 上限；它约束进入回答生成的唯一证据输入规模。",
   中粗层双语派生: "开启后，下一次图谱重建会对 mid/coarse 概念节点和高层概念边额外生成中英双语派生 metadata；关闭时不会产生这部分模型调用成本。",
+  "LLM 双语查询面": "开启后，QA 查询面提取会要求 LLM 为显式领域和过程 facet 生成中英双语 aliases；它只影响下一次检索路由，不写事实证据，也不触发图谱重建。",
   粗概念总预算: "Layered retrieval 在 coarse 层探索的粗概念节点上限；这是层内 hard interrupt，不是相关性评分。",
   每个粗概念中概念预算: "对每个已接受粗概念分别下钻的 mid candidate 数量上限，保证逐父节点探索而不是全局裸 top-k。",
   "中概念 Top K": "所有 mid candidates 合并去重后的层间输出上限；不会绕过 trace、结构恢复或引用验证。",
@@ -1090,6 +1092,7 @@ export function SettingsWorkspace() {
       model_request_concurrency: String(settingsQuery.data.model_request_concurrency ?? 3),
       model_request_timeout_seconds: String(settingsQuery.data.model_request_timeout_seconds ?? 240),
       concept_i18n_enabled: settingsQuery.data.concept_i18n_enabled ?? false,
+      query_facet_bilingual_enabled: settingsQuery.data.query_facet_bilingual_enabled ?? false,
       fixed_chunk_size_tokens: String(settingsQuery.data.fixed_chunk_size_tokens ?? 512),
       fixed_chunk_overlap_tokens: String(settingsQuery.data.fixed_chunk_overlap_tokens ?? 80),
       context_package_token_budget: String(settingsQuery.data.context_package_token_budget ?? 2400),
@@ -1216,6 +1219,7 @@ export function SettingsWorkspace() {
     model_request_concurrency: parseIntField(form.model_request_concurrency),
     model_request_timeout_seconds: parseIntField(form.model_request_timeout_seconds),
     concept_i18n_enabled: form.concept_i18n_enabled,
+    query_facet_bilingual_enabled: form.query_facet_bilingual_enabled,
     fixed_chunk_size_tokens: parseIntField(form.fixed_chunk_size_tokens),
     fixed_chunk_overlap_tokens: parseIntField(form.fixed_chunk_overlap_tokens),
     context_package_token_budget: parseIntField(form.context_package_token_budget),
@@ -1320,6 +1324,7 @@ export function SettingsWorkspace() {
               <StatusPill ok={envSynced}>{envSynced ? ".env 已同步" : ".env 需检查"}</StatusPill>
               <StatusPill ok={!settings?.enable_model_fallback && !settings?.enable_database_fallback}>回退已禁用</StatusPill>
               <StatusPill ok={!settings?.concept_i18n_enabled}>双语派生 {settings?.concept_i18n_enabled ? "已开启" : "已关闭"}</StatusPill>
+              <StatusPill ok={Boolean(settings?.query_facet_bilingual_enabled)}>双语查询面 {settings?.query_facet_bilingual_enabled ? "已开启" : "已关闭"}</StatusPill>
               <StatusPill ok={Boolean(settings?.lifecycle?.hot_reloadable?.length)}>热加载 {settings?.lifecycle?.hot_reloadable?.length ?? 0}</StatusPill>
               <StatusPill ok={Boolean(settings?.lifecycle?.rebuild_required?.length)}>需重建 {settings?.lifecycle?.rebuild_required?.length ?? 0}</StatusPill>
               <StatusPill ok={Boolean(settings?.runtime_settings_version)}>运行时 {settings?.runtime_settings_version ? settings.runtime_settings_version.slice(0, 12) : "等待中"}</StatusPill>
@@ -1534,6 +1539,17 @@ export function SettingsWorkspace() {
               <BoundaryNote title="生效边界：下一次请求、下一次模型调用或下一次 Context Package 构建">
                 模型请求并发、超时、embedding 批大小、Context Package 预算和 Agent envelope 会热加载；已开始的请求或批次按启动时快照继续执行。
               </BoundaryNote>
+              <div className="mt-5">
+                <SwitchRow
+                  title="LLM 双语查询面"
+                  tooltip={SETTINGS_PARAMETER_HELP["LLM 双语查询面"]}
+                  description="开启后，查询面提取会要求 LLM 为用户显式提到的概念和过程补充中英双语 aliases，用于下一次 layered retrieval 入口选择。"
+                  checked={form.query_facet_bilingual_enabled}
+                  onChange={() => updateForm("query_facet_bilingual_enabled", !form.query_facet_bilingual_enabled)}
+                  disabled={saveMutation.isPending}
+                  badge="热加载"
+                />
+              </div>
               <div className="mt-5 grid gap-4 md:grid-cols-4">
                 <SettingField label="模型请求并发" type="number" min={1} max={16} value={form.model_request_concurrency} onChange={(value) => updateForm("model_request_concurrency", value)} />
                 <SettingField label="模型超时秒数" type="number" min={5} max={600} value={form.model_request_timeout_seconds} onChange={(value) => updateForm("model_request_timeout_seconds", value)} />

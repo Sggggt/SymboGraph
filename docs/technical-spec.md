@@ -2358,6 +2358,8 @@ flowchart TB
 
 Query understanding 分成两步：先判断 intent，再生成 query facet packet。LLM 只允许在 typed JSON schema 内提出查询 facet、别名、答案形态和 drop terms；executor 必须本地校验、去噪、归一化后再用于 layered traversal。
 
+`query_facet_bilingual_enabled` 是热加载 Runtime Settings，环境键为 `QUERY_FACET_BILINGUAL_ENABLED`，默认关闭。开启后，query facet extractor 必须要求 LLM 为用户显式提出的 domain/procedure facets 生成标准中英双语 aliases/search terms，用于跨语言语料的入口节点选择和 required facet 匹配；关闭时只保留显式或标准技术同义词。该开关不新增检索层、不创建事实证据、不写 graph concept metadata、不触发 graph rebuild，也不得让 query facet packet 绕过 executor、top-k、path threshold、structure restoration、context package 或 citation verification。开关状态必须进入 query facet diagnostics、runtime settings hash、retrieval trace 与相关 cache key。
+
 目标 packet：
 
 ```text
@@ -3259,7 +3261,7 @@ traversal_observation_budget
 context_path_summary_budget
 ```
 
-其中改变 chunking、embedding、dynamic dense KNN、bridge quota、edge type calibration、relation graph、RQ codebook、RQ membership protocol、edge projection、graph model endpoint 或 concept graph 的参数属于 `rebuild_required`；改变 chat model endpoint、staged traversal budget、layer top-k、label/cycle/path distance threshold/gray-zone observation cadence 等不改变 active graph 的参数属于 `hot_reloadable`，需要失效检索与 QA cache。`concept_i18n_enabled` 是热加载功能开关：保存后立即控制检索是否使用已有成功翻译文本，并控制下一次构图是否执行双语派生；它不会自动改写已有 active graph。预算类参数只作为 hard interrupt 或层间输出上限，不参与路径价值排序。
+其中改变 chunking、embedding、dynamic dense KNN、bridge quota、edge type calibration、relation graph、RQ codebook、RQ membership protocol、edge projection、graph model endpoint 或 concept graph 的参数属于 `rebuild_required`；改变 chat model endpoint、staged traversal budget、layer top-k、label/cycle/path distance threshold/gray-zone observation cadence 等不改变 active graph 的参数属于 `hot_reloadable`，需要失效检索与 QA cache。`concept_i18n_enabled` 是热加载功能开关：保存后立即控制检索是否使用已有成功翻译文本，并控制下一次构图是否执行双语派生；它不会自动改写已有 active graph。`query_facet_bilingual_enabled` 是热加载功能开关：保存后立即控制下一次 QA/search planning 的 LLM query facet packet 是否要求中英双语 aliases；它不写 concept graph，不触发 Qdrant 或 graph rebuild。预算类参数只作为 hard interrupt 或层间输出上限，不参与路径价值排序。
 
 TPE settings 分两层处理。`enable_auto_tpe`、`tpe_trial_budget`、`tpe_startup_random_trials`、`tpe_good_quantile_gamma`、`tpe_probe_query_budget`、`tpe_trial_timeout_seconds` 和 `tpe_candidate_pool_size` 是 automatic optimizer envelope，保存后热加载到下一次 graph build 或下一 trial 边界；它们不直接改写 active graph。dense KNN、bridge quota、threshold 和 edge calibration 改变 active graph 语义，必须只在 graph build 阶段由自动 TPE 或版本化默认 theta 选择，并在最终 active bottom relation graph 写入时一次性落库。前端导入页在清理数据库/文件数量附近提供自动 TPE 开关、可折叠 envelope 参数和最近一次 auto TPE run/blocking reason；设置页不提供启动、取消、手动切换或独立手动调参入口。
 
