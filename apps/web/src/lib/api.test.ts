@@ -44,6 +44,19 @@ describe("api client", () => {
     );
   });
 
+  it("cancels agent runs through the control endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ run_id: "run-1", status: "failed", error: "cancelled_by_user" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { cancelAgentRun } = await import("./api");
+
+    await cancelAgentRun("run-1");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://api.test/api/agent/runs/run-1/cancel",
+      expect.objectContaining({ method: "POST", headers: { "X-API-Key": "test-key" } }),
+    );
+  });
+
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
@@ -370,10 +383,12 @@ describe("api client", () => {
         controller.close();
       },
     });
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(body, { status: 200 })));
+    const fetchMock = vi.fn().mockResolvedValue(new Response(body, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
     const { streamAnswer } = await import("./api");
     const tokens: string[] = [];
     const meta: unknown[] = [];
+    const controller = new AbortController();
 
     await streamAnswer(
       { question: "hello", top_k: 3 },
@@ -382,8 +397,13 @@ describe("api client", () => {
         onCitations: () => undefined,
         onMeta: (value) => meta.push(value),
       },
+      { signal: controller.signal },
     );
 
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://api.test/api/qa/stream",
+      expect.objectContaining({ signal: controller.signal }),
+    );
     expect(tokens).toEqual(["hello"]);
     expect(meta).toContainEqual({ run_id: "run-1", session_id: "session-1", route: undefined });
     expect(meta).toContainEqual({ degraded_mode: false, run_id: "run-1", session_id: "session-1", route: "retrieve_sources" });

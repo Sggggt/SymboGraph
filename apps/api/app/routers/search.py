@@ -11,7 +11,7 @@ from app.db import get_db
 from app.models import AgentRun, AgentTraceEvent
 from app.services.agent_graph import trace_event_to_payload
 from app.schemas import AgentRequest, AgentResponse, QARequest, QAResponse, SearchRequest, SearchResponse, TaskStatusResponse
-from app.services.agent_graph import run_agent, run_to_task_status, stream_agent_events
+from app.services.agent_graph import cancel_agent_run, run_agent, run_to_task_status, stream_agent_events
 from app.services.embeddings import is_degraded_mode
 from app.services.error_sanitizer import external_error_payload, public_exception_message
 from app.services.ingestion import resolve_knowledge_base
@@ -131,5 +131,17 @@ def agent_run_status(run_id: str, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=404, detail="Agent run not found")
     payload = run_to_task_status(run)
     trace_events = db.scalars(select(AgentTraceEvent).where(AgentTraceEvent.run_id == run.id).order_by(AgentTraceEvent.created_at.asc())).all()
+    payload["trace"] = [trace_event_to_payload(event) for event in trace_events]
+    return payload
+
+
+@router.post("/agent/runs/{run_id}/cancel", response_model=TaskStatusResponse)
+@router.post("/tasks/{run_id}/cancel", response_model=TaskStatusResponse)
+def agent_run_cancel(run_id: str, db: Session = Depends(get_db)) -> dict:
+    try:
+        payload = cancel_agent_run(db, run_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    trace_events = db.scalars(select(AgentTraceEvent).where(AgentTraceEvent.run_id == run_id).order_by(AgentTraceEvent.created_at.asc())).all()
     payload["trace"] = [trace_event_to_payload(event) for event in trace_events]
     return payload

@@ -48,6 +48,10 @@ from app.services.model_output import coerce_confidence
 
 
 _TRACE_SUBSCRIBERS: dict[str, set[asyncio.Queue[dict]]] = {}
+_ACTIVE_AGENT_TASKS: dict[str, asyncio.Task] = {}
+TERMINAL_AGENT_RUN_STATUSES = {"completed", "failed", "needs_clarification"}
+CANCELLED_BY_USER = "cancelled_by_user"
+CANCEL_TRACE_NODE = "cancelled_by_user"
 
 
 def _summarize(text: str, limit: int = 280) -> str:
@@ -91,6 +95,21 @@ def trace_event_to_payload(event: AgentTraceEvent) -> dict:
 
 
 def trace(db: Session, run_id: str, node: str, *, input_summary: str = "", output_summary: str = "", document_ids: list[str] | None = None, scores: dict | None = None, duration_ms: int = 0, status: str = "completed", error: str | None = None) -> dict:
+    run_state = db.execute(select(AgentRun.status, AgentRun.error_message).where(AgentRun.id == run_id)).one_or_none()
+    if run_state is not None and run_state.status == "failed" and run_state.error_message == CANCELLED_BY_USER and node != CANCEL_TRACE_NODE:
+        return {
+            "id": None,
+            "run_id": run_id,
+            "node": node,
+            "status": status,
+            "input_summary": input_summary,
+            "output_summary": output_summary,
+            "document_ids": document_ids or [],
+            "scores": scores or {},
+            "duration_ms": duration_ms,
+            "error": error,
+            "created_at": None,
+        }
     event = AgentTraceEvent(
         run_id=run_id,
         node=node,
@@ -554,6 +573,9 @@ def create_agent_run_context(db: Session, request: AgentRequest) -> tuple[QASess
 
 
 def set_run_state(db: Session, run: AgentRun, status: str, *, current_node: str | None = None, answer: str | None = None, error: str | None = None) -> None:
+    db.refresh(run)
+    if run.status in TERMINAL_AGENT_RUN_STATUSES and run.status != status:
+        return
     run.status = status
     run.current_node = current_node
     if status == "running" and run.started_at is None:
@@ -565,6 +587,62 @@ def set_run_state(db: Session, run: AgentRun, status: str, *, current_node: str 
     if error is not None:
         run.error_message = error
     db.commit()
+
+
+def ensure_agent_run_not_cancelled(db: Session, run: AgentRun) -> None:
+    db.refresh(run)
+    if run.status == "failed" and run.error_message == CANCELLED_BY_USER:
+        raise asyncio.CancelledError(CANCELLED_BY_USER)
+
+
+def _cancel_task(task: asyncio.Task) -> None:
+    if task.done():
+        return
+    loop = task.get_loop()
+    loop.call_soon_threadsafe(task.cancel)
+
+
+def mark_agent_run_cancelled(db: Session, run: AgentRun) -> None:
+    db.refresh(run)
+    if run.status == "completed":
+        return
+    already_cancelled = run.status == "failed" and run.error_message == CANCELLED_BY_USER
+    if not already_cancelled:
+        run.status = "failed"
+        run.current_node = None
+        run.completed_at = datetime.utcnow()
+        run.error_message = CANCELLED_BY_USER
+        db.commit()
+        db.refresh(run)
+        trace(
+            db,
+            run.id,
+            CANCEL_TRACE_NODE,
+            status="failed",
+            output_summary=CANCELLED_BY_USER,
+            scores={"cancel_requested": True},
+            error=CANCELLED_BY_USER,
+        )
+
+
+def mark_agent_run_cancelled_by_id(run_id: str) -> None:
+    from app.db import SessionLocal
+
+    with SessionLocal() as db:
+        run = db.get(AgentRun, run_id)
+        if run is not None:
+            mark_agent_run_cancelled(db, run)
+
+
+def cancel_agent_run(db: Session, run_id: str) -> dict:
+    run = db.get(AgentRun, run_id)
+    if run is None:
+        raise LookupError("Agent run not found")
+    task = _ACTIVE_AGENT_TASKS.get(run_id)
+    if task is not None:
+        _cancel_task(task)
+    mark_agent_run_cancelled(db, run)
+    return run_to_task_status(run)
 
 
 def append_session_turn(db: Session, session: QASession, question: str, answer: str, run_id: str, citations: list[dict]) -> None:
@@ -1252,6 +1330,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
         set_run_state(db, run, "running", current_node="query_understanding")
         start = time.perf_counter()
         query_intent = await perceive_query_intent(request.question, [item.model_dump() for item in request.history])
+        ensure_agent_run_not_cancelled(db, run)
         trace(
             db,
             run.id,
@@ -1270,6 +1349,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             query_intent,
             envelope,
         )
+        ensure_agent_run_not_cancelled(db, run)
         typed_actions, validation = validate_typed_actions(proposed_actions, envelope, db=db, knowledge_base_id=run.knowledge_base_id)
         plan, action_rows = record_agent_plan_and_actions(
             db,
@@ -1302,6 +1382,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
 
         start = time.perf_counter()
         search_result = await layered_search(db, run.knowledge_base_id, request.question, request.filters, request.top_k)
+        ensure_agent_run_not_cancelled(db, run)
         plan.retrieval_trace_id = search_result.trace.id
         record_observation(
             db,
@@ -1450,6 +1531,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
 
         start = time.perf_counter()
         chat_result = await ChatProvider().answer_question_with_meta(request.question, contexts, [item.model_dump() for item in request.history])
+        ensure_agent_run_not_cancelled(db, run)
         answer_model_audit = {
             "provider": chat_result.provider,
             "model": chat_result.model,
@@ -1480,6 +1562,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             contexts,
             verification_budget=int(envelope.get("verification_budget") or 1),
         )
+        ensure_agent_run_not_cancelled(db, run)
         repair_actions: list[dict[str, Any]] = []
         if any(item.get("verdict") != "supported" for item in provisional_verifications) and int(envelope.get("repair_round_budget") or 0) > 0:
             failure_types = sorted({str(item.get("failure_type") or "unsupported_claim") for item in provisional_verifications if item.get("verdict") != "supported"})
@@ -1507,6 +1590,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             db.flush()
             repair_top_k = min(50, request.top_k + max(2, len(failure_types) * 2))
             repaired_search = await layered_search(db, run.knowledge_base_id, request.question, request.filters, repair_top_k)
+            ensure_agent_run_not_cancelled(db, run)
             repaired_package = build_context_package(
                 db,
                 knowledge_base_id=run.knowledge_base_id,
@@ -1520,6 +1604,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                 repaired_contexts,
                 [item.model_dump() for item in request.history],
             )
+            ensure_agent_run_not_cancelled(db, run)
             record_observation(
                 db,
                 run_id=run.id,
@@ -1684,10 +1769,10 @@ async def stream_agent_events(request: AgentRequest) -> AsyncGenerator[dict, Non
     session, run = create_agent_run_context(db, request)
     trace_queue = _subscribe_trace(run.id)
     task = asyncio.create_task(_execute_agent_run_and_close(db, request, session, run))
+    _ACTIVE_AGENT_TASKS[run.id] = task
     task.add_done_callback(_consume_detached_task_result)
     response: dict | None = None
     yielded_trace_ids: set[str] = set()
-    detached = False
     try:
         yield {"type": "meta", "run_id": run.id, "session_id": session.id}
         while not task.done():
@@ -1705,17 +1790,18 @@ async def stream_agent_events(request: AgentRequest) -> AsyncGenerator[dict, Non
                 yield {"type": "trace", "trace": event}
         response = await task
     except asyncio.CancelledError:
-        detached = True
         raise
     except Exception as exc:
         if not task.done():
-            task.cancel()
+            _cancel_task(task)
         yield {"type": "error", "error": public_exception_message(exc)}
         return
     finally:
         _unsubscribe_trace(run.id, trace_queue)
-        if not detached and not task.done():
-            task.cancel()
+        _ACTIVE_AGENT_TASKS.pop(run.id, None)
+        if not task.done():
+            _cancel_task(task)
+            mark_agent_run_cancelled_by_id(run.id)
     if response is None:
         return
     if request.stream_trace:

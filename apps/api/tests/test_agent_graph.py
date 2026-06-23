@@ -175,6 +175,74 @@ def test_citation_payloads_can_select_restored_supporting_chunk():
     assert citations[0]["source_span"]["context_package_id"] == "package-1"
 
 
+def test_cancel_agent_run_marks_running_run_failed_and_records_trace(db_session, sample_knowledge_base):
+    from app.models import AgentRun, AgentTraceEvent
+    from app.services.agent_graph import CANCELLED_BY_USER, cancel_agent_run
+
+    run = AgentRun(
+        knowledge_base_id=sample_knowledge_base.id,
+        question="cancel this run",
+        status="running",
+        route="layered_context_graph",
+        current_node="grounded_answer",
+    )
+    db_session.add(run)
+    db_session.commit()
+    db_session.refresh(run)
+
+    payload = cancel_agent_run(db_session, run.id)
+
+    db_session.refresh(run)
+    events = db_session.query(AgentTraceEvent).filter(AgentTraceEvent.run_id == run.id).all()
+    assert payload["status"] == "failed"
+    assert payload["error"] == CANCELLED_BY_USER
+    assert run.status == "failed"
+    assert run.error_message == CANCELLED_BY_USER
+    assert run.completed_at is not None
+    assert [event.node for event in events] == ["cancelled_by_user"]
+
+
+@pytest.mark.asyncio
+async def test_stream_agent_events_cancels_task_when_stream_closes(monkeypatch, db_session, sample_knowledge_base):
+    from app.models import AgentRun
+    from app.schemas import AgentRequest
+    from app.services import agent_graph
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def fake_execute_agent_run_and_close(db, request, session, run):
+        try:
+            agent_graph.set_run_state(db, run, "running", current_node="test_wait")
+            started.set()
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        finally:
+            db.close()
+
+    monkeypatch.setattr(agent_graph, "_execute_agent_run_and_close", fake_execute_agent_run_and_close)
+    stream = agent_graph.stream_agent_events(
+        AgentRequest(
+            knowledge_base_id=sample_knowledge_base.id,
+            question="cancel the stream",
+            stream_trace=True,
+        )
+    )
+
+    meta = await stream.__anext__()
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await stream.aclose()
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+
+    db_session.expire_all()
+    run = db_session.get(AgentRun, meta["run_id"])
+    assert run is not None
+    assert run.status == "failed"
+    assert run.error_message == agent_graph.CANCELLED_BY_USER
+
+
 @pytest.mark.asyncio
 async def test_agent_answers_from_context_package_and_records_audit(db_session, populated_context_graph):
     from sqlalchemy import func, select

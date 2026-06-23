@@ -12,11 +12,11 @@ import {
   FileText,
   History,
   Layers3,
-  Loader2,
   Plus,
   Send,
   ShieldCheck,
   Sparkles,
+  Square,
   Trash2,
 } from "lucide-react";
 
@@ -28,7 +28,7 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
-import { deleteSession, fetchDashboard, fetchModelSettings, fetchSessionMessages, fetchSessions, fetchTaskStatus, streamAnswer } from "@/lib/api";
+import { cancelAgentRun, deleteSession, fetchDashboard, fetchModelSettings, fetchSessionMessages, fetchSessions, fetchTaskStatus, streamAnswer } from "@/lib/api";
 import { contextGraphTraceFallbackSteps, groupTraceEvents, traceAuditSummary, traceNodeLabel } from "@/lib/agent-trace";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
@@ -48,6 +48,12 @@ type ActiveStreamState = {
   question: string;
   startedAt: string;
 };
+
+const userCancelledMessage = "已取消当前对话";
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
 
 const fallbackSuggestions = [
   "总结这批资料最核心的知识结构",
@@ -396,12 +402,14 @@ function ChatComposer({
   value,
   onChange,
   onSubmit,
+  onCancel,
   isPending,
   activeSessionId,
 }: {
   value: string;
   onChange: (value: string) => void;
   onSubmit: () => void;
+  onCancel: () => void;
   isPending: boolean;
   activeSessionId: string | null;
 }) {
@@ -451,9 +459,21 @@ function ChatComposer({
                 className="max-h-44 min-h-[72px] resize-none border-0 bg-transparent px-2 text-base text-white shadow-none placeholder:text-white/30 focus-visible:ring-0"
                 placeholder="输入问题，系统会检索、评估、回答并给出引用..."
               />
-              <Button type="button" size="icon-lg" className="rounded-full" onClick={handleSubmit} disabled={isPending || !value.trim()}>
-                {isPending ? <Loader2 className="animate-spin" /> : <Send />}
-                <span className="sr-only">提问</span>
+              <Button
+                type="button"
+                size="icon-lg"
+                className={cn(
+                  isPending
+                    ? "rounded-[0.45rem] border-rose-200/40 bg-rose-500 text-white shadow-[0_0_24px_rgba(244,63,94,0.35)] hover:bg-rose-400"
+                    : "rounded-full",
+                )}
+                onClick={isPending ? onCancel : handleSubmit}
+                disabled={!isPending && !value.trim()}
+                title={isPending ? "取消当前对话" : "发送"}
+                aria-label={isPending ? "取消当前对话" : "提问"}
+              >
+                {isPending ? <Square className="size-4 fill-current stroke-[2.4]" /> : <Send />}
+                <span className="sr-only">{isPending ? "取消当前对话" : "提问"}</span>
               </Button>
             </div>
           </div>
@@ -609,6 +629,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
   const [latestRun, setLatestRun] = useLocalStorage<AgentResponse | null>(`qa.latestRun.${storageScope}`, null);
   const [activeStream, setActiveStream] = useLocalStorage<ActiveStreamState | null>(`qa.activeStream.${storageScope}`, null);
   const [streamError, setStreamError] = useState<string | null>(null);
+  const streamAbortControllerRef = useRef<AbortController | null>(null);
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [citationsOpen, setCitationsOpen] = useState(false);
   const activeRunId = activeStream?.runId ?? null;
@@ -618,6 +639,23 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
     enabled: Boolean(activeRunId),
     refetchInterval: activeRunId ? 1500 : false,
     retry: false,
+  });
+
+  const cancelRunMutation = useMutation({
+    mutationFn: (runId: string) => cancelAgentRun(runId),
+    onSuccess: (status) => {
+      if (status.trace?.length) {
+        setTrace(status.trace);
+      }
+      const runState = status.status ?? status.state;
+      if (runState === "failed") {
+        setStreamError(status.error === "cancelled_by_user" ? userCancelledMessage : status.error ?? "回答生成已停止");
+      }
+      void queryClient.invalidateQueries({ queryKey: ["agent-run", status.run_id] });
+    },
+    onError: (error) => {
+      setStreamError(error instanceof Error ? error.message : String(error));
+    },
   });
 
   const askMutation = useMutation({
@@ -632,6 +670,8 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
       setTrace([]);
       setLatestRun(null);
       setActiveStream({ question: nextQuestion, startedAt: new Date().toISOString() });
+      const controller = new AbortController();
+      streamAbortControllerRef.current = controller;
       const nextTraceEvents: AgentTraceEventPayload[] = [];
       setTurns((current) => [...current, { role: "user", content: nextQuestion }]);
       setQuestion("");
@@ -681,17 +721,33 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
               void queryClient.invalidateQueries({ queryKey: ["session-messages", response.session_id] });
             },
             onError: (message) => {
-              setStreamError(message);
+              setStreamError(message === "cancelled_by_user" ? userCancelledMessage : message);
               setActiveStream(null);
             },
           },
+          { signal: controller.signal },
         );
       } catch (error) {
-        setStreamError(error instanceof Error ? error.message : String(error));
+        setStreamError(isAbortError(error) ? userCancelledMessage : error instanceof Error ? error.message : String(error));
         setActiveStream(null);
+      } finally {
+        if (streamAbortControllerRef.current === controller) {
+          streamAbortControllerRef.current = null;
+        }
       }
     },
   });
+
+  const handleCancelActiveRun = () => {
+    const runId = activeStream?.runId;
+    streamAbortControllerRef.current?.abort();
+    setDraftAnswer("");
+    setActiveStream(null);
+    setStreamError(userCancelledMessage);
+    if (runId) {
+      cancelRunMutation.mutate(runId);
+    }
+  };
 
   useEffect(() => {
     const status = runStatusQuery.data;
@@ -740,6 +796,11 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
       }
     } else if (runState === "failed") {
       window.queueMicrotask(() => {
+        if (status.error === "cancelled_by_user") {
+          setStreamError(userCancelledMessage);
+          setActiveStream(null);
+          return;
+        }
         setStreamError(status.error ?? "回答生成失败");
         setActiveStream(null);
       });
@@ -818,6 +879,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
             }
             askMutation.mutate();
           }}
+          onCancel={handleCancelActiveRun}
           isPending={isGenerating}
           activeSessionId={activeSessionId}
         />

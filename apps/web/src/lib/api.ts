@@ -476,6 +476,11 @@ export async function fetchTaskStatus(runId: string): Promise<TaskStatusResponse
   return parseResponse<TaskStatusResponse>(response);
 }
 
+export async function cancelAgentRun(runId: string): Promise<TaskStatusResponse> {
+  const response = await fetch(buildApiUrl(`/agent/runs/${encodeURIComponent(runId)}/cancel`), { method: "POST", headers: authHeaders() });
+  return parseResponse<TaskStatusResponse>(response);
+}
+
 export async function fetchSessions(knowledgeBaseId?: string | null): Promise<SessionSummary[]> {
   const response = await fetch(buildApiUrl("/sessions", { knowledge_base_id: knowledgeBaseId }), { cache: "no-store", headers: authHeaders() });
   return parseResponse<SessionSummary[]>(response);
@@ -501,11 +506,13 @@ export async function streamAnswer(
     onMeta?: (value: { degraded_mode?: boolean; run_id?: string; session_id?: string; route?: string }) => void;
     onError?: (value: string) => void;
   },
+  options?: { signal?: AbortSignal },
 ): Promise<void> {
   const response = await fetch(buildApiUrl("/qa/stream"), {
     method: "POST",
     headers: jsonHeaders(),
     body: JSON.stringify(payload),
+    signal: options?.signal,
   });
   if (!response.ok) {
     const message = extractApiErrorMessage(await response.text(), response.status);
