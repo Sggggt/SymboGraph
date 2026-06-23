@@ -141,6 +141,7 @@ export interface ModelAudit {
   frontier_pops?: number;
   dominance_pruned_count?: number;
   hard_stop_pruned_count?: number;
+  red_zone_pruned_count?: number;
   gray_zone_decision_count?: number;
   query_rq_path?: string[] | number[] | null;
   degraded?: boolean;
@@ -204,6 +205,7 @@ export interface AgentRequest extends QARequest {
 
 export type AgentTraceNode =
   | "query_understanding"
+  | "query_facet_extraction"
   | "agent_planner"
   | "typed_action_validation"
   | "entry_selection"

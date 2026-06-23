@@ -23,6 +23,150 @@ def test_entry_seed_calibration_prevents_zero_distance_route_seeds():
     assert distance_from_strength(calibrated_entry_seed_strength(1.0, "mid_drilldown_entry")) > 0.0
 
 
+def test_path_distance_zone_has_red_and_hard_boundaries():
+    from app.services.context_graph import _path_distance_zone
+
+    envelope = {
+        "path_distance_green_threshold": 0.45,
+        "path_distance_gray_threshold": 1.35,
+        "path_distance_hard_threshold": 2.4,
+    }
+
+    assert _path_distance_zone(0.45, envelope) == "green"
+    assert _path_distance_zone(1.35, envelope) == "gray"
+    assert _path_distance_zone(2.4, envelope) == "red"
+    assert _path_distance_zone(2.4001, envelope) == "hard_stop"
+
+
+def test_query_facet_packet_drops_fillers_and_matches_aliases():
+    from app.services.context_graph import matched_required_facets_for_text, query_facets_for_search
+
+    facets = query_facets_for_search(
+        "\u7ed9\u6211\u914d\u7f6e\u6a21\u578b\u7684\u5177\u4f53\u7b97\u6cd5\u6b65\u9aa4",
+        {
+            "domain_facets": [{"facet": "\u914d\u7f6e\u6a21\u578b", "aliases": ["configuration model"]}],
+            "procedure_facets": [
+                {
+                    "facet": "\u7b97\u6cd5\u6b65\u9aa4",
+                    "aliases": ["\u6807\u51c6\u6784\u9020", "\u534a\u8fb9", "stub", "\u968f\u673a\u5339\u914d", "\u4e24\u4e24\u5339\u914d"],
+                }
+            ],
+            "drop_terms": ["\u7ed9", "\u6211", "\u7684", "\u5177\u4f53"],
+            "answer_shape": "step_by_step_algorithm",
+        },
+        {"intent": "procedure"},
+    )
+
+    assert facets["protocol_version"] == "query_facet_packet_v1"
+    assert facets["intent"] == "procedure"
+    assert "\u7ed9" not in facets["required_facets"]
+    assert "\u6211" not in facets["required_facets"]
+    assert "\u7684" not in facets["required_facets"]
+    assert "\u914d\u7f6e\u6a21\u578b" in facets["required_facets"]
+    assert "\u7b97\u6cd5\u6b65\u9aa4" in facets["required_facets"]
+    assert "\u7ed9" not in facets["terms"]
+    assert "\u6211" not in facets["terms"]
+
+    text = "\u914d\u7f6e\u6a21\u578b\u7684\u6807\u51c6\u6784\u9020\uff1a\u4e3a\u6bcf\u4e2a\u8282\u70b9\u653e\u7f6e k_i \u4e2a\u534a\u8fb9 stub\uff0c\u7136\u540e\u5c06\u534a\u8fb9\u968f\u673a\u5339\u914d\u3002"
+    matched = set(matched_required_facets_for_text(text, facets))
+    assert {"\u914d\u7f6e\u6a21\u578b", "\u7b97\u6cd5\u6b65\u9aa4"}.issubset(matched)
+
+
+def test_context_package_restores_graph_path_chunks(db_session, sample_knowledge_base):
+    from app.models import Chunk, Document, DocumentVersion, RetrievalTrace
+    from app.services.chunking import stable_hash
+    from app.services.context_graph import build_context_package
+
+    document = Document(
+        knowledge_base_id=sample_knowledge_base.id,
+        title="Configuration model",
+        source_path="configuration-model.md",
+        source_type="markdown",
+        tags=["network"],
+        checksum="checksum",
+        is_active=True,
+    )
+    db_session.add(document)
+    db_session.flush()
+    version = DocumentVersion(document_id=document.id, version=1, checksum="checksum", storage_path="configuration-model.md", is_active=True)
+    db_session.add(version)
+    db_session.flush()
+    path_chunk = Chunk(
+        knowledge_base_id=sample_knowledge_base.id,
+        document_id=document.id,
+        document_version_id=version.id,
+        chunk_version=1,
+        chunk_index=0,
+        token_start=0,
+        token_end=12,
+        char_start=0,
+        char_end=80,
+        text="Configuration model uses stubs and random matching.",
+        text_hash=stable_hash({"chunk": "path"}),
+        section_path="Configuration model",
+        page_start=1,
+        page_end=1,
+        state="active",
+    )
+    hit_chunk = Chunk(
+        knowledge_base_id=sample_knowledge_base.id,
+        document_id=document.id,
+        document_version_id=version.id,
+        chunk_version=1,
+        chunk_index=1,
+        token_start=12,
+        token_end=24,
+        char_start=81,
+        char_end=160,
+        text="The final answer should cite grounded algorithm steps.",
+        text_hash=stable_hash({"chunk": "hit"}),
+        section_path="Configuration model",
+        page_start=1,
+        page_end=1,
+        state="active",
+    )
+    db_session.add_all([path_chunk, hit_chunk])
+    db_session.flush()
+    trace = RetrievalTrace(
+        knowledge_base_id=sample_knowledge_base.id,
+        query="\u914d\u7f6e\u6a21\u578b\u7b97\u6cd5",
+        filters_json={},
+        result_chunk_ids_json=[hit_chunk.id],
+        query_facets_json={"required_facets": ["\u914d\u7f6e\u6a21\u578b"]},
+        path_labels_json=[{"path": [path_chunk.id, hit_chunk.id], "path_edge_ids": ["edge-1"]}],
+        convergence_json={},
+    )
+    db_session.add(trace)
+    db_session.flush()
+
+    package = build_context_package(
+        db_session,
+        knowledge_base_id=sample_knowledge_base.id,
+        query=trace.query,
+        trace=trace,
+        results=[
+            {
+                "chunk_id": hit_chunk.id,
+                "metadata": {
+                    "traversal": {
+                        "path": [path_chunk.id, hit_chunk.id],
+                        "path_edge_ids": ["edge-1"],
+                        "covered_facets": ["\u914d\u7f6e\u6a21\u578b"],
+                        "evidence_roles": ["dense_semantic"],
+                        "why_selected": "accepted_by_priority_queue_graph_traversal",
+                    }
+                },
+            }
+        ],
+        token_budget=1000,
+    )
+
+    chunks = (package.package_json or {}).get("chunks") or []
+    assert path_chunk.id in package.restored_chunk_ids_json
+    assert any(item.get("chunk_id") == path_chunk.id and item.get("role") == "graph_path" for item in chunks)
+    assert package.why_selected_json[path_chunk.id]["reason"] == "restored_from_selected_graph_path"
+
+
 def test_concept_searchable_text_uses_successful_i18n_only():
     from app.services.context_graph import concept_searchable_text
 

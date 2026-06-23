@@ -14,12 +14,12 @@ import {
   Layers3,
   Plus,
   Send,
-  ShieldCheck,
   Sparkles,
   Square,
   Trash2,
 } from "lucide-react";
 
+import { AgentTraceStream } from "@/components/agent-trace-stream";
 import { CitationCard } from "@/components/citation-card";
 import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
@@ -29,7 +29,6 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
 import { cancelAgentRun, deleteSession, fetchDashboard, fetchModelSettings, fetchSessionMessages, fetchSessions, fetchTaskStatus, streamAnswer } from "@/lib/api";
-import { contextGraphTraceFallbackSteps, groupTraceEvents, traceAuditSummary, traceNodeLabel } from "@/lib/agent-trace";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 
@@ -196,83 +195,6 @@ function EmptyChatState({ suggestions, onPick }: { suggestions: string[]; onPick
   );
 }
 
-function TraceSummaryStrip({ trace, isRunning }: { trace: AgentTraceEventPayload[]; isRunning: boolean }) {
-  if (trace.length === 0 && !isRunning) {
-    return null;
-  }
-  const latest = trace.at(-1);
-  return (
-    <div className="flex flex-wrap items-center gap-2 text-[11px] text-white/45">
-      <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.025] px-2.5 py-1">
-        {isRunning ? <span className="tech-dot" /> : <ShieldCheck className="size-3.5 text-cyan-100/60" />}
-        {trace.length ? `${trace.length} 步轨迹` : "准备轨迹"}
-      </span>
-      {latest ? (
-        <span className="min-w-0 truncate rounded-full border border-white/10 bg-white/[0.025] px-2.5 py-1">
-          {traceNodeLabel(latest.node)}
-        </span>
-      ) : null}
-    </div>
-  );
-}
-
-function InlineTraceDisclosure({
-  trace,
-  isRunning = false,
-}: {
-  trace: AgentTraceEventPayload[];
-  isRunning?: boolean;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const steps: AgentTraceEventPayload[] = trace.length
-    ? trace
-    : contextGraphTraceFallbackSteps.map((node) => ({ node, status: "pending", document_ids: [], scores: {}, duration_ms: 0 }));
-  const groups = trace.length
-    ? groupTraceEvents(steps)
-    : [{ key: "entry" as const, label: "待执行链路", events: steps }];
-
-  if (trace.length === 0 && !isRunning) {
-    return null;
-  }
-
-  return (
-    <div className="mb-4 rounded-2xl border border-white/8 bg-white/[0.018] px-3 py-2">
-      <button type="button" onClick={() => setExpanded((current) => !current)} className="flex w-full items-center justify-between gap-3 text-left">
-        <TraceSummaryStrip trace={trace} isRunning={isRunning} />
-        <span className="shrink-0 text-[11px] text-cyan-100/55">{expanded ? "收起" : "查看轨迹"}</span>
-      </button>
-      {expanded ? (
-        <div className="mt-3 flex flex-col gap-3 border-t border-white/8 pt-3">
-          {groups.map((group) => (
-            <section key={group.key} className="space-y-2">
-              <div className="flex items-center justify-between gap-2 text-[11px] text-white/46">
-                <span>{group.label}</span>
-                <span>{group.events.length} 项</span>
-              </div>
-              {group.events.map((event, index) => {
-                const latest = isRunning && index === group.events.length - 1 && group.key === groups.at(-1)?.key;
-                const auditSummary = traceAuditSummary(event.scores);
-                return (
-                  <div key={event.id ?? `${event.node}-${index}`} className="rounded-xl border border-white/8 bg-black/10 px-3 py-2">
-                    <div className="flex items-center justify-between gap-3">
-                      <span className={cn("min-w-0 truncate text-xs font-medium", latest ? "text-cyan-100" : "text-white/70")}>
-                        {traceNodeLabel(event.node)}
-                      </span>
-                      <span className="shrink-0 font-mono text-[10px] text-white/34">{event.duration_ms}ms</span>
-                    </div>
-                    {event.output_summary ? <MarkdownRenderer content={event.output_summary} compact className="mt-1 text-xs leading-5 text-white/46" /> : null}
-                    {auditSummary.length ? <p className="mt-1 line-clamp-2 text-[10px] text-white/34">{auditSummary.join(" / ")}</p> : null}
-                  </div>
-                );
-              })}
-            </section>
-          ))}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 function MessageBubble({ turn, index, onOpenCitations }: { turn: ChatTurn; index: number; onOpenCitations: () => void }) {
   const isUser = turn.role === "user";
   return (
@@ -294,7 +216,7 @@ function MessageBubble({ turn, index, onOpenCitations }: { turn: ChatTurn; index
           {isUser ? <CircleDot /> : <BrainCircuit />}
           {isUser ? "你" : turn.route ? `智能体 / ${turn.route}` : "智能体"}
         </div>
-        {!isUser && turn.trace?.length ? <InlineTraceDisclosure trace={turn.trace} /> : null}
+        {!isUser && turn.trace?.length ? <AgentTraceStream trace={turn.trace} compact className="mb-5" /> : null}
         <MarkdownRenderer content={turn.content} className={cn(isUser ? "text-white/78" : "text-white/74")} />
         {!isUser && turn.citations?.length ? (
           <button type="button" onClick={onOpenCitations} className="kg-micro-chip mt-4 rounded-full px-3 py-2 text-xs transition hover:border-cyan-200/30 hover:text-white">
@@ -315,7 +237,7 @@ function GeneratingBubble({ content, trace }: { content: string; trace: AgentTra
           <span className="tech-dot" />
           {content ? "正在输出" : "智能体运行中"}
         </div>
-        {!content ? <InlineTraceDisclosure trace={trace} isRunning /> : null}
+        {!content ? <AgentTraceStream trace={trace} isRunning defaultExpanded compact className="mb-5" /> : null}
         {content ? (
           <div className="relative">
             <MarkdownRenderer content={content} className="pr-3 text-white/76" />

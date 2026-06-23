@@ -6,6 +6,7 @@ describe("agent trace helpers", () => {
   it("uses four-layer P&E fallback steps", () => {
     expect(contextGraphTraceFallbackSteps).toEqual([
       "query_understanding",
+      "query_facet_extraction",
       "agent_planner",
       "typed_action_validation",
       "entry_selection",
@@ -22,6 +23,7 @@ describe("agent trace helpers", () => {
 
   it("labels context graph nodes in Chinese", () => {
     expect(traceNodeLabel("agent_planner")).toBe("智能体规划");
+    expect(traceNodeLabel("query_facet_extraction")).toBe("查询 facets");
     expect(traceNodeLabel("typed_action_validation")).toBe("动作校验");
     expect(traceNodeLabel("entry_selection")).toBe("分阶段入口");
     expect(traceNodeLabel("layer_drilldown")).toBe("逐父下钻");
@@ -48,12 +50,13 @@ describe("agent trace helpers", () => {
           mid_entries: 3,
           rq_membership_entries: 4,
           frontier_pops: 5,
+          red_zone_pruned_count: 2,
           query_rq_path: [1, 2, 3],
           recalled_chunks: 10,
           structure_neighbors: 6,
           context_package_id: "pkg-1",
         },
       }),
-    ).toEqual(["粗入口: 2", "中入口: 3", "RQ 归属: 4", "Frontier pop: 5", "RQ 路径: 1/2/3", "召回片段: 10", "结构邻居: 6", "证据包: pkg-1"]);
+    ).toEqual(["粗入口: 2", "中入口: 3", "RQ 归属: 4", "Frontier pop: 5", "红区剪枝: 2", "RQ 路径: 1/2/3", "召回片段: 10", "结构邻居: 6", "证据包: pkg-1"]);
   });
 });

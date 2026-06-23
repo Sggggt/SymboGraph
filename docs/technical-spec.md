@@ -2354,6 +2354,67 @@ flowchart TB
 
 
 
+### Query facet packet
+
+Query understanding 分成两步：先判断 intent，再生成 query facet packet。LLM 只允许在 typed JSON schema 内提出查询 facet、别名、答案形态和 drop terms；executor 必须本地校验、去噪、归一化后再用于 layered traversal。
+
+目标 packet：
+
+```text
+query_facet_packet = {
+  protocol_version,
+  query,
+  intent,
+  answer_shape,
+  terms,
+  required_facets,
+  facet_groups: [
+    {
+      facet,
+      role: domain | procedure | constraint | alias | lexical,
+      aliases,
+      source,
+      confidence
+    }
+  ],
+  drop_terms,
+  diagnostics
+}
+```
+
+`terms` 是入口选择和文本匹配使用的干净检索 token；`required_facets` 是 priority queue key 中的覆盖目标；`facet_groups.aliases` 只作为匹配扩展和召回提示，不是事实证据。用户填充词、代词、礼貌词和纯交互词不得进入 `required_facets`。
+
+LLM facet extractor 的输入只能包含：
+
+```text
+question
+bounded conversation history
+query_intent
+allowed output schema
+rejection rules
+```
+
+LLM facet extractor 不得输出 document id、chunk id、node id、citation、answer claim 或路径决策。validator 必须拒绝或降级不合规字段，并保证 packet 只影响：
+
+```text
+coarse/mid entry text match
+covered_facets calculation
+priority queue uncovered facet count
+gray-zone observation packet
+trace and cache key
+```
+
+packet 不得绕过 executor、top-k、path threshold、structure restoration、context package 或 citation verification。回答阶段仍只能读取 context package；query facet packet 不是证据源。
+
+同一个 answer session 的首次 retrieval 和 repair retrieval 必须复用同一个 validated query facet packet，避免 repair 轮重新分词导致证据目标漂移。
+
+**架构影响：**
+- 影响对象：QA/Agent query understanding、layered retrieval、retrieval trace、context package diagnostics、cache key、前端轨迹展示和 repair retrieval。
+- 影响方式：LLM 从“直接决定检索结果”降级为“提出可校验 facet packet”；executor 负责去噪、别名匹配、priority queue key 和 trace 持久化。context package 仍只打包 raw chunk span 与结构/路径恢复结果。
+- 传播字段：`query_facets_json`、`query_facet_protocol_hash`、`query_facets_hash`、`covered_facets`、`why_selected_json`、`diagnostics_json`、`cache_key_components`。
+- 触发条件：LLM facet schema、validator、stopword/drop term policy、facet alias expansion、conversation scope 或 query intent 变化时，retrieval trace 与 cache key 必须刷新。
+- 验收观察点：填充词不进入 required facets，标准中英别名能命中 covered facets，trace 可显示 facet 来源与 drop terms，同一 answer session 的 repair retrieval 不产生新的 facet drift，citation verification 仍只引用 context package 中的 raw spans。
+
 ### Entry selection
 
 入口选择使用三类信号：语义候选、拓扑先验和 LLM 语义判定。active traversal layer 包括 coarse、mid 和 chunk relation graph；coarse entry selection 只决定粗粒度探索起点，mid 与 chunk entry 由上一层保留队列逐父节点下钻生成。RQ membership/address 作为 mid 节点归属、chunk seed selection 和边界诊断输入。拓扑指标是 prior，不是事实源，也不单独决定入口。
@@ -2498,11 +2559,12 @@ Zone(P)
 \begin{cases}
 green,&D(P)\le\tau_{\mathrm{green}}\\
 gray,&\tau_{\mathrm{green}}<D(P)\le\tau_{\mathrm{gray}}\\
+red,&\tau_{\mathrm{gray}}<D(P)\le\tau_{\mathrm{hard}}\\
 hard\_stop,&D(P)>\tau_{\mathrm{hard}}
 \end{cases}
 $$
 
-`green` 路径由 executor 自动继续；`gray` 路径生成 observation packet 交给 LLM evaluator 判断是否仍有探索价值；`hard_stop` 路径直接剪枝，不再展开。
+`green` 路径由 executor 自动继续；`gray` 路径生成 observation packet 交给 LLM evaluator 判断是否仍有探索价值；`red` 路径记录 red-zone prune 并停止展开；`hard_stop` 路径触发硬熔断剪枝。必须满足 \(\tau_{\mathrm{green}}\le\tau_{\mathrm{gray}}\le\tau_{\mathrm{hard}}\)。若 \(D(P)> \tau_{\mathrm{hard}}\)，该路径不允许进入 repair 或 context package，只能作为 trace 中的拒绝诊断。
 
 奖励：
 
@@ -2633,6 +2695,7 @@ hard_budget_hit
 per_parent_budget_hit
 layer_top_k_cut
 path_distance_hard_stop
+red_zone_pruned
 llm_stop_layer_irrelevant
 llm_stop_layer_sufficient
 llm_drilldown_ready
@@ -2679,6 +2742,17 @@ document_version_id + char_span
 
 相同 chunk 只进入 context package 一次；多条路径、多个 RQ membership 或多个概念命中只合并到 contribution summary。结构闭包可以追加上下文窗口，但不把不同 raw spans 做语义合并。
 
+进入 context package 的 chunk 来源包括：
+
+```text
+hit chunks
+previous/next structure restoration chunks
+bridge chunks
+graph_path chunks from accepted traversal paths
+```
+
+若某个 chunk 出现在最终 accepted hit 的 traversal path 中，即使它不是最终 hit chunk，也必须作为 `graph_path` restored chunk 候选进入 context package，并在 `why_selected_json` 中保留路径、边、covered facets 和 evidence roles。该规则用于防止“检索路径已发现关键证据，但 final top-k 未打包”的断裂。
+
 但保留 path summary：
 
 ```text
@@ -2687,6 +2761,7 @@ why_selected:
   query_facets
   evidence_roles
   graph_paths
+  graph_path_chunks
   convergence_score
 ```
 
@@ -2739,9 +2814,9 @@ result metadata 与 trace steps 保存 query/candidate RQ path、LCP depth、res
 **架构影响：**
 - 影响对象：搜索页结果、QA/Agent retrieval step、context package、citation payload、reward metrics、policy update 和前端检索轨迹。
 - 影响方式：layered retrieval 从加权融合排名改为 coarse/mid/chunk/structure 的 staged path search；RQ membership/address 作为语义地址贯穿 mid candidate collection、chunk seed selection、桥接路径解释和灰区 LLM 判停；trace 必须可回放每个 entry、局部 frontier pop、父节点下钻、candidate pool 合并、top-k 截断、edge expansion、cycle distance reward、gray-zone decision、dominance pruning、收敛判断和 context 去重。
-- 传播字段：`retrieval_trace_id`、`graph_retrieval_steps`、`result_chunk_ids`、`concept_path_json`、`frontier_json`、`stage_queues_json`、`candidate_pools_json`、`topk_selection_json`、`path_labels_json`、`convergence_json`、`diagnostics_json`、`runtime_settings_hash`。
+- 传播字段：`retrieval_trace_id`、`graph_retrieval_steps`、`result_chunk_ids`、`query_facets_json`、`query_facet_protocol_hash`、`query_facets_hash`、`concept_path_json`、`frontier_json`、`stage_queues_json`、`candidate_pools_json`、`topk_selection_json`、`path_labels_json`、`convergence_json`、`diagnostics_json`、`runtime_settings_hash`。
 - 触发条件：query facets、relation/RQ/mid/coarse hash、edge distance protocol、traversal budget、agent envelope 或 conversation scope 变化时，graph traversal trace 与 cache key 需要刷新。
-- 验收观察点：entry node 选择可解释、coarse queue 覆盖、per-coarse mid candidate coverage、mid top-k selection audit、per-mid chunk candidate coverage、chunk top-k selection audit、chunk seed quality、frontier expansion count、path convergence score、gray-zone LLM decision audit、cycle distance reward bounded、dominance pruning count、structure restore step、RQ diagnostics、cache hit audit 和 evidence package de-duplication。
+- 验收观察点：entry node 选择可解释、coarse queue 覆盖、per-coarse mid candidate coverage、mid top-k selection audit、per-mid chunk candidate coverage、chunk top-k selection audit、chunk seed quality、frontier expansion count、path convergence score、gray-zone LLM decision audit、red-zone prune audit、cycle distance reward bounded、dominance pruning count、structure restore step、graph path chunk restoration、RQ diagnostics、cache hit audit 和 evidence package de-duplication。
 
 ## Layered P&E Agent
 
@@ -3602,6 +3677,8 @@ retrieval_traces:
   edge_projection_protocol_hash
   traversal_protocol_hash
   conversation_state_scope_hash
+  diagnostics_json.cache_key_components.query_facet_protocol_hash
+  diagnostics_json.cache_key_components.query_facets_hash
 
 graph_retrieval_steps:
   layer
@@ -3621,6 +3698,7 @@ graph_retrieval_steps:
 
 context_packages:
   selected_chunk_ids
+  restored_chunk_ids with role=graph_path
   citation_spans
   graph_path_ids
   why_selected_json

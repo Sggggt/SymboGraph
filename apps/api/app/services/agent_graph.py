@@ -38,6 +38,7 @@ from app.services.context_graph import (
     build_context_package,
     context_package_to_contexts,
     layered_search,
+    query_facets_for_search,
     runtime_settings_state_hash,
 )
 from app.services.embeddings import ChatProvider, FallbackDisabledError, is_degraded_mode
@@ -278,6 +279,50 @@ async def perceive_query_intent(question: str, history: list[dict] | None = None
         except Exception:
             raise
     return heuristic_query_intent(question, history)
+
+
+async def propose_query_facets(question: str, history: list[dict] | None, query_intent: dict[str, Any]) -> dict[str, Any]:
+    fallback_marker = {"_fallback_query_facets": True}
+    system = (
+        "You are the query facet extractor for a Four-Layer Context Graph RAG executor. "
+        "Return ONLY a JSON object. You may identify domain facets, procedure facets, aliases/search terms, "
+        "constraints, answer_shape, and drop_terms. Do not choose documents, chunks, node ids, citations, or facts. "
+        "The executor will validate this packet and use it only as retrieval priority metadata."
+    )
+    user_prompt = str(
+        {
+            "question": question,
+            "history": (history or [])[-6:],
+            "query_intent": query_intent,
+            "required_json_shape": {
+                "domain_facets": ["main concepts explicitly requested by the user"],
+                "procedure_facets": ["algorithm/procedure/formula aspects requested by the user"],
+                "alias_facets": [
+                    {
+                        "facet": "canonical query facet",
+                        "aliases": ["standard bilingual or technical aliases useful for retrieval"],
+                    }
+                ],
+                "constraint_facets": ["scope, comparison target, time, source, or modality constraints"],
+                "answer_shape": "definition | comparison | step_by_step_algorithm | formula_explanation | grounded_answer",
+                "drop_terms": ["user filler words that must not become required facets"],
+            },
+            "rejection_rules": [
+                "Do not output chunk ids, document ids, node ids, or citations.",
+                "Do not infer corpus facts.",
+                "Do not put polite filler or pronouns in required facets.",
+            ],
+        }
+    )
+    try:
+        raw = await ChatProvider().classify_json(system_prompt=system, user_prompt=user_prompt, fallback=fallback_marker)
+    except Exception:
+        if not get_settings().enable_model_fallback:
+            raise
+        raw = fallback_marker
+    if not isinstance(raw, dict) or raw.get("_fallback_query_facets"):
+        return query_facets_for_search(question, None, query_intent)
+    return query_facets_for_search(question, raw, query_intent)
 
 
 async def propose_agent_plan(question: str, history: list[dict], query_intent: dict[str, Any], envelope: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1341,6 +1386,19 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
 
+        start = time.perf_counter()
+        query_facets = await propose_query_facets(request.question, [item.model_dump() for item in request.history], query_intent)
+        ensure_agent_run_not_cancelled(db, run)
+        trace(
+            db,
+            run.id,
+            "query_facet_extraction",
+            input_summary=request.question,
+            output_summary=", ".join(query_facets.get("required_facets") or [])[:240],
+            scores={"query_facets": query_facets},
+            duration_ms=int((time.perf_counter() - start) * 1000),
+        )
+
         envelope = agent_operating_envelope()
         start = time.perf_counter()
         proposed_actions, raw_planner_output = await propose_agent_plan(
@@ -1381,7 +1439,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
         )
 
         start = time.perf_counter()
-        search_result = await layered_search(db, run.knowledge_base_id, request.question, request.filters, request.top_k)
+        search_result = await layered_search(db, run.knowledge_base_id, request.question, request.filters, request.top_k, query_facets=query_facets)
         ensure_agent_run_not_cancelled(db, run)
         plan.retrieval_trace_id = search_result.trace.id
         record_observation(
@@ -1589,7 +1647,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             db.add(repair_action)
             db.flush()
             repair_top_k = min(50, request.top_k + max(2, len(failure_types) * 2))
-            repaired_search = await layered_search(db, run.knowledge_base_id, request.question, request.filters, repair_top_k)
+            repaired_search = await layered_search(db, run.knowledge_base_id, request.question, request.filters, repair_top_k, query_facets=query_facets)
             ensure_agent_run_not_cancelled(db, run)
             repaired_package = build_context_package(
                 db,

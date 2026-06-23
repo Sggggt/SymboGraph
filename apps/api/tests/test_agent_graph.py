@@ -7,6 +7,38 @@ import pytest
 
 
 @pytest.mark.asyncio
+async def test_propose_query_facets_validates_llm_packet(monkeypatch):
+    from app.services import agent_graph
+
+    class FacetChatProvider:
+        async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
+            return {
+                "domain_facets": [{"facet": "\u914d\u7f6e\u6a21\u578b", "aliases": ["configuration model"]}],
+                "procedure_facets": [{"facet": "\u7b97\u6cd5\u6b65\u9aa4", "aliases": ["stub", "\u534a\u8fb9", "\u968f\u673a\u5339\u914d"]}],
+                "drop_terms": ["\u7ed9", "\u6211", "\u7684", "\u5177\u4f53"],
+                "answer_shape": "step_by_step_algorithm",
+                "chunk_ids": ["must-not-survive"],
+                "document_ids": ["must-not-survive"],
+            }
+
+    monkeypatch.setattr(agent_graph, "ChatProvider", FacetChatProvider)
+
+    facets = await agent_graph.propose_query_facets(
+        "\u7ed9\u6211\u914d\u7f6e\u6a21\u578b\u7684\u5177\u4f53\u7b97\u6cd5\u6b65\u9aa4",
+        [],
+        {"intent": "procedure"},
+    )
+
+    assert facets["protocol_version"] == "query_facet_packet_v1"
+    assert facets["intent"] == "procedure"
+    assert "\u914d\u7f6e\u6a21\u578b" in facets["required_facets"]
+    assert "\u7b97\u6cd5\u6b65\u9aa4" in facets["required_facets"]
+    assert "\u7ed9" not in facets["required_facets"]
+    assert "chunk_ids" not in facets
+    assert "document_ids" not in facets
+
+
+@pytest.mark.asyncio
 async def test_citation_verification_normalizes_label_confidence(monkeypatch):
     from app.services import agent_graph
 

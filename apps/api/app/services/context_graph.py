@@ -77,6 +77,70 @@ EDGE_DISTANCE_PROTOCOL_VERSION = "edge_distance_log_raw_strength_v1"
 EDGE_PROJECTION_PROTOCOL_VERSION = "edge_projection_support_ids_v1"
 TRAVERSAL_PROTOCOL_VERSION = "staged_layered_traversal_v2"
 CONCEPT_I18N_PROTOCOL_VERSION = "concept_i18n_bilingual_v1"
+QUERY_FACET_PROTOCOL_VERSION = "query_facet_packet_v1"
+
+QUERY_FACET_MAX_GROUPS = 12
+QUERY_FACET_MAX_ALIASES = 8
+QUERY_FACET_MAX_REQUIRED = 8
+QUERY_FACET_MAX_TERMS = 48
+QUERY_FACET_STOP_TERMS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "about",
+    "for",
+    "from",
+    "give",
+    "how",
+    "in",
+    "is",
+    "me",
+    "of",
+    "on",
+    "please",
+    "show",
+    "tell",
+    "the",
+    "to",
+    "what",
+    "why",
+    "\u4e00\u4e0b",
+    "\u4e2d",
+    "\u4e3a\u4ec0\u4e48",
+    "\u4e48",
+    "\u4e86",
+    "\u4ec0\u4e48",
+    "\u4ed6",
+    "\u4f60",
+    "\u4f60\u4eec",
+    "\u5177\u4f53",
+    "\u5185",
+    "\u5417",
+    "\u5462",
+    "\u548c",
+    "\u54ea",
+    "\u54ea\u4e2a",
+    "\u5728",
+    "\u5e2e",
+    "\u5e2e\u6211",
+    "\u600e\u4e48",
+    "\u6211",
+    "\u6211\u4eec",
+    "\u628a",
+    "\u6750\u6599",
+    "\u6837",
+    "\u8bb2",
+    "\u8bf4",
+    "\u8bf7",
+    "\u8ddf",
+    "\u8fd9",
+    "\u8fd9\u4e2a",
+    "\u91cc",
+    "\u91cc\u9762",
+    "\u7684",
+    "\u7ed9",
+}
 
 
 @dataclass(frozen=True)
@@ -228,6 +292,15 @@ def traversal_protocol_hash() -> str:
     return stable_hash({"protocol": TRAVERSAL_PROTOCOL_VERSION, "queue_key": ["uncovered_facets", "distance_minus_reward", "depth", "negative_evidence_roles"]})
 
 
+def query_facet_protocol_hash() -> str:
+    return stable_hash(
+        {
+            "protocol": QUERY_FACET_PROTOCOL_VERSION,
+            "fields": ["terms", "required_facets", "facet_groups", "drop_terms", "answer_shape", "intent"],
+        }
+    )
+
+
 def context_graph_cache_key_components(
     *,
     knowledge_base_id: str,
@@ -236,6 +309,7 @@ def context_graph_cache_key_components(
     context_state: ContextGraphState | None,
     retrieval_mode: str,
     conversation_state_scope_hash: str | None = None,
+    query_facets: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     filter_payload = filters.model_dump() if isinstance(filters, SearchFilters) else dict(filters or {})
     return {
@@ -252,6 +326,8 @@ def context_graph_cache_key_components(
         "edge_distance_protocol_hash": edge_distance_protocol_hash(),
         "edge_projection_protocol_hash": edge_projection_protocol_hash(),
         "traversal_protocol_hash": traversal_protocol_hash(),
+        "query_facet_protocol_hash": query_facet_protocol_hash(),
+        "query_facets_hash": stable_hash(query_facets or {}),
         "runtime_settings_hash": runtime_settings_state_hash(),
         "policy_state_hash": context_state.policy_state_hash if context_state else None,
         "agent_operating_envelope_hash": agent_operating_envelope_state_hash(),
@@ -269,6 +345,7 @@ def context_graph_cache_key(
     context_state: ContextGraphState | None,
     retrieval_mode: str,
     conversation_state_scope_hash: str | None = None,
+    query_facets: dict[str, Any] | None = None,
 ) -> str:
     return stable_hash(
         context_graph_cache_key_components(
@@ -278,6 +355,7 @@ def context_graph_cache_key(
             context_state=context_state,
             retrieval_mode=retrieval_mode,
             conversation_state_scope_hash=conversation_state_scope_hash,
+            query_facets=query_facets,
         )
     )
 
@@ -3184,10 +3262,12 @@ async def layered_search(
     query: str,
     filters: SearchFilters,
     top_k: int,
+    *,
+    query_facets: dict[str, Any] | None = None,
 ) -> LayeredSearchResult:
     chunks = list(db.scalars(active_chunks_query(knowledge_base_id)).all())
+    query_facets = query_facets_for_search(query, query_facets)
     if not chunks:
-        query_facets = query_facets_for_search(query)
         trace = RetrievalTrace(
             knowledge_base_id=knowledge_base_id,
             query=query,
@@ -3207,7 +3287,6 @@ async def layered_search(
     relation_state = latest_relation_state(db, knowledge_base_id)
     query_vector = (await EmbeddingProvider().embed_texts([query], text_type="query"))[0]
     query_rq = encode_query_rq(relation_state, query_vector)
-    query_facets = query_facets_for_search(query)
     coarse_entries = select_coarse_entries(db, knowledge_base_id, query_facets)
     mid_entries = select_mid_entries(db, knowledge_base_id, query_facets, coarse_entries)
     rq_membership_entries = select_rq_membership_entries(db, knowledge_base_id, query_vector, query_rq, mid_entries)
@@ -3256,21 +3335,232 @@ async def layered_search(
         "chunk_topk_selected": len(((traversal.get("topk_selection") or {}).get("chunk") or {}).get("selected_ids") or []),
         "dominance_pruned_count": traversal["convergence"]["dominance_pruned_count"],
         "hard_stop_pruned_count": traversal["convergence"].get("hard_stop_pruned_count", 0),
+        "red_zone_pruned_count": traversal["convergence"].get("red_zone_pruned_count", 0),
         "gray_zone_decision_count": traversal["convergence"].get("gray_zone_decision_count", 0),
         "query_rq_path": query_rq.get("rq_path") if query_rq else [],
     }
     return LayeredSearchResult(results, trace, audit)
 
 
-def query_facets_for_search(query: str) -> dict[str, Any]:
-    terms = tokenize_for_search_terms(query)
-    intent = "formula_table_lookup" if any(term in query.lower() for term in ("formula", "equation", "table", "鍏紡", "琛ㄦ牸")) else "semantic"
+def _normalize_query_facet_text(value: Any, *, max_length: int = 96) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text[:max_length]
+
+
+def _facet_dedupe_key(value: str) -> str:
+    return _normalize_query_facet_text(value).casefold()
+
+
+def _dedupe_query_values(values: list[Any], *, max_items: int | None = None) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        text = _normalize_query_facet_text(value)
+        if not text:
+            continue
+        key = _facet_dedupe_key(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(text)
+        if max_items is not None and len(deduped) >= max_items:
+            break
+    return deduped
+
+
+def _query_term_allowed(term: Any) -> bool:
+    text = _normalize_query_facet_text(term, max_length=48)
+    if not text:
+        return False
+    lowered = text.casefold()
+    if lowered in QUERY_FACET_STOP_TERMS:
+        return False
+    if len(text) == 1 and not re.fullmatch(r"[A-Za-z0-9]|[=<>+\-*/^(),.;:_]+", text):
+        return False
+    return True
+
+
+def _query_terms_from_values(values: list[Any]) -> list[str]:
+    terms: list[str] = []
+    for value in values:
+        text = _normalize_query_facet_text(value)
+        if not text:
+            continue
+        tokenized_terms = tokenize_for_search_terms(text)
+        if not tokenized_terms and _query_term_allowed(text):
+            terms.append(text.casefold())
+        for term in tokenized_terms:
+            if _query_term_allowed(term):
+                terms.append(term.casefold())
+    return _dedupe_query_values(terms, max_items=QUERY_FACET_MAX_TERMS)
+
+
+def _coerce_facet_group(raw: Any, *, role: str) -> dict[str, Any] | None:
+    if isinstance(raw, dict):
+        facet = _normalize_query_facet_text(
+            raw.get("facet")
+            or raw.get("label")
+            or raw.get("name")
+            or raw.get("term")
+            or raw.get("value")
+        )
+        aliases = raw.get("aliases") or raw.get("alias") or raw.get("search_terms") or raw.get("terms") or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        elif not isinstance(aliases, list):
+            aliases = []
+        raw_role = _normalize_query_facet_text(raw.get("role") or role, max_length=32) or role
+        source = _normalize_query_facet_text(raw.get("source") or "llm", max_length=32) or "llm"
+        confidence = coerce_confidence(raw.get("confidence"), default=0.7)
+    else:
+        facet = _normalize_query_facet_text(raw)
+        aliases = []
+        raw_role = role
+        source = "llm"
+        confidence = 0.7
+    if not facet or not _query_term_allowed(facet):
+        return None
+    return {
+        "facet": facet,
+        "role": raw_role,
+        "aliases": _dedupe_query_values(list(aliases), max_items=QUERY_FACET_MAX_ALIASES),
+        "source": source,
+        "confidence": confidence,
+    }
+
+
+def _facet_groups_from_llm_payload(llm_facets: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(llm_facets, dict):
+        return []
+    groups: list[dict[str, Any]] = []
+    raw_groups = llm_facets.get("facet_groups")
+    if isinstance(raw_groups, list):
+        for item in raw_groups:
+            group = _coerce_facet_group(item, role="domain")
+            if group is not None:
+                groups.append(group)
+    keyed_roles = {
+        "domain_facets": "domain",
+        "entity_facets": "domain",
+        "procedure_facets": "procedure",
+        "algorithm_facets": "procedure",
+        "constraint_facets": "constraint",
+        "alias_facets": "alias",
+        "required_facets": "required",
+    }
+    for key, role in keyed_roles.items():
+        values = llm_facets.get(key)
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            group = _coerce_facet_group(item, role=role)
+            if group is not None:
+                groups.append(group)
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in groups:
+        key = _facet_dedupe_key(group["facet"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(group)
+        if len(deduped) >= QUERY_FACET_MAX_GROUPS:
+            break
+    return deduped
+
+
+def query_facets_for_search(query: str, llm_facets: dict[str, Any] | None = None, query_intent: dict[str, Any] | None = None) -> dict[str, Any]:
+    lexical_terms = _query_terms_from_values(tokenize_for_search_terms(query))
+    facet_groups = _facet_groups_from_llm_payload(llm_facets)
+    if not facet_groups:
+        facet_groups = [
+            {
+                "facet": term,
+                "role": "lexical",
+                "aliases": [],
+                "source": "deterministic_tokenizer",
+                "confidence": 0.55,
+            }
+            for term in lexical_terms[:QUERY_FACET_MAX_REQUIRED]
+        ]
+    raw_drop_terms = (llm_facets or {}).get("drop_terms") or []
+    if isinstance(raw_drop_terms, str):
+        raw_drop_terms = [raw_drop_terms]
+    if not isinstance(raw_drop_terms, list):
+        raw_drop_terms = []
+    drop_terms = _dedupe_query_values(list(raw_drop_terms) + sorted(QUERY_FACET_STOP_TERMS), max_items=64)
+    dropped = {_facet_dedupe_key(term) for term in drop_terms}
+    required_facets = [
+        group["facet"]
+        for group in facet_groups
+        if _facet_dedupe_key(group["facet"]) not in dropped and group.get("role") != "alias"
+    ][:QUERY_FACET_MAX_REQUIRED]
+    if not required_facets:
+        required_facets = lexical_terms[:QUERY_FACET_MAX_REQUIRED]
+    term_sources: list[Any] = [*lexical_terms]
+    for group in facet_groups:
+        term_sources.append(group["facet"])
+        term_sources.extend(group.get("aliases") or [])
+    terms = [
+        term
+        for term in _query_terms_from_values(term_sources)
+        if _facet_dedupe_key(term) not in dropped
+    ][:QUERY_FACET_MAX_TERMS]
+    if not terms:
+        terms = lexical_terms[:QUERY_FACET_MAX_TERMS]
+    lower_query = query.lower()
+    intent = str((query_intent or {}).get("intent") or (llm_facets or {}).get("intent") or "")
+    if not intent:
+        intent = "formula_table_lookup" if any(term in lower_query for term in ("formula", "equation", "table", "\u516c\u5f0f", "\u8868\u683c")) else "semantic"
     return {
         "query": query,
+        "protocol_version": QUERY_FACET_PROTOCOL_VERSION,
         "terms": terms,
-        "required_facets": list(dict.fromkeys(terms[:8])),
+        "required_facets": _dedupe_query_values(required_facets, max_items=QUERY_FACET_MAX_REQUIRED),
+        "facet_groups": facet_groups,
+        "drop_terms": drop_terms,
+        "answer_shape": _normalize_query_facet_text((llm_facets or {}).get("answer_shape") or (query_intent or {}).get("intent") or "grounded_answer", max_length=48),
         "intent": intent,
+        "diagnostics": {
+            "source": "llm_validated" if isinstance(llm_facets, dict) and llm_facets else "deterministic_tokenizer",
+            "lexical_terms": lexical_terms,
+            "dropped_query_terms": [term for term in tokenize_for_search_terms(query) if _facet_dedupe_key(term) in dropped or not _query_term_allowed(term)],
+            "llm_keys": sorted(llm_facets.keys()) if isinstance(llm_facets, dict) else [],
+        },
     }
+
+
+def matched_required_facets_for_text(text: str, query_facets: dict[str, Any]) -> list[str]:
+    required_facets = list(query_facets.get("required_facets") or [])
+    if not required_facets:
+        return []
+    text_value = str(text or "")
+    text_lower = text_value.casefold()
+    text_terms = set(term.casefold() for term in tokenize_for_search_terms(text_value))
+    groups_by_facet = {
+        _facet_dedupe_key(group.get("facet")): group
+        for group in (query_facets.get("facet_groups") or [])
+        if isinstance(group, dict) and group.get("facet")
+    }
+    matched: list[str] = []
+    for facet in required_facets:
+        facet_text = _normalize_query_facet_text(facet)
+        if not facet_text:
+            continue
+        group = groups_by_facet.get(_facet_dedupe_key(facet_text)) or {"facet": facet_text, "aliases": []}
+        candidates = [group.get("facet"), *(group.get("aliases") or [])]
+        for candidate in candidates:
+            candidate_text = _normalize_query_facet_text(candidate)
+            if not candidate_text:
+                continue
+            candidate_lower = candidate_text.casefold()
+            candidate_terms = [term.casefold() for term in tokenize_for_search_terms(candidate_text) if _query_term_allowed(term)]
+            if candidate_lower in text_lower or (candidate_terms and set(candidate_terms).issubset(text_terms)):
+                matched.append(facet_text)
+                break
+    return _dedupe_query_values(matched)
 
 
 def select_coarse_entries(db: Session, knowledge_base_id: str, query_facets: dict[str, Any]) -> dict[str, float]:
@@ -3694,12 +3984,12 @@ def _path_distance_zone(distance: float, envelope: dict[str, Any]) -> str:
     green = float(envelope.get("path_distance_green_threshold") or 0.0)
     gray = float(envelope.get("path_distance_gray_threshold") or green)
     hard = float(envelope.get("path_distance_hard_threshold") or gray)
-    if hard and distance > hard:
-        return "hard_stop"
     if distance <= green:
         return "green"
     if distance <= gray:
         return "gray"
+    if hard and distance <= hard:
+        return "red"
     return "hard_stop"
 
 
@@ -3775,8 +4065,7 @@ def execute_layer_priority_walk(
     required_facets = set(query_facets.get("required_facets") or [])
 
     def covered_facets_for_node(node_id: str) -> set[str]:
-        text_terms = set(tokenize_for_search_terms(node_text_by_id.get(node_id, "")))
-        return {facet for facet in required_facets if facet in text_terms}
+        return set(matched_required_facets_for_text(node_text_by_id.get(node_id, ""), query_facets))
 
     entry_nodes = [
         {
@@ -3821,6 +4110,7 @@ def execute_layer_priority_walk(
     dominance_labels: dict[str, list[tuple[float, float, int, int]]] = defaultdict(list)
     dominance_pruned_count = 0
     hard_stop_pruned_count = 0
+    red_zone_pruned_count = 0
     expansion_count = 0
     max_expansions = layer_frontier_budget(layer, envelope)
     max_depth = int(envelope.get("max_depth_per_layer") or 1)
@@ -3864,8 +4154,10 @@ def execute_layer_priority_walk(
             edge_distance = _edge_distance(edge)
             next_distance = round(float(state["distance_so_far"]) + edge_distance, 6)
             zone = _path_distance_zone(next_distance, envelope)
-            if zone == "hard_stop":
+            if zone in {"red", "hard_stop"}:
                 hard_stop_pruned_count += 1
+                if zone == "red":
+                    red_zone_pruned_count += 1
                 gray_zone_decisions.append(
                     {
                         "layer": layer,
@@ -3874,7 +4166,7 @@ def execute_layer_priority_walk(
                         "to_node_id": neighbor_id,
                         "path_distance": next_distance,
                         "distance_zone": zone,
-                        "decision": "hard_stop_pruned",
+                        "decision": "red_zone_pruned" if zone == "red" else "hard_stop_pruned",
                     }
                 )
                 continue
@@ -3963,6 +4255,7 @@ def execute_layer_priority_walk(
             "frontier_expansion_count": expansion_count,
             "dominance_pruned_count": dominance_pruned_count,
             "hard_stop_pruned_count": hard_stop_pruned_count,
+            "red_zone_pruned_count": red_zone_pruned_count,
             "cycle_distance_reward_bounded": True,
             "path_distance_thresholds": {
                 "green": envelope.get("path_distance_green_threshold"),
@@ -4249,8 +4542,7 @@ def execute_priority_queue_traversal(
     required_facets = set(query_facets.get("required_facets") or [])
 
     def covered_facets_for_chunk(chunk: Chunk) -> set[str]:
-        text_terms = set(tokenize_for_search_terms(chunk.text))
-        return {facet for facet in required_facets if facet in text_terms}
+        return set(matched_required_facets_for_text(chunk.text, query_facets))
 
     adjacency: dict[str, list[ChunkRelationEdge]] = defaultdict(list)
     if relation_state:
@@ -4313,6 +4605,7 @@ def execute_priority_queue_traversal(
     dominance_labels: dict[str, list[tuple[float, float, int, int]]] = defaultdict(list)
     dominance_pruned_count = 0
     hard_stop_pruned_count = 0
+    red_zone_pruned_count = 0
     expansion_count = 0
     stop_reason = "frontier_empty"
     max_expansions = layer_frontier_budget("chunk", envelope)
@@ -4359,8 +4652,10 @@ def execute_priority_queue_traversal(
             edge_distance = float(edge.distance if edge.distance is not None else distance_from_strength(edge.raw_strength or 1e-6))
             next_distance = round(float(state["distance_so_far"]) + edge_distance, 6)
             zone = _path_distance_zone(next_distance, envelope)
-            if zone == "hard_stop":
+            if zone in {"red", "hard_stop"}:
                 hard_stop_pruned_count += 1
+                if zone == "red":
+                    red_zone_pruned_count += 1
                 gray_zone_decisions.append(
                     {
                         "layer": "chunk",
@@ -4369,7 +4664,7 @@ def execute_priority_queue_traversal(
                         "to_chunk_id": neighbor_id,
                         "path_distance": next_distance,
                         "distance_zone": zone,
-                        "decision": "hard_stop_pruned",
+                        "decision": "red_zone_pruned" if zone == "red" else "hard_stop_pruned",
                     }
                 )
                 continue
@@ -4499,6 +4794,7 @@ def execute_priority_queue_traversal(
         "frontier_expansion_count": expansion_count,
         "dominance_pruned_count": dominance_pruned_count,
         "hard_stop_pruned_count": hard_stop_pruned_count,
+        "red_zone_pruned_count": red_zone_pruned_count,
         "cycle_distance_reward_bounded": True,
         "path_distance_thresholds": {
             "green": envelope.get("path_distance_green_threshold"),
@@ -4542,6 +4838,7 @@ def execute_priority_queue_traversal(
     layer_convergence = {layer_name: (layer_walks.get(layer_name, {}).get("convergence") or {}) for layer_name in ("coarse", "mid", "rq_membership", "chunk")}
     convergence["layers"] = layer_convergence
     convergence["hard_stop_pruned_count"] = sum(int((layer.get("hard_stop_pruned_count") or 0)) for layer in layer_convergence.values())
+    convergence["red_zone_pruned_count"] = sum(int((layer.get("red_zone_pruned_count") or 0)) for layer in layer_convergence.values())
     convergence["gray_zone_decision_count"] = len(all_gray_zone_decisions)
     return {
         "query_facets": query_facets,
@@ -4686,6 +4983,7 @@ def write_retrieval_trace(
         context_state=context_state,
         retrieval_mode="layered_context_graph",
         conversation_state_scope_hash=conversation_hash,
+        query_facets=traversal.get("query_facets") or {},
     )
     cache_key = stable_hash(cache_components)
     trace = RetrievalTrace(
@@ -4878,8 +5176,10 @@ def build_context_package(
 
     token_budget = token_budget or int(get_settings().context_package_token_budget or 2400)
     hit_ids = [item["chunk_id"] for item in results]
+    hit_id_set = set(hit_ids)
     selected_ids: list[str] = []
     bridge_ids: set[str] = set()
+    graph_path_chunk_ids: set[str] = set()
     parent_node_ids: set[str] = set()
     chunks_by_id: dict[str, Chunk] = {}
     structure_by_chunk_id: dict[str, dict[str, Any]] = {}
@@ -4892,6 +5192,12 @@ def build_context_package(
             return
         chunks_by_id[chunk.id] = chunk
         selected_ids.append(chunk.id)
+
+    for item in results:
+        traversal = (item.get("metadata") or {}).get("traversal") or {}
+        for path_chunk_id in traversal.get("path") or []:
+            if path_chunk_id and path_chunk_id not in hit_id_set:
+                graph_path_chunk_ids.add(path_chunk_id)
 
     for chunk_id in hit_ids:
         chunk = db.get(Chunk, chunk_id)
@@ -4914,6 +5220,13 @@ def build_context_package(
             other_id = edge.target_chunk_id if edge.source_chunk_id == chunk_id else edge.source_chunk_id
             bridge_ids.add(other_id)
             add_chunk_id(other_id)
+
+    for chunk_id in sorted(graph_path_chunk_ids):
+        add_chunk_id(chunk_id)
+        chunk = chunks_by_id.get(chunk_id)
+        if chunk:
+            for mapping in db.scalars(select(ChunkStructureMapping).where(ChunkStructureMapping.chunk_id == chunk.id)).all():
+                parent_node_ids.add(mapping.structure_node_id)
 
     def structure_context(chunk: Chunk) -> dict[str, Any]:
         if chunk.id in structure_by_chunk_id:
@@ -4964,10 +5277,16 @@ def build_context_package(
         return value
 
     path_labels = list(trace.path_labels_json or [])
-    traversal_by_chunk = {
-        item["chunk_id"]: (item.get("metadata") or {}).get("traversal") or {}
-        for item in results
-    }
+    traversal_by_chunk: dict[str, dict[str, Any]] = {}
+    for item in results:
+        traversal = (item.get("metadata") or {}).get("traversal") or {}
+        for path_chunk_id in traversal.get("path") or []:
+            if path_chunk_id and path_chunk_id not in traversal_by_chunk:
+                traversal_by_chunk[path_chunk_id] = {
+                    **traversal,
+                    "why_selected": "restored_from_selected_graph_path",
+                }
+        traversal_by_chunk[item["chunk_id"]] = traversal
 
     def why_selected_for_chunk(chunk_id: str, role: str) -> dict[str, Any]:
         traversal = traversal_by_chunk.get(chunk_id) or {}
@@ -4987,7 +5306,7 @@ def build_context_package(
             continue
         document = db.get(Document, chunk.document_id)
         structure = structure_context(chunk)
-        role = "hit" if chunk.id in hit_ids else "bridge" if chunk.id in bridge_ids else "restored_context"
+        role = "hit" if chunk.id in hit_id_set else "bridge" if chunk.id in bridge_ids else "graph_path" if chunk.id in graph_path_chunk_ids else "restored_context"
         source_span = chunk_source_span(db, chunk, retrieval_trace_id=trace.id)
         dedupe_key = f"{chunk.id}:{[chunk.char_start, chunk.char_end]}"
         package_chunks.append(
@@ -5089,6 +5408,7 @@ def build_context_package(
                 "hit_chunks": len(hit_ids),
                 "restored_chunks": len([chunk_id for chunk_id in selected_ids if chunk_id not in hit_ids]),
                 "bridge_chunks": len(bridge_ids),
+                "graph_path_chunks": len(graph_path_chunk_ids),
                 "parent_structure_nodes": len(parent_node_ids),
             },
         },

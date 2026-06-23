@@ -2,6 +2,7 @@ import type { AgentTraceEventPayload, AgentTraceNode } from "@course-kg/shared";
 
 export const contextGraphTraceFallbackSteps: AgentTraceNode[] = [
   "query_understanding",
+  "query_facet_extraction",
   "agent_planner",
   "typed_action_validation",
   "entry_selection",
@@ -17,6 +18,7 @@ export const contextGraphTraceFallbackSteps: AgentTraceNode[] = [
 
 const traceNodeLabels: Record<AgentTraceNode, string> = {
   query_understanding: "查询意图",
+  query_facet_extraction: "查询 facets",
   agent_planner: "智能体规划",
   typed_action_validation: "动作校验",
   entry_selection: "分阶段入口",
@@ -56,7 +58,7 @@ export function traceNodeLabel(node: string): string {
 }
 
 export function traceGroupForNode(node: string): TraceGroupKey {
-  if (node === "query_understanding" || node === "agent_planner" || node === "typed_action_validation" || node === "entry_selection") {
+  if (node === "query_understanding" || node === "query_facet_extraction" || node === "agent_planner" || node === "typed_action_validation" || node === "entry_selection") {
     return "entry";
   }
   if (node === "layer_drilldown" || node === "layered_retrieval") {
@@ -137,6 +139,9 @@ export function traceAuditSummary(scores: Record<string, unknown> | undefined): 
     ["rq_membership_entries", "RQ 归属"],
     ["frontier_pops", "Frontier pop"],
     ["frontier_expansion_count", "扩展边数"],
+    ["gray_zone_decision_count", "灰区观测"],
+    ["red_zone_pruned_count", "红区剪枝"],
+    ["hard_stop_pruned_count", "硬停剪枝"],
     ["dominance_pruned_count", "支配剪枝"],
     ["convergence_reason", "收敛原因"],
     ["query_rq_path", "RQ 路径"],
