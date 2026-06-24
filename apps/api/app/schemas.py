@@ -104,7 +104,7 @@ class SearchRequest(APIModel):
     query: str
     knowledge_base_id: str | None = None
     filters: SearchFilters = Field(default_factory=SearchFilters)
-    top_k: int = Field(default=8, ge=1, le=50)
+    top_k: int | None = Field(default=None, ge=1, le=50)
 
 
 class SearchResult(APIModel):
@@ -153,7 +153,7 @@ class QARequest(APIModel):
     knowledge_base_id: str | None = None
     session_id: str | None = None
     filters: SearchFilters = Field(default_factory=SearchFilters)
-    top_k: int = Field(default=8, ge=1, le=50)
+    top_k: int | None = Field(default=None, ge=1, le=50)
     history: list[ChatMessage] = Field(default_factory=list)
 
 
@@ -183,7 +183,7 @@ class AgentRequest(APIModel):
     knowledge_base_id: str | None = None
     session_id: str | None = None
     filters: SearchFilters = Field(default_factory=SearchFilters)
-    top_k: int = Field(default=8, ge=1, le=50)
+    top_k: int | None = Field(default=None, ge=1, le=50)
     history: list[ChatMessage] = Field(default_factory=list)
     route: AgentRoute = "layered_context_graph"
     stream_trace: bool = False
@@ -567,6 +567,7 @@ class ModelSettingsUpdate(APIModel):
     operating_point_hard_gate_max_hubness_ratio: float | None = None
     operating_point_hard_gate_min_structure_recovery_rate: float | None = None
     operating_point_hard_gate_max_candidate_latency_p95_ms: int | None = None
+    retrieval_result_top_k_default: int | None = Field(default=None, ge=1, le=50)
     agent_coarse_total_budget: int | None = None
     agent_mid_per_coarse_budget: int | None = None
     agent_mid_top_k: int | None = None

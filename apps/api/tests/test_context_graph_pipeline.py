@@ -23,6 +23,50 @@ def test_entry_seed_calibration_prevents_zero_distance_route_seeds():
     assert distance_from_strength(calibrated_entry_seed_strength(1.0, "mid_drilldown_entry")) > 0.0
 
 
+def test_result_top_k_resolves_hot_reload_default_and_cache_key(monkeypatch):
+    from app.core.config import get_settings
+    from app.schemas import SearchFilters
+    from app.services import context_graph
+
+    monkeypatch.setattr(context_graph, "get_settings", lambda: SimpleNamespace(retrieval_result_top_k_default=7))
+
+    assert context_graph.resolve_result_top_k(None) == 7
+    assert context_graph.resolve_result_top_k(3) == 3
+    with pytest.raises(ValueError, match="between 1 and 50"):
+        context_graph.resolve_result_top_k(51)
+
+    monkeypatch.setattr(context_graph, "get_settings", get_settings)
+    components = context_graph.context_graph_cache_key_components(
+        knowledge_base_id="kb-1",
+        query="graph retrieval",
+        filters=SearchFilters(),
+        context_state=None,
+        retrieval_mode="layered_context_graph",
+        result_top_k=7,
+    )
+    assert components["result_top_k"] == 7
+
+
+@pytest.mark.asyncio
+async def test_layered_search_writes_default_result_top_k_for_empty_kb(monkeypatch, db_session, sample_knowledge_base):
+    from app.schemas import SearchFilters
+    from app.services import context_graph
+
+    monkeypatch.setattr(context_graph, "get_settings", lambda: SimpleNamespace(retrieval_result_top_k_default=6))
+
+    result = await context_graph.layered_search(
+        db_session,
+        sample_knowledge_base.id,
+        "empty knowledge base",
+        SearchFilters(),
+        None,
+    )
+
+    assert result.results == []
+    assert result.audit["result_top_k"] == 6
+    assert result.trace.diagnostics_json["result_top_k"] == 6
+
+
 def test_path_distance_zone_has_red_and_hard_boundaries():
     from app.services.context_graph import _path_distance_zone
 

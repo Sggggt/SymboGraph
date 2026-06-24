@@ -6,6 +6,25 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_agent_run_context_records_resolved_result_top_k(monkeypatch, db_session, sample_knowledge_base):
+    from app.schemas import AgentRequest
+    from app.services import agent_graph
+
+    monkeypatch.setattr(agent_graph, "resolve_result_top_k", lambda top_k: 9 if top_k is None else int(top_k))
+
+    _session, default_run = agent_graph.create_agent_run_context(
+        db_session,
+        AgentRequest(knowledge_base_id=sample_knowledge_base.id, question="default top k"),
+    )
+    _session, explicit_run = agent_graph.create_agent_run_context(
+        db_session,
+        AgentRequest(knowledge_base_id=sample_knowledge_base.id, question="explicit top k", top_k=4),
+    )
+
+    assert default_run.metadata_json["top_k"] == 9
+    assert explicit_run.metadata_json["top_k"] == 4
+
+
 @pytest.mark.asyncio
 async def test_propose_query_facets_validates_llm_packet(monkeypatch):
     from app.services import agent_graph

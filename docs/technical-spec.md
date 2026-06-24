@@ -2482,7 +2482,7 @@ select_entry_nodes(layer, node_ids, reason, expected_evidence, budget)
 
 coarse 下钻到 mid graph 时，系统对每个 coarse 父节点独立执行局部探索，收集该父节点覆盖的 mid candidates；所有 coarse 父节点完成后，mid candidates 合并去重并按层内 priority key、路径证据和贡献摘要排序，保留 `agent_mid_top_k` 个 mid 节点进入下一层队列。coarse 层不设置 top-k；coarse queue 中的所有保留父节点都获得各自的 mid 下钻预算。
 
-mid 下钻到 chunk relation graph 时，RQ L3 membership 负责选择入口 chunk seeds，而不是把 mid 节点下所有 chunks 全量送入 frontier。系统对每个 selected mid 父节点独立执行局部 chunk 探索；所有 mid 父节点完成后，chunk candidates 合并去重并按层内 priority key、路径证据、citation span 可用性和结构恢复需求排序，保留 `agent_chunk_top_k` 个 chunk 进入 context package：
+mid 下钻到 chunk relation graph 时，RQ L3 membership 负责选择入口 chunk seeds，而不是把 mid 节点下所有 chunks 全量送入 frontier。系统对每个 selected mid 父节点独立执行局部 chunk 探索；所有 mid 父节点完成后，chunk candidates 合并去重并按层内 priority key、路径证据、citation span 可用性和结构恢复需求排序，保留 `agent_chunk_top_k` 个 chunk seeds 进入底层 frontier；最终直接命中 chunk 数量由请求 `top_k` 或热加载默认值 `retrieval_result_top_k_default` 决定：
 
 ```text
 core_member_chunks
@@ -2680,10 +2680,11 @@ max_labels_per_node
 max_edge_reuse
 max_cycle_reward_per_path
 max_time_ms
+retrieval_result_top_k_default
 context_package_token_budget
 ```
 
-粗粒度层使用 `agent_coarse_total_budget` 探索 coarse nodes，生成 coarse node queue，不设置 coarse top-k。中粒度层对 coarse node queue 中的每个父节点分别使用 `agent_mid_per_coarse_budget` 探索 mid candidates；所有 mid candidates 汇总、去重、排序后，使用 `agent_mid_top_k` 形成 mid node queue。底层对 mid node queue 中的每个父节点分别使用 `agent_chunk_per_mid_budget` 探索 chunk candidates；所有 chunk candidates 汇总、去重、排序后，使用 `agent_chunk_top_k` 形成进入 context package 的 hit chunks。`agent_mid_top_k` 与 `agent_chunk_top_k` 是层间输出上限，不是裸向量召回结果，也不能绕过 trace、structure restoration 或 citation verification。
+粗粒度层使用 `agent_coarse_total_budget` 探索 coarse nodes，生成 coarse node queue，不设置 coarse top-k。中粒度层对 coarse node queue 中的每个父节点分别使用 `agent_mid_per_coarse_budget` 探索 mid candidates；所有 mid candidates 汇总、去重、排序后，使用 `agent_mid_top_k` 形成 mid node queue。底层对 mid node queue 中的每个父节点分别使用 `agent_chunk_per_mid_budget` 探索 chunk candidates；所有 chunk candidates 汇总、去重、排序后，使用 `agent_chunk_top_k` 形成 chunk frontier seeds；chunk frontier 接受节点排序后再按请求 `top_k` 截断，未显式传入时使用 `retrieval_result_top_k_default`。`agent_mid_top_k` 与 `agent_chunk_top_k` 是层间输出上限，`retrieval_result_top_k_default` 是最终结果默认上限；它们不是裸向量召回结果，也不能绕过 trace、structure restoration 或 citation verification。
 
 中粗层派生双语路由文本：`concept_i18n_enabled` 是热加载 Runtime Settings，环境键为 `CONCEPT_I18N_ENABLED`，默认关闭。关闭时 mid/coarse concept graph 不执行 `concept_i18n_bilingual_v1`，不调用模型、不写成功翻译 metadata，只在 diagnostics/log 中记录 `status=disabled`；开启后，mid/coarse concept graph 在节点和边写入后执行 `concept_i18n_bilingual_v1` 派生翻译，覆盖 concept label、aliases、definition、summary、scope note 以及高层概念边 explanation。翻译结果只作为可重建的派生 metadata 保存；只有开关开启且翻译 `status=ok` 时，才用于 coarse/mid entry selection 的 searchable text 扩展。翻译结果不能覆盖 `canonical_label`、`definition`、`summary`、`scope_note`、edge `explanation`、support ids、distance、projection stats 或 citation payload。前端图谱页默认继续展示 canonical source fields；回答生成和引用验证仍只能依赖 context package 与 raw chunk span。
 
@@ -3261,7 +3262,7 @@ traversal_observation_budget
 context_path_summary_budget
 ```
 
-其中改变 chunking、embedding、dynamic dense KNN、bridge quota、edge type calibration、relation graph、RQ codebook、RQ membership protocol、edge projection、graph model endpoint 或 concept graph 的参数属于 `rebuild_required`；改变 chat model endpoint、staged traversal budget、layer top-k、label/cycle/path distance threshold/gray-zone observation cadence 等不改变 active graph 的参数属于 `hot_reloadable`，需要失效检索与 QA cache。`concept_i18n_enabled` 是热加载功能开关：保存后立即控制检索是否使用已有成功翻译文本，并控制下一次构图是否执行双语派生；它不会自动改写已有 active graph。`query_facet_bilingual_enabled` 是热加载功能开关：保存后立即控制下一次 QA/search planning 的 LLM query facet packet 是否要求中英双语 aliases；它不写 concept graph，不触发 Qdrant 或 graph rebuild。预算类参数只作为 hard interrupt 或层间输出上限，不参与路径价值排序。
+其中改变 chunking、embedding、dynamic dense KNN、bridge quota、edge type calibration、relation graph、RQ codebook、RQ membership protocol、edge projection、graph model endpoint 或 concept graph 的参数属于 `rebuild_required`；改变 chat model endpoint、staged traversal budget、layer top-k、result top-k default、label/cycle/path distance threshold/gray-zone observation cadence 等不改变 active graph 的参数属于 `hot_reloadable`，需要失效检索与 QA cache。`concept_i18n_enabled` 是热加载功能开关：保存后立即控制检索是否使用已有成功翻译文本，并控制下一次构图是否执行双语派生；它不会自动改写已有 active graph。`query_facet_bilingual_enabled` 是热加载功能开关：保存后立即控制下一次 QA/search planning 的 LLM query facet packet 是否要求中英双语 aliases；它不写 concept graph，不触发 Qdrant 或 graph rebuild。预算类参数只作为 hard interrupt 或层间输出上限，不参与路径价值排序。
 
 TPE settings 分两层处理。`enable_auto_tpe`、`tpe_trial_budget`、`tpe_startup_random_trials`、`tpe_good_quantile_gamma`、`tpe_probe_query_budget`、`tpe_trial_timeout_seconds` 和 `tpe_candidate_pool_size` 是 automatic optimizer envelope，保存后热加载到下一次 graph build 或下一 trial 边界；它们不直接改写 active graph。dense KNN、bridge quota、threshold 和 edge calibration 改变 active graph 语义，必须只在 graph build 阶段由自动 TPE 或版本化默认 theta 选择，并在最终 active bottom relation graph 写入时一次性落库。前端导入页在清理数据库/文件数量附近提供自动 TPE 开关、可折叠 envelope 参数和最近一次 auto TPE run/blocking reason；设置页不提供启动、取消、手动切换或独立手动调参入口。
 

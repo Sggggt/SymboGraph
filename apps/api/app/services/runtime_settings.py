@@ -152,6 +152,7 @@ def runtime_lifecycle_payload() -> dict:
         "operating_point_hard_gate_min_structure_recovery_rate",
         "operating_point_hard_gate_max_candidate_latency_p95_ms",
         "context_package_token_budget",
+        "retrieval_result_top_k_default",
         "agent_coarse_total_budget",
         "agent_mid_per_coarse_budget",
         "agent_mid_top_k",
@@ -276,6 +277,7 @@ def model_settings_payload() -> dict:
         "operating_point_hard_gate_max_candidate_latency_p95_ms": read_env_int(
             "OPERATING_POINT_HARD_GATE_MAX_CANDIDATE_LATENCY_P95_MS", settings.operating_point_hard_gate_max_candidate_latency_p95_ms
         ),
+        "retrieval_result_top_k_default": read_env_int("RETRIEVAL_RESULT_TOP_K_DEFAULT", settings.retrieval_result_top_k_default),
         "agent_coarse_total_budget": read_env_int("AGENT_COARSE_TOTAL_BUDGET", settings.agent_coarse_total_budget),
         "agent_mid_per_coarse_budget": read_env_int("AGENT_MID_PER_COARSE_BUDGET", settings.agent_mid_per_coarse_budget),
         "agent_mid_top_k": read_env_int("AGENT_MID_TOP_K", settings.agent_mid_top_k),
@@ -880,6 +882,7 @@ def update_model_settings(payload: dict) -> dict:
         "operating_point_hard_gate_max_hubness_ratio": "operating_point_hard_gate_max_hubness_ratio",
         "operating_point_hard_gate_min_structure_recovery_rate": "operating_point_hard_gate_min_structure_recovery_rate",
         "operating_point_hard_gate_max_candidate_latency_p95_ms": "operating_point_hard_gate_max_candidate_latency_p95_ms",
+        "retrieval_result_top_k_default": "retrieval_result_top_k_default",
         "agent_coarse_total_budget": "agent_coarse_total_budget",
         "agent_mid_per_coarse_budget": "agent_mid_per_coarse_budget",
         "agent_mid_top_k": "agent_mid_top_k",

@@ -285,6 +285,8 @@ def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch)
     monkeypatch.setenv("FIXED_CHUNK_SIZE_TOKENS", "512")
     monkeypatch.setenv("FIXED_CHUNK_OVERLAP_TOKENS", "80")
     monkeypatch.setenv("CONTEXT_PACKAGE_TOKEN_BUDGET", "2400")
+    monkeypatch.setenv("CONCEPT_I18N_ENABLED", "false")
+    monkeypatch.setenv("QUERY_FACET_BILINGUAL_ENABLED", "false")
     monkeypatch.setattr(runtime_settings, "current_runtime_settings_version", lambda: "unit-version")
     monkeypatch.setattr(
         runtime_settings,
@@ -293,6 +295,9 @@ def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch)
             "FIXED_CHUNK_SIZE_TOKENS": "512",
             "FIXED_CHUNK_OVERLAP_TOKENS": "80",
             "CONTEXT_PACKAGE_TOKEN_BUDGET": "2400",
+            "RETRIEVAL_RESULT_TOP_K_DEFAULT": "7",
+            "CONCEPT_I18N_ENABLED": "false",
+            "QUERY_FACET_BILINGUAL_ENABLED": "false",
         },
     )
 
@@ -301,6 +306,7 @@ def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch)
     assert payload["fixed_chunk_size_tokens"] == 512
     assert payload["fixed_chunk_overlap_tokens"] == 80
     assert payload["context_package_token_budget"] == 2400
+    assert payload["retrieval_result_top_k_default"] == 7
     assert payload["concept_i18n_enabled"] is False
     assert payload["query_facet_bilingual_enabled"] is False
     assert payload["agent_coarse_total_budget"] > 0
@@ -477,6 +483,11 @@ def test_model_settings_update_rejects_legacy_generic_api_key():
     from app.schemas import ModelSettingsUpdate
 
     assert ModelSettingsUpdate(clear_embedding_api_key=False).clear_embedding_api_key is False
+    assert ModelSettingsUpdate(retrieval_result_top_k_default=8).retrieval_result_top_k_default == 8
+    with pytest.raises(ValidationError):
+        ModelSettingsUpdate(retrieval_result_top_k_default=0)
+    with pytest.raises(ValidationError):
+        ModelSettingsUpdate(retrieval_result_top_k_default=51)
     with pytest.raises(ValidationError):
         ModelSettingsUpdate(api_key="legacy-secret")
 

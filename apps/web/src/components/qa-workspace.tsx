@@ -599,7 +599,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
       setQuestion("");
       try {
         await streamAnswer(
-          { question: nextQuestion, session_id: activeSessionId, knowledge_base_id: selectedKnowledgeBaseId, top_k: 6 },
+          { question: nextQuestion, session_id: activeSessionId, knowledge_base_id: selectedKnowledgeBaseId },
           {
             onTrace: (event) => {
               nextTraceEvents.push(event);

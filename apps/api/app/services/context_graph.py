@@ -237,6 +237,16 @@ def agent_operating_envelope_state_hash() -> str:
     return stable_hash(agent_operating_envelope())
 
 
+RESULT_TOP_K_MAX = 50
+
+
+def resolve_result_top_k(top_k: int | None = None) -> int:
+    value = int(top_k if top_k is not None else get_settings().retrieval_result_top_k_default)
+    if value < 1 or value > RESULT_TOP_K_MAX:
+        raise ValueError(f"result top_k must be between 1 and {RESULT_TOP_K_MAX}")
+    return value
+
+
 def qdrant_collection_name(*, embedding_model: str, embedding_text_version: str, chunk_schema_version: str) -> str:
     raw = f"symbograph_{embedding_model}_{embedding_text_version}_{chunk_schema_version}"
     return re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_").lower()[:180]
@@ -308,6 +318,7 @@ def context_graph_cache_key_components(
     filters: SearchFilters | dict[str, Any] | None,
     context_state: ContextGraphState | None,
     retrieval_mode: str,
+    result_top_k: int | None = None,
     conversation_state_scope_hash: str | None = None,
     query_facets: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -334,6 +345,7 @@ def context_graph_cache_key_components(
         "conversation_state_scope_hash": conversation_state_scope_hash or stable_hash({"conversation_state": "none"}),
         "prompt_protocol_hash": context_state.prompt_protocol_hash if context_state else None,
         "retrieval_mode": retrieval_mode,
+        "result_top_k": result_top_k,
     }
 
 
@@ -344,6 +356,7 @@ def context_graph_cache_key(
     filters: SearchFilters | dict[str, Any] | None,
     context_state: ContextGraphState | None,
     retrieval_mode: str,
+    result_top_k: int | None = None,
     conversation_state_scope_hash: str | None = None,
     query_facets: dict[str, Any] | None = None,
 ) -> str:
@@ -354,6 +367,7 @@ def context_graph_cache_key(
             filters=filters,
             context_state=context_state,
             retrieval_mode=retrieval_mode,
+            result_top_k=result_top_k,
             conversation_state_scope_hash=conversation_state_scope_hash,
             query_facets=query_facets,
         )
@@ -3261,12 +3275,13 @@ async def layered_search(
     knowledge_base_id: str,
     query: str,
     filters: SearchFilters,
-    top_k: int,
+    top_k: int | None,
     *,
     query_facets: dict[str, Any] | None = None,
 ) -> LayeredSearchResult:
     chunks = list(db.scalars(active_chunks_query(knowledge_base_id)).all())
     query_facets = query_facets_for_search(query, query_facets)
+    result_top_k = resolve_result_top_k(top_k)
     if not chunks:
         trace = RetrievalTrace(
             knowledge_base_id=knowledge_base_id,
@@ -3275,14 +3290,14 @@ async def layered_search(
             result_chunk_ids_json=[],
             query_facets_json=query_facets,
             convergence_json={"reason": "no_active_chunks"},
-            diagnostics_json={"reason": "no_active_chunks"},
+            diagnostics_json={"reason": "no_active_chunks", "result_top_k": result_top_k},
             edge_distance_protocol_hash=edge_distance_protocol_hash(),
             edge_projection_protocol_hash=edge_projection_protocol_hash(),
             traversal_protocol_hash=traversal_protocol_hash(),
         )
         db.add(trace)
         db.flush()
-        return LayeredSearchResult([], trace, {"retrieval_pipeline": "layered_context_graph", "reason": "no_active_chunks"})
+        return LayeredSearchResult([], trace, {"retrieval_pipeline": "layered_context_graph", "reason": "no_active_chunks", "result_top_k": result_top_k})
     context_state = latest_context_graph_state(db, knowledge_base_id)
     relation_state = latest_relation_state(db, knowledge_base_id)
     query_vector = (await EmbeddingProvider().embed_texts([query], text_type="query"))[0]
@@ -3302,7 +3317,7 @@ async def layered_search(
         rq_membership_entries=rq_membership_entries,
         dense_entries=dense_entries,
         query_rq=query_rq,
-        top_k=top_k,
+        top_k=result_top_k,
     )
     results = traversal["results"]
     trace = write_retrieval_trace(
@@ -3314,6 +3329,7 @@ async def layered_search(
         context_state,
         traversal,
         query_rq,
+        result_top_k,
     )
     for item in results:
         item["metadata"]["retrieval_trace_id"] = trace.id
@@ -3326,6 +3342,7 @@ async def layered_search(
         "retrieval_trace_id": trace.id,
         "context_graph_state_id": context_state.id if context_state else None,
         "degraded_mode": is_degraded_mode(),
+        "result_top_k": result_top_k,
         "coarse_entries": len(coarse_entries),
         "mid_entries": len(mid_entries),
         "rq_membership_entries": len(rq_membership_entries),
@@ -4962,6 +4979,7 @@ def write_retrieval_trace(
     context_state: ContextGraphState | None,
     traversal: dict[str, Any],
     query_rq: dict[str, Any] | None = None,
+    result_top_k: int | None = None,
 ) -> RetrievalTrace:
     candidate_rq = {
         item["chunk_id"]: (item.get("metadata") or {}).get("rq")
@@ -4982,6 +5000,7 @@ def write_retrieval_trace(
         filters=filters,
         context_state=context_state,
         retrieval_mode="layered_context_graph",
+        result_top_k=result_top_k,
         conversation_state_scope_hash=conversation_hash,
         query_facets=traversal.get("query_facets") or {},
     )
@@ -5022,6 +5041,7 @@ def write_retrieval_trace(
             "runtime_settings_hash": runtime_settings_state_hash(),
             "agent_operating_envelope": agent_operating_envelope(),
             "agent_operating_envelope_hash": agent_operating_envelope_state_hash(),
+            "result_top_k": result_top_k,
             "scores_json_retired_as_primary_audit": True,
             "traversal_protocol": TRAVERSAL_PROTOCOL_VERSION,
             "rq": {

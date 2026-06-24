@@ -33,7 +33,7 @@ async def search_chunks_with_audit(
     knowledge_base_id: str,
     query: str,
     filters: SearchFilters,
-    top_k: int,
+    top_k: int | None,
 ) -> tuple[list[dict], dict]:
     result = await layered_search(db, knowledge_base_id, query, filters, top_k)
     return result.results, result.audit
@@ -44,7 +44,7 @@ async def layered_context_search_chunks_with_audit(
     knowledge_base_id: str,
     query: str,
     filters: SearchFilters,
-    top_k: int,
+    top_k: int | None,
     route: str = "multi_hop_research",
 ) -> tuple[list[dict], dict]:
     result = await layered_search(db, knowledge_base_id, query, filters, top_k)
@@ -57,7 +57,7 @@ async def search_chunks(
     knowledge_base_id: str,
     query: str,
     filters: SearchFilters,
-    top_k: int,
+    top_k: int | None,
 ) -> list[dict]:
     return (await search_chunks_with_audit(db, knowledge_base_id, query, filters, top_k))[0]
 

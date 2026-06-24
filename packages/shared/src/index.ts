@@ -480,6 +480,7 @@ export interface ModelSettingsResponse {
   operating_point_hard_gate_max_hubness_ratio?: number;
   operating_point_hard_gate_min_structure_recovery_rate?: number;
   operating_point_hard_gate_max_candidate_latency_p95_ms?: number;
+  retrieval_result_top_k_default?: number;
   agent_coarse_total_budget?: number;
   agent_mid_per_coarse_budget?: number;
   agent_mid_top_k?: number;
@@ -607,6 +608,7 @@ export interface ModelSettingsUpdate {
   operating_point_hard_gate_max_hubness_ratio?: number | null;
   operating_point_hard_gate_min_structure_recovery_rate?: number | null;
   operating_point_hard_gate_max_candidate_latency_p95_ms?: number | null;
+  retrieval_result_top_k_default?: number | null;
   agent_coarse_total_budget?: number | null;
   agent_mid_per_coarse_budget?: number | null;
   agent_mid_top_k?: number | null;

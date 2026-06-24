@@ -39,6 +39,7 @@ from app.services.context_graph import (
     context_package_to_contexts,
     layered_search,
     query_facets_for_search,
+    resolve_result_top_k,
     runtime_settings_state_hash,
 )
 from app.services.embeddings import ChatProvider, FallbackDisabledError, is_degraded_mode
@@ -617,13 +618,14 @@ def create_or_get_session(db: Session, knowledge_base_id: str, session_id: str |
 def create_agent_run_context(db: Session, request: AgentRequest) -> tuple[QASession, AgentRun]:
     knowledge_base = resolve_knowledge_base(db, request.knowledge_base_id)
     session = create_or_get_session(db, knowledge_base.id, request.session_id, request.question)
+    result_top_k = resolve_result_top_k(request.top_k)
     run = AgentRun(
         knowledge_base_id=knowledge_base.id,
         session_id=session.id,
         question=request.question,
         status="queued",
         route="layered_context_graph",
-        metadata_json={"top_k": request.top_k, "filters": request.filters.model_dump()},
+        metadata_json={"top_k": result_top_k, "filters": request.filters.model_dump()},
     )
     db.add(run)
     db.commit()
@@ -1386,6 +1388,7 @@ def run_to_task_status(run: AgentRun) -> dict:
 
 async def execute_agent_run(db: Session, request: AgentRequest, session: QASession, run: AgentRun) -> dict:
     try:
+        result_top_k = resolve_result_top_k(request.top_k)
         set_run_state(db, run, "running", current_node="query_understanding")
         start = time.perf_counter()
         query_intent = await perceive_query_intent(request.question, [item.model_dump() for item in request.history])
@@ -1396,7 +1399,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             "query_understanding",
             input_summary=request.question,
             output_summary=str(query_intent.get("intent") or "layered_context_graph"),
-            scores={"top_k": request.top_k, "query_intent": query_intent},
+            scores={"top_k": result_top_k, "query_intent": query_intent},
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
 
@@ -1453,7 +1456,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
         )
 
         start = time.perf_counter()
-        search_result = await layered_search(db, run.knowledge_base_id, request.question, request.filters, request.top_k, query_facets=query_facets)
+        search_result = await layered_search(db, run.knowledge_base_id, request.question, request.filters, result_top_k, query_facets=query_facets)
         ensure_agent_run_not_cancelled(db, run)
         plan.retrieval_trace_id = search_result.trace.id
         record_observation(
@@ -1660,7 +1663,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             )
             db.add(repair_action)
             db.flush()
-            repair_top_k = min(50, request.top_k + max(2, len(failure_types) * 2))
+            repair_top_k = min(50, result_top_k + max(2, len(failure_types) * 2))
             repaired_search = await layered_search(db, run.knowledge_base_id, request.question, request.filters, repair_top_k, query_facets=query_facets)
             ensure_agent_run_not_cancelled(db, run)
             repaired_package = build_context_package(

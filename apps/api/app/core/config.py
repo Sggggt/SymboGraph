@@ -70,6 +70,7 @@ HOT_RELOAD_SETTINGS = {
     "operating_point_hard_gate_max_hubness_ratio",
     "operating_point_hard_gate_min_structure_recovery_rate",
     "operating_point_hard_gate_max_candidate_latency_p95_ms",
+    "retrieval_result_top_k_default",
     "agent_coarse_total_budget",
     "agent_mid_per_coarse_budget",
     "agent_mid_top_k",
@@ -151,6 +152,7 @@ class Settings(BaseSettings):
     fixed_chunk_size_tokens: int = Field(default=512, ge=128, le=4096)
     fixed_chunk_overlap_tokens: int = Field(default=80, ge=0, le=1024)
     context_package_token_budget: int = Field(default=2400, ge=256, le=20000)
+    retrieval_result_top_k_default: int = Field(default=8, ge=1, le=50)
     enable_model_fallback: bool = False
     concept_i18n_enabled: bool = False
     query_facet_bilingual_enabled: bool = False
@@ -313,6 +315,7 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "tpe_trial_timeout_seconds",
         "tpe_candidate_pool_size",
         "operating_point_hard_gate_max_candidate_latency_p95_ms",
+        "retrieval_result_top_k_default",
         "agent_coarse_total_budget",
         "agent_mid_per_coarse_budget",
         "agent_mid_top_k",
@@ -395,6 +398,7 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "OPERATING_POINT_HARD_GATE_MAX_HUBNESS_RATIO": "operating_point_hard_gate_max_hubness_ratio",
         "OPERATING_POINT_HARD_GATE_MIN_STRUCTURE_RECOVERY_RATE": "operating_point_hard_gate_min_structure_recovery_rate",
         "OPERATING_POINT_HARD_GATE_MAX_CANDIDATE_LATENCY_P95_MS": "operating_point_hard_gate_max_candidate_latency_p95_ms",
+        "RETRIEVAL_RESULT_TOP_K_DEFAULT": "retrieval_result_top_k_default",
         "AGENT_COARSE_TOTAL_BUDGET": "agent_coarse_total_budget",
         "AGENT_MID_PER_COARSE_BUDGET": "agent_mid_per_coarse_budget",
         "AGENT_MID_TOP_K": "agent_mid_top_k",

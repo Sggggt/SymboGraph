@@ -681,7 +681,6 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
       searchKnowledge({
         knowledge_base_id: selectedKnowledgeBaseId,
         query: searchText,
-        top_k: 8,
         filters: {
           partition: partition || undefined,
           source_type: (sourceType || undefined) as never,

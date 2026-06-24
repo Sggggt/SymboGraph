@@ -100,6 +100,7 @@ type SettingsForm = {
   cross_language_out_quota_min: string;
   cross_language_out_quota_max: string;
   cross_language_min_cosine: string;
+  retrieval_result_top_k_default: string;
   agent_coarse_total_budget: string;
   agent_mid_per_coarse_budget: string;
   agent_mid_top_k: string;
@@ -188,6 +189,7 @@ export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   "中概念 Top K": "所有 mid candidates 合并去重后的层间输出上限；不会绕过 trace、结构恢复或引用验证。",
   每个中概念片段预算: "对每个已选中概念分别下钻到 chunk candidate 的数量上限，控制底层候选扩展范围。",
   "片段 Top K": "chunk candidates 合并去重后进入 Context Package 候选的输出上限，不等同于裸向量召回 top-k。",
+  "结果 Top K 默认值": "搜索、QA 和 Agent 请求未显式传 top_k 时返回的直接命中 chunk 数量上限；它不控制图遍历候选规模。",
   候选去重池预算: "限制跨路径、跨 RQ membership 和跨概念候选合并去重时保留的候选池规模，防止单次检索过载。",
   每层最大深度: "图遍历在每个层级允许继续扩展的最大深度，避免路径无限扩张。",
   每节点标签上限: "每个节点参与 dominance pruning 的路径标签数量上限，用来控制同一节点上的重复路径状态。",
@@ -1126,6 +1128,7 @@ export function SettingsWorkspace() {
       cross_language_out_quota_min: String(settingsQuery.data.cross_language_out_quota_min ?? 0),
       cross_language_out_quota_max: String(settingsQuery.data.cross_language_out_quota_max ?? 3),
       cross_language_min_cosine: String(settingsQuery.data.cross_language_min_cosine ?? 0.65),
+      retrieval_result_top_k_default: String(settingsQuery.data.retrieval_result_top_k_default ?? 8),
       agent_coarse_total_budget: String(settingsQuery.data.agent_coarse_total_budget ?? 8),
       agent_mid_per_coarse_budget: String(settingsQuery.data.agent_mid_per_coarse_budget ?? 6),
       agent_mid_top_k: String(settingsQuery.data.agent_mid_top_k ?? 16),
@@ -1253,6 +1256,7 @@ export function SettingsWorkspace() {
     cross_language_out_quota_min: parseIntField(form.cross_language_out_quota_min),
     cross_language_out_quota_max: parseIntField(form.cross_language_out_quota_max),
     cross_language_min_cosine: parseFloatField(form.cross_language_min_cosine),
+    retrieval_result_top_k_default: parseIntField(form.retrieval_result_top_k_default),
     agent_coarse_total_budget: parseIntField(form.agent_coarse_total_budget),
     agent_mid_per_coarse_budget: parseIntField(form.agent_mid_per_coarse_budget),
     agent_mid_top_k: parseIntField(form.agent_mid_top_k),
@@ -1555,6 +1559,7 @@ export function SettingsWorkspace() {
                 <SettingField label="模型超时秒数" type="number" min={5} max={600} value={form.model_request_timeout_seconds} onChange={(value) => updateForm("model_request_timeout_seconds", value)} />
                 <SettingField label="Embedding 批大小" type="number" min={1} max={10} value={form.embedding_batch_size} onChange={(value) => updateForm("embedding_batch_size", value)} />
                 <SettingField label="证据包 token 预算" type="number" min={256} max={20000} value={form.context_package_token_budget} onChange={(value) => updateForm("context_package_token_budget", value)} />
+                <SettingField label="结果 Top K 默认值" type="number" min={1} max={50} value={form.retrieval_result_top_k_default} onChange={(value) => updateForm("retrieval_result_top_k_default", value)} />
                 <SettingField label="粗概念总预算" type="number" min={1} max={200} value={form.agent_coarse_total_budget} onChange={(value) => updateForm("agent_coarse_total_budget", value)} />
                 <SettingField label="每个粗概念中概念预算" type="number" min={1} max={100} value={form.agent_mid_per_coarse_budget} onChange={(value) => updateForm("agent_mid_per_coarse_budget", value)} />
                 <SettingField label="中概念 Top K" type="number" min={1} max={500} value={form.agent_mid_top_k} onChange={(value) => updateForm("agent_mid_top_k", value)} />
