@@ -66,10 +66,8 @@ type SettingsForm = {
   model_request_concurrency: string;
   model_request_timeout_seconds: string;
   concept_i18n_enabled: boolean;
-  query_facet_bilingual_enabled: boolean;
   fixed_chunk_size_tokens: string;
   fixed_chunk_overlap_tokens: string;
-  context_package_token_budget: string;
   chat_api_key: string;
   clear_chat_api_key: boolean;
   graph_api_key: string;
@@ -100,27 +98,6 @@ type SettingsForm = {
   cross_language_out_quota_min: string;
   cross_language_out_quota_max: string;
   cross_language_min_cosine: string;
-  retrieval_result_top_k_default: string;
-  agent_coarse_total_budget: string;
-  agent_mid_per_coarse_budget: string;
-  agent_mid_top_k: string;
-  agent_chunk_per_mid_budget: string;
-  agent_chunk_top_k: string;
-  candidate_pool_dedupe_budget: string;
-  agent_max_depth_per_layer: string;
-  agent_max_labels_per_node: string;
-  agent_max_edge_reuse: string;
-  agent_max_cycle_reward_per_path: string;
-  agent_cycle_reward_distance_threshold: string;
-  agent_path_distance_green_threshold: string;
-  agent_path_distance_gray_threshold: string;
-  agent_path_distance_hard_threshold: string;
-  agent_structure_restore_budget: string;
-  context_path_summary_budget: string;
-  agent_planning_round_budget: string;
-  agent_max_typed_actions_per_round: string;
-  agent_repair_round_budget: string;
-  agent_verification_budget: string;
 };
 
 type ErrorDialogState = {
@@ -1094,10 +1071,8 @@ export function SettingsWorkspace() {
       model_request_concurrency: String(settingsQuery.data.model_request_concurrency ?? 3),
       model_request_timeout_seconds: String(settingsQuery.data.model_request_timeout_seconds ?? 240),
       concept_i18n_enabled: settingsQuery.data.concept_i18n_enabled ?? false,
-      query_facet_bilingual_enabled: settingsQuery.data.query_facet_bilingual_enabled ?? false,
       fixed_chunk_size_tokens: String(settingsQuery.data.fixed_chunk_size_tokens ?? 512),
       fixed_chunk_overlap_tokens: String(settingsQuery.data.fixed_chunk_overlap_tokens ?? 80),
-      context_package_token_budget: String(settingsQuery.data.context_package_token_budget ?? 2400),
       chat_api_key: "",
       clear_chat_api_key: false,
       graph_api_key: "",
@@ -1128,27 +1103,6 @@ export function SettingsWorkspace() {
       cross_language_out_quota_min: String(settingsQuery.data.cross_language_out_quota_min ?? 0),
       cross_language_out_quota_max: String(settingsQuery.data.cross_language_out_quota_max ?? 3),
       cross_language_min_cosine: String(settingsQuery.data.cross_language_min_cosine ?? 0.65),
-      retrieval_result_top_k_default: String(settingsQuery.data.retrieval_result_top_k_default ?? 8),
-      agent_coarse_total_budget: String(settingsQuery.data.agent_coarse_total_budget ?? 8),
-      agent_mid_per_coarse_budget: String(settingsQuery.data.agent_mid_per_coarse_budget ?? 6),
-      agent_mid_top_k: String(settingsQuery.data.agent_mid_top_k ?? 16),
-      agent_chunk_per_mid_budget: String(settingsQuery.data.agent_chunk_per_mid_budget ?? 8),
-      agent_chunk_top_k: String(settingsQuery.data.agent_chunk_top_k ?? 40),
-      candidate_pool_dedupe_budget: String(settingsQuery.data.candidate_pool_dedupe_budget ?? 160),
-      agent_max_depth_per_layer: String(settingsQuery.data.agent_max_depth_per_layer ?? 3),
-      agent_max_labels_per_node: String(settingsQuery.data.agent_max_labels_per_node ?? 3),
-      agent_max_edge_reuse: String(settingsQuery.data.agent_max_edge_reuse ?? 2),
-      agent_max_cycle_reward_per_path: String(settingsQuery.data.agent_max_cycle_reward_per_path ?? 0.18),
-      agent_cycle_reward_distance_threshold: String(settingsQuery.data.agent_cycle_reward_distance_threshold ?? 1.2),
-      agent_path_distance_green_threshold: String(settingsQuery.data.agent_path_distance_green_threshold ?? 0.45),
-      agent_path_distance_gray_threshold: String(settingsQuery.data.agent_path_distance_gray_threshold ?? 1.35),
-      agent_path_distance_hard_threshold: String(settingsQuery.data.agent_path_distance_hard_threshold ?? 2.4),
-      agent_structure_restore_budget: String(settingsQuery.data.agent_structure_restore_budget ?? 16),
-      context_path_summary_budget: String(settingsQuery.data.context_path_summary_budget ?? 32),
-      agent_planning_round_budget: String(settingsQuery.data.agent_planning_round_budget ?? 2),
-      agent_max_typed_actions_per_round: String(settingsQuery.data.agent_max_typed_actions_per_round ?? 8),
-      agent_repair_round_budget: String(settingsQuery.data.agent_repair_round_budget ?? 2),
-      agent_verification_budget: String(settingsQuery.data.agent_verification_budget ?? 8),
     });
     setApiKeyEditing(false);
     setGraphApiKeyEditing(false);
@@ -1222,10 +1176,8 @@ export function SettingsWorkspace() {
     model_request_concurrency: parseIntField(form.model_request_concurrency),
     model_request_timeout_seconds: parseIntField(form.model_request_timeout_seconds),
     concept_i18n_enabled: form.concept_i18n_enabled,
-    query_facet_bilingual_enabled: form.query_facet_bilingual_enabled,
     fixed_chunk_size_tokens: parseIntField(form.fixed_chunk_size_tokens),
     fixed_chunk_overlap_tokens: parseIntField(form.fixed_chunk_overlap_tokens),
-    context_package_token_budget: parseIntField(form.context_package_token_budget),
     chat_api_key: form.chat_api_key.trim() || null,
     clear_chat_api_key: form.clear_chat_api_key,
     graph_api_key: form.graph_api_key.trim() || null,
@@ -1256,27 +1208,6 @@ export function SettingsWorkspace() {
     cross_language_out_quota_min: parseIntField(form.cross_language_out_quota_min),
     cross_language_out_quota_max: parseIntField(form.cross_language_out_quota_max),
     cross_language_min_cosine: parseFloatField(form.cross_language_min_cosine),
-    retrieval_result_top_k_default: parseIntField(form.retrieval_result_top_k_default),
-    agent_coarse_total_budget: parseIntField(form.agent_coarse_total_budget),
-    agent_mid_per_coarse_budget: parseIntField(form.agent_mid_per_coarse_budget),
-    agent_mid_top_k: parseIntField(form.agent_mid_top_k),
-    agent_chunk_per_mid_budget: parseIntField(form.agent_chunk_per_mid_budget),
-    agent_chunk_top_k: parseIntField(form.agent_chunk_top_k),
-    candidate_pool_dedupe_budget: parseIntField(form.candidate_pool_dedupe_budget),
-    agent_max_depth_per_layer: parseIntField(form.agent_max_depth_per_layer),
-    agent_max_labels_per_node: parseIntField(form.agent_max_labels_per_node),
-    agent_max_edge_reuse: parseIntField(form.agent_max_edge_reuse),
-    agent_max_cycle_reward_per_path: parseFloatField(form.agent_max_cycle_reward_per_path),
-    agent_cycle_reward_distance_threshold: parseFloatField(form.agent_cycle_reward_distance_threshold),
-    agent_path_distance_green_threshold: parseFloatField(form.agent_path_distance_green_threshold),
-    agent_path_distance_gray_threshold: parseFloatField(form.agent_path_distance_gray_threshold),
-    agent_path_distance_hard_threshold: parseFloatField(form.agent_path_distance_hard_threshold),
-    agent_structure_restore_budget: parseIntField(form.agent_structure_restore_budget),
-    context_path_summary_budget: parseIntField(form.context_path_summary_budget),
-    agent_planning_round_budget: parseIntField(form.agent_planning_round_budget),
-    agent_max_typed_actions_per_round: parseIntField(form.agent_max_typed_actions_per_round),
-    agent_repair_round_budget: parseIntField(form.agent_repair_round_budget),
-    agent_verification_budget: parseIntField(form.agent_verification_budget),
   });
 
   const handleSubmit = async () => {
@@ -1328,7 +1259,6 @@ export function SettingsWorkspace() {
               <StatusPill ok={envSynced}>{envSynced ? ".env 已同步" : ".env 需检查"}</StatusPill>
               <StatusPill ok={!settings?.enable_model_fallback && !settings?.enable_database_fallback}>回退已禁用</StatusPill>
               <StatusPill ok={!settings?.concept_i18n_enabled}>双语派生 {settings?.concept_i18n_enabled ? "已开启" : "已关闭"}</StatusPill>
-              <StatusPill ok={Boolean(settings?.query_facet_bilingual_enabled)}>双语查询面 {settings?.query_facet_bilingual_enabled ? "已开启" : "已关闭"}</StatusPill>
               <StatusPill ok={Boolean(settings?.lifecycle?.hot_reloadable?.length)}>热加载 {settings?.lifecycle?.hot_reloadable?.length ?? 0}</StatusPill>
               <StatusPill ok={Boolean(settings?.lifecycle?.rebuild_required?.length)}>需重建 {settings?.lifecycle?.rebuild_required?.length ?? 0}</StatusPill>
               <StatusPill ok={Boolean(settings?.runtime_settings_version)}>运行时 {settings?.runtime_settings_version ? settings.runtime_settings_version.slice(0, 12) : "等待中"}</StatusPill>
@@ -1539,47 +1469,14 @@ export function SettingsWorkspace() {
             </section>
 
             <section className={sectionClass}>
-              <p className="text-sm font-semibold text-white">调用与 Agent 预算</p>
-              <BoundaryNote title="生效边界：下一次请求、下一次模型调用或下一次 Context Package 构建">
-                模型请求并发、超时、embedding 批大小、Context Package 预算和 Agent envelope 会热加载；已开始的请求或批次按启动时快照继续执行。
+              <p className="text-sm font-semibold text-white">模型调用参数</p>
+              <BoundaryNote title="生效边界：下一次请求或下一次模型调用">
+                模型请求并发、超时和 embedding 批大小会热加载；已开始的请求或批次按启动时快照继续执行。
               </BoundaryNote>
-              <div className="mt-5">
-                <SwitchRow
-                  title="LLM 双语查询面"
-                  tooltip={SETTINGS_PARAMETER_HELP["LLM 双语查询面"]}
-                  description="开启后，查询面提取会要求 LLM 为用户显式提到的概念和过程补充中英双语 aliases，用于下一次 layered retrieval 入口选择。"
-                  checked={form.query_facet_bilingual_enabled}
-                  onChange={() => updateForm("query_facet_bilingual_enabled", !form.query_facet_bilingual_enabled)}
-                  disabled={saveMutation.isPending}
-                  badge="热加载"
-                />
-              </div>
-              <div className="mt-5 grid gap-4 md:grid-cols-4">
+              <div className="mt-5 grid gap-4 md:grid-cols-3">
                 <SettingField label="模型请求并发" type="number" min={1} max={16} value={form.model_request_concurrency} onChange={(value) => updateForm("model_request_concurrency", value)} />
                 <SettingField label="模型超时秒数" type="number" min={5} max={600} value={form.model_request_timeout_seconds} onChange={(value) => updateForm("model_request_timeout_seconds", value)} />
                 <SettingField label="Embedding 批大小" type="number" min={1} max={10} value={form.embedding_batch_size} onChange={(value) => updateForm("embedding_batch_size", value)} />
-                <SettingField label="证据包 token 预算" type="number" min={256} max={20000} value={form.context_package_token_budget} onChange={(value) => updateForm("context_package_token_budget", value)} />
-                <SettingField label="结果 Top K 默认值" type="number" min={1} max={50} value={form.retrieval_result_top_k_default} onChange={(value) => updateForm("retrieval_result_top_k_default", value)} />
-                <SettingField label="粗概念总预算" type="number" min={1} max={200} value={form.agent_coarse_total_budget} onChange={(value) => updateForm("agent_coarse_total_budget", value)} />
-                <SettingField label="每个粗概念中概念预算" type="number" min={1} max={100} value={form.agent_mid_per_coarse_budget} onChange={(value) => updateForm("agent_mid_per_coarse_budget", value)} />
-                <SettingField label="中概念 Top K" type="number" min={1} max={500} value={form.agent_mid_top_k} onChange={(value) => updateForm("agent_mid_top_k", value)} />
-                <SettingField label="每个中概念片段预算" type="number" min={1} max={200} value={form.agent_chunk_per_mid_budget} onChange={(value) => updateForm("agent_chunk_per_mid_budget", value)} />
-                <SettingField label="片段 Top K" type="number" min={1} max={1000} value={form.agent_chunk_top_k} onChange={(value) => updateForm("agent_chunk_top_k", value)} />
-                <SettingField label="候选去重池预算" type="number" min={1} max={5000} value={form.candidate_pool_dedupe_budget} onChange={(value) => updateForm("candidate_pool_dedupe_budget", value)} />
-                <SettingField label="每层最大深度" type="number" min={1} max={12} value={form.agent_max_depth_per_layer} onChange={(value) => updateForm("agent_max_depth_per_layer", value)} />
-                <SettingField label="每节点标签上限" type="number" min={1} max={20} value={form.agent_max_labels_per_node} onChange={(value) => updateForm("agent_max_labels_per_node", value)} />
-                <SettingField label="边复用上限" type="number" min={1} max={20} value={form.agent_max_edge_reuse} onChange={(value) => updateForm("agent_max_edge_reuse", value)} />
-                <SettingField label="Cycle reward 上限" type="number" min={0} max={2} step={0.01} value={form.agent_max_cycle_reward_per_path} onChange={(value) => updateForm("agent_max_cycle_reward_per_path", value)} />
-                <SettingField label="Cycle reward 距离阈值" type="number" min={0} max={20} step={0.01} value={form.agent_cycle_reward_distance_threshold} onChange={(value) => updateForm("agent_cycle_reward_distance_threshold", value)} />
-                <SettingField label="路径 green 阈值" type="number" min={0} max={20} step={0.01} value={form.agent_path_distance_green_threshold} onChange={(value) => updateForm("agent_path_distance_green_threshold", value)} />
-                <SettingField label="路径 gray 阈值" type="number" min={0} max={20} step={0.01} value={form.agent_path_distance_gray_threshold} onChange={(value) => updateForm("agent_path_distance_gray_threshold", value)} />
-                <SettingField label="路径 hard 阈值" type="number" min={0} max={40} step={0.01} value={form.agent_path_distance_hard_threshold} onChange={(value) => updateForm("agent_path_distance_hard_threshold", value)} />
-                <SettingField label="结构恢复预算" type="number" min={1} max={200} value={form.agent_structure_restore_budget} onChange={(value) => updateForm("agent_structure_restore_budget", value)} />
-                <SettingField label="路径摘要预算" type="number" min={1} max={500} value={form.context_path_summary_budget} onChange={(value) => updateForm("context_path_summary_budget", value)} />
-                <SettingField label="规划轮次预算" type="number" min={1} max={10} value={form.agent_planning_round_budget} onChange={(value) => updateForm("agent_planning_round_budget", value)} />
-                <SettingField label="每轮动作上限" type="number" min={1} max={50} value={form.agent_max_typed_actions_per_round} onChange={(value) => updateForm("agent_max_typed_actions_per_round", value)} />
-                <SettingField label="修复轮次预算" type="number" min={0} max={10} value={form.agent_repair_round_budget} onChange={(value) => updateForm("agent_repair_round_budget", value)} />
-                <SettingField label="引用验证预算" type="number" min={1} max={100} value={form.agent_verification_budget} onChange={(value) => updateForm("agent_verification_budget", value)} />
               </div>
             </section>
 

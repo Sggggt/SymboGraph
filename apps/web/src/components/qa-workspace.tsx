@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { AgentResponse, AgentTraceEventPayload, Citation, SessionSummary } from "@course-kg/shared";
+import type { AgentResponse, AgentTraceEventPayload, Citation, ModelSettingsResponse, ModelSettingsUpdate, SessionSummary } from "@course-kg/shared";
 import { motion } from "framer-motion";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -12,8 +12,13 @@ import {
   FileText,
   History,
   Layers3,
+  Loader2,
   Plus,
+  RotateCcw,
+  Save,
   Send,
+  Settings,
+  SlidersHorizontal,
   Sparkles,
   Square,
   Trash2,
@@ -25,10 +30,12 @@ import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
-import { cancelAgentRun, deleteSession, fetchDashboard, fetchModelSettings, fetchSessionMessages, fetchSessions, fetchTaskStatus, streamAnswer } from "@/lib/api";
+import { cancelAgentRun, deleteSession, fetchDashboard, fetchModelSettings, fetchSessionMessages, fetchSessions, fetchTaskStatus, streamAnswer, updateModelSettings } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 
@@ -48,10 +55,146 @@ type ActiveStreamState = {
   startedAt: string;
 };
 
+type AgentSettingsForm = {
+  query_facet_bilingual_enabled: boolean;
+  context_package_token_budget: string;
+  retrieval_result_top_k_default: string;
+  agent_coarse_total_budget: string;
+  agent_mid_per_coarse_budget: string;
+  agent_mid_top_k: string;
+  agent_chunk_per_mid_budget: string;
+  agent_chunk_top_k: string;
+  candidate_pool_dedupe_budget: string;
+  agent_max_depth_per_layer: string;
+  agent_max_labels_per_node: string;
+  agent_max_edge_reuse: string;
+  agent_max_cycle_reward_per_path: string;
+  agent_cycle_reward_distance_threshold: string;
+  agent_path_distance_green_threshold: string;
+  agent_path_distance_gray_threshold: string;
+  agent_path_distance_hard_threshold: string;
+  agent_structure_restore_budget: string;
+  context_path_summary_budget: string;
+  agent_planning_round_budget: string;
+  agent_max_typed_actions_per_round: string;
+  agent_repair_round_budget: string;
+  agent_verification_budget: string;
+};
+
+type AgentNumberSettingKey = Exclude<keyof AgentSettingsForm, "query_facet_bilingual_enabled">;
+
+type AgentNumberField = {
+  key: AgentNumberSettingKey;
+  label: string;
+  min: number;
+  max: number;
+  step?: number;
+};
+
 const userCancelledMessage = "已取消当前对话";
+
+const agentSettingsInputClass = "h-11 rounded-xl border-white/10 bg-white/[0.045] px-3 text-white placeholder:text-white/28";
+
+const agentTraversalFields: AgentNumberField[] = [
+  { key: "context_package_token_budget", label: "证据包 token 预算", min: 256, max: 20000 },
+  { key: "retrieval_result_top_k_default", label: "结果 Top K 默认值", min: 1, max: 50 },
+  { key: "agent_coarse_total_budget", label: "粗概念总预算", min: 1, max: 200 },
+  { key: "agent_mid_per_coarse_budget", label: "每个粗概念中概念预算", min: 1, max: 100 },
+  { key: "agent_mid_top_k", label: "中概念 Top K", min: 1, max: 500 },
+  { key: "agent_chunk_per_mid_budget", label: "每个中概念片段预算", min: 1, max: 200 },
+  { key: "agent_chunk_top_k", label: "片段 Top K", min: 1, max: 1000 },
+  { key: "candidate_pool_dedupe_budget", label: "候选去重池预算", min: 1, max: 5000 },
+];
+
+const agentControlFields: AgentNumberField[] = [
+  { key: "agent_max_depth_per_layer", label: "每层最大深度", min: 1, max: 12 },
+  { key: "agent_max_labels_per_node", label: "每节点标签上限", min: 1, max: 20 },
+  { key: "agent_max_edge_reuse", label: "边复用上限", min: 1, max: 20 },
+  { key: "agent_max_cycle_reward_per_path", label: "Cycle reward 上限", min: 0, max: 2, step: 0.01 },
+  { key: "agent_cycle_reward_distance_threshold", label: "Cycle reward 距离阈值", min: 0, max: 20, step: 0.01 },
+  { key: "agent_path_distance_green_threshold", label: "路径 green 阈值", min: 0, max: 20, step: 0.01 },
+  { key: "agent_path_distance_gray_threshold", label: "路径 gray 阈值", min: 0, max: 20, step: 0.01 },
+  { key: "agent_path_distance_hard_threshold", label: "路径 hard 阈值", min: 0, max: 40, step: 0.01 },
+  { key: "agent_structure_restore_budget", label: "结构恢复预算", min: 1, max: 200 },
+  { key: "context_path_summary_budget", label: "路径摘要预算", min: 1, max: 500 },
+  { key: "agent_planning_round_budget", label: "规划轮次预算", min: 1, max: 10 },
+  { key: "agent_max_typed_actions_per_round", label: "每轮动作上限", min: 1, max: 50 },
+  { key: "agent_repair_round_budget", label: "修复轮次预算", min: 0, max: 10 },
+  { key: "agent_verification_budget", label: "引用验证预算", min: 1, max: 100 },
+];
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
+}
+
+function parseIntField(value: string): number | undefined {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function parseFloatField(value: string): number | undefined {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function stringSetting(value: number | undefined, fallback: number): string {
+  return String(value ?? fallback);
+}
+
+function agentSettingsFormFromSettings(settings?: ModelSettingsResponse | null): AgentSettingsForm {
+  return {
+    query_facet_bilingual_enabled: settings?.query_facet_bilingual_enabled ?? false,
+    context_package_token_budget: stringSetting(settings?.context_package_token_budget, 12000),
+    retrieval_result_top_k_default: stringSetting(settings?.retrieval_result_top_k_default, 12),
+    agent_coarse_total_budget: stringSetting(settings?.agent_coarse_total_budget, 5),
+    agent_mid_per_coarse_budget: stringSetting(settings?.agent_mid_per_coarse_budget, 6),
+    agent_mid_top_k: stringSetting(settings?.agent_mid_top_k, 8),
+    agent_chunk_per_mid_budget: stringSetting(settings?.agent_chunk_per_mid_budget, 12),
+    agent_chunk_top_k: stringSetting(settings?.agent_chunk_top_k, 16),
+    candidate_pool_dedupe_budget: stringSetting(settings?.candidate_pool_dedupe_budget, 80),
+    agent_max_depth_per_layer: stringSetting(settings?.agent_max_depth_per_layer, 3),
+    agent_max_labels_per_node: stringSetting(settings?.agent_max_labels_per_node, 3),
+    agent_max_edge_reuse: stringSetting(settings?.agent_max_edge_reuse, 2),
+    agent_max_cycle_reward_per_path: stringSetting(settings?.agent_max_cycle_reward_per_path, 0.18),
+    agent_cycle_reward_distance_threshold: stringSetting(settings?.agent_cycle_reward_distance_threshold, 1.2),
+    agent_path_distance_green_threshold: stringSetting(settings?.agent_path_distance_green_threshold, 0.45),
+    agent_path_distance_gray_threshold: stringSetting(settings?.agent_path_distance_gray_threshold, 1.35),
+    agent_path_distance_hard_threshold: stringSetting(settings?.agent_path_distance_hard_threshold, 2.4),
+    agent_structure_restore_budget: stringSetting(settings?.agent_structure_restore_budget, 16),
+    context_path_summary_budget: stringSetting(settings?.context_path_summary_budget, 32),
+    agent_planning_round_budget: stringSetting(settings?.agent_planning_round_budget, 2),
+    agent_max_typed_actions_per_round: stringSetting(settings?.agent_max_typed_actions_per_round, 8),
+    agent_repair_round_budget: stringSetting(settings?.agent_repair_round_budget, 2),
+    agent_verification_budget: stringSetting(settings?.agent_verification_budget, 8),
+  };
+}
+
+function buildAgentSettingsPayload(form: AgentSettingsForm): ModelSettingsUpdate {
+  return {
+    query_facet_bilingual_enabled: form.query_facet_bilingual_enabled,
+    context_package_token_budget: parseIntField(form.context_package_token_budget),
+    retrieval_result_top_k_default: parseIntField(form.retrieval_result_top_k_default),
+    agent_coarse_total_budget: parseIntField(form.agent_coarse_total_budget),
+    agent_mid_per_coarse_budget: parseIntField(form.agent_mid_per_coarse_budget),
+    agent_mid_top_k: parseIntField(form.agent_mid_top_k),
+    agent_chunk_per_mid_budget: parseIntField(form.agent_chunk_per_mid_budget),
+    agent_chunk_top_k: parseIntField(form.agent_chunk_top_k),
+    candidate_pool_dedupe_budget: parseIntField(form.candidate_pool_dedupe_budget),
+    agent_max_depth_per_layer: parseIntField(form.agent_max_depth_per_layer),
+    agent_max_labels_per_node: parseIntField(form.agent_max_labels_per_node),
+    agent_max_edge_reuse: parseIntField(form.agent_max_edge_reuse),
+    agent_max_cycle_reward_per_path: parseFloatField(form.agent_max_cycle_reward_per_path),
+    agent_cycle_reward_distance_threshold: parseFloatField(form.agent_cycle_reward_distance_threshold),
+    agent_path_distance_green_threshold: parseFloatField(form.agent_path_distance_green_threshold),
+    agent_path_distance_gray_threshold: parseFloatField(form.agent_path_distance_gray_threshold),
+    agent_path_distance_hard_threshold: parseFloatField(form.agent_path_distance_hard_threshold),
+    agent_structure_restore_budget: parseIntField(form.agent_structure_restore_budget),
+    context_path_summary_budget: parseIntField(form.context_path_summary_budget),
+    agent_planning_round_budget: parseIntField(form.agent_planning_round_budget),
+    agent_max_typed_actions_per_round: parseIntField(form.agent_max_typed_actions_per_round),
+    agent_repair_round_budget: parseIntField(form.agent_repair_round_budget),
+    agent_verification_budget: parseIntField(form.agent_verification_budget),
+  };
 }
 
 const fallbackSuggestions = [
@@ -124,13 +267,161 @@ function ChatHeader({
   );
 }
 
+function AgentSettingsField({
+  field,
+  value,
+  onChange,
+  disabled,
+}: {
+  field: AgentNumberField;
+  value: string;
+  onChange: (value: string) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <label className="flex min-w-0 flex-col gap-2">
+      <span className="text-xs font-medium uppercase tracking-[0.16em] text-cyan-100/52">{field.label}</span>
+      <Input
+        type="number"
+        min={field.min}
+        max={field.max}
+        step={field.step}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        disabled={disabled}
+        className={agentSettingsInputClass}
+      />
+    </label>
+  );
+}
+
+function AgentSettingsDialog({
+  open,
+  onOpenChange,
+  form,
+  onChange,
+  onReset,
+  onSave,
+  isLoading,
+  error,
+  isSaving,
+  savedMessage,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  form: AgentSettingsForm | null;
+  onChange: <K extends keyof AgentSettingsForm>(key: K, value: AgentSettingsForm[K]) => void;
+  onReset: () => void;
+  onSave: () => void;
+  isLoading: boolean;
+  error: Error | null;
+  isSaving: boolean;
+  savedMessage: { kind: "success" | "error"; text: string } | null;
+}) {
+  const disabled = isLoading || isSaving || !form;
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="flex max-h-[calc(100vh-2rem)] w-[min(58rem,calc(100vw-2rem))] flex-col overflow-hidden border border-cyan-200/14 bg-[rgba(3,10,22,0.96)] p-0 text-white shadow-[0_30px_90px_rgba(0,0,0,0.48)] backdrop-blur-2xl sm:!max-w-[58rem]">
+        <DialogHeader className="shrink-0 border-b border-cyan-200/10 px-6 py-5 pr-14">
+          <DialogTitle className="flex items-center gap-2 text-lg text-white">
+            <SlidersHorizontal className="size-5 text-cyan-100/78" />
+            Agent 参数
+          </DialogTitle>
+          <DialogDescription className="text-cyan-50/58">保存后通过运行时热加载影响下一次检索、对话和引用验证。</DialogDescription>
+        </DialogHeader>
+        <form
+          className="flex min-h-0 flex-1 flex-col"
+          onSubmit={(event) => {
+            event.preventDefault();
+            onSave();
+          }}
+        >
+          <ScrollArea className="min-h-0 flex-1 px-6 py-5">
+            {isLoading ? <LoadingBlock rows={3} /> : null}
+            {error ? <ErrorBlock message={error.message} /> : null}
+            {form ? (
+              <div className="grid gap-6">
+                <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/8 pb-5">
+                  <div className="min-w-[14rem] flex-1">
+                    <p className="text-sm font-semibold text-white">LLM 双语查询面</p>
+                    <p className="mt-1 text-sm leading-6 text-white/55">要求查询面提取为显式概念补充中英双语 aliases。</p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={form.query_facet_bilingual_enabled}
+                    disabled={disabled}
+                    onClick={() => onChange("query_facet_bilingual_enabled", !form.query_facet_bilingual_enabled)}
+                    className={`relative h-8 w-16 rounded-full border transition ${
+                      form.query_facet_bilingual_enabled ? "border-cyan-100/40 bg-cyan-300/70" : "border-white/14 bg-white/10"
+                    } disabled:cursor-not-allowed disabled:opacity-60`}
+                  >
+                    <span className={`absolute top-1 size-6 rounded-full bg-white shadow transition ${form.query_facet_bilingual_enabled ? "left-9" : "left-1"}`} />
+                  </button>
+                </div>
+
+                <section className="grid gap-4">
+                  <p className="text-sm font-semibold text-white">检索与证据包</p>
+                  <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                    {agentTraversalFields.map((field) => (
+                      <AgentSettingsField
+                        key={field.key}
+                        field={field}
+                        value={form[field.key]}
+                        onChange={(value) => onChange(field.key, value)}
+                        disabled={disabled}
+                      />
+                    ))}
+                  </div>
+                </section>
+
+                <section className="grid gap-4">
+                  <p className="text-sm font-semibold text-white">遍历、修复与验证</p>
+                  <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                    {agentControlFields.map((field) => (
+                      <AgentSettingsField
+                        key={field.key}
+                        field={field}
+                        value={form[field.key]}
+                        onChange={(value) => onChange(field.key, value)}
+                        disabled={disabled}
+                      />
+                    ))}
+                  </div>
+                </section>
+              </div>
+            ) : null}
+          </ScrollArea>
+          <DialogFooter className="shrink-0 border-t border-cyan-200/10 bg-white/[0.025] px-6 pb-6 pt-4">
+            <div className="flex w-full flex-wrap items-center justify-between gap-3">
+              <div className={cn("text-sm", savedMessage?.kind === "error" ? "text-rose-100/78" : "text-emerald-100/72")}>{savedMessage?.text}</div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button type="button" variant="outline" onClick={onReset} disabled={disabled} className="border-white/10 bg-white/[0.03] text-white hover:bg-white/[0.08]">
+                  <RotateCcw className="size-4" />
+                  重置
+                </Button>
+                <Button type="submit" disabled={disabled} className="rounded-full bg-cyan-300 text-slate-950 hover:bg-cyan-200">
+                  {isSaving ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
+                  保存
+                </Button>
+              </div>
+            </div>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function ChatActionRail({
   onOpenSessions,
   onOpenCitations,
+  onOpenAgentSettings,
   citationsCount,
 }: {
   onOpenSessions: () => void;
   onOpenCitations: () => void;
+  onOpenAgentSettings: () => void;
   citationsCount: number;
 }) {
   const actions = [
@@ -139,7 +430,16 @@ function ChatActionRail({
   ];
 
   return (
-    <div className="fixed bottom-[11.5rem] right-4 z-40 flex flex-col gap-2 lg:bottom-auto lg:right-7 lg:top-[10rem]">
+    <div className="fixed bottom-[11.5rem] right-4 z-40 flex flex-col items-end gap-2 lg:bottom-auto lg:right-7 lg:top-[10rem]">
+      <button
+        type="button"
+        onClick={onOpenAgentSettings}
+        className="group grid size-11 place-items-center rounded-full border border-cyan-200/18 bg-[rgba(7,13,31,0.9)] text-cyan-100/72 shadow-[0_16px_44px_rgba(0,0,0,0.28),0_0_28px_rgba(86,217,255,0.08)] backdrop-blur-2xl transition hover:border-cyan-200/36 hover:bg-cyan-300/[0.09] hover:text-white"
+        title="Agent 参数"
+        aria-label="Agent 参数"
+      >
+        <Settings className="size-4 transition group-hover:rotate-45" />
+      </button>
       {actions.map(({ label, icon: Icon, onClick }) => (
         <button
           key={label}
@@ -554,6 +854,9 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
   const streamAbortControllerRef = useRef<AbortController | null>(null);
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [citationsOpen, setCitationsOpen] = useState(false);
+  const [agentSettingsOpen, setAgentSettingsOpen] = useState(false);
+  const [agentSettingsForm, setAgentSettingsForm] = useState<AgentSettingsForm | null>(null);
+  const [agentSettingsSavedMessage, setAgentSettingsSavedMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const activeRunId = activeStream?.runId ?? null;
   const runStatusQuery = useQuery({
     queryKey: ["agent-run", activeRunId],
@@ -561,6 +864,19 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
     enabled: Boolean(activeRunId),
     refetchInterval: activeRunId ? 1500 : false,
     retry: false,
+  });
+
+  const saveAgentSettingsMutation = useMutation({
+    mutationFn: (payload: ModelSettingsUpdate) => updateModelSettings(payload),
+    onSuccess: async (settings) => {
+      setAgentSettingsForm(agentSettingsFormFromSettings(settings));
+      setAgentSettingsSavedMessage({ kind: "success", text: "已保存" });
+      window.setTimeout(() => setAgentSettingsSavedMessage(null), 1800);
+      await queryClient.invalidateQueries({ queryKey: ["model-settings"] });
+    },
+    onError: (error) => {
+      setAgentSettingsSavedMessage({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    },
   });
 
   const cancelRunMutation = useMutation({
@@ -757,8 +1073,29 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
     },
   });
 
+  const updateAgentSettingsForm = <K extends keyof AgentSettingsForm>(key: K, value: AgentSettingsForm[K]) => {
+    setAgentSettingsSavedMessage(null);
+    setAgentSettingsForm((current) => {
+      const base = current ?? (modelSettingsQuery.data ? agentSettingsFormFromSettings(modelSettingsQuery.data) : null);
+      return base ? { ...base, [key]: value } : current;
+    });
+  };
+
+  const resetAgentSettingsForm = () => {
+    setAgentSettingsSavedMessage(null);
+    setAgentSettingsForm(modelSettingsQuery.data ? agentSettingsFormFromSettings(modelSettingsQuery.data) : null);
+  };
+
+  const openAgentSettingsDialog = () => {
+    setAgentSettingsSavedMessage(null);
+    setAgentSettingsForm(null);
+    setAgentSettingsOpen(true);
+    void modelSettingsQuery.refetch();
+  };
+
   const suggestions = useMemo(() => buildKnowledgeBaseSuggestions(dashboardQuery.data?.tree), [dashboardQuery.data?.tree]);
   const isGenerating = askMutation.isPending || Boolean(activeStream);
+  const activeAgentSettingsForm = agentSettingsForm ?? (modelSettingsQuery.data ? agentSettingsFormFromSettings(modelSettingsQuery.data) : null);
 
   if (dashboardQuery.isLoading) {
     return <LoadingBlock rows={4} />;
@@ -776,6 +1113,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
         <ChatActionRail
           onOpenSessions={() => setSessionsOpen(true)}
           onOpenCitations={() => setCitationsOpen(true)}
+          onOpenAgentSettings={openAgentSettingsDialog}
           citationsCount={citations.length}
         />
 
@@ -837,6 +1175,22 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
           setQuestion("");
         }}
         isPending={isGenerating}
+      />
+      <AgentSettingsDialog
+        open={agentSettingsOpen}
+        onOpenChange={setAgentSettingsOpen}
+        form={activeAgentSettingsForm}
+        onChange={updateAgentSettingsForm}
+        onReset={resetAgentSettingsForm}
+        onSave={() => {
+          if (activeAgentSettingsForm) {
+            saveAgentSettingsMutation.mutate(buildAgentSettingsPayload(activeAgentSettingsForm));
+          }
+        }}
+        isLoading={modelSettingsQuery.isLoading}
+        error={modelSettingsQuery.error instanceof Error ? modelSettingsQuery.error : null}
+        isSaving={saveAgentSettingsMutation.isPending}
+        savedMessage={agentSettingsSavedMessage}
       />
       <CitationsDrawer open={citationsOpen} onOpenChange={setCitationsOpen} citations={citations} />
     </div>
