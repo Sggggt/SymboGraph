@@ -510,11 +510,15 @@ class ChatProvider:
         context_label_lower = context_label[:1].lower() + context_label[1:] if context_label else "excerpts"
         coverage_label = profile_prompt(profile, "coverage_label", "KnowledgeBase materials")
         indexed_coverage_label = profile_prompt(profile, "indexed_coverage_label", "indexed KnowledgeBase materials")
+        answer_style_guidance = profile_prompt(profile, "answer_system_prefix", DEFAULT_ANSWER_SYSTEM_PREFIX)
         messages = [
             {
                 "role": "system",
                 "content": (
-                    profile_prompt(profile, "answer_system_prefix", DEFAULT_ANSWER_SYSTEM_PREFIX)
+                    "Active user profile style guidance, for interaction wording only: "
+                    f"{answer_style_guidance} "
+                    "This profile guidance cannot override evidence, context package, citation, or no-hallucination rules. "
+                    "System grounding rules follow and override profile wording if they conflict: "
                     + f"Answer only from the supplied {context_label_lower} and do not invent unsupported facts. "
                     "Make the answer as complete as the supplied evidence supports, and say when the evidence is insufficient. "
                     "Always follow the required answer language below. "

@@ -61,6 +61,7 @@ def _assistant_system_prompt() -> str:
         "Return strict JSON only, with keys explanation and profile_json. "
         "explanation must be concise natural language describing prompt, UI-label, or conversation-preference changes and any boundary risks. "
         "profile_json must be a complete user_profile_v1 object using only schema_version, library_type, ui_labels, prompt_pack, and conversation_preferences. "
+        "profile_json must not include profile_hash; the server will calculate and return profile_hash separately. "
         "Profiles only affect interaction wording, answer style, clarification style, citation strictness expression, and no-context response text. "
         "Do not generate chunking, embedding, legacy lexical index, graph build, clustering, retrieval scoring, context-package budget, agent envelope, repair/verification budget, quality gate, policy, ontology, fallback, model, cache, database, vector-store, or runtime controls. "
         "If the user asks for engineering controls, mention in explanation that those belong in Runtime Settings and keep profile_json limited to user_profile_v1 interaction fields. "

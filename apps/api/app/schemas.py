@@ -602,6 +602,9 @@ class StrategyProfileSummary(APIModel):
     name: str
     library_type: str
     is_builtin: bool = False
+    is_active: bool = True
+    profile_hash: str | None = None
+    knowledge_base_ids: list[str] = Field(default_factory=list)
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

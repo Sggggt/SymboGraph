@@ -112,6 +112,9 @@ def fake_model_stack(monkeypatch: pytest.MonkeyPatch):
             return {"ok": active_ids.issubset(vector_ids), "missing": sorted(active_ids - vector_ids), "stale": sorted(vector_ids - active_ids)}
 
     class FakeChatProvider:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
         async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
             return fallback or {"label": "Unit concept", "definition": "Unit definition"}
 

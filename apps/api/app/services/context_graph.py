@@ -5192,9 +5192,10 @@ def build_context_package(
     results: list[dict[str, Any]],
     token_budget: int | None = None,
 ) -> ContextPackage:
-    from app.services.strategy_profiles import active_profile_json
+    from app.services.strategy_profiles import active_profile_hash
 
     token_budget = token_budget or int(get_settings().context_package_token_budget or 2400)
+    profile_hash = active_profile_hash(db, knowledge_base_id)
     hit_ids = [item["chunk_id"] for item in results]
     hit_id_set = set(hit_ids)
     selected_ids: list[str] = []
@@ -5405,12 +5406,12 @@ def build_context_package(
         token_budget=token_budget,
         token_count=token_count,
         runtime_settings_hash=runtime_settings_state_hash(),
-        profile_hash=(active_profile_json(db, knowledge_base_id) or {}).get("profile_hash"),
+        profile_hash=profile_hash,
         citation_spans_json=[],
         diagnostics_json={
             "context_restoration_protocol": "previous_next_structure_bridge_v1",
             "runtime_settings_hash": runtime_settings_state_hash(),
-            "profile_hash": (active_profile_json(db, knowledge_base_id) or {}).get("profile_hash"),
+            "profile_hash": profile_hash,
             "path_summary": {
                 "distinct_path_count": len({tuple(label.get("path") or []) for label in path_labels}),
                 "distinct_edge_type_count": len(

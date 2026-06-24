@@ -47,6 +47,7 @@ from app.services.error_sanitizer import public_exception_message
 from app.services.ingestion import resolve_knowledge_base
 from app.services.chunking import stable_hash
 from app.services.model_output import coerce_confidence
+from app.services.strategy_profiles import get_active_profile_record, use_strategy_profile
 
 
 _TRACE_SUBSCRIBERS: dict[str, set[asyncio.Queue[dict]]] = {}
@@ -1820,12 +1821,18 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
 
 async def run_agent(db: Session, request: AgentRequest) -> dict:
     session, run = create_agent_run_context(db, request)
-    return await execute_agent_run(db, request, session, run)
+    return await execute_agent_run_with_active_profile(db, request, session, run)
+
+
+async def execute_agent_run_with_active_profile(db: Session, request: AgentRequest, session: QASession, run: AgentRun) -> dict:
+    profile = get_active_profile_record(db, run.knowledge_base_id)
+    with use_strategy_profile(profile.profile_json):
+        return await execute_agent_run(db, request, session, run)
 
 
 async def _execute_agent_run_and_close(db: Session, request: AgentRequest, session: QASession, run: AgentRun) -> dict:
     try:
-        return await execute_agent_run(db, request, session, run)
+        return await execute_agent_run_with_active_profile(db, request, session, run)
     finally:
         db.close()
 

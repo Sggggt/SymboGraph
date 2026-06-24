@@ -346,12 +346,25 @@ async def test_context_graph_pipeline_builds_all_layers(db_session, populated_co
 async def test_layered_retrieval_writes_trace_and_context_package(db_session, populated_context_graph):
     from sqlalchemy import func, select
 
-    from app.models import ContextPackage, GraphRetrievalStep, RetrievalTrace
+    from app.models import Chunk, ContextGraphState, ContextPackage, GraphRetrievalStep, RetrievalTrace
     from app.schemas import SearchFilters
     from app.services.context_graph import build_context_package, layered_search
     from app.services.retrieval import get_context_package
+    from app.services.strategy_profiles import bind_profile_to_knowledge_base, create_profile, default_profile_payload
 
     kb = populated_context_graph["knowledge_base"]
+    state_before = db_session.scalar(select(ContextGraphState.id).where(ContextGraphState.knowledge_base_id == kb.id, ContextGraphState.state == "active"))
+    chunk_count_before = db_session.scalar(select(func.count(Chunk.id)).where(Chunk.knowledge_base_id == kb.id, Chunk.state == "active"))
+    profile_payload = default_profile_payload()
+    profile_payload["prompt_pack"]["answer_system_prefix"] = "Context package audit profile."
+    profile, warnings = create_profile(
+        db_session,
+        name="Context package audit profile",
+        library_type="custom",
+        profile_json=profile_payload,
+    )
+    assert warnings == []
+    bind_profile_to_knowledge_base(db_session, knowledge_base_id=kb.id, profile_id=profile.id)
     result = await layered_search(db_session, kb.id, "How does a Markov blanket affect conditional independence?", SearchFilters(), 4)
     assert result.results
     assert result.audit["retrieval_pipeline"] == "layered_context_graph"
@@ -410,6 +423,10 @@ async def test_layered_retrieval_writes_trace_and_context_package(db_session, po
     assert package.restored_chunk_ids_json
     assert package.parent_structure_node_ids_json
     assert package.citation_spans_json
+    assert package.profile_hash == profile.profile_hash
+    assert (package.diagnostics_json or {}).get("profile_hash") == profile.profile_hash
+    assert db_session.scalar(select(ContextGraphState.id).where(ContextGraphState.knowledge_base_id == kb.id, ContextGraphState.state == "active")) == state_before
+    assert db_session.scalar(select(func.count(Chunk.id)).where(Chunk.knowledge_base_id == kb.id, Chunk.state == "active")) == chunk_count_before
     chunks = (package.package_json or {}).get("chunks") or []
     assert any(item.get("structure_path") for item in chunks)
     assert any(item.get("structure_nodes") for item in chunks)
