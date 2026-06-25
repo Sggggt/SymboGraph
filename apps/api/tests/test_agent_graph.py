@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 
-def test_agent_run_context_records_resolved_result_top_k(monkeypatch, db_session, sample_knowledge_base):
+def test_retrieval_granularity_agent_run_context_records_resolved_result_top_k(monkeypatch, db_session, sample_knowledge_base):
     from app.schemas import AgentRequest
     from app.services import agent_graph
 
@@ -18,11 +18,13 @@ def test_agent_run_context_records_resolved_result_top_k(monkeypatch, db_session
     )
     _session, explicit_run = agent_graph.create_agent_run_context(
         db_session,
-        AgentRequest(knowledge_base_id=sample_knowledge_base.id, question="explicit top k", top_k=4),
+        AgentRequest(knowledge_base_id=sample_knowledge_base.id, question="explicit top k", top_k=4, retrieval_granularity="coarse"),
     )
 
     assert default_run.metadata_json["top_k"] == 9
+    assert default_run.metadata_json["retrieval_granularity"] == "mid"
     assert explicit_run.metadata_json["top_k"] == 4
+    assert explicit_run.metadata_json["retrieval_granularity"] == "coarse"
 
 
 @pytest.mark.asyncio
@@ -325,7 +327,7 @@ def test_cancel_agent_run_marks_running_run_failed_and_records_trace(db_session,
 
 
 @pytest.mark.asyncio
-async def test_stream_agent_events_cancels_task_when_stream_closes(monkeypatch, db_session, sample_knowledge_base):
+async def test_retrieval_granularity_stream_agent_events_cancels_task_when_stream_closes(monkeypatch, db_session, sample_knowledge_base):
     from app.models import AgentRun
     from app.schemas import AgentRequest
     from app.services import agent_graph
@@ -349,11 +351,13 @@ async def test_stream_agent_events_cancels_task_when_stream_closes(monkeypatch, 
         AgentRequest(
             knowledge_base_id=sample_knowledge_base.id,
             question="cancel the stream",
+            retrieval_granularity="coarse",
             stream_trace=True,
         )
     )
 
     meta = await stream.__anext__()
+    assert meta["retrieval_granularity"] == "coarse"
     await asyncio.wait_for(started.wait(), timeout=1)
     await stream.aclose()
     await asyncio.wait_for(cancelled.wait(), timeout=1)
@@ -394,8 +398,10 @@ async def test_agent_answers_from_context_package_and_records_audit(db_session, 
     assert "reward_event" in trace_nodes
     assert response["context_package_id"]
     assert response["retrieval_trace_id"]
+    assert response["retrieval_granularity"] == "mid"
     assert response["model_audit"]["context_package_id"] == response["context_package_id"]
     assert response["model_audit"]["retrieval_trace_id"] == response["retrieval_trace_id"]
+    assert response["model_audit"]["retrieval_granularity"] == "mid"
     assert response["model_audit"]["citation_verification_pass_rate"] == 1.0
     assert response["answer_model_audit"]["context_package_id"]
     assert response["answer_model_audit"]["answer_session_id"]
@@ -409,6 +415,127 @@ async def test_agent_answers_from_context_package_and_records_audit(db_session, 
     latest_policy = db_session.scalar(select(PolicyState).where(PolicyState.knowledge_base_id == kb.id).order_by(PolicyState.created_at.desc()))
     assert latest_policy is not None
     assert (latest_policy.reward_summary_json or {}).get("last_reward_event_id")
+
+
+@pytest.mark.asyncio
+async def test_agent_repair_loop_keeps_locked_retrieval_granularity(monkeypatch, db_session, populated_context_graph):
+    from app.schemas import AgentRequest, SearchFilters
+    from app.services import agent_graph
+
+    kb = populated_context_graph["knowledge_base"]
+    captured_granularities: list[str] = []
+    real_layered_search = agent_graph.layered_search
+
+    async def capture_layered_search(*args, **kwargs):
+        captured_granularities.append(kwargs.get("retrieval_granularity", "mid"))
+        return await real_layered_search(*args, **kwargs)
+
+    verify_calls = 0
+
+    async def fail_then_support(answer, citations, contexts, verification_budget):
+        nonlocal verify_calls
+        verify_calls += 1
+        verdict = "unsupported" if verify_calls == 1 else "supported"
+        failure_type = "concept_gap" if verdict == "unsupported" else "none"
+        return [
+            {
+                **citation,
+                "claim_text": answer[:120],
+                "verdict": verdict,
+                "failure_type": failure_type,
+                "confidence": 0.9 if verdict == "supported" else 0.2,
+                "diagnostics": {"test_verifier": "fail_then_support"},
+            }
+            for citation in citations[: max(1, verification_budget)]
+        ]
+
+    monkeypatch.setattr(agent_graph, "layered_search", capture_layered_search)
+    monkeypatch.setattr(agent_graph, "verify_answer_against_context", fail_then_support)
+
+    response = await agent_graph.run_agent(
+        db_session,
+        AgentRequest(
+            knowledge_base_id=kb.id,
+            question="Explain Bayesian network factorization.",
+            filters=SearchFilters(),
+            top_k=4,
+            retrieval_granularity="coarse",
+        ),
+    )
+
+    assert captured_granularities[:2] == ["coarse", "coarse"]
+    assert response["retrieval_granularity"] == "coarse"
+    assert response["model_audit"]["retrieval_granularity"] == "coarse"
+    assert response["model_audit"]["repair_actions"][0]["retrieval_granularity"] == "coarse"
+    assert verify_calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_retrieval_granularity_agent_citation_guard_rewrites_when_repair_has_no_supported_citation(monkeypatch, db_session, populated_context_graph):
+    from app.schemas import AgentRequest, SearchFilters
+    from app.services import agent_graph
+    from app.services.embeddings import ChatCallResult
+
+    kb = populated_context_graph["knowledge_base"]
+
+    class UngroundedChatProvider:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
+            return fallback or {"typed_actions": []}
+
+        async def answer_question_with_meta(self, question: str, contexts: list[dict], history: list[dict] | None = None, context_quality: str = "normal"):
+            return ChatCallResult(
+                answer="这是没有上下文支撑的外部公式和结论。",
+                provider="unit_chat",
+                model="unit-chat",
+                external_called=False,
+            )
+
+    async def guard_aware_verifier(answer, citations, contexts, verification_budget):
+        if "原文摘录" in answer:
+            return [
+                {
+                    **citation,
+                    "claim_text": answer[:120],
+                    "verdict": "supported",
+                    "failure_type": "none",
+                    "confidence": 0.9,
+                    "diagnostics": {"test_verifier": "guard_supported"},
+                }
+                for citation in citations[: max(1, verification_budget)]
+            ]
+        return [
+            {
+                **(citations[0] if citations else {"chunk_id": None, "source_span": {}}),
+                "claim_text": answer[:120],
+                "verdict": "unsupported",
+                "failure_type": "unsupported_claim",
+                "confidence": 0.1,
+                "diagnostics": {"test_verifier": "force_guard"},
+            }
+        ]
+
+    monkeypatch.setattr(agent_graph, "ChatProvider", UngroundedChatProvider)
+    monkeypatch.setattr(agent_graph, "verify_answer_against_context", guard_aware_verifier)
+
+    response = await agent_graph.run_agent(
+        db_session,
+        AgentRequest(
+            knowledge_base_id=kb.id,
+            question="解释贝叶斯网络分解。",
+            filters=SearchFilters(),
+            top_k=4,
+            retrieval_granularity="mid",
+        ),
+    )
+
+    assert response["citations"]
+    assert response["answer"].startswith("当前证据包未能支撑上一版回答")
+    assert response["model_audit"]["citation_guard_applied"] is True
+    assert response["model_audit"]["repair_actions"][-1]["deterministic_citation_guard"] is True
+    assert response["model_audit"]["citation_verification_pass_rate"] == 1.0
 
 
 @pytest.mark.asyncio

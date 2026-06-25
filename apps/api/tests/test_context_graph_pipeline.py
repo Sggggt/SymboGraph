@@ -45,6 +45,26 @@ def test_result_top_k_resolves_hot_reload_default_and_cache_key(monkeypatch):
         result_top_k=7,
     )
     assert components["result_top_k"] == 7
+    assert components["retrieval_granularity"] == "mid"
+
+
+def test_retrieval_granularity_changes_cache_key_component():
+    from app.schemas import SearchFilters
+    from app.services import context_graph
+
+    base = {
+        "knowledge_base_id": "kb-1",
+        "query": "graph retrieval",
+        "filters": SearchFilters(),
+        "context_state": None,
+        "retrieval_mode": "layered_context_graph",
+        "result_top_k": 7,
+    }
+
+    mid_key = context_graph.context_graph_cache_key(**base, retrieval_granularity="mid")
+    coarse_key = context_graph.context_graph_cache_key(**base, retrieval_granularity="coarse")
+
+    assert mid_key != coarse_key
 
 
 @pytest.mark.asyncio
@@ -64,7 +84,9 @@ async def test_layered_search_writes_default_result_top_k_for_empty_kb(monkeypat
 
     assert result.results == []
     assert result.audit["result_top_k"] == 6
+    assert result.audit["retrieval_granularity"] == "mid"
     assert result.trace.diagnostics_json["result_top_k"] == 6
+    assert result.trace.diagnostics_json["retrieval_granularity"] == "mid"
 
 
 def test_path_distance_zone_has_red_and_hard_boundaries():
@@ -438,3 +460,73 @@ async def test_layered_retrieval_writes_trace_and_context_package(db_session, po
     assert package_payload["contexts"]
     assert package_payload["citation_spans"]
     assert package_payload["graph_expansion_paths"]
+
+
+@pytest.mark.asyncio
+async def test_layered_retrieval_granularity_mid_direct_and_coarse_regression(db_session, populated_context_graph):
+    from sqlalchemy import select
+
+    from app.models import GraphRetrievalStep
+    from app.schemas import SearchFilters
+    from app.services.context_graph import build_context_package, layered_search
+
+    kb = populated_context_graph["knowledge_base"]
+
+    mid_result = await layered_search(
+        db_session,
+        kb.id,
+        "What is a Markov blanket?",
+        SearchFilters(),
+        4,
+        retrieval_granularity="mid",
+    )
+
+    assert mid_result.results
+    assert mid_result.audit["retrieval_granularity"] == "mid"
+    assert mid_result.audit["coarse_entries"] == 0
+    assert mid_result.trace.diagnostics_json["retrieval_granularity"] == "mid"
+    assert mid_result.trace.diagnostics_json["cache_key_components"]["retrieval_granularity"] == "mid"
+    assert mid_result.trace.stage_queues_json["coarse"]["skipped_by_granularity"] == "mid"
+    assert mid_result.trace.candidate_pools_json["mid_direct_entries"]["selected_ids"]
+    assert mid_result.trace.topk_selection_json["mid"]["entry_mode"] == "mid"
+    mid_step_actions = {
+        (step.layer, step.action_type)
+        for step in db_session.scalars(select(GraphRetrievalStep).where(GraphRetrievalStep.retrieval_trace_id == mid_result.trace.id)).all()
+    }
+    assert ("coarse", "select_entry_nodes") in mid_step_actions
+    assert ("coarse", "staged_priority_queue_walk") in mid_step_actions
+    assert ("mid", "drill_down_each_coarse_or_direct_mid_entry") in mid_step_actions
+
+    mid_package = build_context_package(
+        db_session,
+        knowledge_base_id=kb.id,
+        query="What is a Markov blanket?",
+        trace=mid_result.trace,
+        results=mid_result.results,
+    )
+    assert (mid_package.diagnostics_json or {})["retrieval_granularity"] == "mid"
+
+    coarse_result = await layered_search(
+        db_session,
+        kb.id,
+        "What is a Markov blanket?",
+        SearchFilters(),
+        4,
+        retrieval_granularity="coarse",
+    )
+
+    assert coarse_result.results
+    assert coarse_result.audit["retrieval_granularity"] == "coarse"
+    assert coarse_result.audit["coarse_entries"] >= 0
+    assert coarse_result.trace.diagnostics_json["retrieval_granularity"] == "coarse"
+    assert coarse_result.trace.diagnostics_json["cache_key_components"]["retrieval_granularity"] == "coarse"
+    assert "skipped_by_granularity" not in (coarse_result.trace.stage_queues_json.get("coarse") or {})
+    assert coarse_result.trace.topk_selection_json["mid"]["entry_mode"] == "coarse"
+    coarse_step_actions = {
+        (step.layer, step.action_type)
+        for step in db_session.scalars(select(GraphRetrievalStep).where(GraphRetrievalStep.retrieval_trace_id == coarse_result.trace.id)).all()
+    }
+    assert ("coarse", "select_entry_nodes") in coarse_step_actions
+    assert ("coarse", "staged_priority_queue_walk") in coarse_step_actions
+    assert ("mid", "drill_down_each_coarse_or_direct_mid_entry") in coarse_step_actions
+    assert mid_result.trace.diagnostics_json["cache_key"] != coarse_result.trace.diagnostics_json["cache_key"]

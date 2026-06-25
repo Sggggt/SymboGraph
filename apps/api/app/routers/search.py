@@ -44,12 +44,25 @@ def embedding_failure_payload(exc: Exception) -> dict:
 async def search(request: SearchRequest, db: Session = Depends(get_db)) -> dict:
     knowledge_base = get_requested_knowledge_base(db, request.knowledge_base_id)
     try:
-        results, model_audit = await search_chunks_with_audit(db, knowledge_base.id, request.query, request.filters, request.top_k)
+        results, model_audit = await search_chunks_with_audit(
+            db,
+            knowledge_base.id,
+            request.query,
+            request.filters,
+            request.top_k,
+            retrieval_granularity=request.retrieval_granularity,
+        )
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=502, detail=embedding_failure_payload(exc)) from exc
     db.commit()
-    return {"query": request.query, "results": results, "degraded_mode": is_degraded_mode(), "model_audit": model_audit}
+    return {
+        "query": request.query,
+        "results": results,
+        "degraded_mode": is_degraded_mode(),
+        "model_audit": model_audit,
+        "retrieval_granularity": request.retrieval_granularity,
+    }
 
 
 @router.post("/search/graph-enhanced", response_model=SearchResponse)
@@ -63,12 +76,19 @@ async def graph_search(request: SearchRequest, db: Session = Depends(get_db)) ->
             request.filters,
             request.top_k,
             route="layered_context_graph",
+            retrieval_granularity=request.retrieval_granularity,
         )
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=502, detail={"code": "graph_search_failed", "message": public_exception_message(exc)}) from exc
     db.commit()
-    return {"query": request.query, "results": results, "degraded_mode": is_degraded_mode(), "model_audit": audit}
+    return {
+        "query": request.query,
+        "results": results,
+        "degraded_mode": is_degraded_mode(),
+        "model_audit": audit,
+        "retrieval_granularity": request.retrieval_granularity,
+    }
 
 
 @router.post("/qa", response_model=QAResponse)
@@ -83,6 +103,7 @@ async def qa(request: QARequest, db: Session = Depends(get_db)) -> dict:
             filters=request.filters,
             top_k=request.top_k,
             history=request.history,
+            retrieval_granularity=request.retrieval_granularity,
             route="layered_context_graph",
             stream_trace=False,
         ),
@@ -102,6 +123,7 @@ async def qa_stream(request: QARequest) -> StreamingResponse:
         filters=request.filters,
         top_k=request.top_k,
         history=request.history,
+        retrieval_granularity=request.retrieval_granularity,
         route="layered_context_graph",
         stream_trace=True,
     )

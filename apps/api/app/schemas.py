@@ -35,6 +35,7 @@ AgentRoute = Literal[
     "formula_table_lookup",
     "cross_document_synthesis",
 ]
+RetrievalGranularity = Literal["mid", "coarse"]
 
 
 class APIModel(BaseModel):
@@ -105,6 +106,7 @@ class SearchRequest(APIModel):
     knowledge_base_id: str | None = None
     filters: SearchFilters = Field(default_factory=SearchFilters)
     top_k: int | None = Field(default=None, ge=1, le=50)
+    retrieval_granularity: RetrievalGranularity = "mid"
 
 
 class SearchResult(APIModel):
@@ -128,6 +130,7 @@ class ModelAudit(APIModel):
     embedding_model: str | None = None
     embedding_text_version: str | None = None
     retrieval_mode: str | None = None
+    retrieval_granularity: RetrievalGranularity | None = None
     retrieval_trace_id: str | None = None
     context_package_id: str | None = None
     degraded: bool = False
@@ -141,6 +144,7 @@ class SearchResponse(APIModel):
     results: list[SearchResult]
     degraded_mode: bool = False
     model_audit: ModelAudit | dict[str, Any] = Field(default_factory=ModelAudit)
+    retrieval_granularity: RetrievalGranularity = "mid"
 
 
 class ChatMessage(APIModel):
@@ -155,6 +159,7 @@ class QARequest(APIModel):
     filters: SearchFilters = Field(default_factory=SearchFilters)
     top_k: int | None = Field(default=None, ge=1, le=50)
     history: list[ChatMessage] = Field(default_factory=list)
+    retrieval_granularity: RetrievalGranularity = "mid"
 
 
 class AnswerModelAudit(ModelAudit):
@@ -170,6 +175,7 @@ class QAResponse(APIModel):
     run_id: str | None = None
     context_package_id: str | None = None
     retrieval_trace_id: str | None = None
+    retrieval_granularity: RetrievalGranularity = "mid"
     used_chunks: list[dict[str, Any]] = Field(default_factory=list)
     route: AgentRoute | str | None = None
     trace: list["AgentTraceEventPayload"] = Field(default_factory=list)
@@ -185,6 +191,7 @@ class AgentRequest(APIModel):
     filters: SearchFilters = Field(default_factory=SearchFilters)
     top_k: int | None = Field(default=None, ge=1, le=50)
     history: list[ChatMessage] = Field(default_factory=list)
+    retrieval_granularity: RetrievalGranularity = "mid"
     route: AgentRoute = "layered_context_graph"
     stream_trace: bool = False
 
@@ -216,6 +223,7 @@ class TaskStatusResponse(APIModel):
     current_node: str | None = None
     retry_count: int | None = None
     route: str | None = None
+    retrieval_granularity: RetrievalGranularity = "mid"
     answer: str | None = None
     error: str | None = None
     created_at: datetime | None = None
@@ -495,6 +503,19 @@ class ContextPackageResponse(APIModel):
 
 class RetrievalTraceStepsResponse(APIModel):
     trace_id: str
+    query: str | None = None
+    retrieval_mode: str | None = None
+    retrieval_granularity: RetrievalGranularity | None = None
+    concept_path: list[dict[str, Any]] = Field(default_factory=list)
+    result_chunk_ids: list[str] = Field(default_factory=list)
+    query_facets: dict[str, Any] = Field(default_factory=dict)
+    entry_nodes: list[dict[str, Any]] = Field(default_factory=list)
+    frontier: list[dict[str, Any]] = Field(default_factory=list)
+    stage_queues: dict[str, Any] = Field(default_factory=dict)
+    candidate_pools: dict[str, Any] = Field(default_factory=dict)
+    topk_selection: dict[str, Any] = Field(default_factory=dict)
+    path_labels: list[dict[str, Any]] = Field(default_factory=list)
+    convergence: dict[str, Any] = Field(default_factory=dict)
     steps: list[dict[str, Any]] = Field(default_factory=list)
 
 

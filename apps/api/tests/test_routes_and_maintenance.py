@@ -96,7 +96,10 @@ async def test_search_route_commits_retrieval_trace(db_session, populated_contex
     )
     trace_id = payload["model_audit"]["retrieval_trace_id"]
 
+    assert payload["retrieval_granularity"] == "mid"
+    assert payload["model_audit"]["retrieval_granularity"] == "mid"
     assert db_session.get(RetrievalTrace, trace_id) is not None
+    assert db_session.get(RetrievalTrace, trace_id).diagnostics_json["retrieval_granularity"] == "mid"
     assert db_session.scalar(select(func.count(GraphRetrievalStep.id)).where(GraphRetrievalStep.retrieval_trace_id == trace_id)) >= 4
 
 
@@ -475,6 +478,20 @@ def test_agent_run_status_includes_trace_for_frontend_recovery(db_session, sampl
     assert payload["status"] == "completed"
     assert payload["answer"] == "Recovered answer"
     assert payload["trace"][0]["node"] == "query_understanding"
+
+
+def test_retrieval_granularity_schema_defaults_and_rejects_invalid_values():
+    from pydantic import ValidationError
+
+    from app.schemas import AgentRequest, QARequest, SearchRequest
+
+    assert SearchRequest(query="default").retrieval_granularity == "mid"
+    assert QARequest(question="default").retrieval_granularity == "mid"
+    assert AgentRequest(question="default").retrieval_granularity == "mid"
+    assert SearchRequest(query="coarse", retrieval_granularity="coarse").retrieval_granularity == "coarse"
+    for invalid in ("hybrid", "summary", "normal", "普通模式", ""):
+        with pytest.raises(ValidationError):
+            SearchRequest(query="invalid", retrieval_granularity=invalid)
 
 
 def test_model_settings_update_rejects_legacy_generic_api_key():

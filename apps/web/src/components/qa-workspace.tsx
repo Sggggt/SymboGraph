@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { AgentResponse, AgentTraceEventPayload, Citation, ModelSettingsResponse, ModelSettingsUpdate, SessionSummary } from "@course-kg/shared";
+import type { AgentResponse, AgentTraceEventPayload, Citation, ModelSettingsResponse, ModelSettingsUpdate, RetrievalGranularity, SessionSummary } from "@course-kg/shared";
 import { motion } from "framer-motion";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -51,6 +51,7 @@ type ChatTurn = {
 type ActiveStreamState = {
   runId?: string | null;
   sessionId?: string | null;
+  retrievalGranularity?: RetrievalGranularity;
   question: string;
   startedAt: string;
 };
@@ -121,6 +122,19 @@ const agentControlFields: AgentNumberField[] = [
   { key: "agent_max_typed_actions_per_round", label: "每轮动作上限", min: 1, max: 50 },
   { key: "agent_repair_round_budget", label: "修复轮次预算", min: 0, max: 10 },
   { key: "agent_verification_budget", label: "引用验证预算", min: 1, max: 100 },
+];
+
+const retrievalGranularityOptions: Array<{ value: RetrievalGranularity; label: string; description: string }> = [
+  {
+    value: "mid",
+    label: "普通模式",
+    description: "从中层概念直接进入检索，适合具体知识点和术语问题",
+  },
+  {
+    value: "coarse",
+    label: "摘要模式",
+    description: "先从粗层摘要概念进入检索，适合总览和主题性问题",
+  },
 ];
 
 function isAbortError(error: unknown): boolean {
@@ -620,6 +634,85 @@ function MessageList({
   );
 }
 
+export function RetrievalGranularitySelector({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: RetrievalGranularity;
+  onChange: (value: RetrievalGranularity) => void;
+  disabled?: boolean;
+}) {
+  const [tooltipMode, setTooltipMode] = useState<RetrievalGranularity | null>(null);
+  const tooltipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeOption = retrievalGranularityOptions.find((option) => option.value === value) ?? retrievalGranularityOptions[0];
+
+  const clearTooltipTimer = () => {
+    if (tooltipTimerRef.current) {
+      clearTimeout(tooltipTimerRef.current);
+      tooltipTimerRef.current = null;
+    }
+  };
+
+  const queueTooltip = (mode: RetrievalGranularity) => {
+    clearTooltipTimer();
+    tooltipTimerRef.current = setTimeout(() => {
+      setTooltipMode(mode);
+      tooltipTimerRef.current = null;
+    }, 1000);
+  };
+
+  const hideTooltip = () => {
+    clearTooltipTimer();
+    setTooltipMode(null);
+  };
+
+  useEffect(() => {
+    return () => clearTooltipTimer();
+  }, []);
+
+  return (
+    <div className="relative flex flex-wrap items-center gap-2" aria-label="检索模式">
+      <div className="flex rounded-full border border-white/10 bg-black/16 p-1" role="group" aria-label="检索粒度模式">
+        {retrievalGranularityOptions.map((option) => {
+          const selected = option.value === value;
+          return (
+            <button
+              key={option.value}
+              type="button"
+              data-testid={`retrieval-granularity-${option.value}`}
+              aria-pressed={selected}
+              disabled={disabled}
+              onClick={() => onChange(option.value)}
+              onMouseEnter={() => queueTooltip(option.value)}
+              onMouseLeave={hideTooltip}
+              onFocus={() => queueTooltip(option.value)}
+              onBlur={hideTooltip}
+              className={cn(
+                "inline-flex h-8 min-w-0 items-center gap-1.5 rounded-full px-3 text-[11px] font-medium transition disabled:cursor-not-allowed disabled:opacity-55",
+                selected ? "bg-cyan-200 text-slate-950 shadow-[0_0_18px_rgba(86,217,255,0.18)]" : "text-white/58 hover:bg-white/8 hover:text-white/82",
+              )}
+            >
+              {option.value === "mid" ? <Layers3 /> : <FileText />}
+              <span className="whitespace-nowrap">{option.label}</span>
+            </button>
+          );
+        })}
+      </div>
+      <span className="min-w-0 truncate text-[11px] text-white/42">{activeOption.value === "mid" ? "中层入口" : "粗层入口"}</span>
+      {tooltipMode ? (
+        <div
+          role="tooltip"
+          data-testid="retrieval-granularity-tooltip"
+          className="absolute bottom-[calc(100%+0.5rem)] left-0 max-w-[min(22rem,calc(100vw-3rem))] rounded-lg border border-cyan-200/18 bg-[#071124] px-3 py-2 text-xs leading-5 text-white/70 shadow-[0_16px_42px_rgba(0,0,0,0.34)]"
+        >
+          {retrievalGranularityOptions.find((option) => option.value === tooltipMode)?.description}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ChatComposer({
   value,
   onChange,
@@ -627,6 +720,8 @@ function ChatComposer({
   onCancel,
   isPending,
   activeSessionId,
+  retrievalGranularity,
+  onRetrievalGranularityChange,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -634,6 +729,8 @@ function ChatComposer({
   onCancel: () => void;
   isPending: boolean;
   activeSessionId: string | null;
+  retrievalGranularity: RetrievalGranularity;
+  onRetrievalGranularityChange: (value: RetrievalGranularity) => void;
 }) {
   const handleSubmit = () => {
     if (isPending || !value.trim()) {
@@ -664,6 +761,7 @@ function ChatComposer({
               <span className="kg-micro-chip max-w-full truncate rounded-full px-2.5 py-1 text-[11px]">
                 会话 {activeSessionId ? activeSessionId.slice(0, 8) : "新建"}
               </span>
+              <RetrievalGranularitySelector value={retrievalGranularity} onChange={onRetrievalGranularityChange} disabled={isPending} />
             </div>
             <div className="flex items-end gap-3">
               <Textarea
@@ -850,6 +948,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
   const [trace, setTrace] = useLocalStorage<AgentTraceEventPayload[]>(`qa.trace.${storageScope}`, []);
   const [latestRun, setLatestRun] = useLocalStorage<AgentResponse | null>(`qa.latestRun.${storageScope}`, null);
   const [activeStream, setActiveStream] = useLocalStorage<ActiveStreamState | null>(`qa.activeStream.${storageScope}`, null);
+  const [retrievalGranularity, setRetrievalGranularity] = useLocalStorage<RetrievalGranularity>(`qa.retrievalGranularity.${storageScope}`, "mid");
   const [streamError, setStreamError] = useState<string | null>(null);
   const streamAbortControllerRef = useRef<AbortController | null>(null);
   const [sessionsOpen, setSessionsOpen] = useState(false);
@@ -907,7 +1006,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
       setCitations([]);
       setTrace([]);
       setLatestRun(null);
-      setActiveStream({ question: nextQuestion, startedAt: new Date().toISOString() });
+      setActiveStream({ question: nextQuestion, retrievalGranularity, startedAt: new Date().toISOString() });
       const controller = new AbortController();
       streamAbortControllerRef.current = controller;
       const nextTraceEvents: AgentTraceEventPayload[] = [];
@@ -915,7 +1014,12 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
       setQuestion("");
       try {
         await streamAnswer(
-          { question: nextQuestion, session_id: activeSessionId, knowledge_base_id: selectedKnowledgeBaseId },
+          {
+            question: nextQuestion,
+            session_id: activeSessionId,
+            knowledge_base_id: selectedKnowledgeBaseId,
+            retrieval_granularity: retrievalGranularity,
+          },
           {
             onTrace: (event) => {
               nextTraceEvents.push(event);
@@ -931,6 +1035,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
                 setActiveStream((current) => ({
                   question: current?.question ?? nextQuestion,
                   startedAt: current?.startedAt ?? new Date().toISOString(),
+                  retrievalGranularity: meta.retrieval_granularity ?? current?.retrievalGranularity ?? retrievalGranularity,
                   runId: meta.run_id ?? current?.runId ?? null,
                   sessionId: meta.session_id ?? current?.sessionId ?? null,
                 }));
@@ -1142,6 +1247,8 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
           onCancel={handleCancelActiveRun}
           isPending={isGenerating}
           activeSessionId={activeSessionId}
+          retrievalGranularity={retrievalGranularity}
+          onRetrievalGranularityChange={setRetrievalGranularity}
         />
       </div>
 
@@ -1173,6 +1280,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
           setLatestRun(null);
           setActiveStream(null);
           setQuestion("");
+          setRetrievalGranularity("mid");
         }}
         isPending={isGenerating}
       />

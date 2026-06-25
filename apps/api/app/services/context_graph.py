@@ -49,7 +49,7 @@ from app.models import (
     RetrievalTrace,
     VectorRecord,
 )
-from app.schemas import SearchFilters
+from app.schemas import RetrievalGranularity, SearchFilters
 from app.services.chunking import (
     CHUNK_SCHEMA_VERSION,
     CURRENT_EMBEDDING_TEXT_VERSION,
@@ -318,6 +318,7 @@ def context_graph_cache_key_components(
     filters: SearchFilters | dict[str, Any] | None,
     context_state: ContextGraphState | None,
     retrieval_mode: str,
+    retrieval_granularity: RetrievalGranularity = "mid",
     result_top_k: int | None = None,
     conversation_state_scope_hash: str | None = None,
     query_facets: dict[str, Any] | None = None,
@@ -345,6 +346,7 @@ def context_graph_cache_key_components(
         "conversation_state_scope_hash": conversation_state_scope_hash or stable_hash({"conversation_state": "none"}),
         "prompt_protocol_hash": context_state.prompt_protocol_hash if context_state else None,
         "retrieval_mode": retrieval_mode,
+        "retrieval_granularity": retrieval_granularity,
         "result_top_k": result_top_k,
     }
 
@@ -356,6 +358,7 @@ def context_graph_cache_key(
     filters: SearchFilters | dict[str, Any] | None,
     context_state: ContextGraphState | None,
     retrieval_mode: str,
+    retrieval_granularity: RetrievalGranularity = "mid",
     result_top_k: int | None = None,
     conversation_state_scope_hash: str | None = None,
     query_facets: dict[str, Any] | None = None,
@@ -367,6 +370,7 @@ def context_graph_cache_key(
             filters=filters,
             context_state=context_state,
             retrieval_mode=retrieval_mode,
+            retrieval_granularity=retrieval_granularity,
             result_top_k=result_top_k,
             conversation_state_scope_hash=conversation_state_scope_hash,
             query_facets=query_facets,
@@ -3278,6 +3282,7 @@ async def layered_search(
     top_k: int | None,
     *,
     query_facets: dict[str, Any] | None = None,
+    retrieval_granularity: RetrievalGranularity = "mid",
 ) -> LayeredSearchResult:
     chunks = list(db.scalars(active_chunks_query(knowledge_base_id)).all())
     query_facets = query_facets_for_search(query, query_facets)
@@ -3290,19 +3295,33 @@ async def layered_search(
             result_chunk_ids_json=[],
             query_facets_json=query_facets,
             convergence_json={"reason": "no_active_chunks"},
-            diagnostics_json={"reason": "no_active_chunks", "result_top_k": result_top_k},
+            diagnostics_json={
+                "reason": "no_active_chunks",
+                "result_top_k": result_top_k,
+                "retrieval_granularity": retrieval_granularity,
+                "cache_key_components": {"retrieval_granularity": retrieval_granularity},
+            },
             edge_distance_protocol_hash=edge_distance_protocol_hash(),
             edge_projection_protocol_hash=edge_projection_protocol_hash(),
             traversal_protocol_hash=traversal_protocol_hash(),
         )
         db.add(trace)
         db.flush()
-        return LayeredSearchResult([], trace, {"retrieval_pipeline": "layered_context_graph", "reason": "no_active_chunks", "result_top_k": result_top_k})
+        return LayeredSearchResult(
+            [],
+            trace,
+            {
+                "retrieval_pipeline": "layered_context_graph",
+                "retrieval_granularity": retrieval_granularity,
+                "reason": "no_active_chunks",
+                "result_top_k": result_top_k,
+            },
+        )
     context_state = latest_context_graph_state(db, knowledge_base_id)
     relation_state = latest_relation_state(db, knowledge_base_id)
     query_vector = (await EmbeddingProvider().embed_texts([query], text_type="query"))[0]
     query_rq = encode_query_rq(relation_state, query_vector)
-    coarse_entries = select_coarse_entries(db, knowledge_base_id, query_facets)
+    coarse_entries = select_coarse_entries(db, knowledge_base_id, query_facets) if retrieval_granularity == "coarse" else {}
     mid_entries = select_mid_entries(db, knowledge_base_id, query_facets, coarse_entries)
     rq_membership_entries = select_rq_membership_entries(db, knowledge_base_id, query_vector, query_rq, mid_entries)
     dense_entries = dense_chunk_entries(db, knowledge_base_id, query_vector)
@@ -3318,6 +3337,7 @@ async def layered_search(
         dense_entries=dense_entries,
         query_rq=query_rq,
         top_k=result_top_k,
+        retrieval_granularity=retrieval_granularity,
     )
     results = traversal["results"]
     trace = write_retrieval_trace(
@@ -3330,6 +3350,7 @@ async def layered_search(
         traversal,
         query_rq,
         result_top_k,
+        retrieval_granularity,
     )
     for item in results:
         item["metadata"]["retrieval_trace_id"] = trace.id
@@ -3339,6 +3360,7 @@ async def layered_search(
                 citation["source_span"]["retrieval_trace_id"] = trace.id
     audit = {
         "retrieval_pipeline": "layered_context_graph",
+        "retrieval_granularity": retrieval_granularity,
         "retrieval_trace_id": trace.id,
         "context_graph_state_id": context_state.id if context_state else None,
         "degraded_mode": is_degraded_mode(),
@@ -3355,6 +3377,8 @@ async def layered_search(
         "red_zone_pruned_count": traversal["convergence"].get("red_zone_pruned_count", 0),
         "gray_zone_decision_count": traversal["convergence"].get("gray_zone_decision_count", 0),
         "query_rq_path": query_rq.get("rq_path") if query_rq else [],
+        "coarse_skipped_reason": (traversal.get("retrieval_granularity_audit") or {}).get("coarse_skipped_reason"),
+        "mid_direct_entry_count": (traversal.get("retrieval_granularity_audit") or {}).get("mid_direct_entry_count"),
     }
     return LayeredSearchResult(results, trace, audit)
 
@@ -4298,36 +4322,65 @@ def execute_priority_queue_traversal(
     dense_entries: dict[str, float],
     query_rq: dict[str, Any] | None,
     top_k: int,
+    retrieval_granularity: RetrievalGranularity = "mid",
 ) -> dict[str, Any]:
     envelope = agent_operating_envelope()
     chunk_by_id = {chunk.id: chunk for chunk in chunks}
     layer_walks: dict[str, dict[str, Any]] = {}
 
-    coarse_state = latest_coarse_state(db, knowledge_base_id)
-    coarse_concepts = (
-        list(db.scalars(select(CoarseConcept).where(CoarseConcept.coarse_state_id == coarse_state.id, CoarseConcept.state == "active")).all())
-        if coarse_state
-        else []
-    )
-    coarse_text = {concept.id: concept_searchable_text(concept) for concept in coarse_concepts}
-    coarse_edges = list(db.scalars(select(CoarseConceptEdge).where(CoarseConceptEdge.coarse_state_id == coarse_state.id)).all()) if coarse_state else []
-    layer_walks["coarse"] = execute_layer_priority_walk(
-        layer="coarse",
-        entry_scores=coarse_entries,
-        node_text_by_id=coarse_text,
-        adjacency=_build_adjacency(coarse_edges, "source_concept_id", "target_concept_id"),
-        query_facets=query_facets,
-        source_attr="source_concept_id",
-        target_attr="target_concept_id",
-        envelope=envelope,
-    )
-    stage_queues: dict[str, Any] = {
-        "coarse": {
-            "entry_ids": list(coarse_entries.keys()),
-            "accepted_ids": list(layer_walks["coarse"].get("accepted_nodes") or []),
-            "frontier_pop_count": len(layer_walks["coarse"].get("frontier_pops") or []),
+    coarse_concepts: list[CoarseConcept] = []
+    if retrieval_granularity == "coarse":
+        coarse_state = latest_coarse_state(db, knowledge_base_id)
+        coarse_concepts = (
+            list(db.scalars(select(CoarseConcept).where(CoarseConcept.coarse_state_id == coarse_state.id, CoarseConcept.state == "active")).all())
+            if coarse_state
+            else []
+        )
+        coarse_text = {concept.id: concept_searchable_text(concept) for concept in coarse_concepts}
+        coarse_edges = list(db.scalars(select(CoarseConceptEdge).where(CoarseConceptEdge.coarse_state_id == coarse_state.id)).all()) if coarse_state else []
+        layer_walks["coarse"] = execute_layer_priority_walk(
+            layer="coarse",
+            entry_scores=coarse_entries,
+            node_text_by_id=coarse_text,
+            adjacency=_build_adjacency(coarse_edges, "source_concept_id", "target_concept_id"),
+            query_facets=query_facets,
+            source_attr="source_concept_id",
+            target_attr="target_concept_id",
+            envelope=envelope,
+        )
+        stage_queues: dict[str, Any] = {
+            "coarse": {
+                "entry_ids": list(coarse_entries.keys()),
+                "accepted_ids": list(layer_walks["coarse"].get("accepted_nodes") or []),
+                "frontier_pop_count": len(layer_walks["coarse"].get("frontier_pops") or []),
+            }
         }
-    }
+        coarse_skipped_reason = None
+    else:
+        coarse_skipped_reason = "skipped_by_granularity=mid"
+        layer_walks["coarse"] = {
+            "entry_nodes": [],
+            "accepted_nodes": [],
+            "accepted_states": [],
+            "frontier_pops": [],
+            "frontier_json": [],
+            "path_labels": [],
+            "gray_zone_path_decisions": [],
+            "convergence": {
+                "reason": coarse_skipped_reason,
+                "skipped_by_granularity": "mid",
+                "active_traversal_layer": False,
+            },
+        }
+        stage_queues = {
+            "coarse": {
+                "entry_ids": [],
+                "accepted_ids": [],
+                "frontier_pop_count": 0,
+                "skipped_by_granularity": "mid",
+                "reason": coarse_skipped_reason,
+            }
+        }
     candidate_pools: dict[str, Any] = {"mid_by_coarse": [], "chunk_by_mid": []}
     topk_selection: dict[str, Any] = {}
 
@@ -4340,37 +4393,46 @@ def execute_priority_queue_traversal(
     mid_by_id = {concept.id: concept for concept in mid_concepts}
     coarse_by_id = {concept.id: concept for concept in coarse_concepts}
     mid_text = {concept.id: concept_searchable_text(concept) for concept in mid_concepts}
-    accepted_coarse_ids = list(layer_walks["coarse"].get("accepted_nodes") or []) or list(coarse_entries.keys())[: int(envelope["agent_coarse_total_budget"])]
     mid_candidate_scores: dict[str, float] = {}
-    for coarse_id in accepted_coarse_ids:
-        coarse = coarse_by_id.get(coarse_id)
-        if coarse is None:
-            continue
-        coarse_strength = max(coarse_entries.get(coarse_id, 0.35), 0.35)
-        candidates: list[dict[str, Any]] = []
-        for mid_id in coarse.included_mid_concept_ids_json or []:
-            if mid_id not in mid_by_id:
+    if retrieval_granularity == "coarse":
+        accepted_coarse_ids = list(layer_walks["coarse"].get("accepted_nodes") or []) or list(coarse_entries.keys())[: int(envelope["agent_coarse_total_budget"])]
+        for coarse_id in accepted_coarse_ids:
+            coarse = coarse_by_id.get(coarse_id)
+            if coarse is None:
                 continue
-            score = normalized_strength(max(mid_entries.get(mid_id, 0.0), coarse_strength * 0.9))
-            candidates.append({"id": mid_id, "score": score, "parent_layer": "coarse", "parent_node_id": coarse_id})
-        candidates.sort(key=lambda item: item["score"], reverse=True)
-        selected = candidates[: int(envelope["agent_mid_per_coarse_budget"])]
-        for item in selected:
-            mid_candidate_scores[item["id"]] = max(mid_candidate_scores.get(item["id"], 0.0), float(item["score"]))
-        candidate_pools["mid_by_coarse"].append(
-            {
-                "parent_layer": "coarse",
-                "parent_node_id": coarse_id,
-                "candidate_ids": [item["id"] for item in candidates],
-                "selected_ids": [item["id"] for item in selected],
-                "per_parent_budget_status": {
-                    "budget": int(envelope["agent_mid_per_coarse_budget"]),
-                    "candidate_count": len(candidates),
-                    "selected_count": len(selected),
-                    "stop_reason": "per_parent_budget_hit" if len(candidates) > len(selected) else "parent_candidates_exhausted",
-                },
-            }
-        )
+            coarse_strength = max(coarse_entries.get(coarse_id, 0.35), 0.35)
+            candidates: list[dict[str, Any]] = []
+            for mid_id in coarse.included_mid_concept_ids_json or []:
+                if mid_id not in mid_by_id:
+                    continue
+                score = normalized_strength(max(mid_entries.get(mid_id, 0.0), coarse_strength * 0.9))
+                candidates.append({"id": mid_id, "score": score, "parent_layer": "coarse", "parent_node_id": coarse_id})
+            candidates.sort(key=lambda item: item["score"], reverse=True)
+            selected = candidates[: int(envelope["agent_mid_per_coarse_budget"])]
+            for item in selected:
+                mid_candidate_scores[item["id"]] = max(mid_candidate_scores.get(item["id"], 0.0), float(item["score"]))
+            candidate_pools["mid_by_coarse"].append(
+                {
+                    "parent_layer": "coarse",
+                    "parent_node_id": coarse_id,
+                    "candidate_ids": [item["id"] for item in candidates],
+                    "selected_ids": [item["id"] for item in selected],
+                    "per_parent_budget_status": {
+                        "budget": int(envelope["agent_mid_per_coarse_budget"]),
+                        "candidate_count": len(candidates),
+                        "selected_count": len(selected),
+                        "stop_reason": "per_parent_budget_hit" if len(candidates) > len(selected) else "parent_candidates_exhausted",
+                    },
+                }
+            )
+    else:
+        mid_candidate_scores = dict(mid_entries)
+        candidate_pools["mid_direct_entries"] = {
+            "candidate_ids": list(mid_entries.keys()),
+            "selected_ids": list(mid_entries.keys())[: int(envelope["agent_mid_top_k"])],
+            "top_k": int(envelope["agent_mid_top_k"]),
+            "coarse_skipped_reason": coarse_skipped_reason,
+        }
     if not mid_candidate_scores:
         mid_candidate_scores = dict(mid_entries)
     mid_entries = dict(sorted(mid_candidate_scores.items(), key=lambda item: item[1], reverse=True)[: int(envelope["agent_mid_top_k"])])
@@ -4379,8 +4441,13 @@ def execute_priority_queue_traversal(
         "candidate_count": len(mid_candidate_scores),
         "selected_ids": list(mid_entries.keys()),
         "stop_reason": "layer_top_k_cut" if len(mid_candidate_scores) > len(mid_entries) else "candidate_pool_exhausted",
+        "entry_mode": retrieval_granularity,
     }
-    stage_queues["mid"] = {"selected_ids": list(mid_entries.keys()), "top_k": int(envelope["agent_mid_top_k"])}
+    stage_queues["mid"] = {
+        "selected_ids": list(mid_entries.keys()),
+        "top_k": int(envelope["agent_mid_top_k"]),
+        "entry_mode": "direct_mid" if retrieval_granularity == "mid" else "coarse_drilldown",
+    }
     mid_edges = list(db.scalars(select(MidConceptEdge).where(MidConceptEdge.concept_state_id == mid_state.id)).all()) if mid_state else []
     layer_walks["mid"] = execute_layer_priority_walk(
         layer="mid",
@@ -4857,7 +4924,17 @@ def execute_priority_queue_traversal(
     convergence["hard_stop_pruned_count"] = sum(int((layer.get("hard_stop_pruned_count") or 0)) for layer in layer_convergence.values())
     convergence["red_zone_pruned_count"] = sum(int((layer.get("red_zone_pruned_count") or 0)) for layer in layer_convergence.values())
     convergence["gray_zone_decision_count"] = len(all_gray_zone_decisions)
+    granularity_audit = {
+        "retrieval_granularity": retrieval_granularity,
+        "coarse_skipped_reason": coarse_skipped_reason,
+        "mid_direct_entry_count": len(mid_entries) if retrieval_granularity == "mid" else 0,
+        "mid_entry_mode": "direct_mid" if retrieval_granularity == "mid" else "coarse_drilldown",
+    }
+    convergence["retrieval_granularity"] = retrieval_granularity
+    convergence["granularity_audit"] = granularity_audit
     return {
+        "retrieval_granularity": retrieval_granularity,
+        "retrieval_granularity_audit": granularity_audit,
         "query_facets": query_facets,
         "entry_nodes": all_entry_nodes,
         "frontier_pops": frontier_pops,
@@ -4980,6 +5057,7 @@ def write_retrieval_trace(
     traversal: dict[str, Any],
     query_rq: dict[str, Any] | None = None,
     result_top_k: int | None = None,
+    retrieval_granularity: RetrievalGranularity = "mid",
 ) -> RetrievalTrace:
     candidate_rq = {
         item["chunk_id"]: (item.get("metadata") or {}).get("rq")
@@ -5000,6 +5078,7 @@ def write_retrieval_trace(
         filters=filters,
         context_state=context_state,
         retrieval_mode="layered_context_graph",
+        retrieval_granularity=retrieval_granularity,
         result_top_k=result_top_k,
         conversation_state_scope_hash=conversation_hash,
         query_facets=traversal.get("query_facets") or {},
@@ -5036,8 +5115,14 @@ def write_retrieval_trace(
         conversation_state_scope_hash=conversation_hash,
         diagnostics_json={
             "context_graph_state_id": context_state.id if context_state else None,
+            "retrieval_granularity": retrieval_granularity,
             "cache_key": cache_key,
             "cache_key_components": cache_components,
+            "coarse_skipped_reason": (traversal.get("retrieval_granularity_audit") or {}).get("coarse_skipped_reason"),
+            "mid_direct_entry_audit": {
+                "entry_mode": (traversal.get("retrieval_granularity_audit") or {}).get("mid_entry_mode"),
+                "direct_entry_count": (traversal.get("retrieval_granularity_audit") or {}).get("mid_direct_entry_count"),
+            },
             "runtime_settings_hash": runtime_settings_state_hash(),
             "agent_operating_envelope": agent_operating_envelope(),
             "agent_operating_envelope_hash": agent_operating_envelope_state_hash(),
@@ -5060,10 +5145,20 @@ def write_retrieval_trace(
         if layer == "coarse":
             input_json = {"entry_nodes": walk.get("entry_nodes") or [], "query_facets": traversal.get("query_facets") or {}}
             output_json = {"accepted_nodes": walk.get("accepted_nodes") or [], "convergence": walk.get("convergence") or {}}
+            steps.append(
+                (
+                    layer,
+                    "select_entry_nodes",
+                    {"query_facets": traversal.get("query_facets") or {}, "retrieval_granularity": retrieval_granularity},
+                    {"selected_entry_nodes": walk.get("entry_nodes") or [], "skipped_by_granularity": "mid" if retrieval_granularity == "mid" else None},
+                    walk,
+                )
+            )
+            steps.append((layer, "staged_priority_queue_walk", input_json, output_json, walk))
         else:
             input_json = {"entry_nodes": walk.get("entry_nodes") or [], "coarse_entry_ids": list((traversal.get("coarse_entries") or {}).keys())}
             output_json = {"accepted_nodes": walk.get("accepted_nodes") or [], "convergence": walk.get("convergence") or {}}
-        steps.append((layer, "walk_graph_frontier", input_json, output_json, walk))
+            steps.append((layer, "drill_down_each_coarse_or_direct_mid_entry", input_json, output_json, walk))
     seed_walk = layer_walks.get("rq_membership") or {}
     steps.append(
         (
@@ -5169,6 +5264,7 @@ def write_retrieval_trace(
                 per_parent_budget_status_json=per_parent_budget_status,
                 stop_reason=str(convergence.get("reason") or ""),
                 diagnostics_json={
+                    "retrieval_granularity": retrieval_granularity,
                     "traversal_protocol": TRAVERSAL_PROTOCOL_VERSION,
                     "scores_json_retired_as_primary_audit": True,
                     "frontier_json": walk.get("frontier_json") or [],
@@ -5410,6 +5506,7 @@ def build_context_package(
         citation_spans_json=[],
         diagnostics_json={
             "context_restoration_protocol": "previous_next_structure_bridge_v1",
+            "retrieval_granularity": (trace.diagnostics_json or {}).get("retrieval_granularity", "mid"),
             "runtime_settings_hash": runtime_settings_state_hash(),
             "profile_hash": profile_hash,
             "path_summary": {

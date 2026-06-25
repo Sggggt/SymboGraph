@@ -31,7 +31,7 @@ from app.models import (
     QASession,
     RewardEvent,
 )
-from app.schemas import AgentRequest
+from app.schemas import AgentRequest, RetrievalGranularity
 from app.services.context_graph import (
     agent_operating_envelope,
     agent_operating_envelope_state_hash,
@@ -42,7 +42,7 @@ from app.services.context_graph import (
     resolve_result_top_k,
     runtime_settings_state_hash,
 )
-from app.services.embeddings import ChatProvider, FallbackDisabledError, is_degraded_mode
+from app.services.embeddings import ChatCallResult, ChatProvider, FallbackDisabledError, is_degraded_mode, prefers_chinese_answer
 from app.services.error_sanitizer import public_exception_message
 from app.services.ingestion import resolve_knowledge_base
 from app.services.chunking import stable_hash
@@ -59,6 +59,33 @@ CANCEL_TRACE_NODE = "cancelled_by_user"
 
 def _summarize(text: str, limit: int = 280) -> str:
     return re.sub(r"\s+", " ", text or "").strip()[:limit]
+
+
+def citation_guard_answer(question: str, contexts: list[dict[str, Any]], *, max_contexts: int = 3, snippet_limit: int = 700) -> str:
+    selected = [item for item in contexts if str(item.get("content") or "").strip()][:max_contexts]
+    if not selected:
+        return "当前证据包没有可引用片段，无法生成有支撑回答。" if prefers_chinese_answer(question) else "The context package has no citable excerpts, so a grounded answer cannot be produced."
+    if prefers_chinese_answer(question):
+        lines = ["当前证据包未能支撑上一版回答的全部表述。以下仅保留可由原文片段直接支撑的内容："]
+        for index, item in enumerate(selected, start=1):
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            section_path = metadata.get("section_path")
+            section = " / ".join(str(part) for part in section_path) if isinstance(section_path, list) else str(section_path or "")
+            source = " / ".join(part for part in [str(item.get("document_title") or "资料片段"), section] if part)
+            snippet = _summarize(str(item.get("content") or item.get("snippet") or ""), snippet_limit)
+            lines.append(f"{index}. 来源：{source}\n\n   原文摘录：{snippet}")
+        lines.append("超出这些摘录的公式、定义或性质，当前证据包未充分支持，因此不补充外部知识。")
+        return "\n\n".join(lines)
+    lines = ["The context package did not support every claim in the previous answer. Only directly supported excerpts are retained below:"]
+    for index, item in enumerate(selected, start=1):
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        section_path = metadata.get("section_path")
+        section = " / ".join(str(part) for part in section_path) if isinstance(section_path, list) else str(section_path or "")
+        source = " / ".join(part for part in [str(item.get("document_title") or "source excerpt"), section] if part)
+        snippet = _summarize(str(item.get("content") or item.get("snippet") or ""), snippet_limit)
+        lines.append(f"{index}. Source: {source}\n\n   Excerpt: {snippet}")
+    lines.append("Claims beyond these excerpts are not sufficiently supported by the current context package.")
+    return "\n\n".join(lines)
 
 
 def _publish_trace_event(run_id: str, payload: dict) -> None:
@@ -341,7 +368,13 @@ async def propose_query_facets(question: str, history: list[dict] | None, query_
     return facets
 
 
-async def propose_agent_plan(question: str, history: list[dict], query_intent: dict[str, Any], envelope: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+async def propose_agent_plan(
+    question: str,
+    history: list[dict],
+    query_intent: dict[str, Any],
+    envelope: dict[str, Any],
+    retrieval_granularity: RetrievalGranularity = "mid",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     fallback = {
         "typed_actions": fallback_typed_actions(question, envelope),
         "planner_diagnostics": {"planner": "fallback_schema_when_model_fallback_enabled"},
@@ -358,6 +391,8 @@ async def propose_agent_plan(question: str, history: list[dict], query_intent: d
             "history": history[-6:],
             "query_intent": query_intent,
             "operating_envelope": envelope,
+            "request_retrieval_granularity": retrieval_granularity,
+            "retrieval_granularity_contract": "The user-selected value is fixed for this run. Do not rewrite it to hybrid, dual-start, or any unimplemented mode.",
             "allowed_action_types": sorted(ALLOWED_TYPED_ACTIONS),
             "required_action_types": REQUIRED_TYPED_ACTIONS,
         }
@@ -386,6 +421,7 @@ async def propose_agent_plan(question: str, history: list[dict], query_intent: d
                     "history": history[-6:],
                     "query_intent": query_intent,
                     "operating_envelope": envelope,
+                    "request_retrieval_granularity": retrieval_granularity,
                 },
             }
         )
@@ -626,7 +662,11 @@ def create_agent_run_context(db: Session, request: AgentRequest) -> tuple[QASess
         question=request.question,
         status="queued",
         route="layered_context_graph",
-        metadata_json={"top_k": result_top_k, "filters": request.filters.model_dump()},
+        metadata_json={
+            "top_k": result_top_k,
+            "filters": request.filters.model_dump(),
+            "retrieval_granularity": request.retrieval_granularity,
+        },
     )
     db.add(run)
     db.commit()
@@ -1379,6 +1419,7 @@ def run_to_task_status(run: AgentRun) -> dict:
         "current_node": run.current_node,
         "retry_count": run.retry_count,
         "route": run.route,
+        "retrieval_granularity": (run.metadata_json or {}).get("retrieval_granularity", "mid"),
         "answer": run.final_answer,
         "error": run.error_message,
         "created_at": run.created_at,
@@ -1390,6 +1431,7 @@ def run_to_task_status(run: AgentRun) -> dict:
 async def execute_agent_run(db: Session, request: AgentRequest, session: QASession, run: AgentRun) -> dict:
     try:
         result_top_k = resolve_result_top_k(request.top_k)
+        retrieval_granularity = request.retrieval_granularity
         set_run_state(db, run, "running", current_node="query_understanding")
         start = time.perf_counter()
         query_intent = await perceive_query_intent(request.question, [item.model_dump() for item in request.history])
@@ -1400,7 +1442,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             "query_understanding",
             input_summary=request.question,
             output_summary=str(query_intent.get("intent") or "layered_context_graph"),
-            scores={"top_k": result_top_k, "query_intent": query_intent},
+            scores={"top_k": result_top_k, "query_intent": query_intent, "retrieval_granularity": retrieval_granularity},
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
 
@@ -1413,7 +1455,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             "query_facet_extraction",
             input_summary=request.question,
             output_summary=", ".join(query_facets.get("required_facets") or [])[:240],
-            scores={"query_facets": query_facets},
+            scores={"query_facets": query_facets, "retrieval_granularity": retrieval_granularity},
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
 
@@ -1424,9 +1466,15 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             [item.model_dump() for item in request.history],
             query_intent,
             envelope,
+            retrieval_granularity,
         )
         ensure_agent_run_not_cancelled(db, run)
         typed_actions, validation = validate_typed_actions(proposed_actions, envelope, db=db, knowledge_base_id=run.knowledge_base_id)
+        validation = {
+            **validation,
+            "retrieval_granularity_locked": retrieval_granularity,
+            "unsupported_retrieval_granularity_rewrites_rejected": True,
+        }
         plan, action_rows = record_agent_plan_and_actions(
             db,
             run=run,
@@ -1444,7 +1492,11 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             "agent_planner",
             input_summary=request.question,
             output_summary=f"planned {len(typed_actions)} typed actions",
-            scores={"plan_id": plan.id, "agent_operating_envelope_hash": agent_operating_envelope_state_hash()},
+            scores={
+                "plan_id": plan.id,
+                "agent_operating_envelope_hash": agent_operating_envelope_state_hash(),
+                "retrieval_granularity": retrieval_granularity,
+            },
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
         trace(
@@ -1457,7 +1509,15 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
         )
 
         start = time.perf_counter()
-        search_result = await layered_search(db, run.knowledge_base_id, request.question, request.filters, result_top_k, query_facets=query_facets)
+        search_result = await layered_search(
+            db,
+            run.knowledge_base_id,
+            request.question,
+            request.filters,
+            result_top_k,
+            query_facets=query_facets,
+            retrieval_granularity=retrieval_granularity,
+        )
         ensure_agent_run_not_cancelled(db, run)
         plan.retrieval_trace_id = search_result.trace.id
         record_observation(
@@ -1468,6 +1528,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             observation={
                 "retrieval_trace_id": search_result.trace.id,
                 "retrieved_chunks": len(search_result.results),
+                "retrieval_granularity": retrieval_granularity,
                 "audit": search_result.audit,
             },
             evidence_chunk_ids=[item["chunk_id"] for item in search_result.results],
@@ -1483,7 +1544,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                 run_id=run.id,
                 action=action_map.get(action_type),
                 observation_type=observation_type,
-                observation={"retrieval_trace_id": search_result.trace.id, "audit": search_result.audit},
+                observation={"retrieval_trace_id": search_result.trace.id, "retrieval_granularity": retrieval_granularity, "audit": search_result.audit},
                 evidence_chunk_ids=[item["chunk_id"] for item in search_result.results],
                 verdict="observed",
             )
@@ -1494,10 +1555,11 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             run.id,
             "entry_selection",
             input_summary=request.question,
-            output_summary=f"coarse={audit.get('coarse_entries', 0)}, stage-queues={audit.get('stage_queue_count', 0)}",
+            output_summary=f"模式={retrieval_granularity}, coarse={audit.get('coarse_entries', 0)}, stage-queues={audit.get('stage_queue_count', 0)}",
             document_ids=[item["chunk_id"] for item in search_result.results],
             scores={
                 "retrieval_trace_id": search_result.trace.id,
+                "retrieval_granularity": retrieval_granularity,
                 "coarse_entries": audit.get("coarse_entries", 0),
                 "stage_queue_count": audit.get("stage_queue_count", 0),
                 "mid_topk_selected": audit.get("mid_topk_selected", 0),
@@ -1513,6 +1575,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             document_ids=[item["chunk_id"] for item in search_result.results],
             scores={
                 "retrieval_trace_id": search_result.trace.id,
+                "retrieval_granularity": retrieval_granularity,
                 "query_rq_path": audit.get("query_rq_path") or [],
                 "mid_topk_selected": audit.get("mid_topk_selected", 0),
                 "chunk_topk_selected": audit.get("chunk_topk_selected", 0),
@@ -1527,6 +1590,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             document_ids=[item["chunk_id"] for item in search_result.results],
             scores={
                 "retrieval_trace_id": search_result.trace.id,
+                "retrieval_granularity": retrieval_granularity,
                 "frontier_pops": audit.get("frontier_pops", 0),
                 "dominance_pruned_count": audit.get("dominance_pruned_count", 0),
             },
@@ -1538,7 +1602,11 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             input_summary=f"trace={search_result.trace.id}",
             output_summary=f"recalled {len(search_result.results)} chunks",
             document_ids=[item["chunk_id"] for item in search_result.results],
-            scores={"retrieval_trace_id": search_result.trace.id, "chunk_ids": [item["chunk_id"] for item in search_result.results]},
+            scores={
+                "retrieval_trace_id": search_result.trace.id,
+                "retrieval_granularity": retrieval_granularity,
+                "chunk_ids": [item["chunk_id"] for item in search_result.results],
+            },
         )
         trace(
             db,
@@ -1614,6 +1682,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             "external_called": chat_result.external_called,
             "fallback_reason": chat_result.fallback_reason,
             "context_package_id": package.id,
+            "retrieval_granularity": retrieval_granularity,
         }
         trace(
             db,
@@ -1665,7 +1734,15 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             db.add(repair_action)
             db.flush()
             repair_top_k = min(50, result_top_k + max(2, len(failure_types) * 2))
-            repaired_search = await layered_search(db, run.knowledge_base_id, request.question, request.filters, repair_top_k, query_facets=query_facets)
+            repaired_search = await layered_search(
+                db,
+                run.knowledge_base_id,
+                request.question,
+                request.filters,
+                repair_top_k,
+                query_facets=query_facets,
+                retrieval_granularity=retrieval_granularity,
+            )
             ensure_agent_run_not_cancelled(db, run)
             repaired_package = build_context_package(
                 db,
@@ -1691,6 +1768,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                     "original_context_package_id": package.id,
                     "repaired_context_package_id": repaired_package.id,
                     "repaired_retrieval_trace_id": repaired_search.trace.id,
+                    "retrieval_granularity": retrieval_granularity,
                     "repair_top_k": repair_top_k,
                 },
                 evidence_chunk_ids=list(repaired_package.hit_chunk_ids_json or []),
@@ -1702,6 +1780,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                     "failure_types": failure_types,
                     "repaired_context_package_id": repaired_package.id,
                     "repaired_retrieval_trace_id": repaired_search.trace.id,
+                    "retrieval_granularity": retrieval_granularity,
                 }
             )
             package = repaired_package
@@ -1721,7 +1800,63 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                 input_summary=", ".join(failure_types),
                 output_summary=f"repacked context {package.id}",
                 document_ids=list(package.hit_chunk_ids_json or []),
-                scores={"repair_actions": repair_actions},
+                scores={"repair_actions": repair_actions, "retrieval_granularity": retrieval_granularity},
+            )
+
+        final_probe_citations = citation_payloads_from_package(
+            package,
+            retrieval_trace_id=package.retrieval_trace_id,
+            answer=chat_result.answer,
+            question=request.question,
+        )
+        final_probe_verifications = await verify_answer_against_context(
+            chat_result.answer,
+            final_probe_citations,
+            contexts,
+            verification_budget=int(envelope.get("verification_budget") or 1),
+        )
+        if not any(item.get("verdict") == "supported" for item in final_probe_verifications) and contexts:
+            guarded_answer = citation_guard_answer(request.question, contexts)
+            chat_result = ChatCallResult(
+                answer=guarded_answer,
+                provider=chat_result.provider,
+                model=chat_result.model,
+                external_called=chat_result.external_called,
+                fallback_reason=chat_result.fallback_reason,
+            )
+            guard_action = {
+                "action_type": "repair_missing_citation",
+                "failure_types": sorted({str(item.get("failure_type") or "unsupported_claim") for item in final_probe_verifications}),
+                "repaired_context_package_id": package.id,
+                "repaired_retrieval_trace_id": package.retrieval_trace_id,
+                "retrieval_granularity": retrieval_granularity,
+                "deterministic_citation_guard": True,
+            }
+            repair_actions.append(guard_action)
+            answer_model_audit = {
+                **answer_model_audit,
+                "context_package_id": package.id,
+                "retrieval_trace_id": package.retrieval_trace_id,
+                "repair_actions": repair_actions,
+                "citation_guard_applied": True,
+            }
+            record_observation(
+                db,
+                run_id=run.id,
+                action=action_map.get("verify_citations"),
+                observation_type="citation_guard_rewrite",
+                observation=guard_action,
+                evidence_chunk_ids=list(package.hit_chunk_ids_json or []),
+                verdict="observed",
+            )
+            trace(
+                db,
+                run.id,
+                "repair_executed",
+                input_summary="citation_guard_rewrite",
+                output_summary=f"rewrote answer from context package {package.id}",
+                document_ids=list(package.hit_chunk_ids_json or []),
+                scores={"repair_actions": repair_actions, "retrieval_granularity": retrieval_granularity, "citation_guard_applied": True},
             )
 
         answer_session = await record_answer_audit(
@@ -1754,6 +1889,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             {
                 "chat_model": chat_result.model,
                 "retrieval_trace_id": package.retrieval_trace_id,
+                "retrieval_granularity": retrieval_granularity,
                 "answer_session_id": answer_session.id,
                 "raw_citation_verification_pass_rate": citation_pass_rate,
                 "repair_actions": repair_actions,
@@ -1809,6 +1945,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             "degraded_mode": is_degraded_mode(),
             "context_package_id": package.id,
             "retrieval_trace_id": package.retrieval_trace_id,
+            "retrieval_granularity": retrieval_granularity,
             "model_audit": answer_model_audit,
             "answer_model_audit": answer_model_audit,
         }
@@ -1856,7 +1993,12 @@ async def stream_agent_events(request: AgentRequest) -> AsyncGenerator[dict, Non
     response: dict | None = None
     yielded_trace_ids: set[str] = set()
     try:
-        yield {"type": "meta", "run_id": run.id, "session_id": session.id}
+        yield {
+            "type": "meta",
+            "run_id": run.id,
+            "session_id": session.id,
+            "retrieval_granularity": request.retrieval_granularity,
+        }
         while not task.done():
             try:
                 event = await asyncio.wait_for(trace_queue.get(), timeout=0.25)

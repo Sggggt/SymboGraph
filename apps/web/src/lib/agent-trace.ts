@@ -124,10 +124,19 @@ export function traceNodeVariant(node: string): "success" | "info" | "warning" |
   return "success";
 }
 
+function formatAuditValue(key: string, value: unknown): string {
+  if (key === "retrieval_granularity") {
+    if (value === "mid") return "普通模式";
+    if (value === "coarse") return "摘要模式";
+  }
+  return Array.isArray(value) ? value.join("/") : String(value);
+}
+
 export function traceAuditSummary(scores: Record<string, unknown> | undefined): string[] {
   const audit = scores?.audit && typeof scores.audit === "object" ? (scores.audit as Record<string, unknown>) : undefined;
   const data = audit ?? scores ?? {};
   const entries: Array<[string, string]> = [
+    ["retrieval_granularity", "检索模式"],
     ["coarse_concepts", "粗概念"],
     ["coarse_entries", "粗入口"],
     ["mid_concepts", "中概念"],
@@ -159,5 +168,5 @@ export function traceAuditSummary(scores: Record<string, unknown> | undefined): 
   ];
   return entries
     .filter(([key]) => data[key] !== undefined && data[key] !== null)
-    .map(([key, label]) => `${label}: ${Array.isArray(data[key]) ? data[key].join("/") : String(data[key])}`);
+    .map(([key, label]) => `${label}: ${formatAuditValue(key, data[key])}`);
 }

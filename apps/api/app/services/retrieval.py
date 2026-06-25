@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.models import Chunk, ContextPackage, Document, IngestionBatch, KnowledgeBase, RetrievalTrace
-from app.schemas import SearchFilters
+from app.schemas import RetrievalGranularity, SearchFilters
 from app.services.context_graph import (
     build_context_package,
     context_graph_stats,
@@ -34,8 +34,9 @@ async def search_chunks_with_audit(
     query: str,
     filters: SearchFilters,
     top_k: int | None,
+    retrieval_granularity: RetrievalGranularity = "mid",
 ) -> tuple[list[dict], dict]:
-    result = await layered_search(db, knowledge_base_id, query, filters, top_k)
+    result = await layered_search(db, knowledge_base_id, query, filters, top_k, retrieval_granularity=retrieval_granularity)
     return result.results, result.audit
 
 
@@ -46,8 +47,9 @@ async def layered_context_search_chunks_with_audit(
     filters: SearchFilters,
     top_k: int | None,
     route: str = "multi_hop_research",
+    retrieval_granularity: RetrievalGranularity = "mid",
 ) -> tuple[list[dict], dict]:
-    result = await layered_search(db, knowledge_base_id, query, filters, top_k)
+    result = await layered_search(db, knowledge_base_id, query, filters, top_k, retrieval_granularity=retrieval_granularity)
     audit = {**result.audit, "route": route}
     return result.results, audit
 
@@ -58,8 +60,9 @@ async def search_chunks(
     query: str,
     filters: SearchFilters,
     top_k: int | None,
+    retrieval_granularity: RetrievalGranularity = "mid",
 ) -> list[dict]:
-    return (await search_chunks_with_audit(db, knowledge_base_id, query, filters, top_k))[0]
+    return (await search_chunks_with_audit(db, knowledge_base_id, query, filters, top_k, retrieval_granularity))[0]
 
 
 def get_context_package(db: Session, package_id: str) -> dict | None:
@@ -125,6 +128,7 @@ def get_retrieval_trace_steps(db: Session, trace_id: str) -> dict | None:
         "trace_id": trace.id,
         "query": trace.query,
         "retrieval_mode": trace.retrieval_mode,
+        "retrieval_granularity": (trace.diagnostics_json or {}).get("retrieval_granularity", "mid"),
         "concept_path": trace.concept_path_json or [],
         "result_chunk_ids": trace.result_chunk_ids_json or [],
         "query_facets": trace.query_facets_json or {},

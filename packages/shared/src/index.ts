@@ -42,6 +42,8 @@ export type AgentRoute =
   | "cross_document_synthesis"
   | "clarify";
 
+export type RetrievalGranularity = "mid" | "coarse";
+
 export type AgentRunState = "queued" | "running" | "needs_clarification" | "completed" | "failed";
 
 export interface SearchFilters {
@@ -77,6 +79,7 @@ export interface SearchRequest {
   knowledge_base_id?: string | null;
   filters?: SearchFilters;
   top_k?: number;
+  retrieval_granularity?: RetrievalGranularity;
 }
 
 export interface Citation {
@@ -129,6 +132,7 @@ export interface ModelAudit {
   embedding_text_version?: string | null;
   embedding_external_called?: boolean;
   retrieval_mode?: string | null;
+  retrieval_granularity?: RetrievalGranularity | null;
   retrieval_pipeline?: string | null;
   retrieval_trace_id?: string | null;
   context_package_id?: string | null;
@@ -168,6 +172,7 @@ export interface SearchResponse {
   results: SearchResult[];
   degraded_mode: boolean;
   model_audit: ModelAudit;
+  retrieval_granularity?: RetrievalGranularity;
 }
 
 export interface ChatMessage {
@@ -182,6 +187,7 @@ export interface QARequest {
   filters?: SearchFilters;
   top_k?: number;
   history?: ChatMessage[];
+  retrieval_granularity?: RetrievalGranularity;
 }
 
 export interface QAResponse {
@@ -197,6 +203,7 @@ export interface QAResponse {
   answer_model_audit?: AnswerModelAudit;
   context_package_id?: string | null;
   retrieval_trace_id?: string | null;
+  retrieval_granularity?: RetrievalGranularity;
 }
 
 export interface AgentRequest extends QARequest {
@@ -251,6 +258,7 @@ export interface TaskStatusResponse {
   current_node?: string | null;
   retry_count?: number;
   route?: AgentRoute | string | null;
+  retrieval_granularity?: RetrievalGranularity;
   answer?: string | null;
   error?: string | null;
   created_at?: string | null;
@@ -1028,6 +1036,10 @@ export interface RetrievalTraceStepsResponse {
   trace_id: string;
   query?: string;
   retrieval_mode?: string;
+  retrieval_granularity?: RetrievalGranularity;
+  concept_path?: Array<Record<string, unknown>>;
+  query_facets?: Record<string, unknown>;
+  entry_nodes?: Array<Record<string, unknown>>;
   stage_queues?: Record<string, unknown>;
   candidate_pools?: Record<string, unknown>;
   topk_selection?: Record<string, unknown>;

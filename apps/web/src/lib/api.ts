@@ -33,6 +33,7 @@
   TaskStatusResponse,
   UploadFileResponse,
   StructuredApiErrorBody,
+  RetrievalGranularity,
   StrategyProfileAssistantRequest,
   StrategyProfileAssistantStateResponse,
   StrategyProfileBindRequest,
@@ -503,7 +504,7 @@ export async function streamAnswer(
     onCitations: (value: QAResponse["citations"]) => void;
     onTrace?: (value: AgentTraceEventPayload) => void;
     onFinal?: (value: AgentResponse) => void;
-    onMeta?: (value: { degraded_mode?: boolean; run_id?: string; session_id?: string; route?: string }) => void;
+    onMeta?: (value: { degraded_mode?: boolean; run_id?: string; session_id?: string; route?: string; retrieval_granularity?: RetrievalGranularity }) => void;
     onError?: (value: string) => void;
   },
   options?: { signal?: AbortSignal },
@@ -551,6 +552,7 @@ export async function streamAnswer(
         run_id?: string;
         session_id?: string;
         route?: string;
+        retrieval_granularity?: RetrievalGranularity;
       };
       try {
         parsed = JSON.parse(line);
@@ -559,7 +561,12 @@ export async function streamAnswer(
         continue;
       }
       if (parsed.type === "meta") {
-        handlers.onMeta?.({ run_id: parsed.run_id, session_id: parsed.session_id, route: parsed.route });
+        handlers.onMeta?.({
+          run_id: parsed.run_id,
+          session_id: parsed.session_id,
+          route: parsed.route,
+          retrieval_granularity: parsed.retrieval_granularity,
+        });
       }
       if (parsed.type === "trace" && parsed.trace) {
         handlers.onTrace?.(parsed.trace);
@@ -581,6 +588,7 @@ export async function streamAnswer(
           run_id: response.run_id,
           session_id: response.session_id,
           route: response.route,
+          retrieval_granularity: response.retrieval_granularity,
         });
       }
       if (typeof parsed.degraded_mode === "boolean") {

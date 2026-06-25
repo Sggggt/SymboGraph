@@ -90,13 +90,14 @@ describe("api client", () => {
     vi.stubGlobal("fetch", fetchMock);
     const { searchKnowledge } = await import("./api");
 
-    await searchKnowledge({ knowledge_base_id: "kb-1", query: "markov blanket", top_k: 8, filters: {} });
+    await searchKnowledge({ knowledge_base_id: "kb-1", query: "markov blanket", top_k: 8, filters: {}, retrieval_granularity: "coarse" });
 
     expect(fetchMock).toHaveBeenCalledWith(
       "http://api.test/api/search/graph-enhanced",
       expect.objectContaining({
         method: "POST",
         headers: { "Content-Type": "application/json", "X-API-Key": "test-key" },
+        body: JSON.stringify({ knowledge_base_id: "kb-1", query: "markov blanket", top_k: 8, filters: {}, retrieval_granularity: "coarse" }),
       }),
     );
   });
@@ -380,9 +381,9 @@ describe("api client", () => {
     const body = new ReadableStream({
       start(controller) {
         const encoder = new TextEncoder();
-        controller.enqueue(encoder.encode('data: {"type":"meta","run_id":"run-1","session_id":"session-1"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"meta","run_id":"run-1","session_id":"session-1","retrieval_granularity":"coarse"}\n\n'));
         controller.enqueue(encoder.encode('data: {"token":"hello"}\n\n'));
-        controller.enqueue(encoder.encode('data: {"type":"final","response":{"run_id":"run-1","session_id":"session-1","answer":"done","citations":[],"used_chunks":[],"route":"retrieve_sources","trace":[],"degraded_mode":false}}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"final","response":{"run_id":"run-1","session_id":"session-1","answer":"done","citations":[],"used_chunks":[],"route":"retrieve_sources","trace":[],"degraded_mode":false,"retrieval_granularity":"coarse"}}\n\n'));
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         controller.close();
       },
@@ -395,7 +396,7 @@ describe("api client", () => {
     const controller = new AbortController();
 
     await streamAnswer(
-      { question: "hello", top_k: 3 },
+      { question: "hello", top_k: 3, retrieval_granularity: "coarse" },
       {
         onToken: (value) => tokens.push(value),
         onCitations: () => undefined,
@@ -406,11 +407,14 @@ describe("api client", () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       "http://api.test/api/qa/stream",
-      expect.objectContaining({ signal: controller.signal }),
+      expect.objectContaining({
+        signal: controller.signal,
+        body: JSON.stringify({ question: "hello", top_k: 3, retrieval_granularity: "coarse" }),
+      }),
     );
     expect(tokens).toEqual(["hello"]);
-    expect(meta).toContainEqual({ run_id: "run-1", session_id: "session-1", route: undefined });
-    expect(meta).toContainEqual({ degraded_mode: false, run_id: "run-1", session_id: "session-1", route: "retrieve_sources" });
+    expect(meta).toContainEqual({ run_id: "run-1", session_id: "session-1", route: undefined, retrieval_granularity: "coarse" });
+    expect(meta).toContainEqual({ degraded_mode: false, run_id: "run-1", session_id: "session-1", route: "retrieve_sources", retrieval_granularity: "coarse" });
   });
 
   it("parses profile assistant SSE chunks", async () => {

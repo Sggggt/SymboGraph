@@ -59,4 +59,9 @@ describe("agent trace helpers", () => {
       }),
     ).toEqual(["粗入口: 2", "中入口: 3", "RQ 归属: 4", "Frontier pop: 5", "红区剪枝: 2", "RQ 路径: 1/2/3", "召回片段: 10", "结构邻居: 6", "证据包: pkg-1"]);
   });
+
+  it("renders retrieval granularity in Chinese", () => {
+    expect(traceAuditSummary({ audit: { retrieval_granularity: "mid" } })).toContain("检索模式: 普通模式");
+    expect(traceAuditSummary({ audit: { retrieval_granularity: "coarse" } })).toContain("检索模式: 摘要模式");
+  });
 });

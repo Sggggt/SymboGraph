@@ -227,8 +227,10 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
                         GraphRetrievalStep.action_type.in_(
                             (
                                 "walk_graph_frontier",
+                                "select_entry_nodes",
                                 "select_seeds_from_mid_rq_membership",
                                 "staged_priority_queue_walk",
+                                "drill_down_each_coarse_or_direct_mid_entry",
                                 "collect_node_queue",
                                 "merge_dedupe_rank_top_k",
                             )

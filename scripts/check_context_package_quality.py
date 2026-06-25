@@ -85,13 +85,17 @@ async def main() -> None:
             ),
             "each_layer_has_frontier_path_convergence": all(
                 bool(step and step.popped_frontier_state_json and step.stop_reason)
-                for layer in ("coarse", "mid", "chunk")
+                for layer, actions in {
+                    "coarse": ("staged_priority_queue_walk", "walk_graph_frontier"),
+                    "mid": ("drill_down_each_coarse_or_direct_mid_entry", "walk_graph_frontier"),
+                    "chunk": ("walk_graph_frontier",),
+                }.items()
                 for step in [
                     db.scalar(
                         select(GraphRetrievalStep).where(
                             GraphRetrievalStep.retrieval_trace_id == package.retrieval_trace_id,
                             GraphRetrievalStep.layer == layer,
-                            GraphRetrievalStep.action == "walk_graph_frontier",
+                            GraphRetrievalStep.action.in_(actions),
                         )
                     )
                 ]

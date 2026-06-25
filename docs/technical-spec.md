@@ -2315,7 +2315,7 @@ coarse diagnostics 必须保存 RQ L2 coverage、child L3 coverage、membership 
 
 ### 目标检索链路
 
-目标检索不是全局加权排序，也不是单个全局 frontier 从 coarse、mid、chunk 连续抢占预算，而是分层暂存的图导航。系统先在 coarse graph 内完成粗粒度探索，形成 coarse node queue，暂不下钻 mid；随后逐个 coarse 父节点下钻探索 mid candidates，合并去重后按层内 priority key 取 mid top-k 形成 mid node queue；最后逐个 mid 父节点下钻探索 chunk candidates，合并去重后按层内 priority key 取 chunk top-k 进入 structure restoration 与 context package。RQ membership/address 不作为额外 active traversal layer，而是作为节点归属、chunk seed selector、模糊边界诊断和灰区路径判断上下文。
+目标检索不是全局加权排序，也不是单个全局 frontier 从 coarse、mid、chunk 连续抢占预算，而是分层暂存的图导航。请求级 `retrieval_granularity` 当前只允许 `coarse` 与 `mid` 两种 active 模式，默认 `mid` 作为普通模式；`coarse` 作为摘要模式完全保持现有粗粒度链路；`mid` 是同构的中粒度入口模式，跳过 coarse gate，直接从 mid concept entry selection 形成 mid node queue，再复用相同的 chunk seed、chunk relation traversal、structure restoration 与 context package；`hybrid`/dual-start 暂不属于 active path。粗粒度模式先在 coarse graph 内完成探索，形成 coarse node queue，暂不下钻 mid；随后逐个 coarse 父节点下钻探索 mid candidates，合并去重后按层内 priority key 取 mid top-k 形成 mid node queue；最后逐个 mid 父节点下钻探索 chunk candidates，合并去重后按层内 priority key 取 chunk top-k 进入 structure restoration 与 context package。RQ membership/address 不作为额外 active traversal layer，而是作为节点归属、chunk seed selector、模糊边界诊断和灰区路径判断上下文。
 
 目标链路：
 
@@ -2419,7 +2419,7 @@ packet 不得绕过 executor、top-k、path threshold、structure restoration、
 
 ### Entry selection
 
-入口选择使用三类信号：语义候选、拓扑先验和 LLM 语义判定。active traversal layer 包括 coarse、mid 和 chunk relation graph；coarse entry selection 只决定粗粒度探索起点，mid 与 chunk entry 由上一层保留队列逐父节点下钻生成。RQ membership/address 作为 mid 节点归属、chunk seed selection 和边界诊断输入。拓扑指标是 prior，不是事实源，也不单独决定入口。
+入口选择使用三类信号：语义候选、拓扑先验和 LLM 语义判定。active traversal layer 包括 coarse、mid 和 chunk relation graph；`retrieval_granularity=coarse` 时，coarse entry selection 决定粗粒度探索起点，mid 与 chunk entry 由上一层保留队列逐父节点下钻生成；`retrieval_granularity=mid` 时，executor 直接执行 mid entry selection，coarse 层只作为 audit/freshness/hash 上下文记录，不作为准入门槛。RQ membership/address 作为 mid 节点归属、chunk seed selection 和边界诊断输入。拓扑指标是 prior，不是事实源，也不单独决定入口；LLM 可以给出 start layer 建议，但用户显式选择的 `retrieval_granularity` 优先，validator 不允许 LLM 将 `mid` 模式升级成未实现的 hybrid/dual-start。
 
 节点候选卡片：
 
@@ -2480,7 +2480,7 @@ LLM 只在入口候选灰区或 query facet 难以映射时裁决，输出 typed
 select_entry_nodes(layer, node_ids, reason, expected_evidence, budget)
 ```
 
-coarse 下钻到 mid graph 时，系统对每个 coarse 父节点独立执行局部探索，收集该父节点覆盖的 mid candidates；所有 coarse 父节点完成后，mid candidates 合并去重并按层内 priority key、路径证据和贡献摘要排序，保留 `agent_mid_top_k` 个 mid 节点进入下一层队列。coarse 层不设置 top-k；coarse queue 中的所有保留父节点都获得各自的 mid 下钻预算。
+coarse 下钻到 mid graph 时，系统对每个 coarse 父节点独立执行局部探索，收集该父节点覆盖的 mid candidates；所有 coarse 父节点完成后，mid candidates 合并去重并按层内 priority key、路径证据和贡献摘要排序，保留 `agent_mid_top_k` 个 mid 节点进入下一层队列。coarse 层不设置 top-k；coarse queue 中的所有保留父节点都获得各自的 mid 下钻预算。`mid` 模式不执行 coarse queue 与 per-coarse drilldown，而是使用当前 mid entry selection 参数直接生成最多 `agent_mid_top_k` 个 mid entries，并继续使用同一 mid frontier、candidate merge、top-k 和 chunk drilldown 规则。
 
 mid 下钻到 chunk relation graph 时，RQ L3 membership 负责选择入口 chunk seeds，而不是把 mid 节点下所有 chunks 全量送入 frontier。系统对每个 selected mid 父节点独立执行局部 chunk 探索；所有 mid 父节点完成后，chunk candidates 合并去重并按层内 priority key、路径证据、citation span 可用性和结构恢复需求排序，保留 `agent_chunk_top_k` 个 chunk seeds 进入底层 frontier；最终直接命中 chunk 数量由请求 `top_k` 或热加载默认值 `retrieval_result_top_k_default` 决定：
 
@@ -2684,7 +2684,7 @@ retrieval_result_top_k_default
 context_package_token_budget
 ```
 
-粗粒度层使用 `agent_coarse_total_budget` 探索 coarse nodes，生成 coarse node queue，不设置 coarse top-k。中粒度层对 coarse node queue 中的每个父节点分别使用 `agent_mid_per_coarse_budget` 探索 mid candidates；所有 mid candidates 汇总、去重、排序后，使用 `agent_mid_top_k` 形成 mid node queue。底层对 mid node queue 中的每个父节点分别使用 `agent_chunk_per_mid_budget` 探索 chunk candidates；所有 chunk candidates 汇总、去重、排序后，使用 `agent_chunk_top_k` 形成 chunk frontier seeds；chunk frontier 接受节点排序后再按请求 `top_k` 截断，未显式传入时使用 `retrieval_result_top_k_default`。`agent_mid_top_k` 与 `agent_chunk_top_k` 是层间输出上限，`retrieval_result_top_k_default` 是最终结果默认上限；它们不是裸向量召回结果，也不能绕过 trace、structure restoration 或 citation verification。
+粗粒度层使用 `agent_coarse_total_budget` 探索 coarse nodes，生成 coarse node queue，不设置 coarse top-k。中粒度层在 `coarse` 模式下对 coarse node queue 中的每个父节点分别使用 `agent_mid_per_coarse_budget` 探索 mid candidates；在 `mid` 模式下不消耗 `agent_coarse_total_budget`，直接以当前 mid entry selection 生成的 mid entries 为起点，并使用 `agent_mid_per_coarse_budget * agent_mid_top_k` 作为同构 mid frontier hard interrupt 上限；所有 mid candidates 汇总、去重、排序后，使用 `agent_mid_top_k` 形成 mid node queue。底层对 mid node queue 中的每个父节点分别使用 `agent_chunk_per_mid_budget` 探索 chunk candidates；所有 chunk candidates 汇总、去重后，使用 `agent_chunk_top_k` 形成 chunk frontier seeds；chunk frontier 接受节点排序后再按请求 `top_k` 截断，未显式传入时使用 `retrieval_result_top_k_default`。`agent_mid_top_k` 与 `agent_chunk_top_k` 是层间输出上限，`retrieval_result_top_k_default` 是最终结果默认上限；它们不是裸向量召回结果，也不能绕过 trace、structure restoration 或 citation verification。
 
 中粗层派生双语路由文本：`concept_i18n_enabled` 是热加载 Runtime Settings，环境键为 `CONCEPT_I18N_ENABLED`，默认关闭。关闭时 mid/coarse concept graph 不执行 `concept_i18n_bilingual_v1`，不调用模型、不写成功翻译 metadata，只在 diagnostics/log 中记录 `status=disabled`；开启后，mid/coarse concept graph 在节点和边写入后执行 `concept_i18n_bilingual_v1` 派生翻译，覆盖 concept label、aliases、definition、summary、scope note 以及高层概念边 explanation。翻译结果只作为可重建的派生 metadata 保存；只有开关开启且翻译 `status=ok` 时，才用于 coarse/mid entry selection 的 searchable text 扩展。翻译结果不能覆盖 `canonical_label`、`definition`、`summary`、`scope_note`、edge `explanation`、support ids、distance、projection stats 或 citation payload。前端图谱页默认继续展示 canonical source fields；回答生成和引用验证仍只能依赖 context package 与 raw chunk span。
 
@@ -2783,7 +2783,7 @@ D_{\mathrm{rq}},\mathbf{h},D_{\mathrm{conv}}
 \right)
 $$
 
-`RetrievalTrace` 保存 query、filters、retrieval mode、各层 hash、runtime settings hash、agent envelope hash、prompt protocol hash、result chunks、concept path、scores 和 diagnostics。
+`RetrievalTrace` 保存 query、filters、retrieval mode、请求级 `retrieval_granularity`、各层 hash、runtime settings hash、agent envelope hash、prompt protocol hash、result chunks、concept path、scores 和 diagnostics。`retrieval_granularity` 必须进入 diagnostics 与 cache key components；`mid` 模式下 coarse steps 必须记录 `skipped_by_granularity=mid` 或空 coarse queue，不能伪装为 coarse entry 命中。
 
 目标 `GraphRetrievalStep` 写入：
 
@@ -2791,7 +2791,7 @@ $$
 coarse / select_entry_nodes
 coarse / staged_priority_queue_walk
 coarse / collect_node_queue
-mid / drill_down_each_coarse
+mid / drill_down_each_coarse_or_direct_mid_entry
 mid / merge_dedupe_rank_top_k
 chunk / select_seeds_from_mid_rq_membership
 chunk / drill_down_each_mid
@@ -2816,10 +2816,10 @@ result metadata 与 trace steps 保存 query/candidate RQ path、LCP depth、res
 
 **架构影响：**
 - 影响对象：搜索页结果、QA/Agent retrieval step、context package、citation payload、reward metrics、policy update 和前端检索轨迹。
-- 影响方式：layered retrieval 从加权融合排名改为 coarse/mid/chunk/structure 的 staged path search；RQ membership/address 作为语义地址贯穿 mid candidate collection、chunk seed selection、桥接路径解释和灰区 LLM 判停；trace 必须可回放每个 entry、局部 frontier pop、父节点下钻、candidate pool 合并、top-k 截断、edge expansion、cycle distance reward、gray-zone decision、dominance pruning、收敛判断和 context 去重。
-- 传播字段：`retrieval_trace_id`、`graph_retrieval_steps`、`result_chunk_ids`、`query_facets_json`、`query_facet_protocol_hash`、`query_facets_hash`、`concept_path_json`、`frontier_json`、`stage_queues_json`、`candidate_pools_json`、`topk_selection_json`、`path_labels_json`、`convergence_json`、`diagnostics_json`、`runtime_settings_hash`。
-- 触发条件：query facets、relation/RQ/mid/coarse hash、edge distance protocol、traversal budget、agent envelope 或 conversation scope 变化时，graph traversal trace 与 cache key 需要刷新。
-- 验收观察点：entry node 选择可解释、coarse queue 覆盖、per-coarse mid candidate coverage、mid top-k selection audit、per-mid chunk candidate coverage、chunk top-k selection audit、chunk seed quality、frontier expansion count、path convergence score、gray-zone LLM decision audit、red-zone prune audit、cycle distance reward bounded、dominance pruning count、structure restore step、graph path chunk restoration、RQ diagnostics、cache hit audit 和 evidence package de-duplication。
+- 影响方式：layered retrieval 从加权融合排名改为 coarse/mid/chunk/structure 的 staged path search；`coarse` 模式保持 coarse-first path search，`mid` 模式保持同构 executor 但从 mid entry 开始；RQ membership/address 作为语义地址贯穿 mid candidate collection、chunk seed selection、桥接路径解释和灰区 LLM 判停；trace 必须可回放每个 entry、局部 frontier pop、父节点下钻或 direct mid entry、candidate pool 合并、top-k 截断、edge expansion、cycle distance reward、gray-zone decision、dominance pruning、收敛判断和 context 去重。
+- 传播字段：`retrieval_trace_id`、`graph_retrieval_steps`、`result_chunk_ids`、`retrieval_granularity`、`query_facets_json`、`query_facet_protocol_hash`、`query_facets_hash`、`concept_path_json`、`frontier_json`、`stage_queues_json`、`candidate_pools_json`、`topk_selection_json`、`path_labels_json`、`convergence_json`、`diagnostics_json`、`runtime_settings_hash`。
+- 触发条件：query facets、`retrieval_granularity`、relation/RQ/mid/coarse hash、edge distance protocol、traversal budget、agent envelope 或 conversation scope 变化时，graph traversal trace 与 cache key 需要刷新。
+- 验收观察点：entry node 选择可解释、coarse queue 覆盖、mid direct entry audit、per-coarse mid candidate coverage、mid top-k selection audit、per-mid chunk candidate coverage、chunk top-k selection audit、chunk seed quality、frontier expansion count、path convergence score、gray-zone LLM decision audit、red-zone prune audit、cycle distance reward bounded、dominance pruning count、structure restore step、graph path chunk restoration、RQ diagnostics、cache hit audit 和 evidence package de-duplication。
 
 ## Layered P&E Agent
 
@@ -3382,19 +3382,19 @@ key
 H(
 kb,q,filters,h_{emb},h_{chunk},h_0,h_1,h_F,h_2,h_3,
 h_{\mathrm{edge}},h_{\mathrm{proj}},h_{\mathrm{trav}},
-h_{\Theta},h_{\pi},h_{\mathrm{conv}},h_{prompt},mode
+h_{\Theta},h_{\pi},h_{\mathrm{conv}},h_{prompt},mode,retrieval\_granularity
 )
 $$
 
-其中 \(h_{\mathrm{edge}}\) 是距离协议 hash，\(h_{\mathrm{proj}}\) 是边投影协议 hash，\(h_{\mathrm{trav}}\) 是 traversal executor 与预算 hash，\(h_{\mathrm{conv}}\) 是 conversation state scope hash。retrieval trace 必须保存关键 hash；缓存层必须以 trace 中同源字段构造 key，并补齐 traversal/projection/conversation 维度。
+其中 \(h_{\mathrm{edge}}\) 是距离协议 hash，\(h_{\mathrm{proj}}\) 是边投影协议 hash，\(h_{\mathrm{trav}}\) 是 traversal executor 与预算 hash，\(h_{\mathrm{conv}}\) 是 conversation state scope hash，`retrieval_granularity` 是请求级 coarse/mid 入口模式。retrieval trace 必须保存关键 hash；缓存层必须以 trace 中同源字段构造 key，并补齐 traversal/projection/conversation 与 retrieval granularity 维度。
 
 
 
 **架构影响：**
 - 影响对象：graph stats、search cache、QA cache、context package reuse、front-end freshness display、runtime hot reload 和运维诊断。
-- 影响方式：freshness 用 hash 等式判断状态是否可用；cache key 把 query、filters、graph hashes、runtime hashes 与 prompt hashes 合并，防止跨状态误命中。
-- 传播字段：`context_graph_freshness`、`chunk_scope_hash`、`structure_graph_hash`、`chunk_relation_hash`、`rq_membership_hash`、`mid_concept_hash`、`coarse_concept_hash`、`edge_distance_protocol_hash`、`edge_projection_protocol_hash`、`traversal_protocol_hash`、`runtime_settings_hash`、`conversation_state_scope_hash`。
-- 触发条件：任何 graph state、edge distance protocol、edge projection protocol、traversal budget、runtime settings、policy state、conversation scope 或 prompt protocol 变化时，相关 cache entry 必须失效或重新标注 stale。
+- 影响方式：freshness 用 hash 等式判断状态是否可用；cache key 把 query、filters、graph hashes、runtime hashes、prompt hashes 与 retrieval granularity 合并，防止跨状态或跨入口模式误命中。
+- 传播字段：`context_graph_freshness`、`chunk_scope_hash`、`structure_graph_hash`、`chunk_relation_hash`、`rq_membership_hash`、`mid_concept_hash`、`coarse_concept_hash`、`edge_distance_protocol_hash`、`edge_projection_protocol_hash`、`traversal_protocol_hash`、`runtime_settings_hash`、`conversation_state_scope_hash`、`retrieval_granularity`。
+- 触发条件：任何 graph state、edge distance protocol、edge projection protocol、traversal budget、runtime settings、policy state、conversation scope、prompt protocol 或 retrieval granularity 变化时，相关 cache entry 必须失效或重新标注 stale。
 - 验收观察点：stale reasons 完整、hash mismatch 可见、cache hit 带审计信息、hot reload 后检索结果使用新 runtime hash。
 
 ## 数据模型
@@ -3668,6 +3668,7 @@ agent_observations
 
 ```text
 retrieval_traces:
+  diagnostics_json.retrieval_granularity
   query_facets_json
   entry_nodes_json
   frontier_json
@@ -3682,6 +3683,7 @@ retrieval_traces:
   conversation_state_scope_hash
   diagnostics_json.cache_key_components.query_facet_protocol_hash
   diagnostics_json.cache_key_components.query_facets_hash
+  diagnostics_json.cache_key_components.retrieval_granularity
 
 graph_retrieval_steps:
   layer
@@ -3777,7 +3779,7 @@ graph payload:
   mid/coarse projected_distance_raw and projection calibration stats
 
 search trace payload:
-  query facets
+  query facets and retrieval granularity
   selected entry nodes
   frontier pops
   stage queues
@@ -3815,7 +3817,7 @@ $$
 搜索页必须展示：
 
 ```text
-entry node candidates and selected entries
+entry node candidates, retrieval granularity and selected entries
 frontier expansion timeline
 stage queues
 per-parent drilldown budget usage

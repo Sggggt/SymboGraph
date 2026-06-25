@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,17 @@ def no_fallback_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("EMBEDDING_DIMENSIONS", "8")
     monkeypatch.setenv("ENABLE_MODEL_FALLBACK", "false")
     monkeypatch.setenv("ENABLE_DATABASE_FALLBACK", "false")
+    monkeypatch.setenv("ENABLE_AUTO_TPE", "false")
+    monkeypatch.setenv("TPE_TRIAL_BUDGET", "6")
+    monkeypatch.setenv("TPE_STARTUP_RANDOM_TRIALS", "3")
+    monkeypatch.setenv("TPE_PROBE_QUERY_BUDGET", "6")
+    monkeypatch.setenv("TPE_CANDIDATE_POOL_SIZE", "24")
+    from app.core import config as config_module
+
+    def read_test_env() -> dict[str, str]:
+        return {key.upper(): value for key, value in os.environ.items()}
+
+    monkeypatch.setattr(config_module, "_read_workspace_env", read_test_env)
     from app.core.config import get_settings
 
     get_settings.cache_clear()

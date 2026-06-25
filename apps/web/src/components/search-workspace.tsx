@@ -2,7 +2,7 @@
 
 import { createPortal } from "react-dom";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { GraphResponse, ModelAudit, SearchResult, SourceType } from "@course-kg/shared";
+import type { GraphResponse, ModelAudit, RetrievalTraceStepsResponse, SearchResult, SourceType } from "@course-kg/shared";
 import { AnimatePresence, motion } from "framer-motion";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
@@ -25,7 +25,7 @@ import { NetworkCanvas } from "@/components/network-canvas";
 import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { fetchDashboard, fetchGraph, searchKnowledge } from "@/lib/api";
+import { fetchDashboard, fetchGraph, fetchRetrievalTraceSteps, searchKnowledge } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 
@@ -38,13 +38,130 @@ type SearchState = {
   model_audit?: ModelAudit;
 };
 
-export function toLayeredContextGraph(graph: GraphResponse | undefined): GraphResponse | undefined {
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function addStringId(value: unknown, ids: Set<string>) {
+  if (typeof value === "string" && value.trim()) {
+    ids.add(value);
+  }
+}
+
+function collectStringIds(value: unknown, ids: Set<string>) {
+  if (!Array.isArray(value)) {
+    return;
+  }
+  for (const item of value) {
+    addStringId(item, ids);
+  }
+}
+
+function collectNodeEntryIds(value: unknown, ids: Set<string>) {
+  if (!Array.isArray(value)) {
+    return;
+  }
+  for (const item of value) {
+    if (typeof item === "string") {
+      addStringId(item, ids);
+      continue;
+    }
+    const record = asRecord(item);
+    if (record) {
+      addStringId(record.node_id ?? record.id, ids);
+    }
+  }
+}
+
+function collectPathLabelIds(value: unknown, ids: Set<string>) {
+  if (!Array.isArray(value)) {
+    return;
+  }
+  for (const item of value) {
+    const record = asRecord(item);
+    if (record) {
+      addStringId(record.node_id, ids);
+      collectStringIds(record.path, ids);
+    }
+  }
+}
+
+export function exploredMidNodeIdsFromTrace(trace: RetrievalTraceStepsResponse | undefined): Set<string> {
+  const ids = new Set<string>();
+  if (!trace) {
+    return ids;
+  }
+
+  const stageQueues = asRecord(trace.stage_queues);
+  const midQueue = asRecord(stageQueues?.mid);
+  collectStringIds(midQueue?.selected_ids, ids);
+  collectStringIds(midQueue?.accepted_ids, ids);
+
+  const topkSelection = asRecord(trace.topk_selection);
+  const midTopkSelection = asRecord(topkSelection?.mid);
+  collectStringIds(midTopkSelection?.selected_ids, ids);
+
+  collectNodeEntryIds(trace.entry_nodes, ids);
+  collectPathLabelIds(trace.path_labels, ids);
+
+  for (const step of trace.steps) {
+    const stepRecord = asRecord(step);
+    if (stepRecord?.layer !== "mid") {
+      continue;
+    }
+    collectStringIds(stepRecord.selected_topk_ids, ids);
+
+    const input = asRecord(stepRecord.input);
+    collectNodeEntryIds(input?.entry_nodes, ids);
+
+    const output = asRecord(stepRecord.output);
+    collectStringIds(output?.accepted_nodes, ids);
+
+    const poppedState = asRecord(stepRecord.popped_frontier_state);
+    addStringId(poppedState?.node_id, ids);
+    collectStringIds(poppedState?.path, ids);
+
+    const diagnostics = asRecord(stepRecord.diagnostics);
+    collectPathLabelIds(diagnostics?.path_labels, ids);
+  }
+
+  return ids;
+}
+
+export function toExploredMidConceptGraph(graph: GraphResponse | undefined, trace: RetrievalTraceStepsResponse | undefined): GraphResponse | undefined {
   if (!graph) {
     return undefined;
   }
+  const exploredIds = exploredMidNodeIdsFromTrace(trace);
+  const nodes = exploredIds.size > 0 ? graph.nodes.filter((node) => exploredIds.has(node.id)) : [];
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const edges = graph.edges.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target));
+
   return {
     ...graph,
-    graph_type: "chunk-relation",
+    graph_type: "mid-concepts",
+    nodes,
+    edges,
+    sampled_counts: {
+      ...graph.sampled_counts,
+      nodes: nodes.length,
+      edges: edges.length,
+    },
+    node_counts: {
+      ...(graph.node_counts ?? {}),
+      mid_concept: nodes.length,
+    },
+    edge_counts: {
+      ...(graph.edge_counts ?? {}),
+      concept_relation: edges.length,
+    },
+    diagnostics: {
+      ...(graph.diagnostics ?? {}),
+      explored_mid_node_count: nodes.length,
+      explored_mid_edge_count: edges.length,
+      explored_mid_trace_id: trace?.trace_id ?? null,
+      filtered_to_explored_mid_nodes: true,
+    },
   };
 }
 
@@ -103,6 +220,12 @@ function pathEdgeBadge(result: SearchResult): string {
 function auditValue(audit: ModelAudit | undefined, key: string): string {
   const value = audit ? (audit as Record<string, unknown>)[key] : undefined;
   return value === undefined || value === null || value === "" ? "无" : String(value);
+}
+
+function retrievalGranularityLabel(value: unknown): string {
+  if (value === "mid") return "普通模式";
+  if (value === "coarse") return "摘要模式";
+  return "无";
 }
 
 function resultRq(result: SearchResult): Record<string, unknown> | null {
@@ -278,6 +401,7 @@ function SearchTraceSummary({ audit }: { audit?: ModelAudit }) {
   return (
     <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3 text-xs text-white/58">
       <span className="kg-micro-chip rounded-full px-2.5 py-1">链路 {pipeline}</span>
+      <span className="kg-micro-chip rounded-full px-2.5 py-1">检索模式 {retrievalGranularityLabel(audit.retrieval_granularity)}</span>
       <span className="kg-micro-chip rounded-full px-2.5 py-1">Trace {traceId}</span>
       <span className="kg-micro-chip rounded-full px-2.5 py-1">粗粒入口 {auditValue(audit, "coarse_entries")}</span>
       <span className="kg-micro-chip rounded-full px-2.5 py-1">中粒入口 {auditValue(audit, "mid_entries")}</span>
@@ -475,40 +599,36 @@ function HoverPreviewOverlay({ preview }: { preview: HoverPreviewState | null })
 }
 
 function GraphCanvasPanel({
-  selectedLabel,
-  selectedPartition,
-  selectedNodeId,
   graph,
-  hasResults,
   isLoading,
   error,
+  hasTrace,
 }: {
-  selectedLabel: string | null;
-  selectedPartition: string;
-  selectedNodeId: string | null;
   graph: GraphResponse | undefined;
-  hasResults: boolean;
   isLoading: boolean;
   error: Error | null;
+  hasTrace: boolean;
 }) {
+  const emptyMessage = hasTrace ? "当前检索 trace 未返回可展示的中层探索节点。" : "发起检索后，这里只显示本次探索到的中层概念节点。";
+
   return (
     <section className="kg-glass-line kg-scroll-shell relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-[2rem] bg-[rgba(4,8,22,0.28)]">
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_20%,rgba(86,217,255,0.11),transparent_38%),linear-gradient(rgba(120,180,255,0.04)_1px,transparent_1px),linear-gradient(90deg,rgba(120,180,255,0.035)_1px,transparent_1px)] bg-[size:auto,42px_42px,42px_42px]" />
       <div className="relative z-10 flex items-center justify-between gap-3 px-5 py-4">
         <div>
           <p className="section-kicker">知识画布</p>
-          <h3 className="mt-1 text-xl font-semibold text-white">{selectedLabel ?? "检索上下文图谱"}</h3>
-          <p className="mt-1 text-sm text-white/42">{selectedPartition || "当前检索结果的片段关系邻域"}</p>
+          <h3 className="mt-1 text-xl font-semibold text-white">中层概念图谱</h3>
+          <p className="mt-1 text-sm text-white/42">仅显示本次检索探索到的中层节点</p>
         </div>
         <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
           <GitBranch data-icon="inline-start" />
-          四层图谱
+          探索中层图
         </span>
       </div>
       <div className="relative z-10 flex min-h-0 flex-1 px-2 pb-2">
         {isLoading ? (
           <div className="kg-shimmer mx-3 grid h-full min-h-0 w-full flex-1 place-items-center rounded-[1.5rem] border border-white/7 bg-white/[0.025] text-sm text-white/54">
-            正在加载关系图谱...
+            正在加载本次探索到的中层节点...
           </div>
         ) : error ? (
           <div className="mx-3 flex min-h-0 w-full flex-1 items-stretch">
@@ -516,11 +636,11 @@ function GraphCanvasPanel({
           </div>
         ) : graph && graph.nodes.length > 0 ? (
           <div className="mx-3 flex h-full min-h-0 w-full flex-1">
-            <NetworkCanvas graph={graph} height="100%" selectedNodeId={selectedNodeId} />
+            <NetworkCanvas graph={graph} height="100%" selectedNodeId={null} />
           </div>
         ) : (
           <div className="mx-3 grid h-full min-h-0 w-full flex-1 place-items-center rounded-[1.5rem] border border-white/7 bg-white/[0.025] px-6 text-center text-sm leading-7 text-white/54">
-            {hasResults ? "当前检索结果暂未返回可展示的关系图谱。" : "发起检索后，这里展示片段关系图谱和命中片段上下文。"}
+            {emptyMessage}
           </div>
         )}
       </div>
@@ -668,7 +788,6 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
   const [searchHistory, setSearchHistory] = useLocalStorage<string[]>(`search.history.${storageScope}`, []);
   const [partition, setPartition] = useLocalStorage(`search.partition.${storageScope}`, "");
   const [sourceType, setSourceType] = useLocalStorage(`search.sourceType.${storageScope}`, "");
-  const [selectedPartition, setSelectedPartition] = useLocalStorage(`search.selectedPartition.${storageScope}`, "");
   const [selectedChunkId, setSelectedChunkId] = useLocalStorage<string | null>(`search.selectedChunkId.${storageScope}`, null);
   const [searchResults, setSearchResults] = useLocalStorage<SearchState | null>(`search.results.${storageScope}`, null);
   const [hoverPreview, setHoverPreview] = useState<HoverPreviewState | null>(null);
@@ -681,6 +800,7 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
       searchKnowledge({
         knowledge_base_id: selectedKnowledgeBaseId,
         query: searchText,
+        retrieval_granularity: "mid",
         filters: {
           partition: partition || undefined,
           source_type: (sourceType || undefined) as never,
@@ -690,8 +810,6 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
       setSearchResults({ results: data.results, degraded_mode: Boolean(data.degraded_mode), model_audit: data.model_audit });
       setSearchHistory((current) => [searchText, ...current.filter((item) => item !== searchText)].slice(0, 50));
       const firstResult = data.results[0];
-      const nextPartition = partition || (firstResult ? resultPartition(firstResult) : undefined) || (dashboardQuery.data?.tree[0]?.title ?? "");
-      setSelectedPartition(nextPartition);
       setSelectedChunkId(firstResult?.chunk_id ?? null);
     },
     onError: () => {
@@ -702,16 +820,18 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
 
   const partitionOptions = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title).filter((title): title is string => Boolean(title)) ?? [], [dashboardQuery.data]);
   const results = searchResults?.results ?? emptySearchResults;
-  const resultChunkIds = useMemo(() => results.map((result) => result.chunk_id), [results]);
-  const queryContextGraphQuery = useQuery({
-    queryKey: ["search-context-graph", selectedKnowledgeBaseId, resultChunkIds],
-    queryFn: () => fetchGraph(selectedKnowledgeBaseId, "chunk-relation", "overview"),
-    enabled: resultChunkIds.length > 0,
+  const retrievalTraceId = searchResults?.model_audit?.retrieval_trace_id || null;
+  const midConceptGraphQuery = useQuery({
+    queryKey: ["search-mid-concept-graph", selectedKnowledgeBaseId],
+    queryFn: () => fetchGraph(selectedKnowledgeBaseId, "mid-concepts", "overview"),
+    enabled: Boolean(selectedKnowledgeBaseId),
   });
-  const queryContextGraph = useMemo(() => toLayeredContextGraph(queryContextGraphQuery.data), [queryContextGraphQuery.data]);
-  const selectedResult = results.find((result) => result.chunk_id === selectedChunkId) ?? null;
-  const focusPartition = selectedResult ? resultPartition(selectedResult) : selectedPartition;
-  const selectedLabel = selectedResult?.document_title ?? selectedResult?.citations[0]?.document_title ?? null;
+  const retrievalTraceQuery = useQuery({
+    queryKey: ["search-retrieval-trace-steps", retrievalTraceId],
+    queryFn: () => fetchRetrievalTraceSteps(retrievalTraceId as string),
+    enabled: Boolean(retrievalTraceId),
+  });
+  const midConceptGraph = useMemo(() => toExploredMidConceptGraph(midConceptGraphQuery.data, retrievalTraceQuery.data), [midConceptGraphQuery.data, retrievalTraceQuery.data]);
 
   useEffect(() => {
     return () => {
@@ -822,18 +942,14 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
             }
             setHoverPreview(null);
             setSelectedChunkId(result.chunk_id);
-            setSelectedPartition(resultPartition(result));
             setDetailResult(result);
           }}
         />
         <GraphCanvasPanel
-          selectedLabel={selectedLabel}
-          selectedPartition={focusPartition}
-          selectedNodeId={null}
-          graph={queryContextGraph}
-          hasResults={results.length > 0}
-          isLoading={queryContextGraphQuery.isLoading || searchMutation.isPending}
-          error={(queryContextGraphQuery.error as Error | null) ?? null}
+          graph={midConceptGraph}
+          isLoading={searchMutation.isPending || midConceptGraphQuery.isLoading || retrievalTraceQuery.isLoading}
+          error={(midConceptGraphQuery.error as Error | null) ?? (retrievalTraceQuery.error as Error | null) ?? null}
+          hasTrace={Boolean(retrievalTraceId)}
         />
       </section>
 
