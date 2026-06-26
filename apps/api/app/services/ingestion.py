@@ -23,6 +23,7 @@ from app.models import (
     ParseJob,
     SourceFile,
 )
+from app.services.cancellation import IngestionCancelled, ensure_not_cancelled
 from app.services.context_graph import context_graph_stats, rebuild_context_graph, write_chunks_and_structure, write_contextual_indexes
 from app.services.embeddings import is_degraded_mode
 from app.services.ingestion_logs import emit_ingestion_log
@@ -36,6 +37,8 @@ EXCLUDED_PARTS = {"output", "scripts", ".ipynb_checkpoints", "__pycache__"}
 IGNORED_NAMES = {".ds_store"}
 TERMINAL_STATES = {"completed", "failed", "partial_failed", "skipped", "cancelled", "cancel_failed"}
 ACTIVE_FILE_JOB_STATES = {"queued", "parsing", "chunking", "embedding", "extracting_graph", "processing"}
+CANCELLING_STATES = {"cancel_requested", "cancelling", "compensating"}
+CANCEL_TERMINATE_SIGNAL = "SIGTERM"
 
 
 def current_worker_id() -> str:
@@ -260,6 +263,8 @@ def mark_batch_task_started(batch_id: str, task_id: str | None, task_name: str) 
         batch = db.get(IngestionBatch, batch_id)
         if batch is None:
             return
+        if batch.status in TERMINAL_STATES:
+            return
         task_ids = set((batch.stats or {}).get("batch_task_ids") or [])
         if task_id:
             task_ids.add(task_id)
@@ -283,7 +288,128 @@ def get_batch_status(db: Session, batch_id: str) -> dict | None:
     batch = db.get(IngestionBatch, batch_id)
     if batch is None:
         return None
+    finalize_cancelling_batch_if_released(db, batch)
     return summarize_batch(batch)
+
+
+def batch_task_ids(stats: dict) -> list[str]:
+    task_ids: list[str] = []
+    for value in stats.get("batch_task_ids") or []:
+        if value:
+            task_ids.append(str(value))
+    celery_task_id = stats.get("celery_task_id")
+    if celery_task_id:
+        task_ids.append(str(celery_task_id))
+    return sorted(set(task_ids))
+
+
+def _celery_control_app():
+    from celery import Celery
+
+    settings = get_settings()
+    return Celery("knowledge_base_cancel_control", broker=settings.redis_url, backend=settings.redis_url)
+
+
+def revoke_celery_batch_tasks(task_ids: list[str]) -> dict:
+    task_ids = sorted({str(task_id) for task_id in task_ids if task_id})
+    if not task_ids:
+        return {"attempted": False, "task_ids": [], "reason": "no_celery_task_ids"}
+    result = {
+        "attempted": True,
+        "terminate": True,
+        "signal": CANCEL_TERMINATE_SIGNAL,
+        "task_ids": task_ids,
+        "revoked_task_ids": [],
+        "errors": [],
+    }
+    try:
+        app = _celery_control_app()
+        for task_id in task_ids:
+            app.control.revoke(task_id, terminate=True, signal=CANCEL_TERMINATE_SIGNAL)
+            result["revoked_task_ids"].append(task_id)
+    except Exception as exc:
+        result["errors"].append(exception_message(exc))
+        result["ok"] = False
+    else:
+        result["ok"] = True
+    return result
+
+
+def inspect_celery_batch_tasks(task_ids: list[str]) -> dict:
+    task_ids = sorted({str(task_id) for task_id in task_ids if task_id})
+    if not task_ids:
+        return {"attempted": False, "task_ids": [], "active_task_ids": [], "reserved_task_ids": [], "scheduled_task_ids": []}
+    result = {
+        "attempted": True,
+        "task_ids": task_ids,
+        "active_task_ids": [],
+        "reserved_task_ids": [],
+        "scheduled_task_ids": [],
+        "errors": [],
+    }
+    try:
+        inspector = _celery_control_app().control.inspect(timeout=1.0)
+        snapshots = {
+            "active_task_ids": inspector.active() or {},
+            "reserved_task_ids": inspector.reserved() or {},
+            "scheduled_task_ids": inspector.scheduled() or {},
+        }
+        task_id_set = set(task_ids)
+        for output_key, workers in snapshots.items():
+            matched: set[str] = set()
+            for worker_items in workers.values():
+                for item in worker_items or []:
+                    request_payload = item.get("request") if isinstance(item, dict) else None
+                    request_id = request_payload.get("id") if isinstance(request_payload, dict) else None
+                    candidate = str((item.get("id") if isinstance(item, dict) else None) or request_id or "")
+                    if candidate in task_id_set:
+                        matched.add(candidate)
+            result[output_key] = sorted(matched)
+    except Exception as exc:
+        result["errors"].append(exception_message(exc))
+        result["ok"] = False
+    else:
+        result["ok"] = True
+    return result
+
+
+def celery_tasks_released(inspection: dict) -> bool:
+    if inspection.get("ok") is False:
+        return False
+    return not (inspection.get("active_task_ids") or inspection.get("reserved_task_ids") or inspection.get("scheduled_task_ids"))
+
+
+def mark_batch_cancelled(db: Session, batch: IngestionBatch, *, cancellation_status: str) -> None:
+    stats = dict(batch.stats or {})
+    batch.status = "cancelled"
+    batch.completed_at = datetime.utcnow()
+    batch.worker_id = None
+    batch.heartbeat_at = None
+    stats["cancel_requested"] = True
+    stats["cancellation_status"] = cancellation_status
+    stats["phase"] = "cancelled"
+    stats["cancelled_at"] = batch.completed_at.isoformat()
+    batch.stats = stats
+    for job in batch.jobs:
+        if job.status not in TERMINAL_STATES:
+            job.status = "cancelled"
+
+
+def finalize_cancelling_batch_if_released(db: Session, batch: IngestionBatch) -> None:
+    if batch.status not in CANCELLING_STATES:
+        return
+    stats = dict(batch.stats or {})
+    task_ids = batch_task_ids(stats)
+    if task_ids:
+        inspection = inspect_celery_batch_tasks(task_ids)
+        stats["celery_cancel_inspection"] = inspection
+        batch.stats = stats
+        if not celery_tasks_released(inspection):
+            db.commit()
+            return
+    mark_batch_cancelled(db, batch, cancellation_status="worker_released")
+    db.commit()
+    emit_ingestion_log(batch.id, "batch_cancelled", "Batch cancellation completed after worker release", state="cancelled", celery_task_ids=task_ids)
 
 
 def summarize_batch(batch: IngestionBatch | None) -> dict:
@@ -306,6 +432,8 @@ def summarize_batch(batch: IngestionBatch | None) -> dict:
         "skipped_count": batch.skipped_count,
         "current_file": stats.get("current_file"),
         "current_phase": current_phase,
+        "cancel_requested": bool(stats.get("cancel_requested")) or batch.status in CANCELLING_STATES,
+        "last_error": batch.last_error,
         "stats": stats,
         "coverage_by_source_type": stats.get("coverage_by_source_type", {}),
         "errors": stats.get("errors", []),
@@ -321,6 +449,7 @@ def summarize_batch(batch: IngestionBatch | None) -> dict:
         "batch_worker_ids": [batch.worker_id] if batch.worker_id else [],
         "worker_id": batch.worker_id,
         "heartbeat_at": batch.heartbeat_at,
+        "created_at": batch.created_at,
         "started_at": batch.started_at,
         "completed_at": batch.completed_at,
     }
@@ -332,15 +461,41 @@ def request_batch_cancel_control(db: Session, batch_id: str, knowledge_base_id: 
         return None
     if batch.knowledge_base_id != knowledge_base_id:
         raise PermissionError("Batch belongs to another knowledge base")
-    if batch.status not in TERMINAL_STATES:
-        batch.status = "cancelled"
-        batch.completed_at = datetime.utcnow()
-        batch.stats = {**(batch.stats or {}), "cancellation_status": "cancelled_by_control_plane", "phase": "cancelled"}
-        for job in batch.jobs:
-            if job.status not in TERMINAL_STATES:
-                job.status = "cancelled"
-        db.commit()
-        emit_ingestion_log(batch.id, "batch_cancelled", "Batch cancelled before the next stage boundary", state="cancelled")
+    if batch.status in TERMINAL_STATES:
+        return summarize_batch(batch)
+
+    stats = dict(batch.stats or {})
+    task_ids = batch_task_ids(stats)
+    now = datetime.utcnow()
+    stats["cancel_requested"] = True
+    stats["cancel_requested_at"] = now.isoformat()
+    stats["cancellation_status"] = "cancel_requested"
+    if task_ids:
+        revoke_result = revoke_celery_batch_tasks(task_ids)
+        stats["celery_revoke"] = revoke_result
+        if revoke_result.get("ok") is False:
+            stats["cancel_failure_reason"] = "; ".join(revoke_result.get("errors") or ["celery revoke failed"])
+            stats["manual_review_required"] = True
+            stats["cancellation_status"] = "worker_terminate_failed"
+        else:
+            stats["cancellation_status"] = "worker_terminate_requested"
+    batch.status = "cancelling" if batch_is_worker_owned(stats) or task_ids else "cancel_requested"
+    batch.stats = stats
+    for job in batch.jobs:
+        if job.status not in TERMINAL_STATES:
+            job.status = "cancel_requested"
+    db.commit()
+    emit_ingestion_log(
+        batch.id,
+        "batch_cancel_requested",
+        "Batch cancellation requested; worker termination signalled" if task_ids else "Batch cancellation requested",
+        state=batch.status,
+        celery_task_ids=task_ids,
+        cancellation_status=stats.get("cancellation_status"),
+    )
+    batch = db.get(IngestionBatch, batch_id)
+    if batch is not None:
+        finalize_cancelling_batch_if_released(db, batch)
     return summarize_batch(batch)
 
 
@@ -523,6 +678,9 @@ async def run_context_graph_rebuild_batch(batch_id: str, *, execution_mode: str 
         batch = db.get(IngestionBatch, batch_id)
         if batch is None:
             raise RuntimeError(f"Batch {batch_id} not found")
+        if batch.status in TERMINAL_STATES:
+            return summarize_batch(batch)
+        ensure_not_cancelled(db, batch_id)
         knowledge_base = resolve_knowledge_base(db, batch.knowledge_base_id)
         batch.status = "extracting_graph"
         batch.started_at = datetime.utcnow()
@@ -543,6 +701,7 @@ async def run_context_graph_rebuild_batch(batch_id: str, *, execution_mode: str 
         }
         db.commit()
         emit_ingestion_log(batch.id, "batch_started", "Context graph rebuild started", maintenance_task="context_graph_rebuild")
+        ensure_not_cancelled(db, batch_id)
         emit_ingestion_log(batch.id, "context_graph_started", "Building four-layer context graph")
         context_state = await rebuild_context_graph(db, knowledge_base.id, batch_id=batch.id, chunk_version_incremented=False)
         graph_stats = dict(context_state.stats_json or {})
@@ -568,6 +727,15 @@ async def run_context_graph_rebuild_batch(batch_id: str, *, execution_mode: str 
         emit_ingestion_log(batch.id, "context_graph_completed", "Four-layer context graph is active", **graph_stats)
         emit_ingestion_log(batch.id, "batch_completed", "Context graph rebuild completed", **graph_stats)
         return summarize_batch(batch)
+    except IngestionCancelled:
+        db.rollback()
+        batch = db.get(IngestionBatch, batch_id)
+        if batch is not None:
+            mark_batch_cancelled(db, batch, cancellation_status="cancelled_by_worker")
+            db.commit()
+            emit_ingestion_log(batch.id, "batch_cancelled", "Context graph rebuild cancelled by worker", state="cancelled")
+            return summarize_batch(batch)
+        raise
     except Exception as exc:
         db.rollback()
         message = exception_message(exc)
@@ -610,6 +778,9 @@ async def run_uploaded_files_ingestion(
         batch = db.get(IngestionBatch, batch_id)
         if batch is None:
             raise RuntimeError(f"Batch {batch_id} not found")
+        if batch.status in TERMINAL_STATES:
+            return summarize_batch(batch)
+        ensure_not_cancelled(db, batch_id)
         knowledge_base = resolve_knowledge_base(db, batch.knowledge_base_id)
         paths = [Path(path).resolve() for path in file_paths]
         current_version = knowledge_base.current_chunk_version or 0
@@ -644,6 +815,7 @@ async def run_uploaded_files_ingestion(
         coverage: Counter[str] = Counter()
         errors: list[dict[str, str]] = []
         for index, path in enumerate(paths, start=1):
+            ensure_not_cancelled(db, batch_id)
             batch = db.get(IngestionBatch, batch_id)
             if batch is None:
                 break
@@ -693,6 +865,7 @@ async def run_uploaded_files_ingestion(
         batch = db.get(IngestionBatch, batch_id)
         if batch is None:
             raise RuntimeError(f"Batch {batch_id} disappeared")
+        ensure_not_cancelled(db, batch_id)
         if batch.success_count > 0:
             batch.status = "extracting_graph"
             batch.stats = {**(batch.stats or {}), "phase": "context_graph"}
@@ -722,6 +895,15 @@ async def run_uploaded_files_ingestion(
         db.commit()
         emit_ingestion_log(batch.id, terminal_event, f"Batch {batch.status}: success={batch.success_count}, failed={batch.failure_count}, skipped={batch.skipped_count}")
         return summarize_batch(batch)
+    except IngestionCancelled:
+        db.rollback()
+        batch = db.get(IngestionBatch, batch_id)
+        if batch is not None:
+            mark_batch_cancelled(db, batch, cancellation_status="cancelled_by_worker")
+            db.commit()
+            emit_ingestion_log(batch.id, "batch_cancelled", "Batch cancelled by worker", state="cancelled")
+            return summarize_batch(batch)
+        raise
     except Exception as exc:
         db.rollback()
         message = exception_message(exc)

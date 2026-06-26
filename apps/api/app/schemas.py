@@ -312,6 +312,15 @@ class IngestionBatchSummary(APIModel):
     current_phase: str | None = None
     cancel_requested: bool = False
     last_error: str | None = None
+    cancellation_status: str | None = None
+    cancel_failure_reason: str | None = None
+    manual_review_required: bool = False
+    celery_task_id: str | None = None
+    celery_task_name: str | None = None
+    batch_task_ids: list[str] = Field(default_factory=list)
+    batch_worker_ids: list[str] = Field(default_factory=list)
+    worker_id: str | None = None
+    heartbeat_at: datetime | None = None
     stats: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime | None = None
     started_at: datetime | None = None

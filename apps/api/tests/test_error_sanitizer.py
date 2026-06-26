@@ -78,3 +78,11 @@ def test_model_bridge_reload_error_does_not_return_raw_body(monkeypatch):
     assert payload["status_code"] == 500
     assert "sk-provider-secret" not in serialized
     assert "Authorization" not in serialized
+
+
+def test_public_exception_message_keeps_transport_error_type_when_message_empty():
+    from app.services.error_sanitizer import public_exception_message
+
+    exc = httpx.ConnectError("", request=httpx.Request("POST", "https://provider.example/v1/chat/completions"))
+
+    assert public_exception_message(exc) == "ConnectError"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
 
@@ -152,3 +153,49 @@ async def test_chat_provider_syncs_model_bridge_for_chat_only(monkeypatch, no_fa
     assert sync_calls == [model_bridge_client_base_url(8765)]
     assert calls[0] == f"{model_bridge_client_base_url(8765)}/chat/completions"
     assert calls[1] == "https://graph.invalid/v1/chat/completions"
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_json_retries_transient_transport_errors(monkeypatch):
+    from app.services import embeddings
+
+    calls = 0
+    sleeps: list[float] = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json, headers):
+            nonlocal calls
+            calls += 1
+            if calls < embeddings.MODEL_REQUEST_MAX_ATTEMPTS:
+                raise httpx.ConnectError("", request=httpx.Request("POST", url))
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={"ok": True},
+            )
+
+    async def fake_sleep(seconds: float):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(embeddings.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(embeddings.asyncio, "sleep", fake_sleep)
+
+    result = await embeddings.post_openai_compatible_json(
+        "https://provider.example/v1/chat/completions",
+        {"model": "unit"},
+        {"Authorization": "Bearer redacted"},
+        timeout=1,
+    )
+
+    assert result == {"ok": True}
+    assert calls == embeddings.MODEL_REQUEST_MAX_ATTEMPTS
+    assert sleeps == [1.0, 2.0, 4.0, 8.0, 16.0]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 import json
 from types import SimpleNamespace
@@ -21,6 +22,20 @@ def test_entry_seed_calibration_prevents_zero_distance_route_seeds():
     assert calibrated_entry_seed_strength(1.0, "mid_drilldown_entry") == pytest.approx(0.82)
     assert calibrated_entry_seed_strength(1.0, "coarse_to_mid_drilldown_entry") == pytest.approx(0.72)
     assert distance_from_strength(calibrated_entry_seed_strength(1.0, "mid_drilldown_entry")) > 0.0
+
+
+@pytest.mark.asyncio
+async def test_gather_bounded_propagates_worker_exception_without_deadlock():
+    from app.services.context_graph import gather_bounded
+
+    async def run_item(item: str) -> str:
+        await asyncio.sleep(0)
+        if item == "bad":
+            raise RuntimeError("unit bounded worker failure")
+        return item
+
+    with pytest.raises(RuntimeError, match="unit bounded worker failure"):
+        await asyncio.wait_for(gather_bounded(["ok-1", "bad", "ok-2", "ok-3"], 2, run_item), timeout=1.0)
 
 
 def test_result_top_k_resolves_hot_reload_default_and_cache_key(monkeypatch):

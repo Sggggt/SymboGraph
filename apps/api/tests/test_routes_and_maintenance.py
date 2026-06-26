@@ -780,6 +780,106 @@ def test_celery_owned_batches_are_not_finalized_on_api_restart():
     assert batch_is_worker_owned({"ingestion_execution_mode": "inline"}) is False
 
 
+def test_cancel_running_celery_batch_revokes_worker_task(monkeypatch, db_session, sample_knowledge_base):
+    from app.models import IngestionBatch, IngestionJob
+    from app.services import ingestion
+
+    revoke_calls: list[list[str]] = []
+
+    def fake_revoke(task_ids: list[str]) -> dict:
+        revoke_calls.append(task_ids)
+        return {"attempted": True, "ok": True, "terminate": True, "signal": "SIGTERM", "task_ids": task_ids, "revoked_task_ids": task_ids, "errors": []}
+
+    def fake_inspect(task_ids: list[str]) -> dict:
+        return {"attempted": True, "ok": True, "task_ids": task_ids, "active_task_ids": ["task-1"], "reserved_task_ids": [], "scheduled_task_ids": []}
+
+    monkeypatch.setattr(ingestion, "revoke_celery_batch_tasks", fake_revoke)
+    monkeypatch.setattr(ingestion, "inspect_celery_batch_tasks", fake_inspect)
+    batch = IngestionBatch(
+        knowledge_base_id=sample_knowledge_base.id,
+        trigger_source="upload",
+        source_root="unit",
+        status="extracting_graph",
+        total_files=1,
+        stats={"phase": "context_graph", "ingestion_execution_mode": "celery", "celery_task_id": "task-1", "batch_task_ids": ["task-1"]},
+    )
+    db_session.add(batch)
+    db_session.flush()
+    job = IngestionJob(knowledge_base_id=sample_knowledge_base.id, batch_id=batch.id, trigger_source="upload", status="processing")
+    db_session.add(job)
+    db_session.commit()
+
+    payload = ingestion.request_batch_cancel_control(db_session, batch.id, sample_knowledge_base.id)
+    db_session.refresh(batch)
+    db_session.refresh(job)
+
+    assert revoke_calls == [["task-1"]]
+    assert payload["state"] == "cancelling"
+    assert payload["cancel_requested"] is True
+    assert batch.status == "cancelling"
+    assert batch.stats["cancellation_status"] == "worker_terminate_requested"
+    assert batch.stats["celery_revoke"]["terminate"] is True
+    assert job.status == "cancel_requested"
+
+
+def test_cancelling_batch_finalizes_after_worker_task_released(monkeypatch, db_session, sample_knowledge_base):
+    from app.models import IngestionBatch, IngestionJob
+    from app.services import ingestion
+
+    monkeypatch.setattr(
+        ingestion,
+        "inspect_celery_batch_tasks",
+        lambda task_ids: {"attempted": True, "ok": True, "task_ids": task_ids, "active_task_ids": [], "reserved_task_ids": [], "scheduled_task_ids": []},
+    )
+    batch = IngestionBatch(
+        knowledge_base_id=sample_knowledge_base.id,
+        trigger_source="upload",
+        source_root="unit",
+        status="cancelling",
+        total_files=1,
+        worker_id="worker-1",
+        stats={"phase": "context_graph", "cancel_requested": True, "ingestion_execution_mode": "celery", "celery_task_id": "task-1", "batch_task_ids": ["task-1"]},
+    )
+    db_session.add(batch)
+    db_session.flush()
+    job = IngestionJob(knowledge_base_id=sample_knowledge_base.id, batch_id=batch.id, trigger_source="upload", status="processing")
+    db_session.add(job)
+    db_session.commit()
+
+    payload = ingestion.get_batch_status(db_session, batch.id)
+    db_session.refresh(batch)
+    db_session.refresh(job)
+
+    assert payload["state"] == "cancelled"
+    assert payload["cancellation_status"] == "worker_released"
+    assert batch.completed_at is not None
+    assert batch.worker_id is None
+    assert job.status == "cancelled"
+
+
+def test_cancel_terminal_batch_does_not_revoke(monkeypatch, db_session, sample_knowledge_base):
+    from app.models import IngestionBatch
+    from app.services import ingestion
+
+    revoke_calls: list[list[str]] = []
+    monkeypatch.setattr(ingestion, "revoke_celery_batch_tasks", lambda task_ids: revoke_calls.append(task_ids))
+    batch = IngestionBatch(
+        knowledge_base_id=sample_knowledge_base.id,
+        trigger_source="upload",
+        source_root="unit",
+        status="completed",
+        total_files=1,
+        stats={"ingestion_execution_mode": "celery", "celery_task_id": "task-1"},
+    )
+    db_session.add(batch)
+    db_session.commit()
+
+    payload = ingestion.request_batch_cancel_control(db_session, batch.id, sample_knowledge_base.id)
+
+    assert payload["state"] == "completed"
+    assert revoke_calls == []
+
+
 def test_context_graph_heartbeat_updates_batch_stats(db_session, sample_knowledge_base):
     from app.models import IngestionBatch
     from app.services.context_graph import context_graph_batch_heartbeat

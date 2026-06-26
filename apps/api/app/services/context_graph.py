@@ -63,6 +63,7 @@ from app.services.chunking import (
 )
 from app.services.cancellation import ensure_not_cancelled
 from app.services.embeddings import ChatProvider, EmbeddingProvider, FallbackDisabledError, is_degraded_mode
+from app.services.error_sanitizer import public_exception_message
 from app.services.model_output import coerce_confidence
 from app.services.parsers import ParsedSection
 from app.services.vector_store import VectorStore
@@ -162,15 +163,14 @@ async def gather_bounded(items: list[Any], limit: int, fn: Any, on_result: Any |
     results: list[Any] = [None] * len(items)
     for index, item in enumerate(items):
         queue.put_nowait((index, item))
-    for _ in range(worker_count):
-        queue.put_nowait(None)
 
     async def run_worker() -> None:
         while True:
-            payload = await queue.get()
             try:
-                if payload is None:
-                    return
+                payload = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
                 index, item = payload
                 result = await fn(item)
                 results[index] = result
@@ -182,9 +182,14 @@ async def gather_bounded(items: list[Any], limit: int, fn: Any, on_result: Any |
                 queue.task_done()
 
     workers = [asyncio.create_task(run_worker()) for _ in range(worker_count)]
-    await queue.join()
-    for worker in workers:
-        await worker
+    try:
+        await asyncio.gather(*workers)
+    except BaseException:
+        for worker in workers:
+            if not worker.done():
+                worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        raise
     return results
 
 
@@ -2181,7 +2186,18 @@ async def build_mid_concept_graph(
 
     async def define_mid_packet_batch(item: tuple[int, list[tuple[RQPrefix, dict[str, Any]]]]) -> tuple[int, list[tuple[RQPrefix, dict[str, Any]]], list[dict[str, Any]]]:
         batch_index, packet_batch = item
-        outputs = await define_mid_concepts_batch([packet for _, packet in packet_batch])
+        packets = [packet for _, packet in packet_batch]
+        try:
+            ensure_not_cancelled(db, batch_id)
+            outputs = await define_mid_concepts_batch(packets)
+            ensure_not_cancelled(db, batch_id)
+        except Exception as exc:
+            packet_ids = [str(packet.get("packet_id")) for packet in packets if packet.get("packet_id")]
+            packet_summary = ", ".join(packet_ids[:8]) or "none"
+            raise RuntimeError(
+                f"Mid concept LLM batch {batch_index}/{total_batches} failed for packet_ids={packet_summary}: "
+                f"{public_exception_message(exc)}"
+            ) from exc
         return batch_index, packet_batch, outputs
 
     completed_mid_batches = 0
@@ -2764,7 +2780,10 @@ async def build_coarse_concept_graph(
     )
 
     async def define_coarse_work_item(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        return item, await define_coarse_concept(item["packet"])
+        ensure_not_cancelled(db, batch_id)
+        output = await define_coarse_concept(item["packet"])
+        ensure_not_cancelled(db, batch_id)
+        return item, output
 
     completed_coarse_batches = 0
 

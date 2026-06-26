@@ -955,6 +955,8 @@ export interface IngestionBatchSummary {
   stats?: Record<string, unknown>;
   phase?: string | null;
   current_phase?: string | null;
+  cancel_requested?: boolean;
+  last_error?: string | null;
   parse_committed?: boolean;
   cancellation_status?: string | null;
   cancel_failure_reason?: string | null;

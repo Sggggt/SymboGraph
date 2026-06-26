@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import asyncio
 import json
+import logging
 import math
 import os
 import re
@@ -28,6 +29,11 @@ from app.services.strategy_profiles import (
     profile_prompt,
 )
 from app.services.error_sanitizer import ExternalServiceError, public_exception_message, sanitize_error_message
+
+
+logger = logging.getLogger(__name__)
+MODEL_REQUEST_MAX_ATTEMPTS = 6
+MODEL_REQUEST_BACKOFF_CAP_SECONDS = 20.0
 
 
 class FallbackDisabledError(RuntimeError):
@@ -757,7 +763,8 @@ async def post_openai_compatible_json(
     if normalized_resolve_ip.lower() in {"", "none", "null", "__none__"}:
         normalized_resolve_ip = ""
     last_error: Exception | None = None
-    for attempt in range(1, 4):
+    max_attempts = MODEL_REQUEST_MAX_ATTEMPTS
+    for attempt in range(1, max_attempts + 1):
         try:
             async with model_request_slot():
                 if normalized_resolve_ip:
@@ -769,9 +776,25 @@ async def post_openai_compatible_json(
                     return response.json()
         except Exception as exc:
             last_error = exc
-            if attempt >= 3 or not _is_retryable_openai_error(exc):
+            retryable = _is_retryable_openai_error(exc)
+            if attempt >= max_attempts or not retryable:
+                if retryable and attempt >= max_attempts:
+                    raise RuntimeError(
+                        f"OpenAI-compatible request failed after {max_attempts} attempts: {public_exception_message(exc)}"
+                    ) from exc
                 raise
-            await asyncio.sleep(float(attempt))
+            retry_in = min(float(2 ** (attempt - 1)), MODEL_REQUEST_BACKOFF_CAP_SECONDS)
+            logger.warning(
+                "OpenAI-compatible request retrying after transient error",
+                extra={
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "retry_in_seconds": retry_in,
+                    "error": public_exception_message(exc),
+                    "url_host": urlparse(url).netloc,
+                },
+            )
+            await asyncio.sleep(retry_in)
     safe_error = public_exception_message(last_error) if last_error else "unknown"
     raise RuntimeError(f"OpenAI-compatible request failed: {safe_error}")
 

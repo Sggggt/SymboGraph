@@ -69,7 +69,12 @@ def public_exception_message(exc: Exception, *, fallback: str = "External servic
     status_code = getattr(response, "status_code", None)
     if status_code is not None:
         return f"{type(exc).__name__}: HTTP {status_code}"
-    return sanitize_error_message(str(exc), fallback=fallback)
+    message = sanitize_error_message(str(exc), fallback=fallback)
+    if message == fallback:
+        exc_type = type(exc).__name__
+        if exc_type and exc_type not in {"Exception", "RuntimeError"}:
+            return exc_type
+    return message
 
 
 def external_error_payload(exc: Exception, *, code: str, title: str, message: str, fix_commands: list[str] | None = None) -> dict[str, Any]:
