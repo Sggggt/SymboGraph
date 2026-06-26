@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import json
 
-from _context_graph_maintenance import resolve_knowledge_base, session_scope, write_report
+from _context_graph_maintenance import prepare_runtime_for_model_io, resolve_knowledge_base, session_scope, write_report
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,6 +24,7 @@ async def main() -> None:
     from app.services.context_graph import build_context_package, layered_search
 
     args = parse_args()
+    model_io_runtime = prepare_runtime_for_model_io()
     with session_scope() as db:
         knowledge_base = resolve_knowledge_base(db, knowledge_base_id=args.knowledge_base_id, knowledge_base_name=args.knowledge_base_name)
         retrieval = await layered_search(db, knowledge_base.id, args.query, SearchFilters(), args.top_k)
@@ -107,6 +108,7 @@ async def main() -> None:
             "knowledge_base_id": knowledge_base.id,
             "knowledge_base_name": knowledge_base.name,
             "query": args.query,
+            "model_io_runtime": model_io_runtime,
             "context_package_id": package.id,
             "retrieval_trace_id": package.retrieval_trace_id,
             "checks": checks,

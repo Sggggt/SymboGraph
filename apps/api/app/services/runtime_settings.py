@@ -554,6 +554,18 @@ def reload_model_bridge(settings=None, env_entries: dict[str, str] | None = None
         return {"attempted": True, "ok": False, "error": public_exception_message(exc)}
 
 
+def sync_model_bridge_runtime_config(settings=None, env_entries: dict[str, str] | None = None, *, raise_on_error: bool = True) -> dict:
+    settings = settings or get_settings()
+    env_entries = env_entries or _env_entries(ENV_PATH)
+    if not settings.model_bridge_enabled:
+        return {"attempted": False, "reason": "model_bridge_disabled"}
+    result = reload_model_bridge(settings=settings, env_entries=env_entries)
+    failed = result.get("ok") is False or (result.get("attempted") is False and result.get("reason") != "model_bridge_disabled")
+    if failed and raise_on_error:
+        raise RuntimeError(f"Model bridge runtime config sync failed: {result.get('error') or result}")
+    return result
+
+
 def current_runtime_settings_version() -> str | None:
     with suppress(Exception):
         version = _redis_client().get(SETTINGS_VERSION_REDIS_KEY)
@@ -621,6 +633,7 @@ def refresh_runtime_settings_if_needed(force: bool = False) -> dict:
     global _LAST_RUNTIME_SETTINGS_VERSION
     version: str | None = None
     redis_error: str | None = None
+    bridge_sync: dict | None = None
     try:
         version = _redis_client().get(SETTINGS_VERSION_REDIS_KEY)
     except Exception as exc:  # pragma: no cover - exercised by integration/runtime checks
@@ -629,13 +642,17 @@ def refresh_runtime_settings_if_needed(force: bool = False) -> dict:
     should_refresh = force or (version is not None and version != _LAST_RUNTIME_SETTINGS_VERSION)
     if should_refresh:
         _local_runtime_refresh(version)
+        bridge_sync = sync_model_bridge_runtime_config(settings=get_settings())
     elif version is not None:
         _LAST_RUNTIME_SETTINGS_VERSION = version
-    return {
+    result = {
         "refreshed": should_refresh,
         "runtime_settings_version": version or _LAST_RUNTIME_SETTINGS_VERSION,
         "redis_error": redis_error,
     }
+    if bridge_sync is not None:
+        result["model_bridge_sync"] = bridge_sync
+    return result
 
 
 def _env_keys(path: Path) -> tuple[set[str], list[str]]:
@@ -755,11 +772,23 @@ def _check_redis() -> bool:
     return False
 
 
-def _check_model_bridge() -> bool | None:
+def _model_bridge_status_with_repair(settings=None) -> dict:
+    settings = settings or get_settings()
+    if not settings.model_bridge_enabled:
+        return {"enabled": False}
+    status = model_bridge_status_payload(settings=settings)
+    if status.get("reachable") and status.get("admin_available") and not status.get("config_matches"):
+        sync_result = sync_model_bridge_runtime_config(settings=settings, raise_on_error=False)
+        status = model_bridge_status_payload(settings=settings)
+        status["last_sync"] = sync_result
+    return status
+
+
+def _check_model_bridge(status: dict | None = None) -> bool | None:
     settings = get_settings()
     if not settings.model_bridge_enabled:
         return None
-    status = model_bridge_status_payload(settings=settings)
+    status = status or _model_bridge_status_with_repair(settings=settings)
     return bool(status.get("reachable") and status.get("admin_available") and status.get("config_matches"))
 
 
@@ -785,11 +814,13 @@ def runtime_check_payload() -> dict:
                 ["对比 .env 和 .env.example，只按需增删键名，不改动密钥值。"],
             )
         )
+    settings = get_settings()
+    bridge_status = _model_bridge_status_with_repair(settings=settings) if settings.model_bridge_enabled else {"enabled": False}
     infrastructure = {
         "postgres": _check_postgres(),
         "qdrant": _check_qdrant(),
         "redis": _check_redis(),
-        "model_bridge": _check_model_bridge(),
+        "model_bridge": _check_model_bridge(bridge_status),
     }
     for key, ok in infrastructure.items():
         if ok is None:
@@ -803,7 +834,6 @@ def runtime_check_payload() -> dict:
                     [".\\start-app.ps1"],
                 )
             )
-    bridge_status = model_bridge_status_payload() if get_settings().model_bridge_enabled else {"enabled": False}
     if bridge_status.get("enabled"):
         for warning in bridge_status.get("warnings") or []:
             warnings.append(

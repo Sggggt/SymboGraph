@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import json
 
-from _context_graph_maintenance import resolve_knowledge_base, session_scope, write_report
+from _context_graph_maintenance import prepare_runtime_for_model_io, resolve_knowledge_base, session_scope, write_report
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,12 +19,14 @@ async def main() -> None:
     from app.services.context_graph import context_graph_stats, rebuild_context_graph
 
     args = parse_args()
+    model_io_runtime = prepare_runtime_for_model_io()
     with session_scope() as db:
         knowledge_base = resolve_knowledge_base(db, knowledge_base_id=args.knowledge_base_id, knowledge_base_name=args.knowledge_base_name)
         payload = {
             "script": "rebuild_mid_concept_graph",
             "knowledge_base_id": knowledge_base.id,
             "knowledge_base_name": knowledge_base.name,
+            "model_io_runtime": model_io_runtime,
             "execute": args.execute,
             "impact": "replace LLM-grounded mid concepts plus dependent coarse/context states" if args.execute else "no writes",
         }

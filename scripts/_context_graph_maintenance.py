@@ -26,6 +26,13 @@ def write_report(name: str, payload: dict[str, Any]) -> Path:
     return path
 
 
+def prepare_runtime_for_model_io() -> dict:
+    from app.services.runtime_settings import refresh_runtime_settings_if_needed, sync_model_bridge_runtime_config
+
+    refresh_runtime_settings_if_needed(force=True)
+    return sync_model_bridge_runtime_config()
+
+
 def session_scope():
     from app.db import SessionLocal
 
@@ -48,6 +55,18 @@ def resolve_knowledge_base(db, *, knowledge_base_id: str | None = None, knowledg
         if knowledge_base is None:
             raise SystemExit(f"Knowledge base not found: {knowledge_base_name}")
         return knowledge_base
+    knowledge_bases = db.scalars(select(KnowledgeBase)).all()
+    def rank_key(item):
+        changed_at = getattr(item[1], "updated_at", None) or getattr(item[1], "created_at", None)
+        return (item[0], changed_at.isoformat() if changed_at else "")
+
+    ranked = sorted(
+        ((active_chunk_count(db, knowledge_base.id), knowledge_base) for knowledge_base in knowledge_bases),
+        key=rank_key,
+        reverse=True,
+    )
+    if ranked and ranked[0][0] > 0:
+        return ranked[0][1]
     try:
         return resolve_default(db, None)
     except LookupError as exc:

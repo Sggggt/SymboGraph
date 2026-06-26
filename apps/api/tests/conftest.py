@@ -128,6 +128,12 @@ def fake_model_stack(monkeypatch: pytest.MonkeyPatch):
             pass
 
         async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
+            if "query facet extractor" in system_prompt:
+                return {
+                    "domain_facets": [{"facet": "Bayesian network", "aliases": ["Bayesian networks"]}],
+                    "procedure_facets": [{"facet": "factorization", "aliases": ["conditional probability factorization"]}],
+                    "answer_shape": "grounded_answer",
+                }
             return fallback or {"label": "Unit concept", "definition": "Unit definition"}
 
         async def answer_question_with_meta(self, question: str, contexts: list[dict], history: list[dict] | None = None, context_quality: str = "normal"):

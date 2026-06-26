@@ -72,6 +72,14 @@ def is_degraded_mode() -> bool:
     return not settings.chat_api_key or not settings.embedding_api_key or not settings.embedding_base_url
 
 
+def _sync_model_bridge_for_model_io(settings) -> None:
+    if not settings.model_bridge_enabled:
+        return
+    from app.services.runtime_settings import sync_model_bridge_runtime_config
+
+    sync_model_bridge_runtime_config(settings=settings)
+
+
 def _exception_message(exc: Exception) -> str:
     return public_exception_message(exc)
 
@@ -199,6 +207,7 @@ class EmbeddingProvider:
                 fallback_reason="missing_embedding_api_key",
             )
         try:
+            _sync_model_bridge_for_model_io(self.settings)
             vectors = await self._openai_compatible_embeddings(texts, text_type=text_type)
             validate_embedding_vectors(vectors, expected_count=len(texts), expected_dimensions=self.settings.embedding_dimensions)
             return EmbeddingCallResult(vectors=vectors, provider="openai_compatible", external_called=True, fallback_reason=None)
@@ -571,6 +580,8 @@ class ChatProvider:
         return await self._post_chat_text(payload)
 
     async def _post_chat_text(self, payload: dict[str, Any]) -> str:
+        if self.purpose == "chat":
+            _sync_model_bridge_for_model_io(self.settings)
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

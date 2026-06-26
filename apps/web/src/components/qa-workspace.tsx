@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { AgentResponse, AgentTraceEventPayload, Citation, ModelSettingsResponse, ModelSettingsUpdate, RetrievalGranularity, SessionSummary } from "@course-kg/shared";
 import { motion } from "framer-motion";
+import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Archive,
@@ -11,6 +12,7 @@ import {
   CircleDot,
   FileText,
   History,
+  Info,
   Layers3,
   Loader2,
   Plus,
@@ -95,15 +97,42 @@ type AgentNumberField = {
 const userCancelledMessage = "已取消当前对话";
 
 const agentSettingsInputClass = "h-11 rounded-xl border-white/10 bg-white/[0.045] px-3 text-white placeholder:text-white/28";
+const agentParameterNameClass = "text-xs font-medium uppercase tracking-[0.16em] text-cyan-100/52";
+
+export const AGENT_PARAMETER_HELP: Record<string, string> = {
+  模型双语查询词面: "开启后，查询词面提取会要求模型为显式概念补充中英文别名；只影响下一次检索路由，不写入事实证据，也不触发图谱重建。",
+  证据包令牌预算: "上下文证据包可容纳的令牌上限。证据包是回答生成的唯一证据输入，预算不足时会优先保留更强支撑。",
+  结果保留数量默认值: "搜索、问答和智能体请求未显式指定结果数量时使用的默认返回上限；它不是裸召回规模。",
+  粗概念总预算: "粗层探索的概念节点上限。该值是层内硬预算，不表示查询相关性评分。",
+  每个粗概念中概念预算: "对每个已接受粗概念分别下钻的中概念候选数量上限，保证逐父节点探索。",
+  中概念保留数量: "中概念候选合并去重后的层间输出上限，不会绕过轨迹、结构恢复或引用验证。",
+  每个中概念片段预算: "对每个已选中概念分别下钻到片段候选的数量上限，用来控制底层候选扩展范围。",
+  片段保留数量: "片段候选合并去重后进入证据包候选的输出上限，不等同于裸向量召回。",
+  候选去重池预算: "跨路径、跨 RQ 成员关系和跨概念合并候选时保留的候选池规模，防止单次检索过载。",
+  每层最大深度: "图遍历在每个层级允许继续扩展的最大深度，用来避免路径无限扩张。",
+  每节点标签上限: "同一节点可保留的路径标签数量上限，用于限制 dominance pruning 中的重复路径状态。",
+  边复用上限: "同一条边在单条路径中允许复用的次数上限，防止环路反复放大。",
+  闭环奖励上限: "单条路径最多可获得的闭环收敛奖励。奖励只辅助短而强的收敛路径，不能替代证据。",
+  闭环奖励距离阈值: "只有总距离足够短的闭环路径才会得到收敛奖励，长而弱的环不会提升路径价值。",
+  路径绿色阈值: "路径距离小于该值时视为高置信路径，通常可继续确定性扩展。",
+  路径灰区阈值: "路径距离落入灰区时可交给智能体评估器做继续、下钻或停止的类型化裁决。",
+  路径硬中断阈值: "路径距离超过该值时执行器直接剪枝，不允许模型绕过硬阈值继续扩展。",
+  结构恢复预算: "命中片段后可追加的前后文、章节和桥接邻居上下文数量上限。",
+  路径摘要预算: "证据包中可保留的图路径摘要数量上限，用于解释证据从粗层到中层再到片段的来源。",
+  规划轮次预算: "智能体可进行规划和评估的最大轮数，用来控制单次任务内的推理成本。",
+  每轮动作上限: "每个规划轮最多允许的类型化动作数量。所有动作仍必须通过验证器和确定性执行器。",
+  修复轮次预算: "引用缺失、桥接不足或结构上下文不足时允许的修复轮次；耗尽后只能返回已验证部分或证据不足说明。",
+  引用验证预算: "回答后可执行的引用验证次数上限，用于把声明绑定回原始片段范围。",
+};
 
 const agentTraversalFields: AgentNumberField[] = [
-  { key: "context_package_token_budget", label: "证据包 token 预算", min: 256, max: 20000 },
-  { key: "retrieval_result_top_k_default", label: "结果 Top K 默认值", min: 1, max: 50 },
+  { key: "context_package_token_budget", label: "证据包令牌预算", min: 256, max: 20000 },
+  { key: "retrieval_result_top_k_default", label: "结果保留数量默认值", min: 1, max: 50 },
   { key: "agent_coarse_total_budget", label: "粗概念总预算", min: 1, max: 200 },
   { key: "agent_mid_per_coarse_budget", label: "每个粗概念中概念预算", min: 1, max: 100 },
-  { key: "agent_mid_top_k", label: "中概念 Top K", min: 1, max: 500 },
+  { key: "agent_mid_top_k", label: "中概念保留数量", min: 1, max: 500 },
   { key: "agent_chunk_per_mid_budget", label: "每个中概念片段预算", min: 1, max: 200 },
-  { key: "agent_chunk_top_k", label: "片段 Top K", min: 1, max: 1000 },
+  { key: "agent_chunk_top_k", label: "片段保留数量", min: 1, max: 1000 },
   { key: "candidate_pool_dedupe_budget", label: "候选去重池预算", min: 1, max: 5000 },
 ];
 
@@ -111,11 +140,11 @@ const agentControlFields: AgentNumberField[] = [
   { key: "agent_max_depth_per_layer", label: "每层最大深度", min: 1, max: 12 },
   { key: "agent_max_labels_per_node", label: "每节点标签上限", min: 1, max: 20 },
   { key: "agent_max_edge_reuse", label: "边复用上限", min: 1, max: 20 },
-  { key: "agent_max_cycle_reward_per_path", label: "Cycle reward 上限", min: 0, max: 2, step: 0.01 },
-  { key: "agent_cycle_reward_distance_threshold", label: "Cycle reward 距离阈值", min: 0, max: 20, step: 0.01 },
-  { key: "agent_path_distance_green_threshold", label: "路径 green 阈值", min: 0, max: 20, step: 0.01 },
-  { key: "agent_path_distance_gray_threshold", label: "路径 gray 阈值", min: 0, max: 20, step: 0.01 },
-  { key: "agent_path_distance_hard_threshold", label: "路径 hard 阈值", min: 0, max: 40, step: 0.01 },
+  { key: "agent_max_cycle_reward_per_path", label: "闭环奖励上限", min: 0, max: 2, step: 0.01 },
+  { key: "agent_cycle_reward_distance_threshold", label: "闭环奖励距离阈值", min: 0, max: 20, step: 0.01 },
+  { key: "agent_path_distance_green_threshold", label: "路径绿色阈值", min: 0, max: 20, step: 0.01 },
+  { key: "agent_path_distance_gray_threshold", label: "路径灰区阈值", min: 0, max: 20, step: 0.01 },
+  { key: "agent_path_distance_hard_threshold", label: "路径硬中断阈值", min: 0, max: 40, step: 0.01 },
   { key: "agent_structure_restore_budget", label: "结构恢复预算", min: 1, max: 200 },
   { key: "context_path_summary_budget", label: "路径摘要预算", min: 1, max: 500 },
   { key: "agent_planning_round_budget", label: "规划轮次预算", min: 1, max: 10 },
@@ -281,6 +310,93 @@ function ChatHeader({
   );
 }
 
+export function AgentParameterName({
+  label,
+  description,
+  className = agentParameterNameClass,
+}: {
+  label: string;
+  description?: string;
+  className?: string;
+}) {
+  const tooltipId = useId();
+  const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const triggerRef = useRef<HTMLSpanElement | null>(null);
+  const [isTooltipVisible, setIsTooltipVisible] = useState(false);
+  const [tooltipPosition, setTooltipPosition] = useState({ left: 0, top: 0 });
+  const helpText = description ?? AGENT_PARAMETER_HELP[label];
+
+  useEffect(() => {
+    return () => {
+      if (hoverTimerRef.current) {
+        clearTimeout(hoverTimerRef.current);
+      }
+    };
+  }, []);
+
+  if (!helpText) {
+    return <span className={className}>{label}</span>;
+  }
+
+  const clearHoverTimer = () => {
+    if (hoverTimerRef.current) {
+      clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+  };
+
+  const openTooltip = () => {
+    const rect = triggerRef.current?.getBoundingClientRect();
+    const viewportWidth = typeof window === "undefined" ? 1024 : window.innerWidth;
+    const tooltipWidth = 288;
+    const gutter = 16;
+    setTooltipPosition({
+      left: Math.max(gutter, Math.min(rect?.left ?? gutter, viewportWidth - tooltipWidth - gutter)),
+      top: (rect?.bottom ?? 0) + 8,
+    });
+    setIsTooltipVisible(true);
+  };
+
+  const handleMouseEnter = () => {
+    clearHoverTimer();
+    hoverTimerRef.current = setTimeout(openTooltip, 1000);
+  };
+
+  const handleMouseLeave = () => {
+    clearHoverTimer();
+    setIsTooltipVisible(false);
+  };
+
+  return (
+    <>
+      <span
+        ref={triggerRef}
+        className={`relative inline-flex w-fit cursor-help items-center gap-1 rounded-sm ${className}`}
+        aria-describedby={isTooltipVisible ? tooltipId : undefined}
+        onMouseEnter={handleMouseEnter}
+        onMouseLeave={handleMouseLeave}
+      >
+        <span>{label}</span>
+        <Info className="size-3.5 text-cyan-100/45" aria-hidden="true" />
+      </span>
+      {isTooltipVisible && typeof document !== "undefined"
+        ? createPortal(
+            <span
+              id={tooltipId}
+              role="tooltip"
+              data-testid="agent-parameter-tooltip"
+              className="pointer-events-none fixed z-[9999] w-72 max-w-[calc(100vw-2rem)] rounded-xl border border-cyan-100/20 bg-[#081322]/95 p-3 text-left text-xs font-normal normal-case leading-5 tracking-normal text-cyan-50/82 opacity-100 shadow-2xl shadow-black/30 backdrop-blur"
+              style={{ left: tooltipPosition.left, top: tooltipPosition.top }}
+            >
+              {helpText}
+            </span>,
+            document.body,
+          )
+        : null}
+    </>
+  );
+}
+
 function AgentSettingsField({
   field,
   value,
@@ -294,7 +410,7 @@ function AgentSettingsField({
 }) {
   return (
     <label className="flex min-w-0 flex-col gap-2">
-      <span className="text-xs font-medium uppercase tracking-[0.16em] text-cyan-100/52">{field.label}</span>
+      <AgentParameterName label={field.label} />
       <Input
         type="number"
         min={field.min}
@@ -335,11 +451,11 @@ function AgentSettingsDialog({
   const disabled = isLoading || isSaving || !form;
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[calc(100vh-2rem)] w-[min(58rem,calc(100vw-2rem))] flex-col overflow-hidden border border-cyan-200/14 bg-[rgba(3,10,22,0.96)] p-0 text-white shadow-[0_30px_90px_rgba(0,0,0,0.48)] backdrop-blur-2xl sm:!max-w-[58rem]">
+      <DialogContent className="flex h-[min(46rem,calc(100dvh-2rem))] max-h-[calc(100dvh-2rem)] w-[min(58rem,calc(100vw-2rem))] flex-col overflow-hidden border border-cyan-200/14 bg-[rgba(3,10,22,0.96)] p-0 text-white shadow-[0_30px_90px_rgba(0,0,0,0.48)] backdrop-blur-2xl sm:!max-w-[58rem]">
         <DialogHeader className="shrink-0 border-b border-cyan-200/10 px-6 py-5 pr-14">
           <DialogTitle className="flex items-center gap-2 text-lg text-white">
             <SlidersHorizontal className="size-5 text-cyan-100/78" />
-            Agent 参数
+            智能体参数
           </DialogTitle>
           <DialogDescription className="text-cyan-50/58">保存后通过运行时热加载影响下一次检索、对话和引用验证。</DialogDescription>
         </DialogHeader>
@@ -350,15 +466,17 @@ function AgentSettingsDialog({
             onSave();
           }}
         >
-          <ScrollArea className="min-h-0 flex-1 px-6 py-5">
+          <ScrollArea className="min-h-0 flex-1 px-6 py-5 pr-4">
             {isLoading ? <LoadingBlock rows={3} /> : null}
             {error ? <ErrorBlock message={error.message} /> : null}
             {form ? (
               <div className="grid gap-6">
                 <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/8 pb-5">
                   <div className="min-w-[14rem] flex-1">
-                    <p className="text-sm font-semibold text-white">LLM 双语查询面</p>
-                    <p className="mt-1 text-sm leading-6 text-white/55">要求查询面提取为显式概念补充中英双语 aliases。</p>
+                    <p className="text-sm font-semibold text-white">
+                      <AgentParameterName label="模型双语查询词面" className="text-sm font-semibold normal-case tracking-normal text-white" />
+                    </p>
+                    <p className="mt-1 text-sm leading-6 text-white/55">要求查询词面提取为显式概念补充中英文别名。</p>
                   </div>
                   <button
                     type="button"
@@ -449,8 +567,8 @@ function ChatActionRail({
         type="button"
         onClick={onOpenAgentSettings}
         className="group grid size-11 place-items-center rounded-full border border-cyan-200/18 bg-[rgba(7,13,31,0.9)] text-cyan-100/72 shadow-[0_16px_44px_rgba(0,0,0,0.28),0_0_28px_rgba(86,217,255,0.08)] backdrop-blur-2xl transition hover:border-cyan-200/36 hover:bg-cyan-300/[0.09] hover:text-white"
-        title="Agent 参数"
-        aria-label="Agent 参数"
+        title="智能体参数"
+        aria-label="智能体参数"
       >
         <Settings className="size-4 transition group-hover:rotate-45" />
       </button>

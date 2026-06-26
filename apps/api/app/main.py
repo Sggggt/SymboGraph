@@ -8,14 +8,16 @@ from app.api import router
 from app.db import ensure_schema
 from app.core.config import get_settings
 from app.services.ingestion import finalize_interrupted_batches
-from app.services.runtime_settings import refresh_runtime_settings_if_needed
+from app.services.runtime_settings import refresh_runtime_settings_if_needed, sync_model_bridge_runtime_config
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    refresh_runtime_settings_if_needed(force=True)
     settings = get_settings()
     if settings.app_env.lower() == "production" and not settings.api_key_list:
         raise RuntimeError("API_KEYS must be configured when APP_ENV=production")
+    sync_model_bridge_runtime_config(settings=settings)
     ensure_schema()
     finalize_interrupted_batches()
     yield

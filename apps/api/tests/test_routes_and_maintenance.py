@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 import types
+from types import SimpleNamespace
 
 import pytest
 
@@ -99,7 +100,8 @@ async def test_search_route_commits_retrieval_trace(db_session, populated_contex
     assert payload["retrieval_granularity"] == "mid"
     assert payload["model_audit"]["retrieval_granularity"] == "mid"
     assert db_session.get(RetrievalTrace, trace_id) is not None
-    assert db_session.get(RetrievalTrace, trace_id).diagnostics_json["retrieval_granularity"] == "mid"
+    trace = db_session.get(RetrievalTrace, trace_id)
+    assert trace.diagnostics_json["retrieval_granularity"] == "mid"
     assert db_session.scalar(select(func.count(GraphRetrievalStep.id)).where(GraphRetrievalStep.retrieval_trace_id == trace_id)) >= 4
 
 
@@ -201,7 +203,7 @@ def test_runtime_check_payload_matches_response_schema(monkeypatch):
     monkeypatch.setattr(runtime_settings, "_check_postgres", lambda: True)
     monkeypatch.setattr(runtime_settings, "_check_qdrant", lambda: True)
     monkeypatch.setattr(runtime_settings, "_check_redis", lambda: True)
-    monkeypatch.setattr(runtime_settings, "_check_model_bridge", lambda: None)
+    monkeypatch.setattr(runtime_settings, "_check_model_bridge", lambda status=None: None)
 
     payload = runtime_settings.runtime_check_payload()
     validated = RuntimeCheckResponse.model_validate(payload)
@@ -209,6 +211,29 @@ def test_runtime_check_payload_matches_response_schema(monkeypatch):
     assert validated.env_sync["synced"] is True
     assert validated.infrastructure["postgres"] is True
     assert validated.blocking_issues == []
+
+
+@pytest.mark.asyncio
+async def test_api_lifespan_syncs_model_bridge_runtime_config(monkeypatch):
+    from app import main
+
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(main, "refresh_runtime_settings_if_needed", lambda force=False: calls.append(("refresh", force)))
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: SimpleNamespace(app_env="development", api_key_list=[], model_bridge_enabled=True),
+    )
+    monkeypatch.setattr(main, "sync_model_bridge_runtime_config", lambda settings=None: calls.append(("bridge", settings)))
+    monkeypatch.setattr(main, "ensure_schema", lambda: calls.append(("schema", None)))
+    monkeypatch.setattr(main, "finalize_interrupted_batches", lambda: calls.append(("finalize", None)))
+
+    async with main.lifespan(main.app):
+        pass
+
+    assert calls[0] == ("refresh", True)
+    assert calls[1][0] == "bridge"
+    assert [name for name, _ in calls[-2:]] == ["schema", "finalize"]
 
 
 def test_runtime_env_sync_treats_legacy_runtime_keys_as_deprecated(monkeypatch, tmp_path):
@@ -409,6 +434,90 @@ def test_update_model_settings_reloads_model_bridge(monkeypatch, tmp_path):
     assert result["concept_i18n_enabled"] is True
     assert result["query_facet_bilingual_enabled"] is True
     assert result["model_bridge_status"]["last_reload"]["ok"] is True
+
+
+def test_runtime_refresh_syncs_model_bridge_after_version_change(monkeypatch):
+    from app.core.config import get_settings
+    from app.services import runtime_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("MODEL_BRIDGE_ENABLED", "true")
+    monkeypatch.setenv("MODEL_BRIDGE_PORT", "8765")
+    monkeypatch.setattr(runtime_settings, "_LAST_RUNTIME_SETTINGS_VERSION", "old-version")
+    monkeypatch.setattr(runtime_settings, "_redis_client", lambda: SimpleNamespace(get=lambda key: "new-version"))
+    sync_calls: list[dict] = []
+
+    def fake_sync_model_bridge_runtime_config(settings=None, env_entries=None, raise_on_error=True):
+        sync_calls.append({"enabled": settings.model_bridge_enabled, "raise_on_error": raise_on_error})
+        return {"attempted": True, "ok": True, "config_version": "bridge-version"}
+
+    monkeypatch.setattr(runtime_settings, "sync_model_bridge_runtime_config", fake_sync_model_bridge_runtime_config)
+
+    result = runtime_settings.refresh_runtime_settings_if_needed()
+
+    assert result["refreshed"] is True
+    assert result["runtime_settings_version"] == "new-version"
+    assert result["model_bridge_sync"]["ok"] is True
+    assert sync_calls == [{"enabled": True, "raise_on_error": True}]
+
+
+def test_runtime_refresh_fails_fast_when_model_bridge_sync_fails(monkeypatch):
+    from app.core.config import get_settings
+    from app.services import runtime_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("MODEL_BRIDGE_ENABLED", "true")
+    monkeypatch.setenv("MODEL_BRIDGE_PORT", "8765")
+    monkeypatch.setattr(runtime_settings, "_LAST_RUNTIME_SETTINGS_VERSION", "old-version")
+    monkeypatch.setattr(runtime_settings, "_redis_client", lambda: SimpleNamespace(get=lambda key: "new-version"))
+
+    def fake_sync_model_bridge_runtime_config(settings=None, env_entries=None, raise_on_error=True):
+        raise RuntimeError("bridge sync failed")
+
+    monkeypatch.setattr(runtime_settings, "sync_model_bridge_runtime_config", fake_sync_model_bridge_runtime_config)
+
+    with pytest.raises(RuntimeError, match="bridge sync failed"):
+        runtime_settings.refresh_runtime_settings_if_needed()
+
+
+def test_runtime_check_repairs_model_bridge_config_mismatch(monkeypatch):
+    from app.core.config import get_settings
+    from app.services import runtime_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("MODEL_BRIDGE_ENABLED", "true")
+    monkeypatch.setenv("MODEL_BRIDGE_PORT", "8765")
+    monkeypatch.setattr(
+        runtime_settings,
+        "env_sync_status",
+        lambda: {"synced": True, "missing_keys": [], "extra_keys": [], "deprecated_keys": [], "bom_keys": []},
+    )
+    monkeypatch.setattr(runtime_settings, "_check_postgres", lambda: True)
+    monkeypatch.setattr(runtime_settings, "_check_qdrant", lambda: True)
+    monkeypatch.setattr(runtime_settings, "_check_redis", lambda: True)
+    statuses = [
+        {"enabled": True, "reachable": True, "admin_available": True, "config_matches": False, "warnings": ["mismatch"]},
+        {"enabled": True, "reachable": True, "admin_available": True, "config_matches": True, "warnings": []},
+    ]
+    sync_calls: list[bool] = []
+
+    def fake_model_bridge_status_payload(settings=None, env_entries=None):
+        return statuses.pop(0) if statuses else {"enabled": True, "reachable": True, "admin_available": True, "config_matches": True, "warnings": []}
+
+    def fake_sync_model_bridge_runtime_config(settings=None, env_entries=None, raise_on_error=True):
+        sync_calls.append(raise_on_error)
+        return {"attempted": True, "ok": True, "config_version": "bridge-version"}
+
+    monkeypatch.setattr(runtime_settings, "model_bridge_status_payload", fake_model_bridge_status_payload)
+    monkeypatch.setattr(runtime_settings, "sync_model_bridge_runtime_config", fake_sync_model_bridge_runtime_config)
+
+    payload = runtime_settings.runtime_check_payload()
+
+    assert payload["infrastructure"]["model_bridge"] is True
+    assert payload["model_bridge_status"]["config_matches"] is True
+    assert payload["model_bridge_status"]["last_sync"]["ok"] is True
+    assert sync_calls == [False]
+    assert payload["warnings"] == []
 
 
 def test_update_model_settings_writes_isolated_chat_and_graph_keys(monkeypatch, tmp_path):

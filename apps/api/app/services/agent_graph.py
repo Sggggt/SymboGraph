@@ -361,6 +361,8 @@ async def propose_query_facets(question: str, history: list[dict] | None, query_
             raise
         raw = fallback_marker
     if not isinstance(raw, dict) or raw.get("_fallback_query_facets"):
+        if not get_settings().enable_model_fallback:
+            raise FallbackDisabledError("Query facet LLM sampling is unavailable because ENABLE_MODEL_FALLBACK is false")
         facets = query_facets_for_search(question, None, query_intent)
     else:
         facets = query_facets_for_search(question, raw, query_intent)

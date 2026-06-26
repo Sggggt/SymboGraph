@@ -96,6 +96,22 @@ async def test_propose_query_facets_can_request_bilingual_aliases(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_propose_query_facets_rejects_fallback_marker_when_fallback_disabled(monkeypatch):
+    from app.services import agent_graph
+    from app.services.embeddings import FallbackDisabledError
+
+    class FallbackFacetChatProvider:
+        async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
+            return fallback or {"_fallback_query_facets": True}
+
+    monkeypatch.setattr(agent_graph, "ChatProvider", FallbackFacetChatProvider)
+    monkeypatch.setattr(agent_graph, "get_settings", lambda: SimpleNamespace(query_facet_bilingual_enabled=False, enable_model_fallback=False))
+
+    with pytest.raises(FallbackDisabledError):
+        await agent_graph.propose_query_facets("What is modularity?", [], {"intent": "definition"})
+
+
+@pytest.mark.asyncio
 async def test_citation_verification_normalizes_label_confidence(monkeypatch):
     from app.services import agent_graph
 
@@ -483,6 +499,12 @@ async def test_retrieval_granularity_agent_citation_guard_rewrites_when_repair_h
             pass
 
         async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
+            if "query facet extractor" in system_prompt:
+                return {
+                    "domain_facets": [{"facet": "Bayesian network", "aliases": ["Bayesian networks"]}],
+                    "procedure_facets": [{"facet": "factorization", "aliases": ["conditional probability factorization"]}],
+                    "answer_shape": "grounded_answer",
+                }
             return fallback or {"typed_actions": []}
 
         async def answer_question_with_meta(self, question: str, contexts: list[dict], history: list[dict] | None = None, context_quality: str = "normal"):
@@ -560,6 +582,12 @@ async def test_run_agent_uses_bound_profile_prompt_pack(monkeypatch, db_session,
 
     class CapturingChatProvider:
         async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
+            if "query facet extractor" in system_prompt:
+                return {
+                    "domain_facets": [{"facet": "Bayesian network", "aliases": ["Bayesian networks"]}],
+                    "procedure_facets": [{"facet": "factorization", "aliases": ["conditional probability factorization"]}],
+                    "answer_shape": "grounded_answer",
+                }
             return fallback or {"verifications": []}
 
         async def answer_question_with_meta(self, question: str, contexts: list[dict], history: list[dict] | None = None, context_quality: str = "normal"):

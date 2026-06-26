@@ -88,3 +88,67 @@ async def test_chat_provider_keeps_chat_and_graph_endpoints_isolated(monkeypatch
     assert calls[1]["url"] == "https://graph.example.test/v1/chat/completions"
     assert calls[1]["payload"]["model"] == "graph-model"
     assert calls[1]["headers"]["Authorization"] == "Bearer graph-key"
+
+
+@pytest.mark.asyncio
+async def test_embedding_provider_syncs_model_bridge_before_external_request(monkeypatch, no_fallback_env):
+    from app.core.config import get_settings, model_bridge_client_base_url
+    from app.services import embeddings, runtime_settings
+    from app.services.embeddings import EmbeddingProvider
+
+    monkeypatch.setenv("MODEL_BRIDGE_ENABLED", "true")
+    monkeypatch.setenv("MODEL_BRIDGE_PORT", "8765")
+    get_settings.cache_clear()
+    sync_calls: list[str] = []
+    captured: dict = {}
+
+    def fake_sync_model_bridge_runtime_config(settings=None, env_entries=None, raise_on_error=True):
+        sync_calls.append(settings.embedding_base_url)
+        return {"attempted": True, "ok": True, "config_version": "bridge-version"}
+
+    async def fake_post(url: str, payload: dict, headers: dict, timeout: float, resolve_ip: str | None = None) -> dict:
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["resolve_ip"] = resolve_ip
+        return {"data": [{"embedding": [0.1] * 8}]}
+
+    monkeypatch.setattr(runtime_settings, "sync_model_bridge_runtime_config", fake_sync_model_bridge_runtime_config)
+    monkeypatch.setattr(embeddings, "post_openai_compatible_json", fake_post)
+
+    result = await EmbeddingProvider().embed_texts_with_meta(["query"], text_type="query")
+
+    assert result.external_called is True
+    assert sync_calls == [model_bridge_client_base_url(8765)]
+    assert captured["url"] == f"{model_bridge_client_base_url(8765)}/embeddings"
+    assert captured["resolve_ip"] == "__none__"
+
+
+@pytest.mark.asyncio
+async def test_chat_provider_syncs_model_bridge_for_chat_only(monkeypatch, no_fallback_env):
+    from app.core.config import get_settings, model_bridge_client_base_url
+    from app.services import embeddings, runtime_settings
+    from app.services.embeddings import ChatProvider
+
+    monkeypatch.setenv("MODEL_BRIDGE_ENABLED", "true")
+    monkeypatch.setenv("MODEL_BRIDGE_PORT", "8765")
+    get_settings.cache_clear()
+    sync_calls: list[str] = []
+    calls: list[str] = []
+
+    def fake_sync_model_bridge_runtime_config(settings=None, env_entries=None, raise_on_error=True):
+        sync_calls.append(settings.chat_base_url)
+        return {"attempted": True, "ok": True, "config_version": "bridge-version"}
+
+    async def fake_post(url: str, payload: dict, headers: dict, timeout: float, resolve_ip: str | None = None) -> dict:
+        calls.append(url)
+        return {"choices": [{"message": {"content": "{\"ok\": true}"}}]}
+
+    monkeypatch.setattr(runtime_settings, "sync_model_bridge_runtime_config", fake_sync_model_bridge_runtime_config)
+    monkeypatch.setattr(embeddings, "post_openai_compatible_json", fake_post)
+
+    await ChatProvider().classify_json("system", "user")
+    await ChatProvider(purpose="graph").classify_json("system", "user")
+
+    assert sync_calls == [model_bridge_client_base_url(8765)]
+    assert calls[0] == f"{model_bridge_client_base_url(8765)}/chat/completions"
+    assert calls[1] == "https://graph.invalid/v1/chat/completions"
