@@ -2360,6 +2360,8 @@ Query understanding 分成两步：先判断 intent，再生成 query facet pack
 
 `query_facet_bilingual_enabled` 是热加载 Runtime Settings，环境键为 `QUERY_FACET_BILINGUAL_ENABLED`，默认关闭。开启后，query facet extractor 必须要求 LLM 为用户显式提出的 domain/procedure facets 生成标准中英双语 aliases/search terms，用于跨语言语料的入口节点选择和 required facet 匹配；关闭时只保留显式或标准技术同义词。该开关不新增检索层、不创建事实证据、不写 graph concept metadata、不触发 graph rebuild，也不得让 query facet packet 绕过 executor、top-k、path threshold、structure restoration、context package 或 citation verification。开关状态必须进入 query facet diagnostics、runtime settings hash、retrieval trace 与相关 cache key。
 
+query facet extractor 的 system prompt 属于资料库绑定 Profile 的 `prompt_pack.query_facet_extractor_system`，默认 Profile 保存当前内置提示词。双语/单语 alias 追加约束分别由 `query_facet_bilingual_suffix` 和 `query_facet_alias_suffix` 提供。Profile 可以按资料库调整提示词表达和领域适配，但 validator 必须继续强制 JSON schema、拒绝 document id/chunk id/node id/citation/fact/path decision，并把 active `profile_hash` 纳入 prompt protocol hash、trace diagnostics 与 cache key。
+
 目标 packet：
 
 ```text
@@ -2412,9 +2414,9 @@ packet 不得绕过 executor、top-k、path threshold、structure restoration、
 
 **架构影响：**
 - 影响对象：QA/Agent query understanding、layered retrieval、retrieval trace、context package diagnostics、cache key、前端轨迹展示和 repair retrieval。
-- 影响方式：LLM 从“直接决定检索结果”降级为“提出可校验 facet packet”；executor 负责去噪、别名匹配、priority queue key 和 trace 持久化。context package 仍只打包 raw chunk span 与结构/路径恢复结果。
-- 传播字段：`query_facets_json`、`query_facet_protocol_hash`、`query_facets_hash`、`covered_facets`、`why_selected_json`、`diagnostics_json`、`cache_key_components`。
-- 触发条件：LLM facet schema、validator、stopword/drop term policy、facet alias expansion、conversation scope 或 query intent 变化时，retrieval trace 与 cache key 必须刷新。
+- 影响方式：LLM 从“直接决定检索结果”降级为“提出可校验 facet packet”；executor 负责去噪、别名匹配、priority queue key 和 trace 持久化。Profile 提供资料库级 system prompt 默认值和覆盖值，但不能改变 executor 边界。context package 仍只打包 raw chunk span 与结构/路径恢复结果。
+- 传播字段：`query_facets_json`、`query_facet_protocol_hash`、`query_facets_hash`、`prompt_protocol_hash`、`profile_hash`、`covered_facets`、`why_selected_json`、`diagnostics_json`、`cache_key_components`。
+- 触发条件：LLM facet schema、Profile prompt、validator、stopword/drop term policy、facet alias expansion、conversation scope 或 query intent 变化时，retrieval trace 与 cache key 必须刷新。
 - 验收观察点：填充词不进入 required facets，标准中英别名能命中 covered facets，trace 可显示 facet 来源与 drop terms，同一 answer session 的 repair retrieval 不产生新的 facet drift，citation verification 仍只引用 context package 中的 raw spans。
 
 ### Entry selection
@@ -3288,21 +3290,28 @@ $$
 
 ### Profile
 
-目标 profile 只影响交互层：
+目标 profile 是资料库级 prompt registry 与交互偏好配置：
 
 $$
 profile
 \to
-(prompt,ui,conversation\ preference)
+(system\ prompts,ui,conversation\ preference)
 $$
 
-且：
+默认 Profile 必须保存当前实现中所有可注册 system prompt 的默认文本，包括 answer generation、JSON response fallback、query rewrite、question perception、query facet extractor、Agent planner、citation entailment judge、mid/coarse concept definition、concept i18n、concept edge i18n 和 profile assistant。自定义 Profile 可以按资料库覆盖这些 prompt，以适配不同资料类型、术语风格和生产效果。
 
-$$
-\frac{\partial G_l}{\partial profile}=0,\quad l\in\{0,1,2,3\}
-$$
+Profile 不保存 chunking、embedding、dynamic dense KNN、bridge quota、TPE graph operating point、model endpoint、fallback、database、vector-store、cache TTL、worker concurrency 或 budget 参数；这些仍属于 Runtime Settings。Profile 也不能替代 typed action validator、context package、citation verification、support span 校验、graph grounded gate 或 destructive operation guard。
 
-context package 保存 profile hash，answer prompt 可读取 active profile JSON。Profile 不参与 graph construction 参数。
+Profile prompt 对链路的影响按生命周期区分：
+
+```text
+answer/query rewrite/question perception/query facet/planner/citation judge prompt -> hot_reloadable
+mid concept/coarse concept/concept i18n/concept edge i18n prompt -> rebuild_required
+```
+
+hot_reloadable prompt 更新后影响下一次 search/QA/repair retrieval/answer/verification，不触发 chunk、embedding、Qdrant 或 relation graph rebuild，但必须让相关 prompt protocol hash、profile hash、retrieval trace、context package diagnostics 和 cache key 刷新。rebuild_required prompt 更新后只能影响下一次 mid/coarse concept graph rebuild 或 shadow rebuild；active concept graph 不得被静默改写。
+
+context package 保存 active `profile_hash`，answer prompt、query facet extractor、planner/evaluator、citation verifier 和 graph concept generator 读取 active profile JSON。凡读取 Profile system prompt 的组件，必须把 `profile_hash` 或由 Profile 派生的 `prompt_protocol_hash` 写入 trace、state 或 diagnostics。
 
 ### Policy
 
@@ -3338,10 +3347,10 @@ Policy state 不替代 planner，只提供 traversal priors、constraints、safe
 
 **架构影响：**
 - 影响对象：chunking、embedding、graph build、graph traversal、Agent envelope、verification/repair budget、cache、prompt protocol 和 UI interaction。
-- 影响方式：runtime settings 改变工程运行点；profile 只改变交互层；policy 改变动作先验、safe arms、staged traversal budget 先验和路径灰区阈值建议，但不替代 planner。
+- 影响方式：runtime settings 改变工程运行点；profile 改变资料库级 system prompts、UI 文案和 conversation preference；policy 改变动作先验、safe arms、staged traversal budget 先验和路径灰区阈值建议，但不替代 planner。
 - 传播字段：`runtime_settings_hash`、`agent_operating_envelope_hash`、`policy_state_hash`、`prompt_protocol_hash`、`profile_hash`、Redis runtime version message。
-- 触发条件：hot reloadable 参数触发 cache/singleton 刷新；rebuild required 参数只在 graph build 阶段通过 automatic TPE simulation 或版本化默认 theta 进入 active relation graph 一次性写入；profile 变化只刷新 prompt/UI/conversation cache。
-- 验收观察点：runtime version publish、Redis broadcast、settings cache clear、profile 不触发 graph rebuild、policy reward history 与 safe arms 可审计。
+- 触发条件：hot reloadable 参数触发 cache/singleton 刷新；rebuild required 参数只在 graph build 阶段通过 automatic TPE simulation 或版本化默认 theta 进入 active relation graph 一次性写入；Profile hot prompt 变化刷新 prompt/UI/conversation cache 与检索/QA cache；Profile concept prompt 变化标记 concept graph rebuild/shadow rebuild 需求。
+- 验收观察点：runtime version publish、Redis broadcast、settings cache clear、Profile prompt key 可见且可覆盖、hot prompt 改动不触发 graph rebuild、concept prompt 改动不会静默改写 active graph、policy reward history 与 safe arms 可审计。
 
 ## Freshness、缓存与热加载
 
@@ -4126,7 +4135,7 @@ $$
 14. Citation verification 必须回到 raw source span。
 15. Repair loop 由 verification failure 和 repair budget 触发。
 16. Conversation state 记录对话和任务状态，不替代证据。
-17. Runtime settings 管工程参数，Profile 管交互偏好。
+17. Runtime settings 管工程参数，Profile 管资料库级 system prompts、UI 文案和对话偏好；Profile prompt 只能通过 schema、validator、trace、hash 和 lifecycle 约束生效。
 18. Policy 提供 staged traversal budget 先验、safe arms、动作先验和灰区阈值，不替代 planner。
 19. PostgreSQL 是事实源，Qdrant 与 Redis 是 active 派生或运行态；legacy BM25 artifacts 不属于 active path。
 20. 每次检索、回答、验证和 reward 都必须能由 trace、hash 与 id 链路审计。

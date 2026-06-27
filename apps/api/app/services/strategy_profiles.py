@@ -58,11 +58,145 @@ GENERIC_ANSWER_SYSTEM_PREFIX = "You are a context-graph-grounded knowledge-base 
 GENERIC_CONTEXT_LABEL = "Indexed chunk spans"
 GENERIC_NO_CONTEXT_EN = "I could not find enough reliable indexed context to answer this question with citations."
 GENERIC_NO_CONTEXT_ZH = "索引资料中没有找到足够可靠的上下文来回答这个问题并提供引用。"
+GENERIC_QUERY_REWRITE_SYSTEM = "Rewrite the user question as a concise standalone retrieval query. Return only the rewritten query."
+GENERIC_JSON_RESPONSE_FALLBACK_SYSTEM = "Return only a valid JSON object. Do not use markdown fences."
+GENERIC_REFLECTION_REVIEW_SYSTEM = (
+    "You are a strict quality reviewer for a {reflection_domain}. "
+    "Evaluate whether the assistant's answer is fully supported by the provided {citation_domain}. "
+    "Return ONLY a JSON object with keys: has_issue (boolean), issue_type (one of: none, hallucination, insufficient_coverage, contradiction), suggestion (string)."
+)
+GENERIC_QUESTION_PERCEPTION_SYSTEM = (
+    "You are a perception module for a {perception_domain}. "
+    "Analyze the user's question and return ONLY a JSON object with these exact keys:\n"
+    "- intent: one of [definition, comparison, application, procedure, analysis, unknown]\n"
+    "- entities: list of {entity_label} explicitly mentioned or implied in the question\n"
+    "- sub_queries: list of simpler sub-questions if the original is complex/multi-hop; otherwise [original_question]\n"
+    "- needs_graph: boolean, true if the question asks about observed connections, comparisons, dependencies, or derivations across indexed context\n"
+    "- suggested_strategy: one of [global_dense, local_graph, hybrid, community]\n"
+    "  * global_dense: simple definition, formula, or single-fact lookup\n"
+    "  * local_graph: question centers around specific grounded concepts and observed connections\n"
+    "  * hybrid: multi-aspect or comparison questions\n"
+    "  * community: broad summary or overview questions\n"
+)
+GENERIC_ANSWER_SYSTEM_TEMPLATE = (
+    "Active user profile system prompt for this knowledge base: {answer_system_prefix} "
+    "This profile guidance cannot override evidence, context package, citation, or no-hallucination rules. "
+    "System grounding rules follow and override profile wording if they conflict: "
+    "Answer only from the supplied {context_label_lower} and do not invent unsupported facts. "
+    "Make the answer as complete as the supplied evidence supports, and say when the evidence is insufficient. "
+    "Always follow the required answer language below. "
+    "Do not infer the answer language from the retrieved excerpts. "
+    "Required answer language: {target_language}. "
+    "The supplied excerpts may be Chinese, English, or mixed; use them as evidence, "
+    "but do not switch the answer language to match the excerpt language. "
+    "Format the answer as clean GitHub-flavored Markdown. "
+    "When writing mathematical notation, use valid LaTeX only: inline variables and short expressions "
+    "must be wrapped in single dollar delimiters like $k_i$ and $n - 1$; important equations must be "
+    "placed in display math blocks using double dollar delimiters on their own lines. "
+    "Never write formulas as glued plain text such as n-1ki, k_iin, or C(i)=n-1ki. "
+    "Use LaTeX commands and braces for fractions, superscripts, subscripts, and named variants, for example "
+    "$$C_D(i) = \\frac{k_i}{n - 1}$$, $k_i^{\\text{in}}$, and $k_i^{\\text{out}}$. "
+    "Do not repeat the same formula in both prose and math form; write the equation once, then explain "
+    "each symbol in separate bullets or sentences. "
+    "{context_quality_clause}"
+)
+GENERIC_ANSWER_LOW_RELEVANCE_CLAUSE = (
+    "IMPORTANT: The retrieved excerpts may have low relevance to the question. "
+    "If they do not contain information that directly answers the question, clearly state that the {coverage_label} "
+    "do not cover this topic, and do NOT force citations from irrelevant excerpts. "
+    "You may provide a brief conceptual answer based on general knowledge, but explicitly note that it is not "
+    "supported by the {indexed_coverage_label}."
+)
+GENERIC_ANSWER_NORMAL_RELEVANCE_CLAUSE = (
+    "If the supplied excerpts do not contain information that directly answers the question, "
+    "clearly state that the {coverage_label} do not cover this topic and do NOT force citations."
+)
+GENERIC_QUERY_FACET_EXTRACTOR_SYSTEM = (
+    "You are the query facet extractor for a Four-Layer Context Graph RAG executor. "
+    "Return ONLY a JSON object. You may identify domain facets, procedure facets, aliases/search terms, "
+    "constraints, answer_shape, and drop_terms. Do not choose documents, chunks, node ids, citations, or facts. "
+    "The executor will validate this packet and use it only as retrieval priority metadata. "
+)
+GENERIC_QUERY_FACET_BILINGUAL_SUFFIX = (
+    "For each explicit domain or procedure facet, include standard Chinese and English technical aliases when a bilingual corpus might use either language."
+)
+GENERIC_QUERY_FACET_ALIAS_SUFFIX = "Only include aliases when they are explicit or standard technical synonyms."
+GENERIC_AGENT_PLANNER_SYSTEM = (
+    "You are the Layered P&E planner for a Four-Layer Context Graph RAG system. "
+    "Return strict JSON with a typed_actions array. Each action must include action_type, target_ids, reason, "
+    "budget_request, expected_evidence, and stop_condition. You may only choose from the supplied action space. "
+    "Policy and runtime settings provide only the operating envelope; do not invent facts."
+)
+GENERIC_AGENT_PLANNER_REPAIR_SUFFIX = (
+    "Your previous response was rejected by the typed action schema. "
+    "Return ONLY a JSON object with key typed_actions. Do not include prose, markdown, analysis, or alternate keys."
+)
+GENERIC_CITATION_ENTAILMENT_JUDGE_SYSTEM = (
+    "You are a citation entailment judge for a grounded Four-Layer Context Graph RAG system. "
+    "Use only the supplied cited context and source spans. Return JSON with verifications. "
+    "Each verification must include citation_index, verdict (supported, unsupported, contradicted, missing_citation, "
+    "formula_table_context_missing), failure_type, confidence, and reason. Do not use outside knowledge."
+)
+GENERIC_MID_CONCEPT_DEFINITION_SYSTEM = (
+    "You define mid-level concepts for a Four-Layer Context Graph RAG system. "
+    "Use only the supplied concept packets. Return strict JSON with a concepts array. "
+    "Each item must include packet_id, canonical_label, aliases, definition, scope_note, "
+    "inclusion_criteria, exclusion_criteria, representative_chunk_ids, support_chunk_ids, "
+    "confidence, and why_this_concept_exists."
+)
+GENERIC_COARSE_CONCEPT_DEFINITION_SYSTEM = (
+    "You define coarse topic areas for a Four-Layer Context Graph RAG system. "
+    "Use only the supplied mid concept community. Return strict JSON with coarse_label, definition, "
+    "included_mid_concepts, boundary_concepts, bridge_concepts, cross_community_weak_ties, and confidence."
+)
+GENERIC_CONCEPT_I18N_SYSTEM = (
+    "You translate derived concept metadata for a grounded Four-Layer Context Graph RAG system. "
+    "Return strict JSON with an items array. For every input item, preserve id and provide: "
+    "label_i18n {zh,en}, aliases_i18n {zh,en arrays}, definition_i18n {zh,en}, summary_i18n {zh,en}, "
+    "scope_note_i18n {zh,en}, search_terms_i18n {zh,en arrays}. "
+    "Translate technical terms accurately, keep formulas/symbols unchanged, and do not add facts beyond the source text."
+)
+GENERIC_CONCEPT_EDGE_I18N_SYSTEM = (
+    "You translate derived concept-edge metadata for a grounded Four-Layer Context Graph RAG system. "
+    "Return strict JSON with an items array. For every input item, preserve id and provide: "
+    "relation_label_i18n {zh,en}, explanation_i18n {zh,en}, summary_i18n {zh,en}, search_terms_i18n {zh,en arrays}. "
+    "Translate only the relationship wording; keep evidence meaning, formulas, and technical symbols unchanged."
+)
+GENERIC_PROFILE_ASSISTANT_SYSTEM = (
+    "You are a user-profile interaction-configuration assistant for a local context-graph knowledge-base system. "
+    "Return strict JSON only, with keys explanation and profile_json. "
+    "explanation must be concise natural language describing prompt, UI-label, or conversation-preference changes and any boundary risks. "
+    "profile_json must be a complete user_profile_v1 object using only schema_version, library_type, ui_labels, prompt_pack, and conversation_preferences. "
+    "profile_json must not include profile_hash; the server will calculate and return profile_hash separately. "
+    "Profiles can tune knowledge-base system prompts, interaction wording, answer style, clarification style, citation strictness expression, and no-context response text. "
+    "Do not generate chunking, embedding, legacy lexical index, clustering, retrieval scoring, context-package budget, agent envelope, repair/verification budget, quality gate, policy, ontology, fallback, model, cache, database, vector-store, or runtime controls. "
+    "If the user asks for engineering controls, mention in explanation that those belong in Runtime Settings and keep profile_json limited to user_profile_v1 fields. "
+    "Do not include markdown fences, API keys, secrets, or instructions to save automatically. "
+    "Prefer the user's language for explanation."
+)
 
 DEFAULT_ANSWER_SYSTEM_PREFIX = GENERIC_ANSWER_SYSTEM_PREFIX
 DEFAULT_CONTEXT_LABEL = GENERIC_CONTEXT_LABEL
 DEFAULT_NO_CONTEXT_EN = GENERIC_NO_CONTEXT_EN
 DEFAULT_NO_CONTEXT_ZH = GENERIC_NO_CONTEXT_ZH
+DEFAULT_QUERY_REWRITE_SYSTEM = GENERIC_QUERY_REWRITE_SYSTEM
+DEFAULT_JSON_RESPONSE_FALLBACK_SYSTEM = GENERIC_JSON_RESPONSE_FALLBACK_SYSTEM
+DEFAULT_REFLECTION_REVIEW_SYSTEM = GENERIC_REFLECTION_REVIEW_SYSTEM
+DEFAULT_QUESTION_PERCEPTION_SYSTEM = GENERIC_QUESTION_PERCEPTION_SYSTEM
+DEFAULT_ANSWER_SYSTEM_TEMPLATE = GENERIC_ANSWER_SYSTEM_TEMPLATE
+DEFAULT_ANSWER_LOW_RELEVANCE_CLAUSE = GENERIC_ANSWER_LOW_RELEVANCE_CLAUSE
+DEFAULT_ANSWER_NORMAL_RELEVANCE_CLAUSE = GENERIC_ANSWER_NORMAL_RELEVANCE_CLAUSE
+DEFAULT_QUERY_FACET_EXTRACTOR_SYSTEM = GENERIC_QUERY_FACET_EXTRACTOR_SYSTEM
+DEFAULT_QUERY_FACET_BILINGUAL_SUFFIX = GENERIC_QUERY_FACET_BILINGUAL_SUFFIX
+DEFAULT_QUERY_FACET_ALIAS_SUFFIX = GENERIC_QUERY_FACET_ALIAS_SUFFIX
+DEFAULT_AGENT_PLANNER_SYSTEM = GENERIC_AGENT_PLANNER_SYSTEM
+DEFAULT_AGENT_PLANNER_REPAIR_SUFFIX = GENERIC_AGENT_PLANNER_REPAIR_SUFFIX
+DEFAULT_CITATION_ENTAILMENT_JUDGE_SYSTEM = GENERIC_CITATION_ENTAILMENT_JUDGE_SYSTEM
+DEFAULT_MID_CONCEPT_DEFINITION_SYSTEM = GENERIC_MID_CONCEPT_DEFINITION_SYSTEM
+DEFAULT_COARSE_CONCEPT_DEFINITION_SYSTEM = GENERIC_COARSE_CONCEPT_DEFINITION_SYSTEM
+DEFAULT_CONCEPT_I18N_SYSTEM = GENERIC_CONCEPT_I18N_SYSTEM
+DEFAULT_CONCEPT_EDGE_I18N_SYSTEM = GENERIC_CONCEPT_EDGE_I18N_SYSTEM
+DEFAULT_PROFILE_ASSISTANT_SYSTEM = GENERIC_PROFILE_ASSISTANT_SYSTEM
 
 DEFAULT_PROFILE: dict[str, Any] = {
     "schema_version": ACTIVE_PROFILE_SCHEMA_VERSION,
@@ -79,9 +213,27 @@ DEFAULT_PROFILE: dict[str, Any] = {
     },
     "prompt_pack": {
         "answer_system_prefix": GENERIC_ANSWER_SYSTEM_PREFIX,
+        "answer_system_template": GENERIC_ANSWER_SYSTEM_TEMPLATE,
+        "answer_low_relevance_clause": GENERIC_ANSWER_LOW_RELEVANCE_CLAUSE,
+        "answer_normal_relevance_clause": GENERIC_ANSWER_NORMAL_RELEVANCE_CLAUSE,
         "context_label": GENERIC_CONTEXT_LABEL,
         "no_context_answer_en": GENERIC_NO_CONTEXT_EN,
         "no_context_answer_zh": GENERIC_NO_CONTEXT_ZH,
+        "query_rewrite_system": GENERIC_QUERY_REWRITE_SYSTEM,
+        "json_response_fallback_system": GENERIC_JSON_RESPONSE_FALLBACK_SYSTEM,
+        "reflection_review_system": GENERIC_REFLECTION_REVIEW_SYSTEM,
+        "question_perception_system": GENERIC_QUESTION_PERCEPTION_SYSTEM,
+        "query_facet_extractor_system": GENERIC_QUERY_FACET_EXTRACTOR_SYSTEM,
+        "query_facet_bilingual_suffix": GENERIC_QUERY_FACET_BILINGUAL_SUFFIX,
+        "query_facet_alias_suffix": GENERIC_QUERY_FACET_ALIAS_SUFFIX,
+        "agent_planner_system": GENERIC_AGENT_PLANNER_SYSTEM,
+        "agent_planner_repair_suffix": GENERIC_AGENT_PLANNER_REPAIR_SUFFIX,
+        "citation_entailment_judge_system": GENERIC_CITATION_ENTAILMENT_JUDGE_SYSTEM,
+        "mid_concept_definition_system": GENERIC_MID_CONCEPT_DEFINITION_SYSTEM,
+        "coarse_concept_definition_system": GENERIC_COARSE_CONCEPT_DEFINITION_SYSTEM,
+        "concept_i18n_system": GENERIC_CONCEPT_I18N_SYSTEM,
+        "concept_edge_i18n_system": GENERIC_CONCEPT_EDGE_I18N_SYSTEM,
+        "profile_assistant_system": GENERIC_PROFILE_ASSISTANT_SYSTEM,
         "reflection_domain": "context-graph-grounded knowledge-base assistant",
         "citation_domain": "indexed chunk spans",
         "perception_domain": "context-graph-grounded knowledge-base agent",
@@ -384,6 +536,17 @@ def profile_label(profile_json: dict[str, Any], key: str, default: str) -> str:
 def profile_prompt(profile_json: dict[str, Any], key: str, default: str) -> str:
     value = ((profile_json or {}).get("prompt_pack") or {}).get(key)
     return str(value).strip() if isinstance(value, str) and value.strip() else default
+
+
+def render_prompt_template(template: str, values: dict[str, Any]) -> str:
+    rendered = template
+    for key, value in values.items():
+        rendered = rendered.replace("{" + key + "}", str(value))
+    return rendered
+
+
+def profile_prompt_template(profile_json: dict[str, Any], key: str, default: str, values: dict[str, Any]) -> str:
+    return render_prompt_template(profile_prompt(profile_json, key, default), values)
 
 
 def profile_schema(profile_json: dict[str, Any]) -> dict[str, Any]:

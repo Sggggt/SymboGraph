@@ -66,6 +66,18 @@ from app.services.embeddings import ChatProvider, EmbeddingProvider, FallbackDis
 from app.services.error_sanitizer import public_exception_message
 from app.services.model_output import coerce_confidence
 from app.services.parsers import ParsedSection
+from app.services.strategy_profiles import (
+    DEFAULT_COARSE_CONCEPT_DEFINITION_SYSTEM,
+    DEFAULT_CONCEPT_EDGE_I18N_SYSTEM,
+    DEFAULT_CONCEPT_I18N_SYSTEM,
+    DEFAULT_MID_CONCEPT_DEFINITION_SYSTEM,
+    active_profile_hash,
+    active_profile_json,
+    get_active_profile_record,
+    profile_prompt,
+    profile_hash as strategy_profile_hash,
+    use_strategy_profile,
+)
 from app.services.vector_store import VectorStore
 
 
@@ -327,8 +339,10 @@ def context_graph_cache_key_components(
     result_top_k: int | None = None,
     conversation_state_scope_hash: str | None = None,
     query_facets: dict[str, Any] | None = None,
+    profile_hash_value: str | None = None,
 ) -> dict[str, Any]:
     filter_payload = filters.model_dump() if isinstance(filters, SearchFilters) else dict(filters or {})
+    active_prompt_profile_hash = profile_hash_value or strategy_profile_hash(active_profile_json())
     return {
         "knowledge_base_id": knowledge_base_id,
         "query": query,
@@ -349,7 +363,8 @@ def context_graph_cache_key_components(
         "policy_state_hash": context_state.policy_state_hash if context_state else None,
         "agent_operating_envelope_hash": agent_operating_envelope_state_hash(),
         "conversation_state_scope_hash": conversation_state_scope_hash or stable_hash({"conversation_state": "none"}),
-        "prompt_protocol_hash": context_state.prompt_protocol_hash if context_state else None,
+        "prompt_protocol_hash": stable_hash([context_state.prompt_protocol_hash if context_state else None, active_prompt_profile_hash]),
+        "profile_hash": active_prompt_profile_hash,
         "retrieval_mode": retrieval_mode,
         "retrieval_granularity": retrieval_granularity,
         "result_top_k": result_top_k,
@@ -367,6 +382,7 @@ def context_graph_cache_key(
     result_top_k: int | None = None,
     conversation_state_scope_hash: str | None = None,
     query_facets: dict[str, Any] | None = None,
+    profile_hash_value: str | None = None,
 ) -> str:
     return stable_hash(
         context_graph_cache_key_components(
@@ -379,6 +395,7 @@ def context_graph_cache_key(
             result_top_k=result_top_k,
             conversation_state_scope_hash=conversation_state_scope_hash,
             query_facets=query_facets,
+            profile_hash_value=profile_hash_value,
         )
     )
 
@@ -1070,18 +1087,20 @@ async def rebuild_context_graph(
     )
     if emit_heartbeats:
         context_graph_batch_heartbeat(batch_id, "mid_concepts", dict(relation_state.stats_json or {}))
-    mid_state = await build_mid_concept_graph(db, knowledge_base_id, relation_state, batch_id=heartbeat_batch_id, state_scope=state_scope, shadow_metadata=shadow_metadata)
-    if emit_heartbeats:
-        context_graph_batch_heartbeat(
-            batch_id,
-            "coarse_concepts",
-            {
-                "mid_concepts": (mid_state.stats_json or {}).get("mid_concept_count"),
-                "projected_rq_l3_prefixes": (mid_state.stats_json or {}).get("projected_rq_l3_prefixes"),
-                "mid_edge_count": (mid_state.stats_json or {}).get("mid_edge_count"),
-            },
-        )
-    coarse_state = await build_coarse_concept_graph(db, knowledge_base_id, mid_state, batch_id=heartbeat_batch_id, state_scope=state_scope, shadow_metadata=shadow_metadata)
+    profile = get_active_profile_record(db, knowledge_base_id)
+    with use_strategy_profile(profile.profile_json):
+        mid_state = await build_mid_concept_graph(db, knowledge_base_id, relation_state, batch_id=heartbeat_batch_id, state_scope=state_scope, shadow_metadata=shadow_metadata)
+        if emit_heartbeats:
+            context_graph_batch_heartbeat(
+                batch_id,
+                "coarse_concepts",
+                {
+                    "mid_concepts": (mid_state.stats_json or {}).get("mid_concept_count"),
+                    "projected_rq_l3_prefixes": (mid_state.stats_json or {}).get("projected_rq_l3_prefixes"),
+                    "mid_edge_count": (mid_state.stats_json or {}).get("mid_edge_count"),
+                },
+            )
+        coarse_state = await build_coarse_concept_graph(db, knowledge_base_id, mid_state, batch_id=heartbeat_batch_id, state_scope=state_scope, shadow_metadata=shadow_metadata)
     if emit_heartbeats:
         context_graph_batch_heartbeat(batch_id, "context_state", dict(coarse_state.diagnostics_json or {}))
     context_state = write_context_graph_state(db, knowledge_base_id, relation_state, mid_state, coarse_state, chunks, state_scope=state_scope, shadow_metadata=shadow_metadata)
@@ -2162,10 +2181,11 @@ async def build_mid_concept_graph(
         raise RuntimeError(f"Mid concept graph requires active RQ L3 prefixes; available RQ levels: {available_levels}.")
     target_leaf_level = RQ_LEVELS
     grounding_hash = stable_hash([cluster.id for cluster in clusters] + [relation_state.state_hash])
+    profile_hash = active_profile_hash(db, knowledge_base_id)
     state = MidConceptState(
         knowledge_base_id=knowledge_base_id,
         chunk_relation_graph_state_id=relation_state.id,
-        state_hash=stable_hash({"grounding": grounding_hash, "prompt": MID_CONCEPT_PROMPT_VERSION}),
+        state_hash=stable_hash({"grounding": grounding_hash, "prompt": MID_CONCEPT_PROMPT_VERSION, "profile_hash": profile_hash}),
         grounding_hash=grounding_hash,
         prompt_protocol_version=MID_CONCEPT_PROMPT_VERSION,
         stats_json={},
@@ -2285,10 +2305,11 @@ async def build_mid_concept_graph(
         "target_leaf_level": target_leaf_level,
         "l3_available": bool(clusters) or not all_prefixes,
         "edge_projection_protocol": EDGE_PROJECTION_PROTOCOL_VERSION,
+        "profile_hash": profile_hash,
         "concept_i18n": concept_i18n_stats,
         "edge_i18n": edge_i18n_stats,
     }
-    state.state_hash = stable_hash({"concepts": [concept.id for concept in concepts], "stats": stats, "diagnostics": state.diagnostics_json})
+    state.state_hash = stable_hash({"concepts": [concept.id for concept in concepts], "stats": stats, "diagnostics": state.diagnostics_json, "profile_hash": profile_hash})
     return state
 
 
@@ -2451,12 +2472,10 @@ async def define_mid_concepts_batch(packets: list[dict[str, Any]]) -> list[dict[
     fallback_concepts = [mid_concept_fallback(packet) for packet in packets]
     if not packets:
         return []
-    system = (
-        "You define mid-level concepts for a Four-Layer Context Graph RAG system. "
-        "Use only the supplied concept packets. Return strict JSON with a concepts array. "
-        "Each item must include packet_id, canonical_label, aliases, definition, scope_note, "
-        "inclusion_criteria, exclusion_criteria, representative_chunk_ids, support_chunk_ids, "
-        "confidence, and why_this_concept_exists."
+    system = profile_prompt(
+        active_profile_json(),
+        "mid_concept_definition_system",
+        DEFAULT_MID_CONCEPT_DEFINITION_SYSTEM,
     )
     output = await ChatProvider(purpose="graph").classify_json(system_prompt=system, user_prompt=str({"concept_packets": packets}), fallback={"concepts": fallback_concepts})
     raw_concepts = output.get("concepts") if isinstance(output, dict) else None
@@ -2681,10 +2700,11 @@ async def build_coarse_concept_graph(
         if child.parent_rq_prefix_id:
             child_l3_prefix_ids_by_l2[child.parent_rq_prefix_id].append(child.id)
     grounding_hash = stable_hash([prefix.id for prefix in l2_prefixes] + [concept.id for concept in mid_concepts] + [mid_state.state_hash])
+    profile_hash = active_profile_hash(db, knowledge_base_id)
     state = CoarseConceptState(
         knowledge_base_id=knowledge_base_id,
         mid_concept_state_id=mid_state.id,
-        state_hash=stable_hash({"grounding": grounding_hash, "prompt": COARSE_CONCEPT_PROMPT_VERSION}),
+        state_hash=stable_hash({"grounding": grounding_hash, "prompt": COARSE_CONCEPT_PROMPT_VERSION, "profile_hash": profile_hash}),
         grounding_hash=grounding_hash,
         prompt_protocol_version=COARSE_CONCEPT_PROMPT_VERSION,
         stats_json={},
@@ -3029,10 +3049,11 @@ async def build_coarse_concept_graph(
         "projected_rq_l2_prefix_ids": [prefix.id for prefix, _community in communities],
         **community_diagnostics,
         "bridge_density": round(stats["bridge_concept_count"] / max(stats["mid_concept_count"], 1), 6),
+        "profile_hash": profile_hash,
         "concept_i18n": concept_i18n_stats,
         "edge_i18n": edge_i18n_stats,
     }
-    state.state_hash = stable_hash({"coarse": [concept.id for concept in coarse_concepts], "stats": stats, "diagnostics": state.diagnostics_json})
+    state.state_hash = stable_hash({"coarse": [concept.id for concept in coarse_concepts], "stats": stats, "diagnostics": state.diagnostics_json, "profile_hash": profile_hash})
     return state
 
 
@@ -3177,10 +3198,10 @@ async def define_coarse_concept(packet: dict[str, Any]) -> dict[str, Any]:
         "cross_community_weak_ties": [],
         "confidence": 0.72,
     }
-    system = (
-        "You define coarse topic areas for a Four-Layer Context Graph RAG system. "
-        "Use only the supplied mid concept community. Return strict JSON with coarse_label, definition, "
-        "included_mid_concepts, boundary_concepts, bridge_concepts, cross_community_weak_ties, and confidence."
+    system = profile_prompt(
+        active_profile_json(),
+        "coarse_concept_definition_system",
+        DEFAULT_COARSE_CONCEPT_DEFINITION_SYSTEM,
     )
     try:
         output = await ChatProvider(purpose="graph").classify_json(system_prompt=system, user_prompt=str(packet), fallback=fallback)
@@ -3239,6 +3260,7 @@ def write_context_graph_state(
             "shadow_metadata": shadow_metadata or {},
         }
     )
+    profile_hash = active_profile_hash(db, knowledge_base_id)
     state = ContextGraphState(
         knowledge_base_id=knowledge_base_id,
         chunk_relation_graph_state_id=relation_state.id,
@@ -3253,7 +3275,7 @@ def write_context_graph_state(
         context_graph_hash=context_hash,
         runtime_settings_hash=runtime_settings_state_hash(),
         agent_operating_envelope_hash=agent_operating_envelope_state_hash(),
-        prompt_protocol_hash=stable_hash([MID_CONCEPT_PROMPT_VERSION, COARSE_CONCEPT_PROMPT_VERSION, ANSWER_PROMPT_PROTOCOL_VERSION]),
+        prompt_protocol_hash=stable_hash([MID_CONCEPT_PROMPT_VERSION, COARSE_CONCEPT_PROMPT_VERSION, ANSWER_PROMPT_PROTOCOL_VERSION, profile_hash]),
         stats_json={
             "chunks": len(chunks),
             "relation_edges": db.scalar(select(func.count(ChunkRelationEdge.id)).where(ChunkRelationEdge.graph_state_id == relation_state.id)) or 0,
@@ -3307,6 +3329,8 @@ async def layered_search(
     query_facets = query_facets_for_search(query, query_facets)
     result_top_k = resolve_result_top_k(top_k)
     if not chunks:
+        active_prompt_profile_hash = active_profile_hash(db, knowledge_base_id)
+        prompt_protocol_hash = stable_hash(["no_context_graph_state", active_prompt_profile_hash])
         trace = RetrievalTrace(
             knowledge_base_id=knowledge_base_id,
             query=query,
@@ -3318,8 +3342,10 @@ async def layered_search(
                 "reason": "no_active_chunks",
                 "result_top_k": result_top_k,
                 "retrieval_granularity": retrieval_granularity,
-                "cache_key_components": {"retrieval_granularity": retrieval_granularity},
+                "active_profile_hash": active_prompt_profile_hash,
+                "cache_key_components": {"retrieval_granularity": retrieval_granularity, "profile_hash": active_prompt_profile_hash},
             },
+            prompt_protocol_hash=prompt_protocol_hash,
             edge_distance_protocol_hash=edge_distance_protocol_hash(),
             edge_projection_protocol_hash=edge_projection_protocol_hash(),
             traversal_protocol_hash=traversal_protocol_hash(),
@@ -3872,12 +3898,10 @@ async def enrich_concepts_i18n(concepts: list[Any], *, layer: str, batch_size: i
             for concept in batch
         ]
         fallback = {"items": [_concept_i18n_fallback(concept, layer) for concept in batch]}
-        system = (
-            "You translate derived concept metadata for a grounded Four-Layer Context Graph RAG system. "
-            "Return strict JSON with an items array. For every input item, preserve id and provide: "
-            "label_i18n {zh,en}, aliases_i18n {zh,en arrays}, definition_i18n {zh,en}, summary_i18n {zh,en}, "
-            "scope_note_i18n {zh,en}, search_terms_i18n {zh,en arrays}. "
-            "Translate technical terms accurately, keep formulas/symbols unchanged, and do not add facts beyond the source text."
+        system = profile_prompt(
+            active_profile_json(),
+            "concept_i18n_system",
+            DEFAULT_CONCEPT_I18N_SYSTEM,
         )
         output = await ChatProvider(purpose="graph").classify_json(system_prompt=system, user_prompt=str({"layer": layer, "items": items}), fallback=fallback)
         output_items = output.get("items") if isinstance(output, dict) else None
@@ -3943,11 +3967,10 @@ async def enrich_concept_edges_i18n(edges: list[Any], concepts_by_id: dict[str, 
             )
             fallbacks.append(_edge_i18n_fallback(edge, source_label, target_label, layer))
         fallback = {"items": fallbacks}
-        system = (
-            "You translate derived concept-edge metadata for a grounded Four-Layer Context Graph RAG system. "
-            "Return strict JSON with an items array. For every input item, preserve id and provide: "
-            "relation_label_i18n {zh,en}, explanation_i18n {zh,en}, summary_i18n {zh,en}, search_terms_i18n {zh,en arrays}. "
-            "Translate only the relationship wording; keep evidence meaning, formulas, and technical symbols unchanged."
+        system = profile_prompt(
+            active_profile_json(),
+            "concept_edge_i18n_system",
+            DEFAULT_CONCEPT_EDGE_I18N_SYSTEM,
         )
         output = await ChatProvider(purpose="graph").classify_json(system_prompt=system, user_prompt=str({"layer": layer, "items": items}), fallback=fallback)
         output_items = output.get("items") if isinstance(output, dict) else None
@@ -5091,6 +5114,8 @@ def write_retrieval_trace(
         {"layer": "chunk", "ids": [item["chunk_id"] for item in results]},
     ]
     conversation_hash = stable_hash({"conversation_state": "none"})
+    active_prompt_profile_hash = active_profile_hash(db, knowledge_base_id)
+    prompt_protocol_hash = stable_hash([context_state.prompt_protocol_hash if context_state else None, active_prompt_profile_hash])
     cache_components = context_graph_cache_key_components(
         knowledge_base_id=knowledge_base_id,
         query=query,
@@ -5101,6 +5126,7 @@ def write_retrieval_trace(
         result_top_k=result_top_k,
         conversation_state_scope_hash=conversation_hash,
         query_facets=traversal.get("query_facets") or {},
+        profile_hash_value=active_prompt_profile_hash,
     )
     cache_key = stable_hash(cache_components)
     trace = RetrievalTrace(
@@ -5116,7 +5142,7 @@ def write_retrieval_trace(
         coarse_concept_hash=context_state.coarse_concept_hash if context_state else None,
         runtime_settings_hash=runtime_settings_state_hash(),
         agent_operating_envelope_hash=agent_operating_envelope_state_hash(),
-        prompt_protocol_hash=context_state.prompt_protocol_hash if context_state else None,
+        prompt_protocol_hash=prompt_protocol_hash,
         result_chunk_ids_json=[item["chunk_id"] for item in results],
         concept_path_json=concept_path,
         scores_json={},
@@ -5137,6 +5163,7 @@ def write_retrieval_trace(
             "retrieval_granularity": retrieval_granularity,
             "cache_key": cache_key,
             "cache_key_components": cache_components,
+            "active_profile_hash": active_prompt_profile_hash,
             "coarse_skipped_reason": (traversal.get("retrieval_granularity_audit") or {}).get("coarse_skipped_reason"),
             "mid_direct_entry_audit": {
                 "entry_mode": (traversal.get("retrieval_granularity_audit") or {}).get("mid_entry_mode"),
@@ -5307,8 +5334,6 @@ def build_context_package(
     results: list[dict[str, Any]],
     token_budget: int | None = None,
 ) -> ContextPackage:
-    from app.services.strategy_profiles import active_profile_hash
-
     token_budget = token_budget or int(get_settings().context_package_token_budget or 2400)
     profile_hash = active_profile_hash(db, knowledge_base_id)
     hit_ids = [item["chunk_id"] for item in results]

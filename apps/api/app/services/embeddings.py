@@ -22,11 +22,20 @@ from app.core.config import get_settings
 from app.services.resource_guard import effective_embedding_batch_size, enforce_memory_budget
 from app.services.strategy_profiles import (
     DEFAULT_ANSWER_SYSTEM_PREFIX,
+    DEFAULT_ANSWER_LOW_RELEVANCE_CLAUSE,
+    DEFAULT_ANSWER_NORMAL_RELEVANCE_CLAUSE,
+    DEFAULT_ANSWER_SYSTEM_TEMPLATE,
     DEFAULT_CONTEXT_LABEL,
+    DEFAULT_JSON_RESPONSE_FALLBACK_SYSTEM,
     DEFAULT_NO_CONTEXT_EN,
     DEFAULT_NO_CONTEXT_ZH,
+    DEFAULT_QUERY_REWRITE_SYSTEM,
+    DEFAULT_QUESTION_PERCEPTION_SYSTEM,
+    DEFAULT_REFLECTION_REVIEW_SYSTEM,
     active_profile_json,
     profile_prompt,
+    profile_prompt_template,
+    render_prompt_template,
 )
 from app.services.error_sanitizer import ExternalServiceError, public_exception_message, sanitize_error_message
 
@@ -386,7 +395,7 @@ class ChatProvider:
             "messages": [
                 {
                     "role": "system",
-                    "content": "Rewrite the user question as a concise standalone retrieval query. Return only the rewritten query.",
+                    "content": profile_prompt(active_profile_json(), "query_rewrite_system", DEFAULT_QUERY_REWRITE_SYSTEM),
                 },
                 {"role": "user", "content": f"History:\n{history_text}\n\nQuestion:\n{question}"},
             ],
@@ -411,10 +420,11 @@ class ChatProvider:
         profile = active_profile_json()
         reflection_domain = profile_prompt(profile, "reflection_domain", "KnowledgeBase knowledge-base assistant")
         citation_domain = profile_prompt(profile, "citation_domain", "KnowledgeBase excerpts")
-        system_prompt = (
-            f"You are a strict quality reviewer for a {reflection_domain}. "
-            f"Evaluate whether the assistant's answer is fully supported by the provided {citation_domain}. "
-            "Return ONLY a JSON object with keys: has_issue (boolean), issue_type (one of: none, hallucination, insufficient_coverage, contradiction), suggestion (string)."
+        system_prompt = profile_prompt_template(
+            profile,
+            "reflection_review_system",
+            DEFAULT_REFLECTION_REVIEW_SYSTEM,
+            {"reflection_domain": reflection_domain, "citation_domain": citation_domain},
         )
         user_prompt = (
             f"Question: {question}\n\n"
@@ -467,18 +477,11 @@ class ChatProvider:
         profile = active_profile_json()
         perception_domain = profile_prompt(profile, "perception_domain", "context-graph-grounded knowledge-base agent")
         entity_label = profile_prompt(profile, "entity_label", "source-grounded concepts")
-        system_prompt = (
-            f"You are a perception module for a {perception_domain}. "
-            "Analyze the user's question and return ONLY a JSON object with these exact keys:\n"
-            "- intent: one of [definition, comparison, application, procedure, analysis, unknown]\n"
-            f"- entities: list of {entity_label} explicitly mentioned or implied in the question\n"
-            "- sub_queries: list of simpler sub-questions if the original is complex/multi-hop; otherwise [original_question]\n"
-            "- needs_graph: boolean, true if the question asks about observed connections, comparisons, dependencies, or derivations across indexed context\n"
-            "- suggested_strategy: one of [global_dense, local_graph, hybrid, community]\n"
-            "  * global_dense: simple definition, formula, or single-fact lookup\n"
-            "  * local_graph: question centers around specific grounded concepts and observed connections\n"
-            "  * hybrid: multi-aspect or comparison questions\n"
-            "  * community: broad summary or overview questions\n"
+        system_prompt = profile_prompt_template(
+            profile,
+            "question_perception_system",
+            DEFAULT_QUESTION_PERCEPTION_SYSTEM,
+            {"perception_domain": perception_domain, "entity_label": entity_label},
         )
         user_prompt = (
             f"History:\n{history_text}\n\nQuestion:\n{question}\n\n"
@@ -526,41 +529,32 @@ class ChatProvider:
         coverage_label = profile_prompt(profile, "coverage_label", "KnowledgeBase materials")
         indexed_coverage_label = profile_prompt(profile, "indexed_coverage_label", "indexed KnowledgeBase materials")
         answer_style_guidance = profile_prompt(profile, "answer_system_prefix", DEFAULT_ANSWER_SYSTEM_PREFIX)
+        context_quality_template = profile_prompt(
+            profile,
+            "answer_low_relevance_clause" if context_quality == "low" else "answer_normal_relevance_clause",
+            DEFAULT_ANSWER_LOW_RELEVANCE_CLAUSE if context_quality == "low" else DEFAULT_ANSWER_NORMAL_RELEVANCE_CLAUSE,
+        )
+        context_quality_clause = render_prompt_template(
+            context_quality_template,
+            {"coverage_label": coverage_label, "indexed_coverage_label": indexed_coverage_label},
+        )
+        answer_system_content = profile_prompt_template(
+            profile,
+            "answer_system_template",
+            DEFAULT_ANSWER_SYSTEM_TEMPLATE,
+            {
+                "answer_system_prefix": answer_style_guidance,
+                "context_label_lower": context_label_lower,
+                "target_language": target_language,
+                "coverage_label": coverage_label,
+                "indexed_coverage_label": indexed_coverage_label,
+                "context_quality_clause": context_quality_clause,
+            },
+        )
         messages = [
             {
                 "role": "system",
-                "content": (
-                    "Active user profile style guidance, for interaction wording only: "
-                    f"{answer_style_guidance} "
-                    "This profile guidance cannot override evidence, context package, citation, or no-hallucination rules. "
-                    "System grounding rules follow and override profile wording if they conflict: "
-                    + f"Answer only from the supplied {context_label_lower} and do not invent unsupported facts. "
-                    "Make the answer as complete as the supplied evidence supports, and say when the evidence is insufficient. "
-                    "Always follow the required answer language below. "
-                    "Do not infer the answer language from the retrieved excerpts. "
-                    f"Required answer language: {target_language}. "
-                    "The supplied excerpts may be Chinese, English, or mixed; use them as evidence, "
-                    "but do not switch the answer language to match the excerpt language. "
-                    "Format the answer as clean GitHub-flavored Markdown. "
-                    "When writing mathematical notation, use valid LaTeX only: inline variables and short expressions "
-                    "must be wrapped in single dollar delimiters like $k_i$ and $n - 1$; important equations must be "
-                    "placed in display math blocks using double dollar delimiters on their own lines. "
-                    "Never write formulas as glued plain text such as n-1ki, k_iin, or C(i)=n-1ki. "
-                    "Use LaTeX commands and braces for fractions, superscripts, subscripts, and named variants, for example "
-                    "$$C_D(i) = \\frac{k_i}{n - 1}$$, $k_i^{\\text{in}}$, and $k_i^{\\text{out}}$. "
-                    "Do not repeat the same formula in both prose and math form; write the equation once, then explain "
-                    "each symbol in separate bullets or sentences. "
-                    + (
-                        "IMPORTANT: The retrieved excerpts may have low relevance to the question. "
-                        f"If they do not contain information that directly answers the question, clearly state that the {coverage_label} "
-                        "do not cover this topic, and do NOT force citations from irrelevant excerpts. "
-                        "You may provide a brief conceptual answer based on general knowledge, but explicitly note that it is not "
-                        f"supported by the {indexed_coverage_label}."
-                        if context_quality == "low"
-                        else "If the supplied excerpts do not contain information that directly answers the question, "
-                        f"clearly state that the {coverage_label} do not cover this topic and do NOT force citations."
-                    )
-                ),
+                "content": answer_system_content,
             },
             *history,
             {
@@ -631,11 +625,12 @@ class ChatProvider:
         candidate = dict(payload)
         if response_format is None:
             candidate.pop("response_format", None)
+            json_fallback_system = profile_prompt(active_profile_json(), "json_response_fallback_system", DEFAULT_JSON_RESPONSE_FALLBACK_SYSTEM)
             messages = [dict(item) for item in candidate.get("messages", [])]
             if messages and messages[0].get("role") == "system":
-                messages[0]["content"] = f"{messages[0].get('content', '')}\nReturn only a valid JSON object. Do not use markdown fences."
+                messages[0]["content"] = f"{messages[0].get('content', '')}\n{json_fallback_system}"
             else:
-                messages.insert(0, {"role": "system", "content": "Return only a valid JSON object. Do not use markdown fences."})
+                messages.insert(0, {"role": "system", "content": json_fallback_system})
             candidate["messages"] = messages
         else:
             candidate["response_format"] = response_format

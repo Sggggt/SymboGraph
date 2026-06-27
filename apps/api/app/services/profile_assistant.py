@@ -9,7 +9,7 @@ from typing import Any
 
 from app.services.cache_manager import get_cache_manager
 from app.services.embeddings import ChatProvider
-from app.services.strategy_profiles import default_profile_payload, profile_hash, validate_profile_payload
+from app.services.strategy_profiles import DEFAULT_PROFILE_ASSISTANT_SYSTEM, default_profile_payload, profile_hash, profile_prompt, validate_profile_payload
 
 
 PROFILE_ASSISTANT_CACHE_NAMESPACE = "profile_assistant"
@@ -55,19 +55,8 @@ def _stringify_profile(profile: dict[str, Any]) -> str:
     return json.dumps(profile, ensure_ascii=False, sort_keys=True)
 
 
-def _assistant_system_prompt() -> str:
-    return (
-        "You are a user-profile interaction-configuration assistant for a local context-graph knowledge-base system. "
-        "Return strict JSON only, with keys explanation and profile_json. "
-        "explanation must be concise natural language describing prompt, UI-label, or conversation-preference changes and any boundary risks. "
-        "profile_json must be a complete user_profile_v1 object using only schema_version, library_type, ui_labels, prompt_pack, and conversation_preferences. "
-        "profile_json must not include profile_hash; the server will calculate and return profile_hash separately. "
-        "Profiles only affect interaction wording, answer style, clarification style, citation strictness expression, and no-context response text. "
-        "Do not generate chunking, embedding, legacy lexical index, graph build, clustering, retrieval scoring, context-package budget, agent envelope, repair/verification budget, quality gate, policy, ontology, fallback, model, cache, database, vector-store, or runtime controls. "
-        "If the user asks for engineering controls, mention in explanation that those belong in Runtime Settings and keep profile_json limited to user_profile_v1 interaction fields. "
-        "Do not include markdown fences, API keys, secrets, or instructions to save automatically. "
-        "Prefer the user's language for explanation."
-    )
+def _assistant_system_prompt(base_profile: dict[str, Any] | None = None) -> str:
+    return profile_prompt(base_profile or default_profile_payload(), "profile_assistant_system", DEFAULT_PROFILE_ASSISTANT_SYSTEM)
 
 
 async def generate_profile_assistant_response(prompt: str, base_profile: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -83,7 +72,7 @@ async def generate_profile_assistant_response(prompt: str, base_profile: dict[st
         "explanation": "已基于当前 Profile 生成草案。请检查提示词、界面标签和对话偏好后再保存。",
         "profile_json": base,
     }
-    result = await ChatProvider().classify_json(_assistant_system_prompt(), user_prompt, fallback=fallback)
+    result = await ChatProvider().classify_json(_assistant_system_prompt(base), user_prompt, fallback=fallback)
     profile_candidate = result.get("profile_json") if isinstance(result, dict) else None
     if not isinstance(profile_candidate, dict):
         profile_candidate = base

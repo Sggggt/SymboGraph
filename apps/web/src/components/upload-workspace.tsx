@@ -861,7 +861,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
 
   return (
     <div className="kg-page">
-      <section className="glass-panel relative grid min-h-[calc(100dvh-8rem)] overflow-hidden rounded-[34px] xl:h-[calc(100dvh-8rem)] xl:min-h-0 xl:grid-cols-[minmax(280px,0.82fr)_minmax(420px,1.32fr)_minmax(320px,0.92fr)]">
+      <section className="glass-panel relative grid min-h-[calc(100dvh-6rem)] overflow-hidden rounded-[34px] xl:h-[calc(100dvh-6rem)] xl:min-h-0 xl:auto-rows-[minmax(0,1fr)] xl:grid-cols-[minmax(280px,0.82fr)_minmax(420px,1.32fr)_minmax(320px,0.92fr)]">
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_18%_0%,rgba(86,217,255,0.12),transparent_32%),radial-gradient(circle_at_88%_20%,rgba(34,197,94,0.08),transparent_28%),linear-gradient(180deg,rgba(255,255,255,0.035),transparent_34%)]" />
         <div className="relative border-b border-white/8 p-6 xl:border-b-0 xl:border-r xl:p-7">
         <div className="grid gap-6">
@@ -1026,33 +1026,9 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
                 </div>
               </div>
             ) : null}
-            {uploadedFiles.length > 0 ? (
-              <div className="max-w-2xl border-l border-cyan-200/20 bg-cyan-300/[0.035] py-3 pl-4 pr-2">
-                <div className="flex items-center justify-between gap-3">
-                  <p className="text-xs uppercase tracking-[0.24em] text-white/45">已上传，待解析</p>
-                  <button type="button" className="text-xs uppercase tracking-[0.2em] text-white/48 hover:text-white" onClick={() => {
-                    setConfirmDialog({
-                      title: "确认清空已上传文件",
-                      message: "即将清空待解析文件列表，已上传的文件不会从服务器删除。",
-                      onConfirm: () => setUploadedFiles([]),
-                      confirmText: "确认清空",
-                    });
-                  }}>
-                    清空
-                  </button>
-                </div>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {uploadedFiles.map((file) => (
-                    <span key={file.path} className="max-w-full truncate rounded-full border border-white/10 px-3 py-1 text-sm text-cyan-50/72">
-                      {file.name}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            ) : null}
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
+          <div className="grid gap-4 sm:grid-cols-2 xl:-mt-3 xl:grid-cols-1">
             {[
               {
                 label: "最新批次",

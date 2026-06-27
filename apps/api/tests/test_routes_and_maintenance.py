@@ -714,11 +714,12 @@ def test_profile_validation_ignores_legacy_strategy_fields():
 
 def test_profile_assistant_prompt_stays_within_profile_boundary():
     from app.services.profile_assistant import _assistant_system_prompt
+    from app.services.strategy_profiles import default_profile_payload
 
     prompt = _assistant_system_prompt()
 
     assert "user-profile interaction-configuration assistant" in prompt
-    assert "Profiles only affect interaction wording" in prompt
+    assert "Profiles can tune knowledge-base system prompts" in prompt
     assert "Runtime Settings" in prompt
     assert "profile_json must not include profile_hash" in prompt
     assert "chunking" in prompt
@@ -728,16 +729,34 @@ def test_profile_assistant_prompt_stays_within_profile_boundary():
     assert "runtime controls" in prompt
     assert "strategy-profile" not in prompt
 
+    profile = default_profile_payload()
+    profile["prompt_pack"]["profile_assistant_system"] = "Profile-specific profile assistant prompt."
+    assert _assistant_system_prompt(profile) == "Profile-specific profile assistant prompt."
 
-def test_default_profile_prompt_pack_excludes_engineering_prompts():
+
+def test_default_profile_prompt_pack_includes_system_prompt_registry():
     from app.services.strategy_profiles import default_profile_payload
 
     prompt_pack = default_profile_payload()["prompt_pack"]
 
-    assert "community_summary_system" not in prompt_pack
-    assert "quality_judge_system" not in prompt_pack
-    assert "query_translation_domain" not in prompt_pack
-    assert "retry_query_suffix" not in prompt_pack
+    for key in [
+        "answer_system_template",
+        "query_rewrite_system",
+        "json_response_fallback_system",
+        "reflection_review_system",
+        "question_perception_system",
+        "query_facet_extractor_system",
+        "agent_planner_system",
+        "citation_entailment_judge_system",
+        "mid_concept_definition_system",
+        "coarse_concept_definition_system",
+        "concept_i18n_system",
+        "concept_edge_i18n_system",
+        "profile_assistant_system",
+    ]:
+        assert key in prompt_pack
+        assert isinstance(prompt_pack[key], str)
+        assert prompt_pack[key].strip()
 
 
 def test_batch_summary_matches_response_schema(db_session, sample_knowledge_base):

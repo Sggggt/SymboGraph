@@ -47,7 +47,18 @@ from app.services.error_sanitizer import public_exception_message
 from app.services.ingestion import resolve_knowledge_base
 from app.services.chunking import stable_hash
 from app.services.model_output import coerce_confidence
-from app.services.strategy_profiles import get_active_profile_record, use_strategy_profile
+from app.services.strategy_profiles import (
+    DEFAULT_AGENT_PLANNER_REPAIR_SUFFIX,
+    DEFAULT_AGENT_PLANNER_SYSTEM,
+    DEFAULT_CITATION_ENTAILMENT_JUDGE_SYSTEM,
+    DEFAULT_QUERY_FACET_ALIAS_SUFFIX,
+    DEFAULT_QUERY_FACET_BILINGUAL_SUFFIX,
+    DEFAULT_QUERY_FACET_EXTRACTOR_SYSTEM,
+    active_profile_json,
+    get_active_profile_record,
+    profile_prompt,
+    use_strategy_profile,
+)
 
 
 _TRACE_SUBSCRIBERS: dict[str, set[asyncio.Queue[dict]]] = {}
@@ -313,15 +324,13 @@ async def perceive_query_intent(question: str, history: list[dict] | None = None
 async def propose_query_facets(question: str, history: list[dict] | None, query_intent: dict[str, Any]) -> dict[str, Any]:
     fallback_marker = {"_fallback_query_facets": True}
     bilingual_enabled = bool(get_settings().query_facet_bilingual_enabled)
+    profile = active_profile_json()
     system = (
-        "You are the query facet extractor for a Four-Layer Context Graph RAG executor. "
-        "Return ONLY a JSON object. You may identify domain facets, procedure facets, aliases/search terms, "
-        "constraints, answer_shape, and drop_terms. Do not choose documents, chunks, node ids, citations, or facts. "
-        "The executor will validate this packet and use it only as retrieval priority metadata. "
+        profile_prompt(profile, "query_facet_extractor_system", DEFAULT_QUERY_FACET_EXTRACTOR_SYSTEM)
         + (
-            "For each explicit domain or procedure facet, include standard Chinese and English technical aliases when a bilingual corpus might use either language."
+            profile_prompt(profile, "query_facet_bilingual_suffix", DEFAULT_QUERY_FACET_BILINGUAL_SUFFIX)
             if bilingual_enabled
-            else "Only include aliases when they are explicit or standard technical synonyms."
+            else profile_prompt(profile, "query_facet_alias_suffix", DEFAULT_QUERY_FACET_ALIAS_SUFFIX)
         )
     )
     user_prompt = str(
@@ -381,12 +390,8 @@ async def propose_agent_plan(
         "typed_actions": fallback_typed_actions(question, envelope),
         "planner_diagnostics": {"planner": "fallback_schema_when_model_fallback_enabled"},
     }
-    system = (
-        "You are the Layered P&E planner for a Four-Layer Context Graph RAG system. "
-        "Return strict JSON with a typed_actions array. Each action must include action_type, target_ids, reason, "
-        "budget_request, expected_evidence, and stop_condition. You may only choose from the supplied action space. "
-        "Policy and runtime settings provide only the operating envelope; do not invent facts."
-    )
+    profile = active_profile_json()
+    system = profile_prompt(profile, "agent_planner_system", DEFAULT_AGENT_PLANNER_SYSTEM)
     user_prompt = str(
         {
             "question": question,
@@ -409,8 +414,8 @@ async def propose_agent_plan(
     actions = output.get("typed_actions") if isinstance(output, dict) else None
     if not isinstance(actions, list):
         repair_system = (
-            f"{system} Your previous response was rejected by the typed action schema. "
-            "Return ONLY a JSON object with key typed_actions. Do not include prose, markdown, analysis, or alternate keys."
+            f"{system} "
+            + profile_prompt(profile, "agent_planner_repair_suffix", DEFAULT_AGENT_PLANNER_REPAIR_SUFFIX)
         )
         repair_prompt = str(
             {
@@ -1130,11 +1135,10 @@ async def verify_answer_against_context(answer: str, citations: list[dict], cont
     try:
         judged = await asyncio.wait_for(
             ChatProvider().classify_json(
-                system_prompt=(
-                    "You are a citation entailment judge for a grounded Four-Layer Context Graph RAG system. "
-                    "Use only the supplied cited context and source spans. Return JSON with verifications. "
-                    "Each verification must include citation_index, verdict (supported, unsupported, contradicted, missing_citation, "
-                    "formula_table_context_missing), failure_type, confidence, and reason. Do not use outside knowledge."
+                system_prompt=profile_prompt(
+                    active_profile_json(),
+                    "citation_entailment_judge_system",
+                    DEFAULT_CITATION_ENTAILMENT_JUDGE_SYSTEM,
                 ),
                 user_prompt=str(judge_payload),
                 fallback=fallback,

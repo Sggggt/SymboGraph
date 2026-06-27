@@ -96,6 +96,36 @@ async def test_propose_query_facets_can_request_bilingual_aliases(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_propose_query_facets_reads_system_prompt_from_profile(monkeypatch):
+    from app.services import agent_graph
+    from app.services.strategy_profiles import default_profile_payload, use_strategy_profile
+
+    captured: dict[str, str] = {}
+
+    class ProfileFacetChatProvider:
+        async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
+            captured["system_prompt"] = system_prompt
+            return {
+                "domain_facets": [{"facet": "custom prompt facet", "aliases": ["custom alias"]}],
+                "drop_terms": [],
+                "answer_shape": "definition",
+            }
+
+    profile = default_profile_payload()
+    profile["prompt_pack"]["query_facet_extractor_system"] = "Profile-specific query facet extractor. "
+
+    monkeypatch.setattr(agent_graph, "ChatProvider", ProfileFacetChatProvider)
+    monkeypatch.setattr(agent_graph, "get_settings", lambda: SimpleNamespace(query_facet_bilingual_enabled=False, enable_model_fallback=False))
+
+    with use_strategy_profile(profile):
+        facets = await agent_graph.propose_query_facets("custom prompt facet", [], {"intent": "definition"})
+
+    assert captured["system_prompt"].startswith("Profile-specific query facet extractor.")
+    assert "Only include aliases" in captured["system_prompt"]
+    assert "custom" in facets["terms"]
+
+
+@pytest.mark.asyncio
 async def test_propose_query_facets_rejects_fallback_marker_when_fallback_disabled(monkeypatch):
     from app.services import agent_graph
     from app.services.embeddings import FallbackDisabledError

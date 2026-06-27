@@ -286,6 +286,82 @@ def test_concept_searchable_text_uses_successful_i18n_only():
 
 
 @pytest.mark.asyncio
+async def test_mid_concept_definition_reads_system_prompt_from_profile(monkeypatch):
+    from app.services import context_graph
+    from app.services.strategy_profiles import default_profile_payload, use_strategy_profile
+
+    captured: dict[str, str] = {}
+
+    class ProfileGraphChatProvider:
+        def __init__(self, purpose: str | None = None):
+            self.purpose = purpose
+
+        async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
+            captured["system_prompt"] = system_prompt
+            return fallback or {"concepts": []}
+
+    profile = default_profile_payload()
+    profile["prompt_pack"]["mid_concept_definition_system"] = "Profile-specific mid concept prompt."
+    packet = {
+        "packet_id": "packet-1",
+        "candidate_label": "Factorization",
+        "representative_chunk_ids": ["chunk-1"],
+        "support_chunk_ids": ["chunk-1"],
+    }
+
+    monkeypatch.setattr(context_graph, "ChatProvider", ProfileGraphChatProvider)
+
+    with use_strategy_profile(profile):
+        concepts = await context_graph.define_mid_concepts_batch([packet])
+
+    assert captured["system_prompt"] == "Profile-specific mid concept prompt."
+    assert concepts
+    assert concepts[0]["packet_id"] == "packet-1"
+
+
+@pytest.mark.asyncio
+async def test_rebuild_context_graph_uses_bound_profile_for_concept_prompts(monkeypatch, db_session, populated_context_graph):
+    from app.models import MidConceptState
+    from app.services import context_graph
+    from app.services.strategy_profiles import bind_profile_to_knowledge_base, create_profile, default_profile_payload
+    from sqlalchemy import select
+
+    kb = populated_context_graph["knowledge_base"]
+    captured: list[str] = []
+
+    class ProfileGraphChatProvider:
+        def __init__(self, purpose: str | None = None):
+            self.purpose = purpose
+
+        async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
+            captured.append(system_prompt)
+            return fallback or {"concepts": []}
+
+    profile_payload = default_profile_payload()
+    profile_payload["prompt_pack"]["mid_concept_definition_system"] = "Profile-bound rebuild mid prompt."
+    profile, warnings = create_profile(
+        db_session,
+        name="Profile-bound rebuild prompt",
+        library_type="custom",
+        profile_json=profile_payload,
+    )
+    assert warnings == []
+    bind_profile_to_knowledge_base(db_session, knowledge_base_id=kb.id, profile_id=profile.id)
+    monkeypatch.setattr(context_graph, "ChatProvider", ProfileGraphChatProvider)
+
+    await context_graph.rebuild_context_graph(db_session, kb.id, emit_heartbeats=False)
+
+    assert "Profile-bound rebuild mid prompt." in captured
+    mid_state = db_session.scalar(
+        select(MidConceptState)
+        .where(MidConceptState.knowledge_base_id == kb.id, MidConceptState.state == "active")
+        .order_by(MidConceptState.created_at.desc())
+    )
+    assert mid_state is not None
+    assert (mid_state.diagnostics_json or {}).get("profile_hash") == profile.profile_hash
+
+
+@pytest.mark.asyncio
 async def test_context_graph_pipeline_builds_all_layers(db_session, populated_context_graph):
     from sqlalchemy import func, select
 
@@ -422,6 +498,8 @@ async def test_layered_retrieval_writes_trace_and_context_package(db_session, po
             assert float(traversal["distance_so_far"]) > 0.0
             assert (item.get("metadata") or {}).get("entry_strengths")
     assert result.trace.id
+    assert (result.trace.diagnostics_json or {}).get("active_profile_hash") == profile.profile_hash
+    assert ((result.trace.diagnostics_json or {}).get("cache_key_components") or {}).get("profile_hash") == profile.profile_hash
     assert result.trace.stage_queues_json
     assert result.trace.candidate_pools_json
     assert result.trace.topk_selection_json

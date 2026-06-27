@@ -479,9 +479,9 @@ function getProfileJsonDiagnostics(text: string): JsonDiagnostic[] {
       diagnostics.push({
         line: getLineForKey(text, key),
         column: 1,
-        severity: "warning",
-        message: `${key} 已退出活动配置档`,
-        reason: "配置档 JSON 只保存 library_type、prompt_pack、ui_labels 和 conversation_preferences；工程参数必须进入运行时设置。",
+      severity: "warning",
+      message: `${key} 已退出活动配置档`,
+      reason: "配置档 JSON 保存 library_type、prompt_pack、ui_labels 和 conversation_preferences；工程参数必须进入运行时设置。",
       });
     }
   }
@@ -492,7 +492,7 @@ function getProfileJsonDiagnostics(text: string): JsonDiagnostic[] {
       column: 1,
       severity: "error",
       message: "prompt_pack 必须是对象",
-      reason: "回答风格、引用严格度表达和无上下文提示需要从 prompt_pack 读取。",
+      reason: "资料库级系统提示词、回答风格、引用严格度表达和无上下文提示需要从 prompt_pack 读取。",
     });
   }
   const conversationPreferences = profile.conversation_preferences;
@@ -998,7 +998,7 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
                   void runAssistant();
                 }
               }}
-              placeholder="描述资料库类型、界面标签、回答风格、引用严格度表达、澄清方式和无上下文回复文案。"
+              placeholder="描述资料库类型、系统提示词、界面标签、回答风格、引用严格度表达、澄清方式和无上下文回复文案。"
               className="min-h-24 resize-none rounded-2xl border-white/10 bg-white/[0.04] text-white"
             />
             <Button type="button" className="mt-3 w-full rounded-full" onClick={() => void runAssistant()} disabled={!assistantPrompt.trim() || assistantStreaming}>
