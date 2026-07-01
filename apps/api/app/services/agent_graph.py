@@ -195,7 +195,10 @@ REQUIRED_TYPED_ACTIONS = ["select_entry_nodes", "walk_graph_frontier", "recall_c
 def _default_budget_for_action(action_type: str, envelope: dict[str, Any]) -> dict[str, int]:
     mapping = {
         "select_entry_nodes": {
-            "agent_coarse_total_budget": int(envelope.get("agent_coarse_total_budget") or 0),
+            "agent_coarse_initial_budget": int(envelope.get("agent_coarse_initial_budget") or 0),
+            "agent_coarse_drilldown_mid_initial_budget": int(envelope.get("agent_coarse_drilldown_mid_initial_budget") or 0),
+            "agent_mid_initial_budget": int(envelope.get("agent_mid_initial_budget") or 0),
+            "agent_chunk_initial_budget": int(envelope.get("agent_chunk_initial_budget") or 0),
         },
         "walk_graph_frontier": {
             "agent_chunk_per_mid_budget": int(envelope.get("agent_chunk_per_mid_budget") or 0),
@@ -203,6 +206,7 @@ def _default_budget_for_action(action_type: str, envelope: dict[str, Any]) -> di
             "max_labels_per_node": int(envelope.get("max_labels_per_node") or 0),
         },
         "drill_down_layer": {
+            "agent_coarse_top_k": int(envelope.get("agent_coarse_top_k") or 0),
             "agent_mid_per_coarse_budget": int(envelope.get("agent_mid_per_coarse_budget") or 0),
             "agent_mid_top_k": int(envelope.get("agent_mid_top_k") or 0),
             "agent_chunk_per_mid_budget": int(envelope.get("agent_chunk_per_mid_budget") or 0),
@@ -214,7 +218,7 @@ def _default_budget_for_action(action_type: str, envelope: dict[str, Any]) -> di
             "path_distance_hard_threshold": float(envelope.get("path_distance_hard_threshold") or 0),
         },
         "recall_chunks": {"agent_chunk_top_k": int(envelope.get("agent_chunk_top_k") or 0)},
-        "restore_context_package": {"structure_restore_budget": int(envelope.get("structure_restore_budget") or 0)},
+        "restore_context_package": {"structure_restore_per_chunk_budget": int(envelope.get("structure_restore_per_chunk_budget") or 0)},
         "build_context_package": {"context_package_token_budget": int(envelope.get("context_package_token_budget") or 0)},
         "verify_citations": {"verification_budget": int(envelope.get("verification_budget") or 0)},
         "repair_missing_citation": {"repair_round_budget": int(envelope.get("repair_round_budget") or 0)},
@@ -325,13 +329,15 @@ async def propose_query_facets(question: str, history: list[dict] | None, query_
     fallback_marker = {"_fallback_query_facets": True}
     bilingual_enabled = bool(get_settings().query_facet_bilingual_enabled)
     profile = active_profile_json()
-    system = (
-        profile_prompt(profile, "query_facet_extractor_system", DEFAULT_QUERY_FACET_EXTRACTOR_SYSTEM)
-        + (
+    system = " ".join(
+        part.strip()
+        for part in (
+            profile_prompt(profile, "query_facet_extractor_system", DEFAULT_QUERY_FACET_EXTRACTOR_SYSTEM),
             profile_prompt(profile, "query_facet_bilingual_suffix", DEFAULT_QUERY_FACET_BILINGUAL_SUFFIX)
             if bilingual_enabled
-            else profile_prompt(profile, "query_facet_alias_suffix", DEFAULT_QUERY_FACET_ALIAS_SUFFIX)
+            else profile_prompt(profile, "query_facet_alias_suffix", DEFAULT_QUERY_FACET_ALIAS_SUFFIX),
         )
+        if part and part.strip()
     )
     user_prompt = str(
         {
@@ -340,19 +346,17 @@ async def propose_query_facets(question: str, history: list[dict] | None, query_
             "query_intent": query_intent,
             "bilingual_query_facets_enabled": bilingual_enabled,
             "required_json_shape": {
-                "domain_facets": ["main concepts explicitly requested by the user"],
-                "procedure_facets": ["algorithm/procedure/formula aspects requested by the user"],
-                "alias_facets": [
+                "facet_groups": [
                     {
-                        "facet": "canonical query facet",
+                        "facet": "canonical query facet in the user's language",
+                        "role": "domain | procedure | constraint",
                         "aliases": [
-                            "standard Chinese and English aliases useful for retrieval"
+                            "standard Chinese lexical surface and standard English lexical surface useful for retrieval"
                             if bilingual_enabled
                             else "standard technical aliases useful for retrieval"
                         ],
                     }
                 ],
-                "constraint_facets": ["scope, comparison target, time, source, or modality constraints"],
                 "answer_shape": "definition | comparison | step_by_step_algorithm | formula_explanation | grounded_answer",
                 "drop_terms": ["user filler words that must not become required facets"],
             },
@@ -360,6 +364,7 @@ async def propose_query_facets(question: str, history: list[dict] | None, query_
                 "Do not output chunk ids, document ids, node ids, or citations.",
                 "Do not infer corpus facts.",
                 "Do not put polite filler or pronouns in required facets.",
+                "Do not split canonical facets and aliases into separate domain_facets or alias_facets; put aliases directly on each facet_groups item.",
             ],
         }
     )

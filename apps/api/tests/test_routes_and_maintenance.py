@@ -313,6 +313,11 @@ def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch)
     monkeypatch.setenv("FIXED_CHUNK_SIZE_TOKENS", "512")
     monkeypatch.setenv("FIXED_CHUNK_OVERLAP_TOKENS", "80")
     monkeypatch.setenv("CONTEXT_PACKAGE_TOKEN_BUDGET", "2400")
+    monkeypatch.setenv("AGENT_COARSE_INITIAL_BUDGET", "6")
+    monkeypatch.setenv("AGENT_COARSE_TOP_K", "4")
+    monkeypatch.setenv("AGENT_MID_INITIAL_BUDGET", "9")
+    monkeypatch.setenv("AGENT_CHUNK_INITIAL_BUDGET", "11")
+    monkeypatch.setenv("AGENT_STRUCTURE_RESTORE_PER_CHUNK_BUDGET", "3")
     monkeypatch.setenv("CONCEPT_I18N_ENABLED", "false")
     monkeypatch.setenv("QUERY_FACET_BILINGUAL_ENABLED", "false")
     monkeypatch.setattr(runtime_settings, "current_runtime_settings_version", lambda: "unit-version")
@@ -324,6 +329,12 @@ def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch)
             "FIXED_CHUNK_OVERLAP_TOKENS": "80",
             "CONTEXT_PACKAGE_TOKEN_BUDGET": "2400",
             "RETRIEVAL_RESULT_TOP_K_DEFAULT": "7",
+            "AGENT_COARSE_INITIAL_BUDGET": "6",
+            "AGENT_COARSE_TOP_K": "4",
+            "AGENT_COARSE_DRILLDOWN_MID_INITIAL_BUDGET": "10",
+            "AGENT_MID_INITIAL_BUDGET": "9",
+            "AGENT_CHUNK_INITIAL_BUDGET": "11",
+            "AGENT_STRUCTURE_RESTORE_PER_CHUNK_BUDGET": "3",
             "CONCEPT_I18N_ENABLED": "false",
             "QUERY_FACET_BILINGUAL_ENABLED": "false",
         },
@@ -335,8 +346,20 @@ def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch)
     assert payload["fixed_chunk_overlap_tokens"] == 80
     assert payload["context_package_token_budget"] == 2400
     assert payload["retrieval_result_top_k_default"] == 7
+    assert payload["agent_coarse_initial_budget"] == 6
+    assert payload["agent_coarse_top_k"] == 4
+    assert payload["agent_coarse_drilldown_mid_initial_budget"] == 10
+    assert payload["agent_mid_initial_budget"] == 9
+    assert payload["agent_chunk_initial_budget"] == 11
+    assert payload["agent_structure_restore_per_chunk_budget"] == 3
     assert payload["concept_i18n_enabled"] is False
     assert payload["query_facet_bilingual_enabled"] is False
+    assert "agent_coarse_initial_budget" in payload["lifecycle"]["hot_reloadable"]
+    assert "agent_coarse_top_k" in payload["lifecycle"]["hot_reloadable"]
+    assert "agent_coarse_drilldown_mid_initial_budget" in payload["lifecycle"]["hot_reloadable"]
+    assert "agent_mid_initial_budget" in payload["lifecycle"]["hot_reloadable"]
+    assert "agent_chunk_initial_budget" in payload["lifecycle"]["hot_reloadable"]
+    assert "agent_structure_restore_per_chunk_budget" in payload["lifecycle"]["hot_reloadable"]
     assert payload["agent_coarse_total_budget"] > 0
     assert payload["agent_chunk_top_k"] > 0
     assert "lifecycle" in payload
@@ -424,6 +447,12 @@ def test_update_model_settings_reloads_model_bridge(monkeypatch, tmp_path):
             "embedding_base_url": "https://embedding.example.test/v2",
             "concept_i18n_enabled": True,
             "query_facet_bilingual_enabled": True,
+            "agent_coarse_initial_budget": 6,
+            "agent_coarse_top_k": 4,
+            "agent_coarse_drilldown_mid_initial_budget": 10,
+            "agent_mid_initial_budget": 9,
+            "agent_chunk_initial_budget": 11,
+            "agent_structure_restore_per_chunk_budget": 3,
         }
     )
 
@@ -431,8 +460,20 @@ def test_update_model_settings_reloads_model_bridge(monkeypatch, tmp_path):
     assert reload_calls[-1]["EMBEDDING_BASE_URL"] == "https://embedding.example.test/v2"
     assert reload_calls[-1]["CONCEPT_I18N_ENABLED"] == "true"
     assert reload_calls[-1]["QUERY_FACET_BILINGUAL_ENABLED"] == "true"
+    assert reload_calls[-1]["AGENT_COARSE_INITIAL_BUDGET"] == "6"
+    assert reload_calls[-1]["AGENT_COARSE_TOP_K"] == "4"
+    assert reload_calls[-1]["AGENT_COARSE_DRILLDOWN_MID_INITIAL_BUDGET"] == "10"
+    assert reload_calls[-1]["AGENT_MID_INITIAL_BUDGET"] == "9"
+    assert reload_calls[-1]["AGENT_CHUNK_INITIAL_BUDGET"] == "11"
+    assert reload_calls[-1]["AGENT_STRUCTURE_RESTORE_PER_CHUNK_BUDGET"] == "3"
     assert result["concept_i18n_enabled"] is True
     assert result["query_facet_bilingual_enabled"] is True
+    assert result["agent_coarse_initial_budget"] == 6
+    assert result["agent_coarse_top_k"] == 4
+    assert result["agent_coarse_drilldown_mid_initial_budget"] == 10
+    assert result["agent_mid_initial_budget"] == 9
+    assert result["agent_chunk_initial_budget"] == 11
+    assert result["agent_structure_restore_per_chunk_budget"] == 3
     assert result["model_bridge_status"]["last_reload"]["ok"] is True
 
 

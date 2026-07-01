@@ -71,10 +71,15 @@ HOT_RELOAD_SETTINGS = {
     "operating_point_hard_gate_min_structure_recovery_rate",
     "operating_point_hard_gate_max_candidate_latency_p95_ms",
     "retrieval_result_top_k_default",
+    "agent_coarse_initial_budget",
     "agent_coarse_total_budget",
+    "agent_coarse_top_k",
     "agent_mid_per_coarse_budget",
+    "agent_coarse_drilldown_mid_initial_budget",
+    "agent_mid_initial_budget",
     "agent_mid_top_k",
     "agent_chunk_per_mid_budget",
+    "agent_chunk_initial_budget",
     "agent_chunk_top_k",
     "agent_max_depth_per_layer",
     "agent_max_labels_per_node",
@@ -85,6 +90,7 @@ HOT_RELOAD_SETTINGS = {
     "agent_path_distance_gray_threshold",
     "agent_path_distance_hard_threshold",
     "candidate_pool_dedupe_budget",
+    "agent_structure_restore_per_chunk_budget",
     "agent_structure_restore_budget",
     "context_path_summary_budget",
     "agent_planning_round_budget",
@@ -191,10 +197,15 @@ class Settings(BaseSettings):
     operating_point_hard_gate_max_hubness_ratio: float = Field(default=12.0, ge=1.0, le=1000.0)
     operating_point_hard_gate_min_structure_recovery_rate: float = Field(default=0.25, ge=0.0, le=1.0)
     operating_point_hard_gate_max_candidate_latency_p95_ms: int = Field(default=30000, ge=10, le=600000)
+    agent_coarse_initial_budget: int | None = Field(default=None, ge=1, le=200)
     agent_coarse_total_budget: int = Field(default=8, ge=1, le=200)
+    agent_coarse_top_k: int | None = Field(default=None, ge=1, le=200)
     agent_mid_per_coarse_budget: int = Field(default=8, ge=1, le=500)
+    agent_coarse_drilldown_mid_initial_budget: int | None = Field(default=None, ge=1, le=500)
+    agent_mid_initial_budget: int | None = Field(default=None, ge=1, le=500)
     agent_mid_top_k: int = Field(default=16, ge=1, le=500)
     agent_chunk_per_mid_budget: int = Field(default=8, ge=1, le=1000)
+    agent_chunk_initial_budget: int | None = Field(default=None, ge=1, le=2000)
     agent_chunk_top_k: int = Field(default=80, ge=1, le=2000)
     agent_max_depth_per_layer: int = Field(default=3, ge=1, le=12)
     agent_max_labels_per_node: int = Field(default=3, ge=1, le=20)
@@ -205,6 +216,7 @@ class Settings(BaseSettings):
     agent_path_distance_gray_threshold: float = Field(default=1.35, ge=0.0, le=20.0)
     agent_path_distance_hard_threshold: float = Field(default=2.4, ge=0.0, le=40.0)
     candidate_pool_dedupe_budget: int = Field(default=1000, ge=1, le=20000)
+    agent_structure_restore_per_chunk_budget: int | None = Field(default=None, ge=1, le=200)
     agent_structure_restore_budget: int = Field(default=16, ge=1, le=200)
     context_path_summary_budget: int = Field(default=32, ge=1, le=500)
     agent_planning_round_budget: int = Field(default=2, ge=1, le=10)
@@ -316,15 +328,21 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "tpe_candidate_pool_size",
         "operating_point_hard_gate_max_candidate_latency_p95_ms",
         "retrieval_result_top_k_default",
+        "agent_coarse_initial_budget",
         "agent_coarse_total_budget",
+        "agent_coarse_top_k",
         "agent_mid_per_coarse_budget",
+        "agent_coarse_drilldown_mid_initial_budget",
+        "agent_mid_initial_budget",
         "agent_mid_top_k",
         "agent_chunk_per_mid_budget",
+        "agent_chunk_initial_budget",
         "agent_chunk_top_k",
         "agent_max_depth_per_layer",
         "agent_max_labels_per_node",
         "agent_max_edge_reuse",
         "candidate_pool_dedupe_budget",
+        "agent_structure_restore_per_chunk_budget",
         "agent_structure_restore_budget",
         "context_path_summary_budget",
         "agent_planning_round_budget",
@@ -399,10 +417,15 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "OPERATING_POINT_HARD_GATE_MIN_STRUCTURE_RECOVERY_RATE": "operating_point_hard_gate_min_structure_recovery_rate",
         "OPERATING_POINT_HARD_GATE_MAX_CANDIDATE_LATENCY_P95_MS": "operating_point_hard_gate_max_candidate_latency_p95_ms",
         "RETRIEVAL_RESULT_TOP_K_DEFAULT": "retrieval_result_top_k_default",
+        "AGENT_COARSE_INITIAL_BUDGET": "agent_coarse_initial_budget",
         "AGENT_COARSE_TOTAL_BUDGET": "agent_coarse_total_budget",
+        "AGENT_COARSE_TOP_K": "agent_coarse_top_k",
         "AGENT_MID_PER_COARSE_BUDGET": "agent_mid_per_coarse_budget",
+        "AGENT_COARSE_DRILLDOWN_MID_INITIAL_BUDGET": "agent_coarse_drilldown_mid_initial_budget",
+        "AGENT_MID_INITIAL_BUDGET": "agent_mid_initial_budget",
         "AGENT_MID_TOP_K": "agent_mid_top_k",
         "AGENT_CHUNK_PER_MID_BUDGET": "agent_chunk_per_mid_budget",
+        "AGENT_CHUNK_INITIAL_BUDGET": "agent_chunk_initial_budget",
         "AGENT_CHUNK_TOP_K": "agent_chunk_top_k",
         "AGENT_MAX_DEPTH_PER_LAYER": "agent_max_depth_per_layer",
         "AGENT_MAX_LABELS_PER_NODE": "agent_max_labels_per_node",
@@ -413,6 +436,7 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "AGENT_PATH_DISTANCE_GRAY_THRESHOLD": "agent_path_distance_gray_threshold",
         "AGENT_PATH_DISTANCE_HARD_THRESHOLD": "agent_path_distance_hard_threshold",
         "CANDIDATE_POOL_DEDUPE_BUDGET": "candidate_pool_dedupe_budget",
+        "AGENT_STRUCTURE_RESTORE_PER_CHUNK_BUDGET": "agent_structure_restore_per_chunk_budget",
         "AGENT_STRUCTURE_RESTORE_BUDGET": "agent_structure_restore_budget",
         "CONTEXT_PATH_SUMMARY_BUDGET": "context_path_summary_budget",
         "AGENT_PLANNING_ROUND_BUDGET": "agent_planning_round_budget",

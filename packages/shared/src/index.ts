@@ -489,10 +489,15 @@ export interface ModelSettingsResponse {
   operating_point_hard_gate_min_structure_recovery_rate?: number;
   operating_point_hard_gate_max_candidate_latency_p95_ms?: number;
   retrieval_result_top_k_default?: number;
+  agent_coarse_initial_budget?: number;
   agent_coarse_total_budget?: number;
+  agent_coarse_top_k?: number;
   agent_mid_per_coarse_budget?: number;
+  agent_coarse_drilldown_mid_initial_budget?: number;
+  agent_mid_initial_budget?: number;
   agent_mid_top_k?: number;
   agent_chunk_per_mid_budget?: number;
+  agent_chunk_initial_budget?: number;
   agent_chunk_top_k?: number;
   candidate_pool_dedupe_budget?: number;
   agent_max_depth_per_layer?: number;
@@ -503,6 +508,7 @@ export interface ModelSettingsResponse {
   agent_path_distance_green_threshold?: number;
   agent_path_distance_gray_threshold?: number;
   agent_path_distance_hard_threshold?: number;
+  agent_structure_restore_per_chunk_budget?: number;
   agent_structure_restore_budget?: number;
   context_path_summary_budget?: number;
   agent_planning_round_budget?: number;
@@ -617,10 +623,15 @@ export interface ModelSettingsUpdate {
   operating_point_hard_gate_min_structure_recovery_rate?: number | null;
   operating_point_hard_gate_max_candidate_latency_p95_ms?: number | null;
   retrieval_result_top_k_default?: number | null;
+  agent_coarse_initial_budget?: number | null;
   agent_coarse_total_budget?: number | null;
+  agent_coarse_top_k?: number | null;
   agent_mid_per_coarse_budget?: number | null;
+  agent_coarse_drilldown_mid_initial_budget?: number | null;
+  agent_mid_initial_budget?: number | null;
   agent_mid_top_k?: number | null;
   agent_chunk_per_mid_budget?: number | null;
+  agent_chunk_initial_budget?: number | null;
   agent_chunk_top_k?: number | null;
   candidate_pool_dedupe_budget?: number | null;
   agent_max_depth_per_layer?: number | null;
@@ -631,6 +642,7 @@ export interface ModelSettingsUpdate {
   agent_path_distance_green_threshold?: number | null;
   agent_path_distance_gray_threshold?: number | null;
   agent_path_distance_hard_threshold?: number | null;
+  agent_structure_restore_per_chunk_budget?: number | null;
   agent_structure_restore_budget?: number | null;
   context_path_summary_budget?: number | null;
   agent_planning_round_budget?: number | null;

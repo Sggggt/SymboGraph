@@ -219,11 +219,18 @@ def runtime_settings_state_hash() -> str:
 
 def agent_operating_envelope(settings: Any | None = None) -> dict[str, Any]:
     settings = settings or get_settings()
+    coarse_initial_budget = int(settings.agent_coarse_initial_budget or settings.agent_coarse_total_budget)
+    structure_restore_per_chunk_budget = int(settings.agent_structure_restore_per_chunk_budget or settings.agent_structure_restore_budget)
     return {
+        "agent_coarse_initial_budget": coarse_initial_budget,
         "agent_coarse_total_budget": int(settings.agent_coarse_total_budget),
+        "agent_coarse_top_k": int(settings.agent_coarse_top_k or coarse_initial_budget),
         "agent_mid_per_coarse_budget": int(settings.agent_mid_per_coarse_budget),
+        "agent_coarse_drilldown_mid_initial_budget": int(settings.agent_coarse_drilldown_mid_initial_budget or settings.agent_mid_top_k),
+        "agent_mid_initial_budget": int(settings.agent_mid_initial_budget or settings.agent_mid_top_k),
         "agent_mid_top_k": int(settings.agent_mid_top_k),
         "agent_chunk_per_mid_budget": int(settings.agent_chunk_per_mid_budget),
+        "agent_chunk_initial_budget": int(settings.agent_chunk_initial_budget or settings.agent_chunk_top_k),
         "agent_chunk_top_k": int(settings.agent_chunk_top_k),
         "max_depth_per_layer": int(settings.agent_max_depth_per_layer),
         "max_labels_per_node": int(settings.agent_max_labels_per_node),
@@ -234,7 +241,8 @@ def agent_operating_envelope(settings: Any | None = None) -> dict[str, Any]:
         "path_distance_gray_threshold": float(settings.agent_path_distance_gray_threshold),
         "path_distance_hard_threshold": float(settings.agent_path_distance_hard_threshold),
         "candidate_pool_dedupe_budget": int(settings.candidate_pool_dedupe_budget),
-        "structure_restore_budget": int(settings.agent_structure_restore_budget),
+        "structure_restore_per_chunk_budget": structure_restore_per_chunk_budget,
+        "structure_restore_budget": structure_restore_per_chunk_budget,
         "context_package_token_budget": int(settings.context_package_token_budget),
         "context_path_summary_budget": int(settings.context_path_summary_budget),
         "planning_round_budget": int(settings.agent_planning_round_budget),
@@ -3367,7 +3375,13 @@ async def layered_search(
     query_vector = (await EmbeddingProvider().embed_texts([query], text_type="query"))[0]
     query_rq = encode_query_rq(relation_state, query_vector)
     coarse_entries = select_coarse_entries(db, knowledge_base_id, query_facets) if retrieval_granularity == "coarse" else {}
-    mid_entries = select_mid_entries(db, knowledge_base_id, query_facets, coarse_entries)
+    envelope = agent_operating_envelope()
+    mid_entry_top_n = (
+        envelope["agent_mid_initial_budget"]
+        if retrieval_granularity == "mid"
+        else envelope["agent_coarse_drilldown_mid_initial_budget"]
+    )
+    mid_entries = select_mid_entries(db, knowledge_base_id, query_facets, coarse_entries, top_n=mid_entry_top_n)
     rq_membership_entries = select_rq_membership_entries(db, knowledge_base_id, query_vector, query_rq, mid_entries)
     dense_entries = dense_chunk_entries(db, knowledge_base_id, query_vector)
     traversal = execute_priority_queue_traversal(
@@ -3497,7 +3511,7 @@ def _coerce_facet_group(raw: Any, *, role: str) -> dict[str, Any] | None:
             aliases = []
         raw_role = _normalize_query_facet_text(raw.get("role") or role, max_length=32) or role
         source = _normalize_query_facet_text(raw.get("source") or "llm", max_length=32) or "llm"
-        confidence = coerce_confidence(raw.get("confidence"), default=0.7)
+        confidence, _confidence_diagnostics = coerce_confidence(raw.get("confidence"), default=0.7)
     else:
         facet = _normalize_query_facet_text(raw)
         aliases = []
@@ -3545,12 +3559,17 @@ def _facet_groups_from_llm_payload(llm_facets: dict[str, Any] | None) -> list[di
             if group is not None:
                 groups.append(group)
     deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    by_facet: dict[str, dict[str, Any]] = {}
     for group in groups:
         key = _facet_dedupe_key(group["facet"])
-        if key in seen:
+        if key in by_facet:
+            existing = by_facet[key]
+            existing["aliases"] = _dedupe_query_values(
+                [*(existing.get("aliases") or []), *(group.get("aliases") or [])],
+                max_items=QUERY_FACET_MAX_ALIASES,
+            )
             continue
-        seen.add(key)
+        by_facet[key] = group
         deduped.append(group)
         if len(deduped) >= QUERY_FACET_MAX_GROUPS:
             break
@@ -3600,6 +3619,9 @@ def query_facets_for_search(query: str, llm_facets: dict[str, Any] | None = None
     intent = str((query_intent or {}).get("intent") or (llm_facets or {}).get("intent") or "")
     if not intent:
         intent = "formula_table_lookup" if any(term in lower_query for term in ("formula", "equation", "table", "\u516c\u5f0f", "\u8868\u683c")) else "semantic"
+    previous_diagnostics = (llm_facets or {}).get("diagnostics") if isinstance(llm_facets, dict) else {}
+    if not isinstance(previous_diagnostics, dict):
+        previous_diagnostics = {}
     return {
         "query": query,
         "protocol_version": QUERY_FACET_PROTOCOL_VERSION,
@@ -3610,7 +3632,8 @@ def query_facets_for_search(query: str, llm_facets: dict[str, Any] | None = None
         "answer_shape": _normalize_query_facet_text((llm_facets or {}).get("answer_shape") or (query_intent or {}).get("intent") or "grounded_answer", max_length=48),
         "intent": intent,
         "diagnostics": {
-            "source": "llm_validated" if isinstance(llm_facets, dict) and llm_facets else "deterministic_tokenizer",
+            **previous_diagnostics,
+            "source": previous_diagnostics.get("source") or ("llm_validated" if isinstance(llm_facets, dict) and llm_facets else "deterministic_tokenizer"),
             "lexical_terms": lexical_terms,
             "dropped_query_terms": [term for term in tokenize_for_search_terms(query) if _facet_dedupe_key(term) in dropped or not _query_term_allowed(term)],
             "llm_keys": sorted(llm_facets.keys()) if isinstance(llm_facets, dict) else [],
@@ -3655,7 +3678,7 @@ def select_coarse_entries(db: Session, knowledge_base_id: str, query_facets: dic
         return {}
     concepts = db.scalars(select(CoarseConcept).where(CoarseConcept.coarse_state_id == state.id, CoarseConcept.state == "active")).all()
     envelope = agent_operating_envelope()
-    scores = _text_entry_score({concept.id: concept_searchable_text(concept) for concept in concepts}, query_facets["terms"], top_n=envelope["agent_coarse_total_budget"])
+    scores = _text_entry_score({concept.id: concept_searchable_text(concept) for concept in concepts}, query_facets["terms"], top_n=envelope["agent_coarse_initial_budget"])
     if scores or not concepts:
         return scores
     supported = sorted(
@@ -3663,16 +3686,24 @@ def select_coarse_entries(db: Session, knowledge_base_id: str, query_facets: dic
         key=lambda concept: (len(concept.included_mid_concept_ids_json or []), len(concept.bridge_mid_concept_ids_json or [])),
         reverse=True,
     )
-    return {concept.id: 0.35 for concept in supported[: envelope["agent_coarse_total_budget"]]}
+    return {concept.id: 0.35 for concept in supported[: envelope["agent_coarse_initial_budget"]]}
 
 
-def select_mid_entries(db: Session, knowledge_base_id: str, query_facets: dict[str, Any], coarse_entries: dict[str, float]) -> dict[str, float]:
+def select_mid_entries(
+    db: Session,
+    knowledge_base_id: str,
+    query_facets: dict[str, Any],
+    coarse_entries: dict[str, float],
+    *,
+    top_n: int | None = None,
+) -> dict[str, float]:
     state = latest_mid_state(db, knowledge_base_id)
     if state is None:
         return {}
     concepts = list(db.scalars(select(MidConcept).where(MidConcept.concept_state_id == state.id, MidConcept.state == "active")).all())
     envelope = agent_operating_envelope()
-    scores = _text_entry_score({concept.id: concept_searchable_text(concept) for concept in concepts}, query_facets["terms"], top_n=envelope["agent_mid_top_k"])
+    limit = int(top_n or envelope["agent_mid_top_k"])
+    scores = _text_entry_score({concept.id: concept_searchable_text(concept) for concept in concepts}, query_facets["terms"], top_n=limit)
     coarse_ids = set(coarse_entries)
     if coarse_ids:
         coarse_concepts = db.scalars(select(CoarseConcept).where(CoarseConcept.id.in_(coarse_ids))).all()
@@ -3682,7 +3713,7 @@ def select_mid_entries(db: Session, knowledge_base_id: str, query_facets: dict[s
                 scores[concept.id] = max(scores.get(concept.id, 0.0), 0.45)
     if not scores and concepts:
         supported = sorted(concepts, key=lambda concept: len(concept.support_rq_prefix_ids_json or []), reverse=True)
-        scores = {concept.id: 0.35 for concept in supported[: envelope["agent_mid_top_k"]]}
+        scores = {concept.id: 0.35 for concept in supported[:limit]}
     return scores
 
 
@@ -4076,13 +4107,24 @@ def _path_distance_zone(distance: float, envelope: dict[str, Any]) -> str:
     return "hard_stop"
 
 
-def layer_frontier_budget(layer: str, envelope: dict[str, Any]) -> int:
+def layer_frontier_budget(layer: str, envelope: dict[str, Any], *, entry_count: int | None = None) -> int:
+    starts = max(1, int(entry_count or 1))
     if layer == "coarse":
-        return int(envelope.get("agent_coarse_total_budget") or 1)
+        return starts * max(1, int(envelope.get("agent_coarse_top_k") or 1))
     if layer == "mid":
-        return max(1, int(envelope.get("agent_mid_per_coarse_budget") or 1) * max(1, int(envelope.get("agent_mid_top_k") or 1)))
+        return starts * max(1, int(envelope.get("agent_mid_top_k") or 1))
     if layer == "chunk":
-        return max(1, int(envelope.get("agent_chunk_per_mid_budget") or 1) * max(1, int(envelope.get("agent_chunk_top_k") or 1)))
+        return starts * max(1, int(envelope.get("agent_chunk_top_k") or 1))
+    return 1
+
+
+def layer_per_entry_expansion_budget(layer: str, envelope: dict[str, Any]) -> int:
+    if layer == "coarse":
+        return max(1, int(envelope.get("agent_coarse_top_k") or 1))
+    if layer == "mid":
+        return max(1, int(envelope.get("agent_mid_top_k") or 1))
+    if layer == "chunk":
+        return max(1, int(envelope.get("agent_chunk_top_k") or 1))
     return 1
 
 
@@ -4178,6 +4220,7 @@ def execute_layer_priority_walk(
             "covered_facets": sorted(covered),
             "evidence_roles": list(entry["roles"]),
             "depth": 0,
+            "root_node_id": node_id,
             "visit_counts": {node_id: 1},
             "support_refs": {"entry_strength": entry["entry_strength"]},
         }
@@ -4195,7 +4238,9 @@ def execute_layer_priority_walk(
     hard_stop_pruned_count = 0
     red_zone_pruned_count = 0
     expansion_count = 0
-    max_expansions = layer_frontier_budget(layer, envelope)
+    max_expansions = layer_frontier_budget(layer, envelope, entry_count=len(entry_scores))
+    per_entry_expansion_budget = layer_per_entry_expansion_budget(layer, envelope)
+    expansion_count_by_entry: dict[str, int] = defaultdict(int)
     max_depth = int(envelope.get("max_depth_per_layer") or 1)
     max_labels = int(envelope.get("max_labels_per_node") or 1)
     stop_reason = "no_entry_nodes" if not frontier else "frontier_empty"
@@ -4215,6 +4260,7 @@ def execute_layer_priority_walk(
         current = accepted_by_node.get(state["node_id"])
         if current is None or key < current["queue_key"]:
             accepted_by_node[state["node_id"]] = {"state": state, "queue_key": key}
+        root_node_id = str(state.get("root_node_id") or (state.get("path") or [state["node_id"]])[0])
         if int(state["depth"]) >= max_depth:
             path_labels.append(
                 {
@@ -4226,6 +4272,22 @@ def execute_layer_priority_walk(
                     "distance_so_far": state["distance_so_far"],
                     "reward_so_far": state["reward_so_far"],
                     "expanded_edge_ids": [],
+                }
+            )
+            continue
+        if expansion_count_by_entry[root_node_id] >= per_entry_expansion_budget:
+            path_labels.append(
+                {
+                    "layer": layer,
+                    "node_id": state["node_id"],
+                    "path": state["path"],
+                    "path_edge_ids": state["path_edge_ids"],
+                    "covered_facets": state["covered_facets"],
+                    "distance_so_far": state["distance_so_far"],
+                    "reward_so_far": state["reward_so_far"],
+                    "expanded_edge_ids": [],
+                    "root_node_id": root_node_id,
+                    "stop_reason": "per_entry_expansion_budget_hit",
                 }
             )
             continue
@@ -4295,6 +4357,7 @@ def execute_layer_priority_walk(
                 "covered_facets": sorted(covered),
                 "evidence_roles": sorted(roles),
                 "depth": int(state["depth"]) + 1,
+                "root_node_id": root_node_id,
                 "visit_counts": visit_counts,
                 "support_refs": _edge_support_refs(edge),
             }
@@ -4308,8 +4371,11 @@ def execute_layer_priority_walk(
             serial += 1
             expanded_edge_ids.append(edge.id)
             expansion_count += 1
+            expansion_count_by_entry[root_node_id] += 1
             if expansion_count >= max_expansions:
                 stop_reason = "hard_budget_hit"
+                break
+            if expansion_count_by_entry[root_node_id] >= per_entry_expansion_budget:
                 break
         path_labels.append(
             {
@@ -4347,6 +4413,8 @@ def execute_layer_priority_walk(
             },
             "frontier_remaining": len(frontier),
             "accepted_node_count": len(accepted),
+            "per_entry_expansion_budget": per_entry_expansion_budget,
+            "expansion_count_by_entry": dict(expansion_count_by_entry),
         },
     }
 
@@ -4369,6 +4437,7 @@ def execute_priority_queue_traversal(
     envelope = agent_operating_envelope()
     chunk_by_id = {chunk.id: chunk for chunk in chunks}
     layer_walks: dict[str, dict[str, Any]] = {}
+    topk_selection: dict[str, Any] = {}
 
     coarse_concepts: list[CoarseConcept] = []
     if retrieval_granularity == "coarse":
@@ -4390,12 +4459,24 @@ def execute_priority_queue_traversal(
             target_attr="target_concept_id",
             envelope=envelope,
         )
+        selected_coarse_ids = (list(layer_walks["coarse"].get("accepted_nodes") or []) or list(coarse_entries.keys()))[: int(envelope["agent_coarse_top_k"])]
         stage_queues: dict[str, Any] = {
             "coarse": {
                 "entry_ids": list(coarse_entries.keys()),
-                "accepted_ids": list(layer_walks["coarse"].get("accepted_nodes") or []),
+                "selected_ids": selected_coarse_ids,
+                "accepted_ids": selected_coarse_ids,
+                "top_k": int(envelope["agent_coarse_top_k"]),
                 "frontier_pop_count": len(layer_walks["coarse"].get("frontier_pops") or []),
             }
+        }
+        topk_selection["coarse"] = {
+            "top_k": int(envelope["agent_coarse_top_k"]),
+            "candidate_count": len(layer_walks["coarse"].get("accepted_nodes") or []),
+            "selected_ids": selected_coarse_ids,
+            "stop_reason": "layer_top_k_cut"
+            if len(layer_walks["coarse"].get("accepted_nodes") or []) > len(selected_coarse_ids)
+            else "candidate_pool_exhausted",
+            "entry_mode": "coarse",
         }
         coarse_skipped_reason = None
     else:
@@ -4424,7 +4505,7 @@ def execute_priority_queue_traversal(
             }
         }
     candidate_pools: dict[str, Any] = {"mid_by_coarse": [], "chunk_by_mid": []}
-    topk_selection: dict[str, Any] = {}
+    mid_layer_budget = int(envelope["agent_mid_top_k"])
 
     mid_state = latest_mid_state(db, knowledge_base_id)
     mid_concepts = (
@@ -4437,7 +4518,7 @@ def execute_priority_queue_traversal(
     mid_text = {concept.id: concept_searchable_text(concept) for concept in mid_concepts}
     mid_candidate_scores: dict[str, float] = {}
     if retrieval_granularity == "coarse":
-        accepted_coarse_ids = list(layer_walks["coarse"].get("accepted_nodes") or []) or list(coarse_entries.keys())[: int(envelope["agent_coarse_total_budget"])]
+        accepted_coarse_ids = list(stage_queues.get("coarse", {}).get("selected_ids") or [])
         for coarse_id in accepted_coarse_ids:
             coarse = coarse_by_id.get(coarse_id)
             if coarse is None:
@@ -4469,31 +4550,36 @@ def execute_priority_queue_traversal(
             )
     else:
         mid_candidate_scores = dict(mid_entries)
-        candidate_pools["mid_direct_entries"] = {
-            "candidate_ids": list(mid_entries.keys()),
-            "selected_ids": list(mid_entries.keys())[: int(envelope["agent_mid_top_k"])],
-            "top_k": int(envelope["agent_mid_top_k"]),
-            "coarse_skipped_reason": coarse_skipped_reason,
-        }
     if not mid_candidate_scores:
         mid_candidate_scores = dict(mid_entries)
-    mid_entries = dict(sorted(mid_candidate_scores.items(), key=lambda item: item[1], reverse=True)[: int(envelope["agent_mid_top_k"])])
-    topk_selection["mid"] = {
-        "top_k": int(envelope["agent_mid_top_k"]),
-        "candidate_count": len(mid_candidate_scores),
-        "selected_ids": list(mid_entries.keys()),
-        "stop_reason": "layer_top_k_cut" if len(mid_candidate_scores) > len(mid_entries) else "candidate_pool_exhausted",
-        "entry_mode": retrieval_granularity,
+    ranked_mid_candidates = sorted(mid_candidate_scores.items(), key=lambda item: item[1], reverse=True)
+    mid_initial_budget = int(
+        envelope["agent_mid_initial_budget"]
+        if retrieval_granularity == "mid"
+        else envelope["agent_coarse_drilldown_mid_initial_budget"]
+    )
+    mid_walk_entries = dict(ranked_mid_candidates[:mid_initial_budget])
+    mid_entry_pool = {
+        "candidate_ids": [mid_id for mid_id, _score in ranked_mid_candidates],
+        "selected_ids": list(mid_walk_entries.keys()),
+        "top_k": mid_initial_budget,
+        "candidate_count": len(ranked_mid_candidates),
+        "stop_reason": "layer_top_k_cut" if len(ranked_mid_candidates) > len(mid_walk_entries) else "candidate_pool_exhausted",
     }
+    if retrieval_granularity == "mid":
+        candidate_pools["mid_direct_entries"] = {**mid_entry_pool, "coarse_skipped_reason": coarse_skipped_reason}
+    else:
+        candidate_pools["mid_initial_entries"] = {**mid_entry_pool, "source": "coarse_drilldown"}
     stage_queues["mid"] = {
-        "selected_ids": list(mid_entries.keys()),
-        "top_k": int(envelope["agent_mid_top_k"]),
+        "entry_ids": list(mid_walk_entries.keys()),
+        "initial_top_k": mid_initial_budget,
+        "top_k": mid_layer_budget,
         "entry_mode": "direct_mid" if retrieval_granularity == "mid" else "coarse_drilldown",
     }
     mid_edges = list(db.scalars(select(MidConceptEdge).where(MidConceptEdge.concept_state_id == mid_state.id)).all()) if mid_state else []
     layer_walks["mid"] = execute_layer_priority_walk(
         layer="mid",
-        entry_scores=mid_entries,
+        entry_scores=mid_walk_entries,
         node_text_by_id=mid_text,
         adjacency=_build_adjacency(mid_edges, "source_concept_id", "target_concept_id"),
         query_facets=query_facets,
@@ -4501,7 +4587,17 @@ def execute_priority_queue_traversal(
         target_attr="target_concept_id",
         envelope=envelope,
     )
-    selected_mid_ids = list(layer_walks["mid"].get("accepted_nodes") or []) or list(mid_entries.keys())
+    explored_mid_ids = list(layer_walks["mid"].get("accepted_nodes") or []) or list(mid_walk_entries.keys())
+    selected_mid_ids = explored_mid_ids[:mid_layer_budget]
+    mid_entries = {mid_id: float(mid_candidate_scores.get(mid_id, mid_walk_entries.get(mid_id, 0.35))) for mid_id in selected_mid_ids}
+    topk_selection["mid"] = {
+        "top_k": mid_layer_budget,
+        "candidate_count": len(explored_mid_ids),
+        "selected_ids": selected_mid_ids,
+        "stop_reason": "layer_top_k_cut" if len(explored_mid_ids) > len(selected_mid_ids) else "candidate_pool_exhausted",
+        "entry_mode": retrieval_granularity,
+    }
+    stage_queues["mid"]["selected_ids"] = selected_mid_ids
     stage_queues["mid"]["accepted_ids"] = selected_mid_ids
     rq_membership_entries = {}
     for mid_id in selected_mid_ids:
@@ -4642,14 +4738,19 @@ def execute_priority_queue_traversal(
                 metadata["rq_prefix_ids"] = [item["rq_prefix_id"]]
             add_chunk_candidate(item["id"], float(item["score"]), "mid_drilldown_entry", metadata)
 
-    selected_chunk_candidates = sorted(chunk_candidate_scores.items(), key=lambda item: item[1], reverse=True)[: int(envelope["agent_chunk_top_k"])]
-    topk_selection["chunk"] = {
-        "top_k": int(envelope["agent_chunk_top_k"]),
-        "candidate_count": len(chunk_candidate_scores),
+    selected_chunk_candidates = sorted(chunk_candidate_scores.items(), key=lambda item: item[1], reverse=True)[: int(envelope["agent_chunk_initial_budget"])]
+    candidate_pools["chunk_initial_entries"] = {
+        "candidate_ids": [chunk_id for chunk_id, _score in sorted(chunk_candidate_scores.items(), key=lambda item: item[1], reverse=True)],
         "selected_ids": [chunk_id for chunk_id, _score in selected_chunk_candidates],
+        "top_k": int(envelope["agent_chunk_initial_budget"]),
+        "candidate_count": len(chunk_candidate_scores),
         "stop_reason": "layer_top_k_cut" if len(chunk_candidate_scores) > len(selected_chunk_candidates) else "candidate_pool_exhausted",
     }
-    stage_queues["chunk"] = {"selected_ids": [chunk_id for chunk_id, _score in selected_chunk_candidates], "top_k": int(envelope["agent_chunk_top_k"])}
+    stage_queues["chunk"] = {
+        "entry_ids": [chunk_id for chunk_id, _score in selected_chunk_candidates],
+        "initial_top_k": int(envelope["agent_chunk_initial_budget"]),
+        "top_k": int(envelope["agent_chunk_top_k"]),
+    }
     for chunk_id, strength in selected_chunk_candidates:
         metadata = dict(chunk_candidate_metadata.get(chunk_id) or {})
         rq_prefix_ids = metadata.get("rq_prefix_ids") or []
@@ -4716,6 +4817,7 @@ def execute_priority_queue_traversal(
             "covered_facets": sorted(covered),
             "evidence_roles": sorted(seed_roles[chunk_id]),
             "depth": 0,
+            "root_node_id": chunk_id,
             "visit_counts": {chunk_id: 1},
             "support_refs": seed_metadata.get(chunk_id, {}),
         }
@@ -4734,7 +4836,10 @@ def execute_priority_queue_traversal(
     red_zone_pruned_count = 0
     expansion_count = 0
     stop_reason = "frontier_empty"
-    max_expansions = layer_frontier_budget("chunk", envelope)
+    final_chunk_top_k = min(int(top_k), int(envelope["agent_chunk_top_k"]))
+    max_expansions = layer_frontier_budget("chunk", envelope, entry_count=len(seed_strengths))
+    per_entry_expansion_budget = layer_per_entry_expansion_budget("chunk", envelope)
+    expansion_count_by_entry: dict[str, int] = defaultdict(int)
     max_depth = int(envelope["max_depth_per_layer"])
     max_labels = int(envelope["max_labels_per_node"])
 
@@ -4763,10 +4868,13 @@ def execute_priority_queue_traversal(
         current = accepted_by_chunk.get(chunk.id)
         if current is None or key < current["queue_key"]:
             accepted_by_chunk[chunk.id] = {"state": state, "queue_key": key}
-        if len(accepted_by_chunk) >= top_k and set(state.get("covered_facets") or []) >= required_facets:
+        root_node_id = str(state.get("root_node_id") or (state.get("path") or [chunk.id])[0])
+        if len(accepted_by_chunk) >= final_chunk_top_k and set(state.get("covered_facets") or []) >= required_facets:
             stop_reason = "all_required_facets_covered"
             break
         if int(state["depth"]) >= max_depth:
+            continue
+        if expansion_count_by_entry[root_node_id] >= per_entry_expansion_budget:
             continue
 
         expanded_edge_ids: list[str] = []
@@ -4837,6 +4945,7 @@ def execute_priority_queue_traversal(
                 "covered_facets": sorted(covered),
                 "evidence_roles": sorted(roles),
                 "depth": int(state["depth"]) + 1,
+                "root_node_id": root_node_id,
                 "visit_counts": visit_counts,
                 "support_refs": {"edge_id": edge.id, "edge_type": edge.edge_type},
             }
@@ -4850,8 +4959,11 @@ def execute_priority_queue_traversal(
             serial += 1
             expanded_edge_ids.append(edge.id)
             expansion_count += 1
+            expansion_count_by_entry[root_node_id] += 1
             if expansion_count >= max_expansions:
                 stop_reason = "hard_budget_hit"
+                break
+            if expansion_count_by_entry[root_node_id] >= per_entry_expansion_budget:
                 break
         path_labels.append(
             {
@@ -4865,8 +4977,15 @@ def execute_priority_queue_traversal(
             }
         )
 
-    accepted_items = sorted(accepted_by_chunk.values(), key=lambda item: item["queue_key"])[:top_k]
+    accepted_items = sorted(accepted_by_chunk.values(), key=lambda item: item["queue_key"])[:final_chunk_top_k]
     accepted_chunk_ids = [item["state"]["node_id"] for item in accepted_items]
+    topk_selection["chunk"] = {
+        "top_k": final_chunk_top_k,
+        "candidate_count": len(accepted_by_chunk),
+        "selected_ids": accepted_chunk_ids,
+        "stop_reason": "layer_top_k_cut" if len(accepted_by_chunk) > len(accepted_items) else "candidate_pool_exhausted",
+    }
+    stage_queues["chunk"]["selected_ids"] = accepted_chunk_ids
     rq_membership_by_chunk: dict[str, RQPrefixMembership] = {}
     if query_rq and accepted_chunk_ids:
         rq_rows = list(
@@ -4929,6 +5048,8 @@ def execute_priority_queue_traversal(
         },
         "accepted_chunk_count": len(results),
         "frontier_remaining": len(frontier),
+        "per_entry_expansion_budget": per_entry_expansion_budget,
+        "expansion_count_by_entry": dict(expansion_count_by_entry),
     }
     chunk_convergence = dict(convergence)
     layer_walks["chunk"] = {
@@ -5334,7 +5455,9 @@ def build_context_package(
     results: list[dict[str, Any]],
     token_budget: int | None = None,
 ) -> ContextPackage:
-    token_budget = token_budget or int(get_settings().context_package_token_budget or 2400)
+    settings = get_settings()
+    token_budget = token_budget or int(settings.context_package_token_budget or 2400)
+    restore_per_chunk_budget = int(settings.agent_structure_restore_per_chunk_budget or settings.agent_structure_restore_budget or 1)
     profile_hash = active_profile_hash(db, knowledge_base_id)
     hit_ids = [item["chunk_id"] for item in results]
     hit_id_set = set(hit_ids)
@@ -5363,9 +5486,14 @@ def build_context_package(
     for chunk_id in hit_ids:
         chunk = db.get(Chunk, chunk_id)
         add_chunk_id(chunk_id)
+        restore_candidates: list[tuple[str | None, str]] = []
         if chunk:
-            add_chunk_id(chunk.previous_chunk_id)
-            add_chunk_id(chunk.next_chunk_id)
+            restore_candidates.extend(
+                [
+                    (chunk.previous_chunk_id, "neighbor"),
+                    (chunk.next_chunk_id, "neighbor"),
+                ]
+            )
             for mapping in db.scalars(select(ChunkStructureMapping).where(ChunkStructureMapping.chunk_id == chunk.id)).all():
                 parent_node_ids.add(mapping.structure_node_id)
         for edge in db.scalars(
@@ -5376,11 +5504,22 @@ def build_context_package(
                 (ChunkRelationEdge.source_chunk_id == chunk_id) | (ChunkRelationEdge.target_chunk_id == chunk_id),
             )
             .order_by(ChunkRelationEdge.distance.asc())
-            .limit(2)
+            .limit(restore_per_chunk_budget)
         ).all():
             other_id = edge.target_chunk_id if edge.source_chunk_id == chunk_id else edge.source_chunk_id
-            bridge_ids.add(other_id)
-            add_chunk_id(other_id)
+            restore_candidates.append((other_id, "bridge"))
+        restored_for_hit = 0
+        for restore_id, restore_role in restore_candidates:
+            if not restore_id or restore_id in hit_id_set:
+                continue
+            if restored_for_hit >= restore_per_chunk_budget:
+                break
+            before_count = len(selected_ids)
+            add_chunk_id(restore_id)
+            if len(selected_ids) > before_count:
+                restored_for_hit += 1
+                if restore_role == "bridge":
+                    bridge_ids.add(restore_id)
 
     for chunk_id in sorted(graph_path_chunk_ids):
         add_chunk_id(chunk_id)
@@ -5572,6 +5711,7 @@ def build_context_package(
                 "bridge_chunks": len(bridge_ids),
                 "graph_path_chunks": len(graph_path_chunk_ids),
                 "parent_structure_nodes": len(parent_node_ids),
+                "per_hit_chunk_budget": restore_per_chunk_budget,
             },
         },
     )

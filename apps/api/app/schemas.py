@@ -598,10 +598,15 @@ class ModelSettingsUpdate(APIModel):
     operating_point_hard_gate_min_structure_recovery_rate: float | None = None
     operating_point_hard_gate_max_candidate_latency_p95_ms: int | None = None
     retrieval_result_top_k_default: int | None = Field(default=None, ge=1, le=50)
+    agent_coarse_initial_budget: int | None = None
     agent_coarse_total_budget: int | None = None
+    agent_coarse_top_k: int | None = None
     agent_mid_per_coarse_budget: int | None = None
+    agent_coarse_drilldown_mid_initial_budget: int | None = None
+    agent_mid_initial_budget: int | None = None
     agent_mid_top_k: int | None = None
     agent_chunk_per_mid_budget: int | None = None
+    agent_chunk_initial_budget: int | None = None
     agent_chunk_top_k: int | None = None
     candidate_pool_dedupe_budget: int | None = None
     agent_max_depth_per_layer: int | None = None
@@ -612,6 +617,7 @@ class ModelSettingsUpdate(APIModel):
     agent_path_distance_green_threshold: float | None = None
     agent_path_distance_gray_threshold: float | None = None
     agent_path_distance_hard_threshold: float | None = None
+    agent_structure_restore_per_chunk_budget: int | None = None
     agent_structure_restore_budget: int | None = None
     context_path_summary_budget: int | None = None
     agent_planning_round_budget: int | None = None

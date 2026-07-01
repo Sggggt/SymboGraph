@@ -153,6 +153,43 @@ def test_query_facet_packet_drops_fillers_and_matches_aliases():
     assert {"\u914d\u7f6e\u6a21\u578b", "\u7b97\u6cd5\u6b65\u9aa4"}.issubset(matched)
 
 
+def test_query_facet_packet_prefers_unified_facet_groups_and_merges_legacy_aliases():
+    from app.services.context_graph import query_facets_for_search
+
+    facets = query_facets_for_search(
+        "alpha relation placeholder",
+        {
+            "facet_groups": [
+                {"facet": "alpha concept", "role": "domain", "aliases": ["alpha topic", "alpha alias"]},
+                {"facet": "beta procedure", "role": "procedure", "aliases": ["beta step", "beta alias"]},
+            ],
+            "drop_terms": ["placeholder"],
+            "answer_shape": "comparison",
+            "diagnostics": {"bilingual_query_facets_enabled": True},
+        },
+        {"intent": "comparison"},
+    )
+
+    groups = {group["facet"]: group for group in facets["facet_groups"]}
+    assert groups["alpha concept"]["aliases"] == ["alpha topic", "alpha alias"]
+    assert groups["beta procedure"]["aliases"] == ["beta step", "beta alias"]
+    assert {"alpha", "concept", "topic", "alias", "beta", "procedure", "step"}.issubset(set(facets["terms"]))
+    assert facets["diagnostics"]["bilingual_query_facets_enabled"] is True
+
+    legacy = query_facets_for_search(
+        "legacy concept",
+        {
+            "domain_facets": ["legacy concept"],
+            "alias_facets": [{"facet": "legacy concept", "aliases": ["legacy alias", "legacy synonym"]}],
+        },
+        {"intent": "definition"},
+    )
+    legacy_group = {group["facet"]: group for group in legacy["facet_groups"]}["legacy concept"]
+    assert legacy_group["role"] == "domain"
+    assert legacy_group["aliases"] == ["legacy alias", "legacy synonym"]
+    assert {"legacy", "concept", "alias", "synonym"}.issubset(set(legacy["terms"]))
+
+
 def test_context_package_restores_graph_path_chunks(db_session, sample_knowledge_base):
     from app.models import Chunk, Document, DocumentVersion, RetrievalTrace
     from app.services.chunking import stable_hash
@@ -623,3 +660,77 @@ async def test_layered_retrieval_granularity_mid_direct_and_coarse_regression(db
     assert ("coarse", "staged_priority_queue_walk") in coarse_step_actions
     assert ("mid", "drill_down_each_coarse_or_direct_mid_entry") in coarse_step_actions
     assert mid_result.trace.diagnostics_json["cache_key"] != coarse_result.trace.diagnostics_json["cache_key"]
+
+
+@pytest.mark.asyncio
+async def test_mid_initial_budget_is_mode_specific(monkeypatch, db_session, populated_context_graph):
+    from app.schemas import SearchFilters
+    from app.services import context_graph
+
+    kb = populated_context_graph["knowledge_base"]
+    envelope = dict(context_graph.agent_operating_envelope())
+    envelope.update(
+        {
+            "agent_coarse_initial_budget": 2,
+            "agent_coarse_top_k": 1,
+            "agent_mid_per_coarse_budget": 2,
+            "agent_coarse_drilldown_mid_initial_budget": 3,
+            "agent_mid_initial_budget": 1,
+            "agent_mid_top_k": 4,
+            "agent_chunk_per_mid_budget": 2,
+            "agent_chunk_initial_budget": 3,
+            "agent_chunk_top_k": 2,
+            "structure_restore_per_chunk_budget": 1,
+            "structure_restore_budget": 1,
+        }
+    )
+    monkeypatch.setattr(context_graph, "agent_operating_envelope", lambda settings=None: dict(envelope))
+
+    mid_result = await context_graph.layered_search(
+        db_session,
+        kb.id,
+        "What is a Markov blanket budget check?",
+        SearchFilters(),
+        4,
+        retrieval_granularity="mid",
+    )
+
+    assert mid_result.results
+    assert mid_result.trace.candidate_pools_json["mid_direct_entries"]["top_k"] == 1
+    assert len(mid_result.trace.stage_queues_json["mid"]["entry_ids"]) <= 1
+    assert mid_result.trace.topk_selection_json["mid"]["top_k"] == 4
+    assert len(mid_result.trace.topk_selection_json["mid"]["selected_ids"]) <= 4
+    assert mid_result.trace.stage_queues_json["mid"]["top_k"] == 4
+    assert mid_result.trace.candidate_pools_json["chunk_initial_entries"]["top_k"] == 3
+    assert mid_result.trace.stage_queues_json["chunk"]["initial_top_k"] == 3
+    assert mid_result.trace.topk_selection_json["chunk"]["top_k"] == 2
+    assert len(mid_result.results) <= 2
+
+    coarse_result = await context_graph.layered_search(
+        db_session,
+        kb.id,
+        "What is a Markov blanket budget check?",
+        SearchFilters(),
+        4,
+        retrieval_granularity="coarse",
+    )
+
+    assert coarse_result.results
+    assert len(coarse_result.trace.stage_queues_json["coarse"]["entry_ids"]) <= 2
+    assert coarse_result.trace.topk_selection_json["coarse"]["top_k"] == 1
+    assert len(coarse_result.trace.topk_selection_json["coarse"]["selected_ids"]) <= 1
+    assert "mid_direct_entries" not in coarse_result.trace.candidate_pools_json
+    assert len(coarse_result.trace.candidate_pools_json["mid_by_coarse"]) <= 1
+    assert all(
+        pool["per_parent_budget_status"]["budget"] == 2
+        for pool in coarse_result.trace.candidate_pools_json["mid_by_coarse"]
+    )
+    assert coarse_result.trace.candidate_pools_json["mid_initial_entries"]["top_k"] == 3
+    assert len(coarse_result.trace.stage_queues_json["mid"]["entry_ids"]) <= 3
+    assert coarse_result.trace.stage_queues_json["mid"]["initial_top_k"] == 3
+    assert coarse_result.trace.topk_selection_json["mid"]["entry_mode"] == "coarse"
+    assert coarse_result.trace.topk_selection_json["mid"]["top_k"] == 4
+    assert coarse_result.trace.stage_queues_json["mid"]["top_k"] == 4
+    assert coarse_result.trace.candidate_pools_json["chunk_initial_entries"]["top_k"] == 3
+    assert coarse_result.trace.topk_selection_json["chunk"]["top_k"] == 2
+    assert len(coarse_result.results) <= 2

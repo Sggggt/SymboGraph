@@ -118,7 +118,7 @@ GENERIC_QUERY_FACET_EXTRACTOR_SYSTEM = (
     "The executor will validate this packet and use it only as retrieval priority metadata. "
 )
 GENERIC_QUERY_FACET_BILINGUAL_SUFFIX = (
-    "For each explicit domain or procedure facet, include standard Chinese and English technical aliases when a bilingual corpus might use either language."
+    "For every explicit domain or procedure facet, output both Chinese and English lexical surfaces in facet_groups.aliases, regardless of the user's input language."
 )
 GENERIC_QUERY_FACET_ALIAS_SUFFIX = "Only include aliases when they are explicit or standard technical synonyms."
 GENERIC_AGENT_PLANNER_SYSTEM = (

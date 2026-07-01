@@ -62,10 +62,14 @@ type AgentSettingsForm = {
   query_facet_bilingual_enabled: boolean;
   context_package_token_budget: string;
   retrieval_result_top_k_default: string;
-  agent_coarse_total_budget: string;
+  agent_coarse_initial_budget: string;
+  agent_coarse_top_k: string;
   agent_mid_per_coarse_budget: string;
+  agent_coarse_drilldown_mid_initial_budget: string;
+  agent_mid_initial_budget: string;
   agent_mid_top_k: string;
   agent_chunk_per_mid_budget: string;
+  agent_chunk_initial_budget: string;
   agent_chunk_top_k: string;
   candidate_pool_dedupe_budget: string;
   agent_max_depth_per_layer: string;
@@ -76,7 +80,7 @@ type AgentSettingsForm = {
   agent_path_distance_green_threshold: string;
   agent_path_distance_gray_threshold: string;
   agent_path_distance_hard_threshold: string;
-  agent_structure_restore_budget: string;
+  agent_structure_restore_per_chunk_budget: string;
   context_path_summary_budget: string;
   agent_planning_round_budget: string;
   agent_max_typed_actions_per_round: string;
@@ -103,11 +107,15 @@ export const AGENT_PARAMETER_HELP: Record<string, string> = {
   模型双语查询词面: "开启后，查询词面提取会要求模型为显式概念补充中英文别名；只影响下一次检索路由，不写入事实证据，也不触发图谱重建。",
   证据包令牌预算: "上下文证据包可容纳的令牌上限。证据包是回答生成的唯一证据输入，预算不足时会优先保留更强支撑。",
   结果保留数量默认值: "搜索、问答和智能体请求未显式指定结果数量时使用的默认返回上限；它不是裸召回规模。",
-  粗概念总预算: "粗层探索的概念节点上限。该值是层内硬预算，不表示查询相关性评分。",
-  每个粗概念中概念预算: "对每个已接受粗概念分别下钻的中概念候选数量上限，保证逐父节点探索。",
-  中概念保留数量: "中概念候选合并去重后的层间输出上限，不会绕过轨迹、结构恢复或引用验证。",
-  每个中概念片段预算: "对每个已选中概念分别下钻到片段候选的数量上限，用来控制底层候选扩展范围。",
-  片段保留数量: "片段候选合并去重后进入证据包候选的输出上限，不等同于裸向量召回。",
+  粗概念起点数量: "摘要模式下从全部粗概念候选中选入图探索的起点数量；普通模式不使用这个参数。",
+  粗概念保留数量: "摘要模式下粗概念图探索后保留并继续下钻的粗概念数量。",
+  每个粗概念中概念预算: "对每个已保留粗概念分别下钻的中概念候选数量上限，保证逐父节点探索。",
+  普通模式中概念起点数量: "普通模式下，从全体中概念候选池中选入中概念图探索的起点数量。",
+  摘要模式中概念起点数量: "摘要模式下，从粗概念逐父节点下钻合并后的中概念候选池中选入中概念图探索的起点数量。",
+  中概念保留数量: "中概念图探索后保留并继续下钻到片段层的中概念数量。",
+  每个中概念片段预算: "对每个已保留中概念分别下钻到片段候选的数量上限，用来控制底层候选扩展范围。",
+  片段起点数量: "从全部片段候选中选入片段图探索的起点数量。",
+  片段最终保留数量: "片段图探索后最终保留进入证据包候选的片段数量。",
   候选去重池预算: "跨路径、跨 RQ 成员关系和跨概念合并候选时保留的候选池规模，防止单次检索过载。",
   每层最大深度: "图遍历在每个层级允许继续扩展的最大深度，用来避免路径无限扩张。",
   每节点标签上限: "同一节点可保留的路径标签数量上限，用于限制 dominance pruning 中的重复路径状态。",
@@ -117,7 +125,7 @@ export const AGENT_PARAMETER_HELP: Record<string, string> = {
   路径绿色阈值: "路径距离小于该值时视为高置信路径，通常可继续确定性扩展。",
   路径灰区阈值: "路径距离落入灰区时可交给智能体评估器做继续、下钻或停止的类型化裁决。",
   路径硬中断阈值: "路径距离超过该值时执行器直接剪枝，不允许模型绕过硬阈值继续扩展。",
-  结构恢复预算: "命中片段后可追加的前后文、章节和桥接邻居上下文数量上限。",
+  每个片段结构恢复数量: "对每个最终命中片段最多追加多少前后文或桥接上下文；不改变片段检索命中数量。",
   路径摘要预算: "证据包中可保留的图路径摘要数量上限，用于解释证据从粗层到中层再到片段的来源。",
   规划轮次预算: "智能体可进行规划和评估的最大轮数，用来控制单次任务内的推理成本。",
   每轮动作上限: "每个规划轮最多允许的类型化动作数量。所有动作仍必须通过验证器和确定性执行器。",
@@ -125,15 +133,26 @@ export const AGENT_PARAMETER_HELP: Record<string, string> = {
   引用验证预算: "回答后可执行的引用验证次数上限，用于把声明绑定回原始片段范围。",
 };
 
-const agentTraversalFields: AgentNumberField[] = [
+const commonRetrievalFields: AgentNumberField[] = [
   { key: "context_package_token_budget", label: "证据包令牌预算", min: 256, max: 20000 },
   { key: "retrieval_result_top_k_default", label: "结果保留数量默认值", min: 1, max: 50 },
-  { key: "agent_coarse_total_budget", label: "粗概念总预算", min: 1, max: 200 },
-  { key: "agent_mid_per_coarse_budget", label: "每个粗概念中概念预算", min: 1, max: 100 },
   { key: "agent_mid_top_k", label: "中概念保留数量", min: 1, max: 500 },
   { key: "agent_chunk_per_mid_budget", label: "每个中概念片段预算", min: 1, max: 200 },
-  { key: "agent_chunk_top_k", label: "片段保留数量", min: 1, max: 1000 },
+  { key: "agent_chunk_initial_budget", label: "片段起点数量", min: 1, max: 1000 },
+  { key: "agent_chunk_top_k", label: "片段最终保留数量", min: 1, max: 1000 },
+  { key: "agent_structure_restore_per_chunk_budget", label: "每个片段结构恢复数量", min: 1, max: 200 },
   { key: "candidate_pool_dedupe_budget", label: "候选去重池预算", min: 1, max: 5000 },
+];
+
+const midModeRetrievalFields: AgentNumberField[] = [
+  { key: "agent_mid_initial_budget", label: "普通模式中概念起点数量", min: 1, max: 500 },
+];
+
+const coarseModeRetrievalFields: AgentNumberField[] = [
+  { key: "agent_coarse_initial_budget", label: "粗概念起点数量", min: 1, max: 200 },
+  { key: "agent_coarse_top_k", label: "粗概念保留数量", min: 1, max: 200 },
+  { key: "agent_mid_per_coarse_budget", label: "每个粗概念中概念预算", min: 1, max: 100 },
+  { key: "agent_coarse_drilldown_mid_initial_budget", label: "摘要模式中概念起点数量", min: 1, max: 500 },
 ];
 
 const agentControlFields: AgentNumberField[] = [
@@ -145,7 +164,6 @@ const agentControlFields: AgentNumberField[] = [
   { key: "agent_path_distance_green_threshold", label: "路径绿色阈值", min: 0, max: 20, step: 0.01 },
   { key: "agent_path_distance_gray_threshold", label: "路径灰区阈值", min: 0, max: 20, step: 0.01 },
   { key: "agent_path_distance_hard_threshold", label: "路径硬中断阈值", min: 0, max: 40, step: 0.01 },
-  { key: "agent_structure_restore_budget", label: "结构恢复预算", min: 1, max: 200 },
   { key: "context_path_summary_budget", label: "路径摘要预算", min: 1, max: 500 },
   { key: "agent_planning_round_budget", label: "规划轮次预算", min: 1, max: 10 },
   { key: "agent_max_typed_actions_per_round", label: "每轮动作上限", min: 1, max: 50 },
@@ -189,10 +207,17 @@ function agentSettingsFormFromSettings(settings?: ModelSettingsResponse | null):
     query_facet_bilingual_enabled: settings?.query_facet_bilingual_enabled ?? false,
     context_package_token_budget: stringSetting(settings?.context_package_token_budget, 12000),
     retrieval_result_top_k_default: stringSetting(settings?.retrieval_result_top_k_default, 12),
-    agent_coarse_total_budget: stringSetting(settings?.agent_coarse_total_budget, 5),
+    agent_coarse_initial_budget: stringSetting(settings?.agent_coarse_initial_budget ?? settings?.agent_coarse_total_budget, 5),
+    agent_coarse_top_k: stringSetting(settings?.agent_coarse_top_k ?? settings?.agent_coarse_initial_budget ?? settings?.agent_coarse_total_budget, 5),
     agent_mid_per_coarse_budget: stringSetting(settings?.agent_mid_per_coarse_budget, 6),
+    agent_coarse_drilldown_mid_initial_budget: stringSetting(
+      settings?.agent_coarse_drilldown_mid_initial_budget ?? settings?.agent_mid_top_k,
+      8
+    ),
+    agent_mid_initial_budget: stringSetting(settings?.agent_mid_initial_budget ?? settings?.agent_mid_top_k, 8),
     agent_mid_top_k: stringSetting(settings?.agent_mid_top_k, 8),
     agent_chunk_per_mid_budget: stringSetting(settings?.agent_chunk_per_mid_budget, 12),
+    agent_chunk_initial_budget: stringSetting(settings?.agent_chunk_initial_budget ?? settings?.agent_chunk_top_k, 16),
     agent_chunk_top_k: stringSetting(settings?.agent_chunk_top_k, 16),
     candidate_pool_dedupe_budget: stringSetting(settings?.candidate_pool_dedupe_budget, 80),
     agent_max_depth_per_layer: stringSetting(settings?.agent_max_depth_per_layer, 3),
@@ -203,7 +228,7 @@ function agentSettingsFormFromSettings(settings?: ModelSettingsResponse | null):
     agent_path_distance_green_threshold: stringSetting(settings?.agent_path_distance_green_threshold, 0.45),
     agent_path_distance_gray_threshold: stringSetting(settings?.agent_path_distance_gray_threshold, 1.35),
     agent_path_distance_hard_threshold: stringSetting(settings?.agent_path_distance_hard_threshold, 2.4),
-    agent_structure_restore_budget: stringSetting(settings?.agent_structure_restore_budget, 16),
+    agent_structure_restore_per_chunk_budget: stringSetting(settings?.agent_structure_restore_per_chunk_budget ?? settings?.agent_structure_restore_budget, 16),
     context_path_summary_budget: stringSetting(settings?.context_path_summary_budget, 32),
     agent_planning_round_budget: stringSetting(settings?.agent_planning_round_budget, 2),
     agent_max_typed_actions_per_round: stringSetting(settings?.agent_max_typed_actions_per_round, 8),
@@ -212,15 +237,14 @@ function agentSettingsFormFromSettings(settings?: ModelSettingsResponse | null):
   };
 }
 
-function buildAgentSettingsPayload(form: AgentSettingsForm): ModelSettingsUpdate {
-  return {
+function buildAgentSettingsPayload(form: AgentSettingsForm, retrievalGranularity: RetrievalGranularity): ModelSettingsUpdate {
+  const payload: ModelSettingsUpdate = {
     query_facet_bilingual_enabled: form.query_facet_bilingual_enabled,
     context_package_token_budget: parseIntField(form.context_package_token_budget),
     retrieval_result_top_k_default: parseIntField(form.retrieval_result_top_k_default),
-    agent_coarse_total_budget: parseIntField(form.agent_coarse_total_budget),
-    agent_mid_per_coarse_budget: parseIntField(form.agent_mid_per_coarse_budget),
     agent_mid_top_k: parseIntField(form.agent_mid_top_k),
     agent_chunk_per_mid_budget: parseIntField(form.agent_chunk_per_mid_budget),
+    agent_chunk_initial_budget: parseIntField(form.agent_chunk_initial_budget),
     agent_chunk_top_k: parseIntField(form.agent_chunk_top_k),
     candidate_pool_dedupe_budget: parseIntField(form.candidate_pool_dedupe_budget),
     agent_max_depth_per_layer: parseIntField(form.agent_max_depth_per_layer),
@@ -231,13 +255,22 @@ function buildAgentSettingsPayload(form: AgentSettingsForm): ModelSettingsUpdate
     agent_path_distance_green_threshold: parseFloatField(form.agent_path_distance_green_threshold),
     agent_path_distance_gray_threshold: parseFloatField(form.agent_path_distance_gray_threshold),
     agent_path_distance_hard_threshold: parseFloatField(form.agent_path_distance_hard_threshold),
-    agent_structure_restore_budget: parseIntField(form.agent_structure_restore_budget),
+    agent_structure_restore_per_chunk_budget: parseIntField(form.agent_structure_restore_per_chunk_budget),
     context_path_summary_budget: parseIntField(form.context_path_summary_budget),
     agent_planning_round_budget: parseIntField(form.agent_planning_round_budget),
     agent_max_typed_actions_per_round: parseIntField(form.agent_max_typed_actions_per_round),
     agent_repair_round_budget: parseIntField(form.agent_repair_round_budget),
     agent_verification_budget: parseIntField(form.agent_verification_budget),
   };
+  if (retrievalGranularity === "coarse") {
+    payload.agent_coarse_initial_budget = parseIntField(form.agent_coarse_initial_budget);
+    payload.agent_coarse_top_k = parseIntField(form.agent_coarse_top_k);
+    payload.agent_mid_per_coarse_budget = parseIntField(form.agent_mid_per_coarse_budget);
+    payload.agent_coarse_drilldown_mid_initial_budget = parseIntField(form.agent_coarse_drilldown_mid_initial_budget);
+  } else {
+    payload.agent_mid_initial_budget = parseIntField(form.agent_mid_initial_budget);
+  }
+  return payload;
 }
 
 const fallbackSuggestions = [
@@ -432,6 +465,8 @@ function AgentSettingsDialog({
   onChange,
   onReset,
   onSave,
+  retrievalGranularity,
+  onRetrievalGranularityChange,
   isLoading,
   error,
   isSaving,
@@ -443,12 +478,16 @@ function AgentSettingsDialog({
   onChange: <K extends keyof AgentSettingsForm>(key: K, value: AgentSettingsForm[K]) => void;
   onReset: () => void;
   onSave: () => void;
+  retrievalGranularity: RetrievalGranularity;
+  onRetrievalGranularityChange: (value: RetrievalGranularity) => void;
   isLoading: boolean;
   error: Error | null;
   isSaving: boolean;
   savedMessage: { kind: "success" | "error"; text: string } | null;
 }) {
   const disabled = isLoading || isSaving || !form;
+  const modeFields = retrievalGranularity === "mid" ? midModeRetrievalFields : coarseModeRetrievalFields;
+  const modeTitle = retrievalGranularity === "mid" ? "普通模式入口参数" : "摘要模式入口参数";
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex h-[min(46rem,calc(100dvh-2rem))] max-h-[calc(100dvh-2rem)] w-[min(58rem,calc(100vw-2rem))] flex-col overflow-hidden border border-cyan-200/14 bg-[rgba(3,10,22,0.96)] p-0 text-white shadow-[0_30px_90px_rgba(0,0,0,0.48)] backdrop-blur-2xl sm:!max-w-[58rem]">
@@ -492,10 +531,20 @@ function AgentSettingsDialog({
                   </button>
                 </div>
 
+                <section className="grid gap-3 rounded-lg border border-white/8 bg-white/[0.025] p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="min-w-[14rem]">
+                      <p className="text-sm font-semibold text-white">检索模式</p>
+                      <p className="mt-1 text-xs leading-5 text-white/48">这里只显示当前模式会读取的入口预算参数。</p>
+                    </div>
+                    <RetrievalGranularitySelector value={retrievalGranularity} onChange={onRetrievalGranularityChange} disabled={disabled} />
+                  </div>
+                </section>
+
                 <section className="grid gap-4">
                   <p className="text-sm font-semibold text-white">检索与证据包</p>
                   <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                    {agentTraversalFields.map((field) => (
+                    {commonRetrievalFields.map((field) => (
                       <AgentSettingsField
                         key={field.key}
                         field={field}
@@ -506,6 +555,23 @@ function AgentSettingsDialog({
                     ))}
                   </div>
                 </section>
+
+                {modeFields.length ? (
+                  <section className="grid gap-4">
+                    <p className="text-sm font-semibold text-white">{modeTitle}</p>
+                    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                      {modeFields.map((field) => (
+                        <AgentSettingsField
+                          key={field.key}
+                          field={field}
+                          value={form[field.key]}
+                          onChange={(value) => onChange(field.key, value)}
+                          disabled={disabled}
+                        />
+                      ))}
+                    </div>
+                  </section>
+                ) : null}
 
                 <section className="grid gap-4">
                   <p className="text-sm font-semibold text-white">遍历、修复与验证</p>
@@ -1408,9 +1474,11 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
         form={activeAgentSettingsForm}
         onChange={updateAgentSettingsForm}
         onReset={resetAgentSettingsForm}
+        retrievalGranularity={retrievalGranularity}
+        onRetrievalGranularityChange={setRetrievalGranularity}
         onSave={() => {
           if (activeAgentSettingsForm) {
-            saveAgentSettingsMutation.mutate(buildAgentSettingsPayload(activeAgentSettingsForm));
+            saveAgentSettingsMutation.mutate(buildAgentSettingsPayload(activeAgentSettingsForm, retrievalGranularity));
           }
         }}
         isLoading={modelSettingsQuery.isLoading}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 from types import SimpleNamespace
 
 import pytest
@@ -72,8 +73,10 @@ async def test_propose_query_facets_can_request_bilingual_aliases(monkeypatch):
             captured["system_prompt"] = system_prompt
             captured["user_prompt"] = user_prompt
             return {
-                "domain_facets": [{"facet": "\u7a7a\u95f4\u7f51\u7edc", "aliases": ["spatial network", "spatial networks"]}],
-                "procedure_facets": [{"facet": "\u5e73\u9762\u7f51\u7edc\u6307\u6807", "aliases": ["planar network metrics"]}],
+                "facet_groups": [
+                    {"facet": "\u7a7a\u95f4\u7f51\u7edc", "role": "domain", "aliases": ["spatial network", "spatial networks"]},
+                    {"facet": "\u5e73\u9762\u7f51\u7edc\u6307\u6807", "role": "procedure", "aliases": ["planar network metrics"]},
+                ],
                 "drop_terms": ["\u4ec0\u4e48\u662f"],
                 "answer_shape": "definition",
             }
@@ -89,7 +92,11 @@ async def test_propose_query_facets_can_request_bilingual_aliases(monkeypatch):
 
     assert facets["diagnostics"]["bilingual_query_facets_enabled"] is True
     assert "Chinese and English" in captured["system_prompt"]
-    assert "bilingual_query_facets_enabled" in captured["user_prompt"]
+    user_payload = ast.literal_eval(captured["user_prompt"])
+    assert "facet_groups" in user_payload["required_json_shape"]
+    assert "domain_facets" not in user_payload["required_json_shape"]
+    assert "alias_facets" not in user_payload["required_json_shape"]
+    assert user_payload["bilingual_query_facets_enabled"] is True
     assert "spatial" in facets["terms"]
     assert "network" in facets["terms"]
     assert "planar" in facets["terms"]
