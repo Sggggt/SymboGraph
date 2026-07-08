@@ -26,7 +26,15 @@ async def test_chat_answer_payload_has_no_output_token_cap(monkeypatch, no_fallb
             {
                 "document_title": "Bayes",
                 "partition": "Chapter 1",
+                "source_path": "/data/math/bayes-notes.md",
                 "content": "贝叶斯网络使用有向边表达条件依赖，并结合证据更新后验。",
+                "metadata": {
+                    "document_id": "doc-internal",
+                    "document_version_id": "version-internal",
+                    "section_path": "Chapter 1 / Bayesian networks",
+                    "page_range": [2, 3],
+                    "char_span": [120, 260],
+                },
             }
         ],
         [],
@@ -39,6 +47,15 @@ async def test_chat_answer_payload_has_no_output_token_cap(monkeypatch, no_fallb
     assert "max_tokens" not in payload
     assert "complete as the supplied evidence supports" in system_prompt
     assert "concise" not in system_prompt.lower()
+    user_prompt = payload["messages"][-1]["content"]
+    assert "File: bayes-notes.md" in user_prompt
+    assert "Source path: /data/math/bayes-notes.md" in user_prompt
+    assert "Partition: Chapter 1" in user_prompt
+    assert "Section: Chapter 1 / Bayesian networks" in user_prompt
+    assert "Pages: 2-3" in user_prompt
+    assert "Character span: 120-260" in user_prompt
+    assert "doc-internal" not in user_prompt
+    assert "version-internal" not in user_prompt
 
 
 @pytest.mark.asyncio

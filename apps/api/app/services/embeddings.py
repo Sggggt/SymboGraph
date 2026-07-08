@@ -66,6 +66,52 @@ def no_context_answer(question: str) -> str:
     return profile_prompt(profile, "no_context_answer_en", DEFAULT_NO_CONTEXT_EN)
 
 
+def _format_location_range(value: Any) -> str:
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return ""
+    start, end = value[0], value[1]
+    if start in (None, "") and end in (None, ""):
+        return ""
+    if start in (None, ""):
+        return str(end)
+    if end in (None, "") or end == start:
+        return str(start)
+    return f"{start}-{end}"
+
+
+def _source_file_name(source_path: str) -> str:
+    if not source_path:
+        return ""
+    parts = [part for part in re.split(r"[\\/]+", source_path.strip()) if part]
+    return parts[-1] if parts else source_path.strip()
+
+
+def _context_source_header(index: int, item: dict[str, Any]) -> str:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    source_span = metadata.get("source_span") if isinstance(metadata.get("source_span"), dict) else {}
+    source_path = str(item.get("source_path") or metadata.get("source_path") or source_span.get("source_path") or "").strip()
+    file_name = _source_file_name(source_path)
+    document_title = str(item.get("document_title") or metadata.get("document_title") or file_name or "Untitled source").strip()
+    section_path = str(metadata.get("section_path") or source_span.get("section_path") or metadata.get("structure_path") or "").strip()
+    page_range = _format_location_range(metadata.get("page_range") or source_span.get("page_range"))
+    char_span = _format_location_range(metadata.get("char_span") or source_span.get("char_span"))
+    partition = str(item.get("partition") or metadata.get("partition") or "").strip()
+    lines = [f"[{index}] {document_title}"]
+    if file_name:
+        lines.append(f"File: {file_name}")
+    if source_path:
+        lines.append(f"Source path: {source_path}")
+    if partition:
+        lines.append(f"Partition: {partition}")
+    if section_path:
+        lines.append(f"Section: {section_path}")
+    if page_range:
+        lines.append(f"Pages: {page_range}")
+    if char_span:
+        lines.append(f"Character span: {char_span}")
+    return "\n".join(lines)
+
+
 def vector_norm(vector: list[float]) -> float:
     return math.sqrt(sum(float(value) * float(value) for value in vector))
 
@@ -520,7 +566,7 @@ class ChatProvider:
     async def _openai_compatible_chat(self, question: str, contexts: list[dict], history: list[dict], context_quality: str = "normal") -> str:
         target_language = answer_language_name(question)
         citations = "\n\n".join(
-            f"[{idx + 1}] {item['document_title']} / {item.get('partition') or 'General'}\n{item['content']}"
+            f"{_context_source_header(idx + 1, item)}\nContent:\n{item.get('content') or ''}"
             for idx, item in enumerate(contexts)
         )
         profile = active_profile_json()

@@ -5799,14 +5799,17 @@ def context_package_to_contexts(package: ContextPackage) -> list[dict[str, Any]]
         {
             "chunk_id": item["chunk_id"],
             "document_title": item.get("document_title") or "",
+            "source_path": item.get("source_path") or "",
             "content": item.get("content") or "",
             "snippet": (item.get("content") or "")[:280],
             "metadata": {
+                "source_path": item.get("source_path") or "",
                 "section_path": item.get("section_path"),
                 "structure_path": item.get("structure_path"),
                 "parent_section": item.get("parent_section"),
                 "structure_node_ids": item.get("structure_node_ids") or [],
                 "page_range": item.get("page_range"),
+                "char_span": item.get("char_span"),
                 "bbox": item.get("bbox") or (item.get("source_span") or {}).get("bbox") or {},
                 "source_span": item.get("source_span") or {},
                 "structure_closure": item.get("structure_closure") or {},

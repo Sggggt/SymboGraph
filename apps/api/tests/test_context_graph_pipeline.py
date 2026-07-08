@@ -193,7 +193,7 @@ def test_query_facet_packet_prefers_unified_facet_groups_and_merges_legacy_alias
 def test_context_package_restores_graph_path_chunks(db_session, sample_knowledge_base):
     from app.models import Chunk, Document, DocumentVersion, RetrievalTrace
     from app.services.chunking import stable_hash
-    from app.services.context_graph import build_context_package
+    from app.services.context_graph import build_context_package, context_package_to_contexts
 
     document = Document(
         knowledge_base_id=sample_knowledge_base.id,
@@ -280,8 +280,14 @@ def test_context_package_restores_graph_path_chunks(db_session, sample_knowledge
     )
 
     chunks = (package.package_json or {}).get("chunks") or []
+    contexts = context_package_to_contexts(package)
     assert path_chunk.id in package.restored_chunk_ids_json
     assert any(item.get("chunk_id") == path_chunk.id and item.get("role") == "graph_path" for item in chunks)
+    hit_context = next(item for item in contexts if item.get("chunk_id") == hit_chunk.id)
+    assert hit_context["source_path"] == "configuration-model.md"
+    assert hit_context["metadata"]["source_path"] == "configuration-model.md"
+    assert hit_context["metadata"]["page_range"] == [1, 1]
+    assert hit_context["metadata"]["char_span"] == [81, 160]
     assert package.why_selected_json[path_chunk.id]["reason"] == "restored_from_selected_graph_path"
 
 
