@@ -201,7 +201,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               </div>
               <div className="kg-micro-chip !hidden shrink-0 rounded-full px-3 py-2 text-xs sm:!inline-flex">
                 <TerminalSquare data-icon="inline-start" />
-                混合图谱链路
+                资料已连接
               </div>
             </div>
           </div>

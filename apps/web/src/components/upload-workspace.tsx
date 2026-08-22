@@ -64,7 +64,7 @@ const autoTpeFields: AutoTpeField[] = [
   { key: "tpe_probe_query_budget", label: "Probe 查询预算", min: 1, max: 200, integer: true, fallback: 6 },
   { key: "tpe_trial_timeout_seconds", label: "Trial 超时秒数", min: 1, max: 3600, integer: true, fallback: 30 },
   { key: "tpe_candidate_pool_size", label: "候选池大小", min: 1, max: 500, integer: true, fallback: 24 },
-  { key: "operating_point_hard_gate_max_edge_density", label: "边密度上限", min: 0.1, max: 1000, step: 0.1, fallback: 24 },
+  { key: "operating_point_hard_gate_max_edge_density", label: "归一化关系密度上限", min: 0.01, max: 1, step: 0.01, fallback: 0.45 },
   { key: "operating_point_hard_gate_max_isolated_ratio", label: "孤立比例上限", min: 0, max: 1, step: 0.01, fallback: 0.35 },
   { key: "operating_point_hard_gate_max_hubness_ratio", label: "Hubness 上限", min: 1, max: 1000, step: 0.1, fallback: 12 },
   { key: "operating_point_hard_gate_min_structure_recovery_rate", label: "结构恢复率下限", min: 0, max: 1, step: 0.01, fallback: 0.25 },
@@ -75,9 +75,11 @@ function autoTpeStatusLabel(status?: string | null): string {
   const labels: Record<string, string> = {
     skipped: "已跳过",
     running: "运行中",
+    selected_pending_graph_commit: "等待图事务提交",
     completed: "已完成",
     failed: "失败",
     blocked: "已阻断",
+    cancelled: "已取消",
   };
   return status ? labels[status] ?? status : "暂无记录";
 }
@@ -241,7 +243,7 @@ function formatBatchFailureDetails(errors?: Array<{ source_path?: string | null;
   }
   return errors
     .slice(0, 5)
-    .map((item) => `${item.source_path ?? "未知文件"}: ${item.message ?? "未返回错误信息"}`)
+    .map((item) => item.message ?? "有文件未能完成处理")
     .join("\n");
 }
 
@@ -1140,7 +1142,6 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
                       <p className="max-w-full truncate text-sm font-medium text-white">{file.title || fileNameFromPath(file.source_path)}</p>
                       <FileStatusBadge status={file.status} />
                     </div>
-                    <p className="mt-2 break-all text-xs leading-5 text-white/42">{file.source_path}</p>
                     {file.error ? <p className="mt-2 break-words text-xs leading-5 text-rose-100/70">{file.error}</p> : null}
                     <FileProgressBar status={file.status} />
                   </div>
@@ -1243,7 +1244,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
             <div className="border border-white/8 bg-black/10 p-5">
               <div className="flex items-center justify-between gap-4">
                 <p className="text-lg font-medium text-white">{batchStateLabel(visibleBatch?.state)}</p>
-                <p className="text-xs uppercase tracking-[0.26em] text-white/45">{visibleBatch ? visibleBatch.batch_id.slice(0, 8) : "无批次"}</p>
+                <p className="text-xs uppercase tracking-[0.26em] text-white/45">{visibleBatch ? "批次已记录" : "无批次"}</p>
               </div>
               <div className="mt-4 h-2 overflow-hidden rounded-full bg-white/6">
                 <div
@@ -1273,7 +1274,9 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
                 <div className="custom-scrollbar kg-rounded-scrollbar mt-4 max-h-64 space-y-3 overflow-y-auto pr-1">
                   {(visibleBatch?.errors ?? []).map((error) => (
                     <div key={`${error.source_path}-${error.message}`} className="rounded-[18px] border border-white/8 px-4 py-3 text-sm text-white/72">
-                      <p className="font-medium text-white">{error.source_path}</p>
+                      <p className="font-medium text-white">
+                        {fileItems.find((file) => file.source_path === error.source_path)?.title ?? "文件处理失败"}
+                      </p>
                       <p className="mt-1 text-white/58">{error.message}</p>
                     </div>
                   ))}

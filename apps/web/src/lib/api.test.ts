@@ -45,7 +45,7 @@ describe("api client", () => {
   });
 
   it("cancels agent runs through the control endpoint", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ run_id: "run-1", status: "failed", error: "cancelled_by_user" }));
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ run_id: "run-1", status: "cancelled", error: "cancelled_by_user" }));
     vi.stubGlobal("fetch", fetchMock);
     const { cancelAgentRun } = await import("./api");
 
@@ -54,6 +54,41 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "http://api.test/api/agent/runs/run-1/cancel",
       expect.objectContaining({ method: "POST", headers: { "X-API-Key": "test-key" } }),
+    );
+  });
+
+  it("reads the canonical PostgreSQL P&E audit endpoint without caching", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        contract_version: "agent_pe_audit_public_v1",
+        run_id: "run-1",
+        knowledge_base_id: "kb-1",
+        run_status: "completed",
+        counts: { plans: 0, actions: 0, observations: 0 },
+        ordering: {
+          plans: "plan_index ASC, created_at ASC, id ASC",
+          actions:
+            "plan_index ASC NULLS LAST, action_index ASC, created_at ASC, id ASC",
+          observations: "created_at ASC, id ASC",
+        },
+        plans: [],
+        actions: [],
+        observations: [],
+        provider_raw_response_exposed: false,
+        credentials_exposed: false,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetchAgentPEAudit } = await import("./api");
+
+    await fetchAgentPEAudit("run-1");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://api.test/api/agent/runs/run-1/pe-audit",
+      expect.objectContaining({
+        cache: "no-store",
+        headers: { "X-API-Key": "test-key" },
+      }),
     );
   });
 
@@ -103,16 +138,24 @@ describe("api client", () => {
   });
 
   it("passes production runtime setting fields", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ provider: "openai_compatible" }));
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ provider: "multi_protocol" }));
     vi.stubGlobal("fetch", fetchMock);
     const { updateModelSettings } = await import("./api");
 
     await updateModelSettings({
+      chat_api_protocol: "anthropic",
+      graph_api_protocol: "anthropic",
       worker_concurrency: 3,
       model_request_concurrency: 3,
       model_request_timeout_seconds: 240,
+      source_io_concurrency: 4,
+      upload_max_bytes: 104857600,
       concept_i18n_enabled: true,
       query_facet_bilingual_enabled: true,
+      query_facet_posterior_enabled: true,
+      query_facet_posterior_observation_budget: 64,
+      query_facet_posterior_round_budget: 2,
+      query_facet_posterior_convergence_epsilon: 0.02,
       embedding_batch_size: 10,
       fixed_chunk_size_tokens: 512,
       fixed_chunk_overlap_tokens: 80,
@@ -167,7 +210,7 @@ describe("api client", () => {
       tpe_probe_query_budget: 6,
       tpe_trial_timeout_seconds: 30,
       tpe_candidate_pool_size: 24,
-      operating_point_hard_gate_max_edge_density: 24,
+      operating_point_hard_gate_max_edge_density: 0.45,
       operating_point_hard_gate_max_isolated_ratio: 0.35,
       operating_point_hard_gate_max_hubness_ratio: 12,
       operating_point_hard_gate_min_structure_recovery_rate: 0.25,
@@ -175,11 +218,19 @@ describe("api client", () => {
     });
 
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+      chat_api_protocol: "anthropic",
+      graph_api_protocol: "anthropic",
       worker_concurrency: 3,
       model_request_concurrency: 3,
       model_request_timeout_seconds: 240,
+      source_io_concurrency: 4,
+      upload_max_bytes: 104857600,
       concept_i18n_enabled: true,
       query_facet_bilingual_enabled: true,
+      query_facet_posterior_enabled: true,
+      query_facet_posterior_observation_budget: 64,
+      query_facet_posterior_round_budget: 2,
+      query_facet_posterior_convergence_epsilon: 0.02,
       embedding_batch_size: 10,
       fixed_chunk_size_tokens: 512,
       fixed_chunk_overlap_tokens: 80,
@@ -234,7 +285,7 @@ describe("api client", () => {
       tpe_probe_query_budget: 6,
       tpe_trial_timeout_seconds: 30,
       tpe_candidate_pool_size: 24,
-      operating_point_hard_gate_max_edge_density: 24,
+      operating_point_hard_gate_max_edge_density: 0.45,
       operating_point_hard_gate_max_isolated_ratio: 0.35,
       operating_point_hard_gate_max_hubness_ratio: 12,
       operating_point_hard_gate_min_structure_recovery_rate: 0.25,
@@ -293,6 +344,67 @@ describe("api client", () => {
     );
   });
 
+  it("uses the explicit Runtime Settings candidate lifecycle endpoints", async () => {
+    const payload = { candidate: { id: "candidate-1", status: "staged" } };
+    // A Response body is single-use; each endpoint call must receive a fresh
+    // response just as it would from the browser fetch implementation.
+    const fetchMock = vi.fn().mockImplementation(async () => jsonResponse(payload));
+    vi.stubGlobal("fetch", fetchMock);
+    const {
+      createRuntimeSettingsCandidate,
+      fetchRuntimeSettingsCandidate,
+      runRuntimeSettingsCandidateAction,
+      promoteRuntimeSettingsCandidate,
+    } = await import("./api");
+
+    await createRuntimeSettingsCandidate({
+      knowledge_base_ids: ["kb-1"],
+      settings: {
+        fixed_chunk_size_tokens: 640,
+        graph_api_protocol: "anthropic",
+        embedding_api_protocol: "openai",
+      },
+      dry_run_only: false,
+      source: "unit_ui",
+    });
+    await fetchRuntimeSettingsCandidate("candidate-1");
+    await runRuntimeSettingsCandidateAction("candidate-1", "build");
+    await promoteRuntimeSettingsCandidate("candidate-1");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://api.test/api/settings/runtime-candidates",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          knowledge_base_ids: ["kb-1"],
+          settings: {
+            fixed_chunk_size_tokens: 640,
+            graph_api_protocol: "anthropic",
+            embedding_api_protocol: "openai",
+          },
+          dry_run_only: false,
+          source: "unit_ui",
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://api.test/api/settings/runtime-candidates/candidate-1",
+      expect.objectContaining({ cache: "no-store" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "http://api.test/api/settings/runtime-candidates/candidate-1/build",
+      expect.objectContaining({ method: "POST", body: "{}" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      "http://api.test/api/settings/runtime-candidates/candidate-1/promote",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
   it("throws structured API errors", async () => {
     const body = {
       detail: {
@@ -306,7 +418,7 @@ describe("api client", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(body), { status: 409 })));
     const { updateModelSettings } = await import("./api");
 
-    await expect(updateModelSettings({ chat_model: "qwen-plus" })).rejects.toMatchObject({
+    await expect(updateModelSettings({ chat_model: "unit-test-chat-model" })).rejects.toMatchObject({
       status: 409,
       structured: body.detail,
     });
@@ -361,7 +473,7 @@ describe("api client", () => {
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      "http://api.test/api/knowledge_bases/current/graph?knowledge_base_id=knowledge-base-1&graph_type=chunk-relation&view=overview",
+      "http://api.test/api/knowledge_bases/current/graph?knowledge_base_id=knowledge-base-1&graph_type=chunk-relation&view=overview&limit=100",
       expect.objectContaining({ cache: "no-store", headers: { "X-API-Key": "test-key" } }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
@@ -395,7 +507,7 @@ describe("api client", () => {
         const encoder = new TextEncoder();
         controller.enqueue(encoder.encode('data: {"type":"meta","run_id":"run-1","session_id":"session-1","retrieval_granularity":"coarse"}\n\n'));
         controller.enqueue(encoder.encode('data: {"token":"hello"}\n\n'));
-        controller.enqueue(encoder.encode('data: {"type":"final","response":{"run_id":"run-1","session_id":"session-1","answer":"done","citations":[],"used_chunks":[],"route":"retrieve_sources","trace":[],"degraded_mode":false,"retrieval_granularity":"coarse"}}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"final","response":{"run_id":"run-1","session_id":"session-1","answer":"done","citations":[],"used_chunks":[],"route":"retrieve_sources","trace":[],"degraded_mode":false,"retrieval_granularity":"coarse","retrieval_trace_id":"trace-1","context_package_id":"package-1"}}\n\n'));
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         controller.close();
       },
@@ -405,6 +517,7 @@ describe("api client", () => {
     const { streamAnswer } = await import("./api");
     const tokens: string[] = [];
     const meta: unknown[] = [];
+    const finalResponses: unknown[] = [];
     const controller = new AbortController();
 
     await streamAnswer(
@@ -413,6 +526,7 @@ describe("api client", () => {
         onToken: (value) => tokens.push(value),
         onCitations: () => undefined,
         onMeta: (value) => meta.push(value),
+        onFinal: (value) => finalResponses.push(value),
       },
       { signal: controller.signal },
     );
@@ -425,6 +539,7 @@ describe("api client", () => {
       }),
     );
     expect(tokens).toEqual(["hello"]);
+    expect(finalResponses).toContainEqual(expect.objectContaining({ retrieval_trace_id: "trace-1", context_package_id: "package-1" }));
     expect(meta).toContainEqual({ run_id: "run-1", session_id: "session-1", route: undefined, retrieval_granularity: "coarse" });
     expect(meta).toContainEqual({ degraded_mode: false, run_id: "run-1", session_id: "session-1", route: "retrieve_sources", retrieval_granularity: "coarse" });
   });

@@ -2,7 +2,7 @@
 
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { GraphResponse, GraphType } from "@course-kg/shared";
+import type { GraphDistribution, GraphHashes, GraphResponse, GraphType } from "@course-kg/shared";
 import { motion } from "framer-motion";
 import { Boxes, Expand, GitBranch, Layers3, Lock, Map, Minimize2, Network, RefreshCw, Unlock } from "lucide-react";
 
@@ -20,36 +20,38 @@ type NodeDetailRow = { label: string; value: string; hint?: string };
 
 const GRAPH_LAYERS: Array<{ type: GraphType; label: string; icon: typeof Network; description: string }> = [
   { type: "chunk-structure", label: "片段结构图", icon: Map, description: "标题、页面、坐标、表格、公式、图注和前后片段" },
-  { type: "chunk-relation", label: "片段关系图", icon: Network, description: "Dense 语义边、跨文档桥边、跨语言桥边与 RQ membership 诊断" },
-  { type: "mid-concepts", label: "中粒度概念图", icon: GitBranch, description: "由片段和RQ 前缀支撑的中粒度概念和关系" },
-  { type: "coarse-concepts", label: "粗粒度概念图", icon: Layers3, description: "社区、桥接概念、弱边和主题区域" },
+  { type: "chunk-relation", label: "片段关系图", icon: Network, description: "内容相近、跨资料和跨语言的片段关系" },
+  { type: "mid-concepts", label: "中粒度概念图", icon: GitBranch, description: "由原文片段支撑的具体概念和关系" },
+  { type: "coarse-concepts", label: "粗粒度概念图", icon: Layers3, description: "聚合后的高层主题和跨主题关系" },
 ];
 
 const EMPTY_VALUE = "无";
-
-function statNumber(values: Record<string, number> | undefined, key: string) {
-  const value = values?.[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
 
 function formatCount(value: number): string {
   return new Intl.NumberFormat("en-US").format(value);
 }
 
+function productDisplayLabel(value: unknown, fallback: string): string {
+  const text = String(value ?? "").trim();
+  if (
+    !text ||
+    /^[0-9a-f]{64}$/i.test(text) ||
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(text)
+  ) {
+    return fallback;
+  }
+  return text;
+}
+
 function graphLayerCounts(graph: GraphResponse) {
-  const diagnosticFullCounts = graph.diagnostics?.layer_full_counts as Record<string, number> | undefined;
-  const fullNodes = statNumber(graph.node_counts, "full") || statNumber(graph.full_counts, "nodes") || statNumber(diagnosticFullCounts, "nodes");
-  const fullEdges = statNumber(graph.edge_counts, "full") || statNumber(graph.full_counts, "edges") || statNumber(diagnosticFullCounts, "edges");
-  const sampledNodes = statNumber(graph.node_counts, "sampled") || statNumber(graph.sampled_counts, "nodes") || graph.nodes.length;
-  const sampledEdges = statNumber(graph.edge_counts, "sampled") || statNumber(graph.sampled_counts, "edges") || graph.edges.length;
   return {
-    full: { nodes: fullNodes, edges: fullEdges },
-    sampled: { nodes: sampledNodes, edges: sampledEdges },
+    full: { nodes: graph.node_counts.full, edges: graph.edge_counts.full },
+    sampled: { nodes: graph.node_counts.sampled, edges: graph.edge_counts.sampled },
   };
 }
 
 function nodeLabel(node: GraphNode): string {
-  return node.name ?? node.label ?? node.id;
+  return productDisplayLabel(node.name ?? node.label, "名称缺失");
 }
 
 function nodeCategory(node: GraphNode): string {
@@ -71,22 +73,7 @@ function nodeCategory(node: GraphNode): string {
 
 function snippetForNode(node: GraphNode | null): string {
   if (!node) return "";
-  return node.summary ?? node.snippet ?? node.text ?? (typeof node.metadata?.text === "string" ? node.metadata.text : "");
-}
-
-function metadataNumber(node: GraphNode, key: string): number | null {
-  const value = node.metadata?.[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function metadataPath(node: GraphNode, key: string): string {
-  const value = node.metadata?.[key];
-  return Array.isArray(value) && value.length ? value.join("/") : EMPTY_VALUE;
-}
-
-function metadataRecord(node: GraphNode, key: string): Record<string, unknown> {
-  const value = node.metadata?.[key];
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+  return node.summary ?? node.snippet ?? node.text ?? "";
 }
 
 function stringList(value: unknown): string[] {
@@ -94,10 +81,6 @@ function stringList(value: unknown): string[] {
     return [];
   }
   return value.map((item) => String(item)).filter(Boolean);
-}
-
-function metadataStringList(node: GraphNode, key: string): string[] {
-  return stringList(node.metadata?.[key]);
 }
 
 function uniqueStrings(values: string[]): string[] {
@@ -112,6 +95,38 @@ function formatNumber(value: unknown, digits = 3): string {
     return value;
   }
   return EMPTY_VALUE;
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function formatPercent(value: unknown): string {
+  const numeric = finiteNumber(value);
+  return numeric === null ? EMPTY_VALUE : `${(numeric * 100).toFixed(1).replace(/\.0$/, "")}%`;
+}
+
+function distributionSummary(distribution: GraphDistribution | null | undefined): string {
+  if (!distribution || distribution.count === 0) {
+    return "0 项";
+  }
+  return `${formatCount(distribution.count)} 项 · min ${formatNumber(distribution.min)} · mean ${formatNumber(distribution.mean)} · max ${formatNumber(distribution.max)} · σ ${formatNumber(distribution.population_std)}`;
+}
+
+const HASH_LABELS: Partial<Record<keyof GraphHashes, string>> = {
+  chunk_scope_hash: "Chunk scope",
+  contextual_index_hash: "Contextual index",
+  structure_graph_hash: "Structure graph",
+  chunk_relation_graph_hash: "Relation graph",
+  mid_concept_hash: "Mid concepts",
+  coarse_concept_hash: "Coarse concepts",
+  context_graph_hash: "Context graph",
+};
+
+function hashRows(graph: GraphResponse): Array<{ key: string; label: string; value: string }> {
+  return (Object.entries(HASH_LABELS) as Array<[keyof GraphHashes, string]>)
+    .map(([key, label]) => ({ key, label, value: String(graph.hashes[key] ?? "") }))
+    .filter((item) => item.value.length > 0);
 }
 
 function formatPage(node: GraphNode): string {
@@ -136,28 +151,67 @@ function formatIdList(ids: unknown, noun: string): string {
   if (!values.length) {
     return EMPTY_VALUE;
   }
-  const preview = values.slice(0, 3).map(shortId).join("、");
-  return `${formatCount(values.length)} 个${noun}：${preview}${values.length > 3 ? " 等" : ""}`;
+  return `${formatCount(values.length)} 个${noun}`;
 }
 
 function supportIdsForNode(node: GraphNode): string[] {
   return uniqueStrings([
     ...(node.support_chunk_ids ?? []),
     ...(node.support_active_chunk_ids ?? []),
-    ...metadataStringList(node, "support_chunk_ids"),
   ].filter(Boolean));
 }
 
 function representativeIdsForNode(node: GraphNode): string[] {
-  return uniqueStrings([...(node.representative_chunk_ids ?? []), ...metadataStringList(node, "representative_chunk_ids")].filter(Boolean));
+  return uniqueStrings(node.representative_chunk_ids.filter(Boolean));
+}
+
+type CoarseGraphNode = Extract<
+  GraphNode,
+  { contract_kind: "coarse_concept_node" }
+>;
+type CoarseRoleField =
+  | "included_mid_concept_ids"
+  | "boundary_mid_concept_ids"
+  | "bridge_mid_concept_ids"
+  | "outlier_mid_concept_ids"
+  | "low_confidence_mid_concept_ids"
+  | "all_mid_concept_ids";
+
+function coarseRoleIdsForNode(
+  node: GraphNode,
+  field: CoarseRoleField,
+): string[] {
+  if (node.contract_kind !== "coarse_concept_node") {
+    return [];
+  }
+  const coarseNode: CoarseGraphNode = node;
+  return uniqueStrings(coarseNode[field].filter(Boolean));
 }
 
 function includedMidIdsForNode(node: GraphNode): string[] {
-  return uniqueStrings([...(node.included_mid_concept_ids ?? []), ...metadataStringList(node, "included_mid_concept_ids")].filter(Boolean));
+  return coarseRoleIdsForNode(node, "included_mid_concept_ids");
+}
+
+function allMidIdsForNode(node: GraphNode): string[] {
+  return coarseRoleIdsForNode(node, "all_mid_concept_ids");
 }
 
 function edgeLabel(edge: GraphEdge): string {
-  return edge.label ?? edge.type ?? edge.category ?? "关系边";
+  const raw = edge.label ?? edge.type ?? edge.category ?? "关系边";
+  const labels: Record<string, string> = {
+    concept_relation: "相关概念",
+    projected_dense_semantic: "语义相关",
+    dense_semantic: "内容相关",
+    dense_cross_document_bridge: "跨资料关联",
+    dense_cross_language_bridge: "跨语言关联",
+    co_occurs_with: "共同出现",
+    bridge_to: "主题桥接",
+    contains: "包含",
+    previous: "前一片段",
+    next: "后一片段",
+    parent: "上级结构",
+  };
+  return labels[raw] ?? raw.replaceAll("_", " ");
 }
 
 function relatedEdgesForNode(graph: GraphResponse, nodeId: string): GraphEdge[] {
@@ -178,25 +232,6 @@ function appendRow(rows: NodeDetailRow[], label: string, value: unknown, hint?: 
     return;
   }
   rows.push({ label, value: text, hint });
-}
-
-function statsNumber(node: GraphNode, key: string): string {
-  return formatNumber(metadataRecord(node, "stats")[key]);
-}
-
-function statusLabel(value: unknown): string {
-  const text = typeof value === "string" && value.trim() ? value : "recorded";
-  const labels: Record<string, string> = {
-    recorded: "已记录",
-    available: "可用",
-    unavailable: "不可用",
-    missing: "缺失",
-    stale: "已过期",
-    fresh: "最新",
-    active: "已激活",
-    pending: "等待中",
-  };
-  return labels[text] ?? text;
 }
 
 function graphTypeLabel(graphType: GraphType): string {
@@ -224,6 +259,101 @@ function MetricCard({ label, value, hint }: { label: string; value: number | str
   );
 }
 
+export function GraphDiagnosticsPanel({ graph }: { graph: GraphResponse }) {
+  const distance = graph.edge_distance_diagnostics;
+  const projection = graph.projection_diagnostics;
+  const contribution = graph.retrieval_contribution;
+  const hashes = hashRows(graph);
+  const hasTraversal = contribution.has_observations || contribution.trace_count > 0;
+
+  return (
+    <section aria-label="图层诊断" className="mb-4 rounded-[22px] border border-white/8 bg-white/[0.025] p-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <p className="section-kicker">可回放诊断</p>
+          <p className="mt-2 text-sm text-white/56">完整状态统计与当前画布采样分开显示，避免用采样边推断全图。</p>
+        </div>
+        <span className="rounded-full border border-white/10 px-3 py-1 text-xs text-white/55">当前层 hash：{shortId(graph.hash)}</span>
+      </div>
+
+      <div className="mt-4 grid gap-3 xl:grid-cols-2">
+        <article className="rounded-[18px] border border-white/8 bg-black/10 p-4">
+          <h3 className="text-sm font-medium text-white/82">状态与 freshness hashes</h3>
+          <div className="mt-3 space-y-2">
+            {hashes.length ? (
+              hashes.map((item) => (
+                <div key={item.key} className="grid gap-1 text-xs sm:grid-cols-[130px_minmax(0,1fr)]">
+                  <span className="text-white/42">{item.label}</span>
+                  <code className="break-all text-cyan-100/72" title={item.value}>{item.value}</code>
+                </div>
+              ))
+            ) : (
+              <p className="text-sm text-amber-100/72">API 未返回 hash 卡，当前图层不能完成 freshness 核对。</p>
+            )}
+          </div>
+        </article>
+
+        <article className="rounded-[18px] border border-white/8 bg-black/10 p-4">
+          <h3 className="text-sm font-medium text-white/82">边距离与类型校准</h3>
+          {distance.applicable === true ? (
+            <div className="mt-3 space-y-2 text-xs text-white/62">
+              <p>完整分布：{distributionSummary(distance.distribution)}</p>
+              <p>协议：{String(distance.protocol_version ?? EMPTY_VALUE)} · {shortId(distance.protocol_hash ?? (Array.isArray(distance.protocol_hashes) ? distance.protocol_hashes[0] : null))}</p>
+              {Object.entries(distance.by_edge_type).length ? (
+                <div className="space-y-1 border-t border-white/8 pt-2">
+                  {Object.entries(distance.by_edge_type).slice(0, 6).map(([edgeType, payload]) => (
+                    <p key={edgeType} className="break-words"><span className="text-white/40">{edgeType}</span> · {distributionSummary(payload.distance)}</p>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <p className="mt-3 text-sm text-white/48">本层不使用统一图距离：{String(distance.reason ?? "not_applicable")}</p>
+          )}
+        </article>
+
+        <article className="rounded-[18px] border border-white/8 bg-black/10 p-4">
+          <h3 className="text-sm font-medium text-white/82">投影支撑与校准</h3>
+          {projection.applicable === true ? (
+            <div className="mt-3 space-y-2 text-xs text-white/62">
+              <p>支撑覆盖：{formatCount(finiteNumber(projection.supported_edge_count) ?? 0)} / {formatCount(finiteNumber(projection.full_edge_count) ?? 0)}（{formatPercent(projection.support_coverage)}）</p>
+              <p>Raw projected distance：{distributionSummary(projection.raw_projected_distance_distribution)}</p>
+              <p>Calibrated projected distance：{distributionSummary(projection.calibrated_projected_distance_distribution)}</p>
+              <p>协议：{String(projection.protocol_version ?? EMPTY_VALUE)} · hash 覆盖 {formatPercent(projection.protocol_hash_coverage)} · 一致 {projection.protocol_hash_consistent === true ? "是" : "否"}</p>
+              {Object.entries(projection.by_edge_type).length ? (
+                <div className="space-y-1 border-t border-white/8 pt-2">
+                  {Object.entries(projection.by_edge_type).slice(0, 6).map(([edgeType, typeDiagnostics]) => {
+                    return (
+                      <p key={edgeType} className="break-words">
+                        <span className="text-white/40">{edgeType}</span> · raw {distributionSummary(typeDiagnostics.raw_projected_distance_distribution)} · calibrated {distributionSummary(typeDiagnostics.calibrated_projected_distance_distribution)}
+                      </p>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <p className="mt-3 text-sm text-white/48">本层没有概念边投影：{String(projection.reason ?? "not_applicable")}</p>
+          )}
+        </article>
+
+        <article className="rounded-[18px] border border-white/8 bg-black/10 p-4">
+          <h3 className="text-sm font-medium text-white/82">最近检索遍历贡献</h3>
+          {hasTraversal ? (
+            <div className="mt-3 space-y-2 text-xs text-white/62">
+              <p>{formatCount(contribution.trace_count)} 条 trace · frontier pops {formatCount(contribution.frontier_pops)} · dominance pruning {formatCount(contribution.dominance_pruned_count)}</p>
+              <p>收敛：{Object.entries(contribution.convergence_reasons).map(([reason, count]) => `${reason} ${formatNumber(count)}`).join(" / ") || EMPTY_VALUE}</p>
+              <p>Top edge contribution：{Object.entries(contribution.expanded_edge_contribution).slice(0, 3).map(([edgeId, score]) => `${shortId(edgeId)} ${formatPercent(score)}`).join(" / ") || EMPTY_VALUE}</p>
+            </div>
+          ) : (
+            <p className="mt-3 text-sm text-white/48">当前资料库还没有可汇总的检索 trace，不把空数据标成“available”。</p>
+          )}
+        </article>
+      </div>
+    </section>
+  );
+}
+
 function nodeNaturalDescription(node: GraphNode, graphType: GraphType, relatedEdges: GraphEdge[]): string {
   const category = nodeCategory(node);
   const relationText = relatedEdges.length ? `当前采样视图里有 ${formatCount(relatedEdges.length)} 条关联边，关系类型包括 ${relatedEdgeTypes(relatedEdges)}。` : "当前采样视图里还没有返回与它直接相连的边。";
@@ -232,12 +362,12 @@ function nodeNaturalDescription(node: GraphNode, graphType: GraphType, relatedEd
   }
   if (graphType === "chunk-relation") {
     if ((node.category ?? node.type) === "rq_prefix") {
-      return `这是 RQ 残差量化前缀节点，表示一组向量空间位置相近、可作为同层候选入口的片段集合。${relationText}`;
+      return `这是一个语义分组，汇集内容相近、可继续定位原文的片段。${relationText}`;
     }
-    return `这是片段关系图里的${category}节点，检索会根据 RQ 路径、残差范数、dense 语义边和桥接边从它扩展到相邻证据。${relationText}`;
+    return `这是片段关系图里的${category}节点，系统会沿有证据支撑的关系寻找相邻内容。${relationText}`;
   }
   if (graphType === "mid-concepts") {
-    return `这是中粒度概念节点，由片段和 RQ 前缀证据投影支撑，用于从概念层向原文片段下钻。${relationText}`;
+    return `这是中粒度概念节点，由原文片段支撑，用于从概念定位到具体证据。${relationText}`;
   }
   if (graphType === "coarse-concepts") {
     return `这是粗粒度概念节点，聚合多个中粒度概念，用于高层入口选择、主题区域定位和跨主题桥接。${relationText}`;
@@ -248,34 +378,23 @@ function nodeNaturalDescription(node: GraphNode, graphType: GraphType, relatedEd
 export function nodeDetailRows(node: GraphNode, graphType: GraphType, relatedEdges: GraphEdge[]): NodeDetailRow[] {
   const rows: NodeDetailRow[] = [];
   appendRow(rows, "节点类型", nodeCategory(node));
-  appendRow(rows, "节点 ID", shortId(node.id));
   appendRow(rows, "关联边", relatedEdges.length ? `${formatCount(relatedEdges.length)} 条` : EMPTY_VALUE, relatedEdgeTypes(relatedEdges));
-
-  if (node.document_id) appendRow(rows, "文档 ID", shortId(node.document_id));
-  if (node.document_version_id) appendRow(rows, "文档版本", shortId(node.document_version_id));
   appendRow(rows, "页码", formatPage(node));
 
   if (graphType === "chunk-structure") {
     appendRow(rows, "结构路径", node.snippet ?? node.section_path?.join(" / "));
-    appendRow(rows, "结构类别", node.type ?? node.category);
+    appendRow(rows, "结构类别", node.type);
     return rows;
   }
 
   if (graphType === "chunk-relation") {
     if ((node.category ?? node.type) === "rq_prefix") {
-      appendRow(rows, "RQ 前缀键", node.metadata?.rq_prefix_key);
-      appendRow(rows, "RQ 层级", node.metadata?.rq_level);
-      appendRow(rows, "前缀路径", metadataPath(node, "rq_path_prefix"));
-      appendRow(rows, "支撑片段", formatIdList(node.metadata?.support_chunk_ids, "支撑片段"));
-      appendRow(rows, "代表片段", formatIdList(node.metadata?.representative_chunk_ids, "代表片段"));
-      appendRow(rows, "桥接片段", formatIdList(node.metadata?.bridge_chunk_ids, "桥接片段"));
-      appendRow(rows, "残差均值", statsNumber(node, "residual_norm_mean"));
-      appendRow(rows, "残差最大值", statsNumber(node, "residual_norm_max"));
+      appendRow(rows, "语义分组层级", node.metadata.rq_level);
+      appendRow(rows, "支撑片段", formatIdList(node.metadata.support_chunk_ids, "支撑片段"));
+      appendRow(rows, "代表片段", formatIdList(node.metadata.representative_chunk_ids, "代表片段"));
+      appendRow(rows, "桥接片段", formatIdList(node.metadata.bridge_chunk_ids, "桥接片段"));
       return rows;
     }
-    appendRow(rows, "RQ 路径", metadataPath(node, "rq_path"));
-    appendRow(rows, "残差范数", formatNumber(metadataNumber(node, "residual_norm")));
-    appendRow(rows, "片段分数", formatNumber(node.score ?? node.importance_score));
     appendRow(rows, "支撑片段", formatIdList(supportIdsForNode(node), "支撑片段"));
     return rows;
   }
@@ -284,17 +403,19 @@ export function nodeDetailRows(node: GraphNode, graphType: GraphType, relatedEdg
     appendRow(rows, "定义置信度", formatNumber(node.confidence));
     appendRow(rows, "支撑片段", formatIdList(supportIdsForNode(node), "支撑片段"));
     appendRow(rows, "代表片段", formatIdList(representativeIdsForNode(node), "代表片段"));
-    appendRow(rows, "重要分数", formatNumber(node.score ?? node.importance_score));
     return rows;
   }
 
   if (graphType === "coarse-concepts") {
     const includedMidIds = includedMidIdsForNode(node);
-    const fallbackMidIds = includedMidIds.length ? includedMidIds : node.support_active_chunk_ids ?? [];
     appendRow(rows, "定义置信度", formatNumber(node.confidence));
-    appendRow(rows, "包含中概念", formatIdList(fallbackMidIds, "中概念"));
+    appendRow(rows, "包含中概念", formatIdList(includedMidIds, "中概念"));
+    appendRow(rows, "边界中概念", formatIdList(coarseRoleIdsForNode(node, "boundary_mid_concept_ids"), "中概念"));
+    appendRow(rows, "桥接中概念", formatIdList(coarseRoleIdsForNode(node, "bridge_mid_concept_ids"), "中概念"));
+    appendRow(rows, "离群中概念", formatIdList(coarseRoleIdsForNode(node, "outlier_mid_concept_ids"), "中概念"));
+    appendRow(rows, "低置信中概念", formatIdList(coarseRoleIdsForNode(node, "low_confidence_mid_concept_ids"), "中概念"));
+    appendRow(rows, "全部中概念", formatIdList(allMidIdsForNode(node), "中概念"));
     appendRow(rows, "支撑片段", formatIdList(node.support_chunk_ids, "支撑片段"));
-    appendRow(rows, "重要分数", formatNumber(node.score ?? node.importance_score));
     return rows;
   }
 
@@ -328,7 +449,7 @@ function DetailSection({ title, children, description }: { title: string; childr
 }
 
 function nodeDetailLeadMetrics(node: GraphNode, graphType: GraphType, relatedEdges: GraphEdge[]): NodeDetailRow[] {
-  const supportCount = supportIdsForNode(node).length || stringList(node.metadata?.support_chunk_ids).length || node.support_count || 0;
+  const supportCount = supportIdsForNode(node).length || node.metadata.support_chunk_ids.length || node.support_count || 0;
   const rows: NodeDetailRow[] = [
     { label: "图层", value: graphTypeLabel(graphType) },
     { label: "类型", value: nodeCategory(node) },
@@ -339,10 +460,6 @@ function nodeDetailLeadMetrics(node: GraphNode, graphType: GraphType, relatedEdg
   }
   if (node.confidence !== null && node.confidence !== undefined) {
     rows.push({ label: "置信度", value: formatNumber(node.confidence) });
-  }
-  const rqPath = metadataPath(node, (node.category ?? node.type) === "rq_prefix" ? "rq_path_prefix" : "rq_path");
-  if (rqPath !== EMPTY_VALUE) {
-    rows.push({ label: "RQ 路径", value: rqPath });
   }
   const page = formatPage(node);
   if (page !== EMPTY_VALUE) {
@@ -358,27 +475,25 @@ function nodeSupportNarrative(node: GraphNode, graphType: GraphType): string {
   }
   if (graphType === "chunk-relation") {
     if ((node.category ?? node.type) === "rq_prefix") {
-      const support = formatIdList(node.metadata?.support_chunk_ids, "支撑片段");
-      const reps = formatIdList(node.metadata?.representative_chunk_ids, "代表片段");
-      return `这个 RQ 前缀由向量残差量化聚合而来。${support !== EMPTY_VALUE ? support : "当前没有返回支撑片段列表"}；${reps !== EMPTY_VALUE ? reps : "当前没有返回代表片段"}。`;
+      const support = formatIdList(node.metadata.support_chunk_ids, "支撑片段");
+      const reps = formatIdList(node.metadata.representative_chunk_ids, "代表片段");
+      return `这个语义分组帮助系统从主题定位到原文。${support !== EMPTY_VALUE ? support : "当前没有返回支撑片段"}；${reps !== EMPTY_VALUE ? reps : "当前没有返回代表片段"}。`;
     }
-    const rqPath = metadataPath(node, "rq_path");
-    const residual = formatNumber(metadataNumber(node, "residual_norm"));
-    return `这个片段节点的 RQ 路径是 ${rqPath}，残差范数是 ${residual}。检索会结合 dense 语义边、桥接边和 RQ membership 判断它是否继续扩展。`;
+    return "这个片段节点来自原文证据，系统会沿有支撑的语义关系寻找相邻内容。";
   }
   if (graphType === "mid-concepts") {
     const support = formatIdList(supportIdsForNode(node), "支撑片段");
     const representatives = formatIdList(representativeIdsForNode(node), "代表片段");
-    return `这个中粒度概念必须能回到底层 evidence。${support !== EMPTY_VALUE ? support : "当前响应没有返回支撑片段"}；${representatives !== EMPTY_VALUE ? representatives : "当前响应没有返回代表片段"}。`;
+    return `这个中粒度概念可以回到原文证据。${support !== EMPTY_VALUE ? support : "当前没有可展示的支撑片段"}；${representatives !== EMPTY_VALUE ? representatives : "当前没有可展示的代表片段"}。`;
   }
   if (graphType === "coarse-concepts") {
-    const mids = formatIdList(includedMidIdsForNode(node).length ? includedMidIdsForNode(node) : node.support_active_chunk_ids, "中概念");
+    const mids = formatIdList(allMidIdsForNode(node), "中概念");
     return `这个粗粒度概念负责把多个中粒度概念聚合成高层主题入口。${mids !== EMPTY_VALUE ? mids : "当前响应没有返回包含的中概念列表"}。`;
   }
   return "当前节点没有额外支撑说明。";
 }
 
-function RelatedEdgeList({ node, graph, relatedEdges }: { node: GraphNode; graph: GraphResponse; relatedEdges: GraphEdge[] }) {
+export function RelatedEdgeList({ node, graph, relatedEdges }: { node: GraphNode; graph: GraphResponse; relatedEdges: GraphEdge[] }) {
   const nodeById = useMemo(() => new globalThis.Map(graph.nodes.map((item) => [item.id, item])), [graph.nodes]);
   if (!relatedEdges.length) {
     return <p className="mt-3 text-sm leading-7 text-white/52">当前采样视图没有返回直接相连的边；可以切换图层或扩大后端采样上限查看更多邻接关系。</p>;
@@ -388,14 +503,12 @@ function RelatedEdgeList({ node, graph, relatedEdges }: { node: GraphNode; graph
       {relatedEdges.slice(0, 6).map((edge, index) => {
         const neighborId = edge.source === node.id ? edge.target : edge.source;
         const neighbor = nodeById.get(neighborId);
-        const metric = edge.distance !== null && edge.distance !== undefined ? `距离 ${formatNumber(edge.distance)}` : edge.weight !== null && edge.weight !== undefined ? `权重 ${formatNumber(edge.weight)}` : null;
         return (
           <div key={edge.id ?? `${edge.source}:${edge.target}:${index}`} className="rounded-[16px] border border-white/8 bg-white/[0.03] px-3 py-3 text-sm">
             <div className="flex min-w-0 items-center justify-between gap-3">
               <span className="min-w-0 break-words font-medium text-white/78">{edgeLabel(edge)}</span>
-              {metric ? <span className="shrink-0 text-xs text-white/42">{metric}</span> : null}
             </div>
-            <p className="mt-1 break-words text-xs leading-5 text-white/50">连接到 {neighbor ? nodeLabel(neighbor) : shortId(neighborId)}</p>
+            <p className="mt-1 break-words text-xs leading-5 text-white/50">连接到 {neighbor ? nodeLabel(neighbor) : "相邻节点"}</p>
           </div>
         );
       })}
@@ -502,9 +615,8 @@ function GraphPanelContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBaseI
   }
 
   const graph = graphQuery.data;
-  const freshnessReason = graph.stale_reason ?? graph.freshness?.reason;
-  const grounding = graph.grounding ?? {};
-  const contribution = graph.retrieval_contribution ?? {};
+  const freshnessReason = graph.stale_reason ?? graph.freshness.stale_reasons[0];
+  const grounding = graph.grounding;
   const treeNodes = dashboardQuery.data.tree;
   const layerCounts = graphLayerCounts(graph);
   const sidePanelStyle = !isFullscreen && sidePanelHeight ? { height: sidePanelHeight, maxHeight: sidePanelHeight } : undefined;
@@ -524,13 +636,13 @@ function GraphPanelContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBaseI
             <Boxes className="size-5 shrink-0 text-cyan-200" />
           </div>
           <div className="mt-6 space-y-4">
-            {treeNodes.map((node) => (
+            {treeNodes.map((node, nodeIndex) => (
               <div key={node.id} className="rounded-[22px] border border-white/8 bg-white/[0.03] px-4 py-4">
-                <p className="break-words text-base font-medium text-white">{node.title ?? node.label ?? node.id}</p>
+                <p className="break-words text-base font-medium text-white">{productDisplayLabel(node.title ?? node.label, `文档 ${nodeIndex + 1}`)}</p>
                 <div className="mt-3 space-y-2">
-                  {(node.children ?? []).map((child) => (
+                  {(node.children ?? []).map((child, childIndex) => (
                     <div key={child.id} className="rounded-[16px] border border-white/8 px-4 py-3 text-sm leading-6 text-white/62 break-words">
-                      {child.title ?? child.label ?? child.id}
+                      {productDisplayLabel(child.title ?? child.label, `章节 ${childIndex + 1}`)}
                     </div>
                   ))}
                 </div>
@@ -611,16 +723,16 @@ function GraphPanelContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBaseI
         <div className="mb-4 grid gap-2 px-2 text-xs text-white/52 sm:grid-cols-4">
           <MetricCard label="节点" value={formatCount(layerCounts.full.nodes)} hint={`采样 ${formatCount(layerCounts.sampled.nodes)}`} />
           <MetricCard label="边" value={formatCount(layerCounts.full.edges)} hint={`采样 ${formatCount(layerCounts.sampled.edges)}`} />
-          <MetricCard label="支撑状态" value={statusLabel(grounding.status ?? grounding.support_status)} hint={`片段 ${String(grounding.support_chunks ?? grounding.chunk_count ?? EMPTY_VALUE)}`} />
-          {selectedGraphType === "chunk-relation" ? (
-            <MetricCard
-              label="RQ-KMeans"
-              value={statNumber(graph.counts, "rq_prefixes")}
-              hint={`片段 RQ 边 ${statNumber(graph.counts, "rq_relation_edges")} / 前缀 ${statNumber(graph.counts, "rq_prefixes")} / 归属 ${statNumber(graph.counts, "rq_prefix_memberships")}`}
-            />
-          ) : (
-            <MetricCard label="检索贡献" value={statusLabel(contribution.role ?? "available")} hint={`权重 ${String(contribution.weight ?? contribution.score ?? EMPTY_VALUE)}`} />
-          )}
+          <MetricCard
+            label="支撑状态"
+            value={graph.graph_type === "coarse-concepts" ? formatPercent(grounding.coarse_grounded_rate) : formatPercent(grounding.mid_grounded_rate)}
+            hint="概念可回到原文证据"
+          />
+          <MetricCard
+            label="状态"
+            value={graph.freshness?.is_stale ? "需要更新" : "已就绪"}
+            hint={graph.freshness?.is_stale ? "请重新构建当前资料库" : "可用于搜索和问答"}
+          />
         </div>
 
         <div className={`grid min-h-0 flex-1 gap-4 ${isFullscreen ? "grid-cols-[minmax(0,1fr)_380px]" : "grid-cols-1"}`}>
@@ -690,7 +802,7 @@ export function GraphNodeSummary({ node, graph, graphType }: { node: GraphNode |
         </div>
       </section>
 
-      <DetailSection title="关键数据" description="这些字段来自当前图层的节点载荷，只展示能解释节点作用的核心指标。">
+      <DetailSection title="关键数据" description="这里只显示帮助理解节点作用的少量信息。">
         <DetailMetricGrid rows={rows} />
       </DetailSection>
 
@@ -698,7 +810,7 @@ export function GraphNodeSummary({ node, graph, graphType }: { node: GraphNode |
         <p className="mt-4 break-words text-sm leading-8 text-white/66">{nodeSupportNarrative(node, graphType)}</p>
       </DetailSection>
 
-      <DetailSection title="相邻关系" description="只展示当前采样画布里直接连到该节点的边；完整图谱仍以数据库和图状态为准。">
+      <DetailSection title="相邻关系" description="显示当前画布中与该节点直接相连的关系。">
         <RelatedEdgeList node={node} graph={graph} relatedEdges={relatedEdges} />
       </DetailSection>
 

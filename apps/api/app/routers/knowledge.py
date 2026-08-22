@@ -14,6 +14,7 @@ from app.schemas import (
     ContextPackageResponse,
     DashboardSnapshot,
     DeleteKnowledgeBaseResponse,
+    GraphFreshness,
     GraphResponse,
     KnowledgeBaseCreateRequest,
     KnowledgeBaseFileSummary,
@@ -24,7 +25,12 @@ from app.schemas import (
     RetrievalTraceStepsResponse,
     AutoTpeStatusResponse,
 )
-from app.services.context_graph import context_graph_stats, graph_layer_payload
+from app.services.context_graph import (
+    EntrySelectionTraceInvariantError,
+    context_graph_stats,
+    graph_layer_payload,
+    reconcile_context_graph_freshness,
+)
 from app.services.ingestion import (
     create_context_graph_rebuild_batch,
     create_knowledge_base_space,
@@ -34,12 +40,32 @@ from app.services.ingestion import (
     remove_knowledge_base_file,
     resolve_knowledge_base,
     run_context_graph_rebuild_batch,
+    SOURCE_FILE_DELETE_LOCK_OPERATION,
+    SourceFileDeleteError,
+    source_file_delete_lock_token,
     summarize_knowledge_base,
 )
 from app.services.ingestion_logs import emit_ingestion_log
-from app.services.maintenance import MaintenanceConflict, cleanup_stale_data, delete_knowledge_base_data
-from app.services.retrieval import get_context_package, get_dashboard_snapshot, get_retrieval_trace_steps
+from app.services.ingestion_resource_lock import (
+    IngestionResourceBusyError,
+    knowledge_base_delete_recovery_owner_token,
+    knowledge_base_ingestion_resource_lock,
+)
+from app.services.maintenance import (
+    KNOWLEDGE_BASE_DELETE_LOCK_OPERATION,
+    MaintenanceConflict,
+    cleanup_stale_data,
+    delete_knowledge_base_data,
+)
+from app.services.retrieval import (
+    ContextPackagePublicIntegrityError,
+    RetrievalTraceAuditError,
+    get_context_package,
+    get_dashboard_snapshot,
+    get_retrieval_trace_steps,
+)
 from app.services.auto_tpe import latest_auto_tpe_status
+from app.services.storage import UploadValidationError, run_bounded_source_io
 
 router = APIRouter()
 
@@ -89,13 +115,49 @@ def create_knowledge_base(request: KnowledgeBaseCreateRequest, db: Session = Dep
 
 
 @router.delete("/knowledge_bases/{knowledge_base_id}", response_model=DeleteKnowledgeBaseResponse)
-def delete_knowledge_base(knowledge_base_id: str, db: Session = Depends(get_db)) -> dict:
-    knowledge_base = get_requested_knowledge_base(db, knowledge_base_id)
+async def delete_knowledge_base(knowledge_base_id: str, db: Session = Depends(get_db)) -> dict:
     try:
-        stats = delete_knowledge_base_data(db, knowledge_base)
+        knowledge_base = resolve_knowledge_base(
+            db,
+            knowledge_base_id,
+            allow_deleting=True,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    knowledge_base_name = str(knowledge_base.name)
+    try:
+        recovery_owner = knowledge_base_delete_recovery_owner_token(
+            db,
+            knowledge_base.id,
+        )
+        async with knowledge_base_ingestion_resource_lock(
+            db,
+            knowledge_base.id,
+            operation=KNOWLEDGE_BASE_DELETE_LOCK_OPERATION,
+            batch_id=recovery_owner,
+        ):
+            stats = await run_bounded_source_io(
+                delete_knowledge_base_data,
+                db,
+                knowledge_base,
+            )
+    except IngestionResourceBusyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ingestion_resource_busy",
+                "message": str(exc),
+                "resource_lock": exc.diagnostics,
+            },
+        ) from exc
     except MaintenanceConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return {"deleted": True, "knowledge_base_id": knowledge_base_id, "knowledge_base_name": knowledge_base.name, "stats": stats}
+    return {
+        "deleted": True,
+        "knowledge_base_id": knowledge_base_id,
+        "knowledge_base_name": knowledge_base_name,
+        "stats": stats,
+    }
 
 
 @router.get("/knowledge_bases/current/dashboard", response_model=DashboardSnapshot)
@@ -118,9 +180,46 @@ def knowledge_base_files(knowledge_base_id: str | None = None, db: Session = Dep
 
 
 @router.delete("/knowledge-base-files")
-def delete_knowledge_base_file(source_path: str, knowledge_base_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+async def delete_knowledge_base_file(source_path: str, knowledge_base_id: str | None = None, db: Session = Depends(get_db)) -> dict:
     knowledge_base = get_requested_knowledge_base(db, knowledge_base_id)
-    if not remove_knowledge_base_file(db, knowledge_base, source_path):
+    try:
+        recovery_owner = source_file_delete_lock_token(
+            db,
+            knowledge_base,
+            source_path,
+        )
+        async with knowledge_base_ingestion_resource_lock(
+            db,
+            knowledge_base.id,
+            operation=SOURCE_FILE_DELETE_LOCK_OPERATION,
+            batch_id=recovery_owner,
+        ):
+            removed = await run_bounded_source_io(
+                remove_knowledge_base_file,
+                db,
+                knowledge_base,
+                source_path,
+            )
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except IngestionResourceBusyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ingestion_resource_busy",
+                "message": str(exc),
+                "resource_lock": exc.diagnostics,
+            },
+        ) from exc
+    except SourceFileDeleteError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "source_file_delete_recovery_pending",
+                "message": str(exc),
+            },
+        ) from exc
+    if not removed:
         raise HTTPException(status_code=404, detail="File not found")
     return {"removed": True}
 
@@ -131,11 +230,31 @@ def get_context_graph_stats(knowledge_base_id: str, db: Session = Depends(get_db
     return context_graph_stats(db, knowledge_base_id)
 
 
+@router.post(
+    "/knowledge_bases/{knowledge_base_id}/context-graph/freshness/reconcile",
+    response_model=GraphFreshness,
+)
+def reconcile_context_graph_freshness_endpoint(
+    knowledge_base_id: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    get_requested_knowledge_base(db, knowledge_base_id)
+    payload = reconcile_context_graph_freshness(db, knowledge_base_id)
+    db.commit()
+    return payload
+
+
 @router.get("/knowledge_bases/{knowledge_base_id}/graph/{graph_type}", response_model=GraphResponse)
 def knowledge_base_layer_graph(knowledge_base_id: str, graph_type: str, limit: int = 200, db: Session = Depends(get_db)) -> dict:
     get_requested_knowledge_base(db, knowledge_base_id)
     try:
-        return graph_layer_payload(db, knowledge_base_id, graph_type, limit=min(max(limit, 1), 1000))
+        payload = graph_layer_payload(
+            db,
+            knowledge_base_id,
+            graph_type,
+            limit=min(max(limit, 1), 1000),
+        )
+        return payload
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -145,14 +264,33 @@ def knowledge_base_layer_graph(knowledge_base_id: str, graph_type: str, limit: i
 def current_knowledge_base_graph(knowledge_base_id: str | None = None, graph_type: str = "chunk-relation", limit: int = 200, db: Session = Depends(get_db)) -> dict:
     knowledge_base = get_requested_knowledge_base(db, knowledge_base_id)
     try:
-        return graph_layer_payload(db, knowledge_base.id, graph_type, limit=min(max(limit, 1), 1000))
+        payload = graph_layer_payload(
+            db,
+            knowledge_base.id,
+            graph_type,
+            limit=min(max(limit, 1), 1000),
+        )
+        return payload
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/context-packages/{package_id}", response_model=ContextPackageResponse)
 def context_package(package_id: str, db: Session = Depends(get_db)) -> dict:
-    payload = get_context_package(db, package_id)
+    try:
+        payload = get_context_package(db, package_id)
+    except ContextPackagePublicIntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "context_package_replay_failed",
+                "message": (
+                    "Persisted context package is not replayable against the "
+                    "current PostgreSQL evidence state."
+                ),
+                "failure_type": type(exc).__name__,
+            },
+        ) from exc
     if payload is None:
         raise HTTPException(status_code=404, detail="Context package not found")
     return payload
@@ -160,7 +298,32 @@ def context_package(package_id: str, db: Session = Depends(get_db)) -> dict:
 
 @router.get("/retrieval-traces/{trace_id}/graph-steps", response_model=RetrievalTraceStepsResponse)
 def retrieval_trace_steps(trace_id: str, db: Session = Depends(get_db)) -> dict:
-    payload = get_retrieval_trace_steps(db, trace_id)
+    try:
+        payload = get_retrieval_trace_steps(db, trace_id)
+    except RetrievalTraceAuditError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "retrieval_gray_zone_audit_failed",
+                "message": str(exc),
+                "audit": exc.audit,
+            },
+        ) from exc
+    except (
+        EntrySelectionTraceInvariantError,
+        ContextPackagePublicIntegrityError,
+    ) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "retrieval_trace_replay_failed",
+                "message": (
+                    "Persisted retrieval trace is not replayable against the "
+                    "current PostgreSQL evidence state."
+                ),
+                "failure_type": type(exc).__name__,
+            },
+        ) from exc
     if payload is None:
         raise HTTPException(status_code=404, detail="Retrieval trace not found")
     return payload

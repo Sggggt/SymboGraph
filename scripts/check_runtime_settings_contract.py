@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import re
 from typing import Any
@@ -32,10 +33,30 @@ def env_example_keys() -> set[str]:
     return keys
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Validate the runtime-settings lifecycle and shared contract. "
+            "This diagnostic is read-only apart from its output report."
+        )
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    from app.core.config import HOT_RELOAD_SETTINGS, Settings
+    parse_args()
+    from app.core.config import (
+        EDGE_DISTANCE_PROTOCOL_ALLOWLIST,
+        EDGE_PROJECTION_PROTOCOL_ALLOWLIST,
+        EDGE_TYPE_CALIBRATION_PROTOCOL_ALLOWLIST,
+        EMBEDDING_API_PROTOCOL_ALLOWLIST,
+        HOT_RELOAD_SETTINGS,
+        MODEL_API_PROTOCOL_ALLOWLIST,
+        RQ_MEMBERSHIP_PROTOCOL_ALLOWLIST,
+        Settings,
+    )
     from app.schemas import ModelSettingsUpdate
-    from app.services.runtime_settings import model_settings_payload
+    from app.services.runtime_settings import model_settings_payload, runtime_lifecycle_payload
 
     issues: list[dict[str, Any]] = []
     settings_fields = set(Settings.model_fields)
@@ -45,6 +66,9 @@ def main() -> None:
     shared_response = ts_interface_keys("ModelSettingsResponse")
     shared_update = ts_interface_keys("ModelSettingsUpdate")
     env_keys = env_example_keys()
+    lifecycle = runtime_lifecycle_payload()
+    rebuild_lifecycle = set(lifecycle.get("rebuild_required") or [])
+    hot_lifecycle = set(lifecycle.get("hot_reloadable") or [])
     runtime_payload_exemptions = {"chat_api_key", "graph_api_key", "embedding_api_key", "model_bridge_admin_token", "model_bridge_port"}
     update_schema_exemptions = {"chat_api_key", "graph_api_key", "embedding_api_key", "model_bridge_admin_token", "model_bridge_port", "enable_model_fallback"}
 
@@ -59,6 +83,9 @@ def main() -> None:
             add_issue(issues, "warning", "hot_reload_missing_shared_update_type", f"{key} is hot_reloadable but missing from shared ModelSettingsUpdate.")
 
     required_runtime_keys = {
+        "chat_api_protocol",
+        "graph_api_protocol",
+        "embedding_api_protocol",
         "fixed_chunk_size_tokens",
         "fixed_chunk_overlap_tokens",
         "context_package_token_budget",
@@ -71,6 +98,14 @@ def main() -> None:
         "agent_max_typed_actions_per_round",
         "agent_repair_round_budget",
         "agent_verification_budget",
+        "traversal_observation_budget",
+        "edge_distance_protocol",
+        "rq_membership_protocol",
+        "edge_projection_protocol",
+        "edge_type_calibration_protocol",
+        "rq_membership_temperature",
+        "rq_membership_top_m",
+        "rq_membership_probability_threshold",
         "enable_auto_tpe",
         "tpe_trial_budget",
         "tpe_startup_random_trials",
@@ -93,9 +128,13 @@ def main() -> None:
             add_issue(issues, "blocker", "required_setting_missing", f"{key} is missing from Settings.")
 
     env_aliases = {
+        "CHAT_API_PROTOCOL",
+        "GRAPH_API_PROTOCOL",
+        "EMBEDDING_API_PROTOCOL",
         "FIXED_CHUNK_SIZE_TOKENS",
         "FIXED_CHUNK_OVERLAP_TOKENS",
         "CONTEXT_PACKAGE_TOKEN_BUDGET",
+        "SOURCE_IO_CONCURRENCY",
         "CONCEPT_I18N_ENABLED",
         "QUERY_FACET_BILINGUAL_ENABLED",
         "RQ_KMEANS_LEVELS",
@@ -111,6 +150,14 @@ def main() -> None:
         "AGENT_MAX_TYPED_ACTIONS_PER_ROUND",
         "AGENT_REPAIR_ROUND_BUDGET",
         "AGENT_VERIFICATION_BUDGET",
+        "TRAVERSAL_OBSERVATION_BUDGET",
+        "EDGE_DISTANCE_PROTOCOL",
+        "RQ_MEMBERSHIP_PROTOCOL",
+        "EDGE_PROJECTION_PROTOCOL",
+        "EDGE_TYPE_CALIBRATION_PROTOCOL",
+        "RQ_MEMBERSHIP_TEMPERATURE",
+        "RQ_MEMBERSHIP_TOP_M",
+        "RQ_MEMBERSHIP_PROBABILITY_THRESHOLD",
         "ENABLE_AUTO_TPE",
         "TPE_TRIAL_BUDGET",
         "TPE_STARTUP_RANDOM_TRIALS",
@@ -128,6 +175,111 @@ def main() -> None:
     if missing_env_examples:
         add_issue(issues, "warning", "env_example_missing_runtime_keys", "Some runtime keys are missing from .env.example.", {"missing": missing_env_examples})
 
+    rebuild_graph_settings = {
+        "edge_distance_protocol",
+        "rq_membership_protocol",
+        "edge_projection_protocol",
+        "edge_type_calibration_protocol",
+        "rq_membership_temperature",
+        "rq_membership_top_m",
+        "rq_membership_probability_threshold",
+    }
+    for key in sorted(rebuild_graph_settings):
+        if key not in rebuild_lifecycle:
+            add_issue(
+                issues,
+                "blocker",
+                "graph_setting_missing_rebuild_lifecycle",
+                f"{key} must be classified rebuild_required.",
+            )
+        if key in hot_lifecycle or key in hot_reload:
+            add_issue(
+                issues,
+                "blocker",
+                "graph_setting_misclassified_hot_reload",
+                f"{key} changes active graph semantics and cannot be hot_reloadable.",
+            )
+        if key not in update_schema:
+            add_issue(issues, "blocker", "graph_setting_missing_update_schema", f"{key} is missing from ModelSettingsUpdate.")
+        if key not in shared_response or key not in shared_update:
+            add_issue(
+                issues,
+                "blocker",
+                "graph_setting_missing_shared_contract",
+                f"{key} is missing from the shared response/update contract.",
+            )
+
+    protocol_allowlists = {
+        "edge_distance_protocol": EDGE_DISTANCE_PROTOCOL_ALLOWLIST,
+        "rq_membership_protocol": RQ_MEMBERSHIP_PROTOCOL_ALLOWLIST,
+        "edge_projection_protocol": EDGE_PROJECTION_PROTOCOL_ALLOWLIST,
+        "edge_type_calibration_protocol": EDGE_TYPE_CALIBRATION_PROTOCOL_ALLOWLIST,
+    }
+    for key, allowlist in protocol_allowlists.items():
+        if len(allowlist) != 1:
+            add_issue(
+                issues,
+                "blocker",
+                "graph_protocol_allowlist_not_closed",
+                f"{key} must use a closed local implementation allowlist.",
+                {"allowlist": sorted(allowlist)},
+            )
+        for protocol in allowlist:
+            lowered = protocol.lower()
+            if any(forbidden in lowered for forbidden in ("prompt", "model", "llm", "expression")):
+                add_issue(
+                    issues,
+                    "blocker",
+                    "graph_protocol_contains_forbidden_dynamic_language",
+                    f"{key} contains a forbidden dynamic protocol token.",
+                    {"protocol": protocol},
+                )
+
+    if MODEL_API_PROTOCOL_ALLOWLIST != frozenset({"openai", "anthropic"}):
+        add_issue(
+            issues,
+            "blocker",
+            "model_api_protocol_allowlist_not_closed",
+            "Model API protocols must be exactly openai and anthropic.",
+            {"allowlist": sorted(MODEL_API_PROTOCOL_ALLOWLIST)},
+        )
+    if EMBEDDING_API_PROTOCOL_ALLOWLIST != frozenset({"openai"}):
+        add_issue(
+            issues,
+            "blocker",
+            "embedding_api_protocol_allowlist_not_closed",
+            "Embedding API protocols must currently be exactly openai; Anthropic Messages has no embedding contract.",
+            {"allowlist": sorted(EMBEDDING_API_PROTOCOL_ALLOWLIST)},
+        )
+    for key, expected_lifecycle in (
+        ("chat_api_protocol", "hot_reloadable"),
+        ("graph_api_protocol", "rebuild_required"),
+        ("embedding_api_protocol", "rebuild_required"),
+    ):
+        if key not in settings_fields or key not in runtime_payload:
+            add_issue(
+                issues,
+                "blocker",
+                "model_api_protocol_missing_runtime_contract",
+                f"{key} must exist in Settings and the public runtime payload.",
+            )
+        if key not in update_schema or key not in shared_response or key not in shared_update:
+            add_issue(
+                issues,
+                "blocker",
+                "model_api_protocol_missing_typed_contract",
+                f"{key} must exist in the API and shared typed contracts.",
+            )
+        lifecycle_set = hot_lifecycle if expected_lifecycle == "hot_reloadable" else rebuild_lifecycle
+        opposite_set = rebuild_lifecycle if expected_lifecycle == "hot_reloadable" else hot_lifecycle
+        if key not in lifecycle_set or key in opposite_set:
+            add_issue(
+                issues,
+                "blocker",
+                "model_api_protocol_lifecycle_mismatch",
+                f"{key} must be classified only as {expected_lifecycle}.",
+            )
+
     blockers = [issue for issue in issues if issue["severity"] == "blocker"]
     payload = {
         "script": "check_runtime_settings_contract",
@@ -142,6 +294,8 @@ def main() -> None:
             "api_update_schema": sorted(update_schema),
             "shared_model_settings_response": sorted(shared_response),
             "shared_model_settings_update": sorted(shared_update),
+            "rebuild_required": sorted(rebuild_lifecycle),
+            "hot_reloadable": sorted(hot_lifecycle),
         },
     }
     report = write_report("runtime_settings_contract", payload)

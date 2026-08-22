@@ -1,7 +1,7 @@
 "use client";
 
 import { AnimatePresence, motion } from "framer-motion";
-import type { AgentTraceEventPayload } from "@course-kg/shared";
+import type { AgentTraceEventPayload, AgentTraceScores } from "@course-kg/shared";
 import {
   Activity,
   AlertTriangle,
@@ -22,18 +22,12 @@ import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { traceAuditSummary, traceGroupForNode, traceGroupLabels, traceNodeLabel } from "@/lib/agent-trace";
 import { cn } from "@/lib/utils";
 
-type JsonRecord = Record<string, unknown>;
-
 interface AgentTraceStreamProps {
   trace: AgentTraceEventPayload[];
   isRunning?: boolean;
   defaultExpanded?: boolean;
   compact?: boolean;
   className?: string;
-}
-
-function asRecord(value: unknown): JsonRecord {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
 }
 
 function formatScalar(value: unknown): string {
@@ -52,49 +46,48 @@ function formatScalar(value: unknown): string {
   return String(value);
 }
 
-function safeJson(value: unknown): string {
-  try {
-    return JSON.stringify(value ?? {}, null, 2);
-  } catch {
-    return String(value);
-  }
+const TRACE_UUID_PATTERN = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi;
+const TRACE_HASH_PATTERN = /\b[0-9a-f]{32,128}\b/gi;
+const TRACE_PATH_PATTERN = /(?:[A-Za-z]:[\\/]|\/(?:app|workspace|home|tmp)\/)[^\s,;]+/g;
+
+export function sanitizeTraceDisplayText(value: unknown): string {
+  return String(value ?? "")
+    .replace(TRACE_UUID_PATTERN, "内部记录")
+    .replace(TRACE_HASH_PATTERN, "内部记录")
+    .replace(TRACE_PATH_PATTERN, "内部路径")
+    .replace(/\btrace\s*=\s*内部记录/gi, "检索已记录")
+    .replace(/\bobservation\s*=\s*内部记录/gi, "证据观察已记录")
+    .trim();
 }
 
-function mergedScores(event: AgentTraceEventPayload): JsonRecord {
-  const scores = asRecord(event.scores);
-  const audit = asRecord(scores.audit);
-  return { ...scores, ...audit };
-}
-
-function metricNumber(data: JsonRecord, keys: string[]): number {
-  for (const key of keys) {
-    const value = data[key];
+function metricNumber(...values: Array<number | null | undefined>): number {
+  for (const value of values) {
     if (typeof value === "number" && Number.isFinite(value)) {
       return Math.max(0, Math.floor(value));
-    }
-    if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) {
-      return Math.max(0, Math.floor(Number(value)));
     }
   }
   return 0;
 }
 
 function eventProgressCount(event: AgentTraceEventPayload): { count: number; noun: string } {
-  const data = mergedScores(event);
-  if (event.node === "frontier_traversal" || event.node === "layered_retrieval") {
-    return { count: metricNumber(data, ["frontier_pops", "frontier_expansion_count"]), noun: "节点" };
+  const scores = event.scores;
+  if (scores.audit_kind === "retrieval_stage") {
+    if (event.node === "chunk_recall") {
+      return { count: metricNumber(scores.chunk_topk_selected, scores.chunk_ids.length), noun: "片段" };
+    }
+    return {
+      count: metricNumber(scores.frontier_pops, scores.stage_queue_count, scores.mid_topk_selected, scores.coarse_entries),
+      noun: "节点",
+    };
   }
-  if (event.node === "layer_drilldown" || event.node === "entry_selection") {
-    return { count: metricNumber(data, ["stage_queue_count", "mid_topk_selected", "coarse_entries", "mid_entries"]), noun: "节点" };
+  if (scores.audit_kind === "layered_retrieval") {
+    return { count: metricNumber(scores.retrieval_audit?.frontier_pops), noun: "节点" };
   }
-  if (event.node === "chunk_recall") {
-    return { count: metricNumber(data, ["recalled_chunks", "chunk_topk_selected"]), noun: "片段" };
+  if (scores.audit_kind === "context_restoration") {
+    return { count: metricNumber(scores.restored_chunks, scores.bridge_chunks, scores.hit_chunks), noun: "片段" };
   }
-  if (event.node === "structure_context_restoration" || event.node === "context_package") {
-    return { count: metricNumber(data, ["context_chunks", "restored_chunks", "bridge_chunks", "graph_path_chunks", "hit_chunks"]), noun: "片段" };
-  }
-  if (event.node === "citation_verification") {
-    return { count: metricNumber(data, ["citation_count", "verification_count"]), noun: "引用" };
+  if (scores.audit_kind === "citation_verification") {
+    return { count: metricNumber(scores.returned_citation_count), noun: "引用" };
   }
   return { count: event.document_ids.length, noun: "证据" };
 }
@@ -121,56 +114,53 @@ function renderEventIcon(event: AgentTraceEventPayload) {
   return <CheckCircle2 className="size-4" />;
 }
 
-function compactId(value: string | null | undefined): string {
-  if (!value) return "";
-  return value.length > 12 ? `${value.slice(0, 8)}…${value.slice(-4)}` : value;
-}
-
-function queryFacetRows(scores: JsonRecord): Array<{ label: string; value: string }> {
-  const packet = asRecord(scores.query_facets);
-  const diagnostics = asRecord(packet.diagnostics);
-  const groups = Array.isArray(packet.facet_groups) ? packet.facet_groups : [];
-  const aliasValues = groups.flatMap((group) => {
-    const record = asRecord(group);
-    const aliases = Array.isArray(record.aliases) ? record.aliases : [];
-    return aliases.map((item) => String(item)).filter(Boolean);
-  });
+function queryFacetRows(scores: AgentTraceScores): Array<{ label: string; value: string }> {
+  if (scores.audit_kind !== "query_facets") return [];
+  const packet = scores.query_facets;
+  if (!packet) return [];
+  const aliasValues = packet.facet_groups.flatMap((group) => group.aliases);
   const rows = [
-    { label: "required", value: Array.isArray(packet.required_facets) ? packet.required_facets.map(String).join(" / ") : "" },
-    { label: "drop", value: Array.isArray(packet.drop_terms) ? packet.drop_terms.slice(0, 16).map(String).join(" / ") : "" },
-    { label: "aliases", value: aliasValues.slice(0, 16).join(" / ") },
-    { label: "source", value: typeof diagnostics.source === "string" ? diagnostics.source : "" },
+    { label: "问题重点", value: packet.required_facets.join(" / ") },
+    { label: "忽略词", value: packet.drop_terms.slice(0, 16).join(" / ") },
+    { label: "同义表达", value: aliasValues.slice(0, 16).join(" / ") },
   ];
   return rows.filter((row) => row.value);
 }
 
 function eventMediumRows(event: AgentTraceEventPayload): Array<{ label: string; value: string }> {
-  const data = mergedScores(event);
+  const statusLabels: Record<string, string> = {
+    completed: "完成",
+    pending: "等待",
+    running: "进行中",
+    failed: "失败",
+    cancelled: "已取消",
+  };
+  const hiddenAuditLabels = new Set(["规划", "检索轨迹", "证据包", "RQ 路径"]);
   const rows: Array<{ label: string; value: unknown }> = [
-    { label: "状态", value: event.status },
+    { label: "状态", value: statusLabels[event.status] ?? event.status },
     { label: "阶段", value: traceGroupLabels[traceGroupForNode(event.node)] },
     { label: "耗时", value: `${event.duration_ms} ms` },
     { label: "证据片段", value: event.document_ids.length ? `${event.document_ids.length} 个` : "" },
-    { label: "最新 run", value: compactId(event.run_id) },
   ];
   for (const item of traceAuditSummary(event.scores).slice(0, 10)) {
     const [label, value] = item.split(/:\s*/, 2);
-    rows.push({ label, value: value ?? item });
+    if (!hiddenAuditLabels.has(label)) {
+      rows.push({ label, value: value ?? item });
+    }
   }
-  for (const row of queryFacetRows(data)) {
+  for (const row of queryFacetRows(event.scores)) {
     rows.push({ label: row.label, value: row.value });
   }
   return rows
     .filter((row) => row.value !== undefined && row.value !== null && row.value !== "")
-    .map((row) => ({ label: row.label, value: formatScalar(row.value) }));
+    .map((row) => ({ label: row.label, value: sanitizeTraceDisplayText(formatScalar(row.value)) }));
 }
 
 function renderMetricIcon(label: string) {
   if (label === "阶段") return <ListTree className="size-3" />;
   if (label === "耗时") return <Clock3 className="size-3" />;
   if (label === "证据片段") return <FileText className="size-3" />;
-  if (label === "required" || label === "drop" || label === "aliases" || label === "source") return <Search className="size-3" />;
-  if (label === "最新 run") return <Activity className="size-3" />;
+  if (label === "问题重点" || label === "忽略词" || label === "同义表达") return <Search className="size-3" />;
   return <Gauge className="size-3" />;
 }
 
@@ -203,6 +193,8 @@ function ExplorationTicker({ event, isActive }: { event: AgentTraceEventPayload;
 
 function FineTraceDetails({ event }: { event: AgentTraceEventPayload }) {
   const [open, setOpen] = useState(false);
+  const inputText = sanitizeTraceDisplayText(event.input_summary) || "无";
+  const outputText = sanitizeTraceDisplayText(event.output_summary) || "无";
   return (
     <div className="mt-3 border-t border-white/8 pt-3">
       <button
@@ -222,33 +214,17 @@ function FineTraceDetails({ event }: { event: AgentTraceEventPayload }) {
             transition={{ duration: 0.18 }}
             className="overflow-hidden"
           >
-            <div className="mt-3 grid gap-3 text-xs text-white/52 lg:grid-cols-2">
-              <div>
-                <p className="mb-1 text-[11px] uppercase text-white/32">input</p>
-                <pre className="max-h-48 overflow-auto border-l border-white/10 bg-black/12 p-3 font-mono text-[10px] leading-5 text-white/54 custom-scrollbar">
-                  {event.input_summary || "无"}
-                </pre>
+            <div data-testid="agent-trace-fine-details" className="mt-3 grid gap-3 text-xs text-white/52 lg:grid-cols-2">
+              <div className="border-l border-white/10 bg-black/12 p-3">
+                <p className="mb-2 text-[11px] uppercase text-white/32">本步输入</p>
+                <p className="break-words text-xs leading-6 text-white/58">{inputText}</p>
               </div>
-              <div>
-                <p className="mb-1 text-[11px] uppercase text-white/32">scores</p>
-                <pre className="max-h-48 overflow-auto border-l border-white/10 bg-black/12 p-3 font-mono text-[10px] leading-5 text-white/54 custom-scrollbar">
-                  {safeJson(event.scores)}
-                </pre>
+              <div className="border-l border-white/10 bg-black/12 p-3">
+                <p className="mb-2 text-[11px] uppercase text-white/32">本步结果</p>
+                <p className="break-words text-xs leading-6 text-white/58">{outputText}</p>
               </div>
             </div>
-            {event.document_ids.length ? (
-              <div className="mt-3">
-                <p className="mb-1 text-[11px] uppercase text-white/32">document / chunk ids</p>
-                <div className="flex flex-wrap gap-1.5">
-                  {event.document_ids.map((id) => (
-                    <span key={id} className="border-l border-white/12 bg-white/[0.025] px-2 py-1 font-mono text-[10px] text-white/48">
-                      {compactId(id)}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-            {event.error ? <p className="mt-3 text-xs text-rose-100/72">{event.error}</p> : null}
+            {event.error ? <p className="mt-3 text-xs text-rose-100/72">{sanitizeTraceDisplayText(event.error)}</p> : null}
           </motion.div>
         ) : null}
       </AnimatePresence>
@@ -290,7 +266,7 @@ function TraceEventItem({
                 <span className={cn("text-[11px]", tone.text)}>{tone.label}</span>
                 {isLatest ? <span className="text-[11px] text-cyan-100/62">实时</span> : null}
               </span>
-              {event.output_summary ? <MarkdownRenderer content={event.output_summary} compact className="mt-1 line-clamp-2 text-xs leading-5 text-white/50" /> : null}
+              {event.output_summary ? <MarkdownRenderer content={sanitizeTraceDisplayText(event.output_summary)} compact className="mt-1 line-clamp-2 text-xs leading-5 text-white/50" /> : null}
             </span>
           </span>
           <span className="mt-1 inline-flex shrink-0 items-center gap-1 text-[11px] text-white/38 transition group-hover:text-white/72">
@@ -344,13 +320,13 @@ export function AgentTraceStream({ trace, isRunning = false, defaultExpanded = f
   }
 
   return (
-    <section className={cn("border-l border-cyan-200/18 pl-4 text-white", compact ? "py-2" : "py-4", className)}>
+    <section data-testid="agent-trace-stream" className={cn("border-l border-cyan-200/18 pl-4 text-white", compact ? "py-2" : "py-4", className)}>
       <button type="button" onClick={() => setExpanded((current) => !current)} className="group flex w-full items-center justify-between gap-4 text-left">
         <span className="min-w-0">
           <span className="flex flex-wrap items-center gap-2">
             {isRunning ? <span className="tech-dot" /> : <CheckCircle2 className="size-4 text-cyan-100/62" />}
             <span className="text-sm font-semibold text-white/82">流式轨迹</span>
-            <span className="font-mono text-[11px] text-white/38">{events.length} events</span>
+            <span className="text-[11px] text-white/38">{events.length} 个步骤</span>
           </span>
           <span className="mt-1 block truncate text-xs text-white/42">
             {latest ? `${isRunning ? "正在执行" : "最新事件"}：${traceNodeLabel(latest.node)}` : "等待事件"}
@@ -396,7 +372,7 @@ export function AgentTraceStream({ trace, isRunning = false, defaultExpanded = f
       {latest?.error ? (
         <div className="mt-3 flex items-start gap-2 border-l border-rose-300/35 bg-rose-300/[0.045] px-3 py-2 text-xs text-rose-100/78">
           <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-          <span>{latest.error}</span>
+          <span>{sanitizeTraceDisplayText(latest.error)}</span>
         </div>
       ) : null}
     </section>

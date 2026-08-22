@@ -2,13 +2,12 @@
 
 import { createPortal } from "react-dom";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { GraphResponse, ModelAudit, RetrievalTraceStepsResponse, SearchResult, SourceType } from "@course-kg/shared";
+import type { ContextPackageResponse, GraphResponse, ModelAudit, RetrievalTraceStepsResponse, SearchResult, SourceType } from "@course-kg/shared";
 import { AnimatePresence, motion } from "framer-motion";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   Activity,
   ArrowUpRight,
-  FileText,
   Filter,
   GitBranch,
   Loader2,
@@ -20,6 +19,7 @@ import {
 } from "lucide-react";
 
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
+import { GrayZoneAuditDetails, GrayZoneAuditFailure, inspectGrayZoneTrace, QueryFacetPosteriorAudit } from "@/components/gray-zone-audit";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { NetworkCanvas } from "@/components/network-canvas";
 import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
@@ -36,6 +36,8 @@ type SearchState = {
   results: SearchResult[];
   degraded_mode: boolean;
   model_audit?: ModelAudit;
+  retrieval_trace_id?: string | null;
+  context_package_id?: string | null;
 };
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -57,72 +59,34 @@ function collectStringIds(value: unknown, ids: Set<string>) {
   }
 }
 
-function collectNodeEntryIds(value: unknown, ids: Set<string>) {
-  if (!Array.isArray(value)) {
-    return;
-  }
-  for (const item of value) {
-    if (typeof item === "string") {
-      addStringId(item, ids);
-      continue;
-    }
-    const record = asRecord(item);
-    if (record) {
-      addStringId(record.node_id ?? record.id, ids);
-    }
-  }
-}
-
-function collectPathLabelIds(value: unknown, ids: Set<string>) {
-  if (!Array.isArray(value)) {
-    return;
-  }
-  for (const item of value) {
-    const record = asRecord(item);
-    if (record) {
-      addStringId(record.node_id, ids);
-      collectStringIds(record.path, ids);
-    }
-  }
-}
-
 export function exploredMidNodeIdsFromTrace(trace: RetrievalTraceStepsResponse | undefined): Set<string> {
   const ids = new Set<string>();
   if (!trace) {
     return ids;
   }
 
-  const stageQueues = asRecord(trace.stage_queues);
-  const midQueue = asRecord(stageQueues?.mid);
-  collectStringIds(midQueue?.selected_ids, ids);
-  collectStringIds(midQueue?.accepted_ids, ids);
+  collectStringIds(trace.stage_queues?.mid?.selected_ids, ids);
+  collectStringIds(trace.stage_queues?.mid?.accepted_ids, ids);
+  collectStringIds(trace.topk_selection?.mid?.selected_ids, ids);
 
-  const topkSelection = asRecord(trace.topk_selection);
-  const midTopkSelection = asRecord(topkSelection?.mid);
-  collectStringIds(midTopkSelection?.selected_ids, ids);
-
-  collectNodeEntryIds(trace.entry_nodes, ids);
-  collectPathLabelIds(trace.path_labels, ids);
+  for (const entry of trace.entry_nodes ?? []) {
+    if (entry.layer === "mid") addStringId(entry.node_id, ids);
+  }
+  for (const pathLabel of trace.path_labels ?? []) {
+    if (pathLabel.layer !== "mid") continue;
+    addStringId(pathLabel.node_id, ids);
+    collectStringIds(pathLabel.path, ids);
+  }
 
   for (const step of trace.steps) {
-    const stepRecord = asRecord(step);
-    if (stepRecord?.layer !== "mid") {
+    if (step.layer !== "mid") {
       continue;
     }
-    collectStringIds(stepRecord.selected_topk_ids, ids);
-
-    const input = asRecord(stepRecord.input);
-    collectNodeEntryIds(input?.entry_nodes, ids);
-
-    const output = asRecord(stepRecord.output);
-    collectStringIds(output?.accepted_nodes, ids);
-
-    const poppedState = asRecord(stepRecord.popped_frontier_state);
-    addStringId(poppedState?.node_id, ids);
-    collectStringIds(poppedState?.path, ids);
-
-    const diagnostics = asRecord(stepRecord.diagnostics);
-    collectPathLabelIds(diagnostics?.path_labels, ids);
+    collectStringIds(step.selected_topk_ids, ids);
+    collectStringIds(step.input.mid_entry_ids, ids);
+    collectStringIds(step.output.accepted_node_ids, ids);
+    addStringId(step.popped_frontier_state.node_id, ids);
+    collectStringIds(step.popped_frontier_state.path, ids);
   }
 
   return ids;
@@ -148,19 +112,12 @@ export function toExploredMidConceptGraph(graph: GraphResponse | undefined, trac
       edges: edges.length,
     },
     node_counts: {
-      ...(graph.node_counts ?? {}),
-      mid_concept: nodes.length,
+      ...graph.node_counts,
+      sampled: nodes.length,
     },
     edge_counts: {
-      ...(graph.edge_counts ?? {}),
-      concept_relation: edges.length,
-    },
-    diagnostics: {
-      ...(graph.diagnostics ?? {}),
-      explored_mid_node_count: nodes.length,
-      explored_mid_edge_count: edges.length,
-      explored_mid_trace_id: trace?.trace_id ?? null,
-      filtered_to_explored_mid_nodes: true,
+      ...graph.edge_counts,
+      sampled: edges.length,
     },
   };
 }
@@ -183,17 +140,6 @@ function traversalTextList(value: unknown): string[] {
   return Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
 }
 
-function traversalMetric(result: SearchResult, key: string): string {
-  const value = resultTraversal(result)[key];
-  if (typeof value === "number") {
-    return value.toFixed(3);
-  }
-  if (Array.isArray(value)) {
-    return value.length ? value.join(" / ") : "无";
-  }
-  return value === undefined || value === null || value === "" ? "无" : String(value);
-}
-
 export function pathEdgeSummary(result: SearchResult): string {
   const traversal = resultTraversal(result);
   const edgeIds = traversalTextList(traversal.path_edge_ids);
@@ -208,33 +154,10 @@ export function pathEdgeSummary(result: SearchResult): string {
   return "无";
 }
 
-function pathEdgeBadge(result: SearchResult): string {
-  const traversal = resultTraversal(result);
-  const edgeIds = traversalTextList(traversal.path_edge_ids);
-  if (edgeIds.length) {
-    return `关系边 ${edgeIds.length}`;
-  }
-  return traversalTextList(traversal.evidence_roles).length ? "入口种子" : "关系边 无";
-}
-
-function auditValue(audit: ModelAudit | undefined, key: string): string {
-  const value = audit ? (audit as Record<string, unknown>)[key] : undefined;
-  return value === undefined || value === null || value === "" ? "无" : String(value);
-}
-
 function retrievalGranularityLabel(value: unknown): string {
   if (value === "mid") return "普通模式";
   if (value === "coarse") return "摘要模式";
   return "无";
-}
-
-function resultRq(result: SearchResult): Record<string, unknown> | null {
-  const rq = result.metadata.rq;
-  return rq && typeof rq === "object" && !Array.isArray(rq) ? (rq as Record<string, unknown>) : null;
-}
-
-function rqPath(value: unknown): string {
-  return Array.isArray(value) && value.length ? value.join("/") : "无";
 }
 
 function sourceTypeLabel(value: string | undefined) {
@@ -250,14 +173,32 @@ function sourceTypeLabel(value: string | undefined) {
   return value ? labels[value] ?? value : "未知";
 }
 
-function resultPartition(result: SearchResult | undefined) {
-  if (!result) return "通用";
-  return result.partition ?? (result.metadata.partition as string | undefined) ?? result.citations[0]?.partition ?? "通用";
-}
-
 function resultSourceType(result: SearchResult | undefined) {
   if (!result) return "未知";
   return sourceTypeLabel(result.source_type ?? (result.metadata.source_type as string | undefined));
+}
+
+export function resultDisplayTitle(result: SearchResult): string {
+  const candidate = String(
+    result.document_title ?? result.citations[0]?.document_title ?? "",
+  ).trim();
+  if (
+    candidate &&
+    !/^[0-9a-f]{64}$/i.test(candidate) &&
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(candidate)
+  ) {
+    return candidate;
+  }
+  const heading = String(result.snippet ?? result.content ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /^#{1,6}\s+\S/.test(line));
+  if (!heading) return "来源名称缺失";
+  const naturalHeading = heading
+    .replace(/^#{1,6}\s+/, "")
+    .split(/\s+#\s+|。|\s+(?=内容涵盖|消息质控采用)/, 1)[0]
+    .trim();
+  return naturalHeading.slice(0, 60) || "来源名称缺失";
 }
 
 function resultContextSnippet(result: SearchResult) {
@@ -288,12 +229,12 @@ function SearchHero({
       <div className="mx-auto flex max-w-5xl flex-col items-center gap-5 text-center">
         <div className="kg-micro-chip rounded-full px-3 py-2 text-xs uppercase tracking-[0.22em]">
           <Radar data-icon="inline-start" />
-          分层图谱检索
+          本地资料检索
         </div>
         <div className="space-y-3">
-          <h2 className="glow-text text-4xl font-semibold text-white lg:text-6xl">检索本地上下文图谱</h2>
+          <h2 className="glow-text text-4xl font-semibold text-white lg:text-6xl">检索本地资料</h2>
           <p className="mx-auto max-w-2xl text-sm leading-7 text-cyan-50/58 lg:text-base">
-            Dense 关系图、RQ membership、中粗概念路由、分阶段队列和结构恢复会在这里汇总。
+            输入问题或引用线索，系统会返回相关片段、来源和必要的上下文。
           </p>
         </div>
 
@@ -385,35 +326,327 @@ function SearchFilterBar({
       </div>
       <div className="kg-micro-chip rounded-full px-3 py-2 text-xs">
         <Activity data-icon="inline-start" />
-        {degradedMode ? "依赖链路不完整" : "向量 + RQ + 四层图谱"}
+        {degradedMode ? "资料索引暂不可用" : "资料索引已就绪"}
       </div>
     </div>
   );
 }
 
-function SearchTraceSummary({ audit }: { audit?: ModelAudit }) {
-  if (!audit) {
-    return null;
-  }
-  const pipeline = audit.retrieval_pipeline ?? audit.retrieval_mode ?? "无";
-  const traceId = audit.retrieval_trace_id ? `${audit.retrieval_trace_id.slice(0, 8)}...` : "无";
-  const queryRqPath = Array.isArray((audit as Record<string, unknown>).query_rq_path) ? ((audit as Record<string, unknown>).query_rq_path as unknown[]).join("/") : "无";
+export function semanticEntryAuditLabels(audit?: ModelAudit) {
+  return {
+    source: audit?.semantic_entry_query_selection_source === "validated_required_facet" ? "已去除交互指令" : "原始问题",
+    grayAuthority: audit?.semantic_entry_query_gray_zone_decision_authority === false ? "无" : "未审计",
+  } as const;
+}
+
+function traceText(value: unknown, fallback = "无"): string {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "number") return Number.isInteger(value) ? String(value) : value.toFixed(4);
+  if (typeof value === "boolean") return value ? "是" : "否";
+  return String(value);
+}
+
+function traceIds(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
+}
+
+function traceJson(value: unknown): string {
+  return JSON.stringify(value ?? {}, null, 2);
+}
+
+function TraceIdList({ values, empty = "无" }: { values: unknown; empty?: string }) {
+  const ids = traceIds(values);
+  if (!ids.length) return <span className="text-white/38">{empty}</span>;
   return (
-    <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3 text-xs text-white/58">
-      <span className="kg-micro-chip rounded-full px-2.5 py-1">链路 {pipeline}</span>
-      <span className="kg-micro-chip rounded-full px-2.5 py-1">检索模式 {retrievalGranularityLabel(audit.retrieval_granularity)}</span>
-      <span className="kg-micro-chip rounded-full px-2.5 py-1">Trace {traceId}</span>
-      <span className="kg-micro-chip rounded-full px-2.5 py-1">粗粒入口 {auditValue(audit, "coarse_entries")}</span>
-      <span className="kg-micro-chip rounded-full px-2.5 py-1">中粒入口 {auditValue(audit, "mid_entries")}</span>
-      <span className="kg-micro-chip rounded-full px-2.5 py-1">RQ 入口 {auditValue(audit, "rq_membership_entries")}</span>
-      <span className="kg-micro-chip rounded-full px-2.5 py-1">Stage 队列 {auditValue(audit, "stage_queue_count")}</span>
-      <span className="kg-micro-chip rounded-full px-2.5 py-1">中概念 TopK {auditValue(audit, "mid_topk_selected")}</span>
-      <span className="kg-micro-chip rounded-full px-2.5 py-1">片段 TopK {auditValue(audit, "chunk_topk_selected")}</span>
-      <span className="kg-micro-chip rounded-full px-2.5 py-1">Frontier {auditValue(audit, "frontier_pops")}</span>
-      <span className="kg-micro-chip rounded-full px-2.5 py-1">支配剪枝 {auditValue(audit, "dominance_pruned_count")}</span>
-      <span className="kg-micro-chip rounded-full px-2.5 py-1">硬停剪枝 {auditValue(audit, "hard_stop_pruned_count")}</span>
-      <span className="kg-micro-chip rounded-full px-2.5 py-1">查询 RQ {queryRqPath}</span>
+    <div className="flex flex-wrap gap-1.5">
+      {ids.map((id, index) => (
+        <code key={`${id}:${index}`} className="rounded-md border border-white/8 bg-black/20 px-1.5 py-0.5 text-[11px] text-cyan-50/68">
+          {id}
+        </code>
+      ))}
     </div>
+  );
+}
+
+function TraceJson({ value }: { value: unknown }) {
+  return <pre className="custom-scrollbar max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-xl border border-white/8 bg-black/20 p-3 text-[11px] leading-5 text-cyan-50/62">{traceJson(value)}</pre>;
+}
+
+function TraceSection({ title, count, children, open = true }: { title: string; count?: number; children: React.ReactNode; open?: boolean }) {
+  return (
+    <details open={open} className="rounded-2xl border border-white/8 bg-white/[0.025] p-4">
+      <summary className="cursor-pointer select-none text-sm font-semibold text-white/82">
+        {title}
+        {count === undefined ? null : <span className="ml-2 text-xs font-normal text-cyan-100/48">{count}</span>}
+      </summary>
+      <div className="mt-3">{children}</div>
+    </details>
+  );
+}
+
+function CandidatePoolCards({ trace }: { trace: RetrievalTraceStepsResponse }) {
+  const pools = asRecord(trace.candidate_pools) ?? {};
+  const rows: Array<{ key: string; pool: Record<string, unknown> }> = [];
+  for (const [key, value] of Object.entries(pools)) {
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => {
+        const pool = asRecord(item);
+        if (pool) rows.push({ key: `${key}[${index}]`, pool });
+      });
+      continue;
+    }
+    const pool = asRecord(value);
+    if (pool && key !== "candidate_dedupe_budget") rows.push({ key, pool });
+  }
+  return (
+    <div className="space-y-3">
+      {rows.length ? (
+        rows.map(({ key, pool }) => (
+          <div key={key} className="rounded-xl border border-white/7 bg-black/15 p-3 text-xs text-white/58">
+            <div className="flex flex-wrap items-center gap-2 text-white/76">
+              <span className="font-medium">{key}</span>
+              <span>父层 {traceText(pool.parent_layer)}</span>
+              <code>{traceText(pool.parent_node_id)}</code>
+              <span>候选 {traceText(pool.candidate_count ?? traceIds(pool.candidate_ids).length)}</span>
+              <span>Top-K {traceText(pool.top_k)}</span>
+              <span>停止 {traceText(pool.stop_reason)}</span>
+            </div>
+            <div className="mt-2 grid gap-2 lg:grid-cols-2">
+              <div><p className="mb-1 text-white/40">候选合并</p><TraceIdList values={pool.candidate_ids} /></div>
+              <div><p className="mb-1 text-white/40">入选</p><TraceIdList values={pool.selected_ids} /></div>
+            </div>
+            <div className="mt-2">
+              <p className="mb-1 text-white/40">RQ seed ranking / scores</p>
+              <TraceJson value={{
+                ranking_protocol_version: pool.ranking_protocol_version,
+                ranking_protocol_hash: pool.ranking_protocol_hash,
+                candidate_scores: pool.candidate_scores,
+              }} />
+            </div>
+            {Object.keys(asRecord(pool.rq_seed_cards) ?? {}).length ? (
+              <div className="mt-2">
+                <p className="mb-1 text-white/40">Query → RQ seed cards</p>
+                <TraceJson value={pool.rq_seed_cards} />
+              </div>
+            ) : null}
+            {Object.keys(asRecord(pool.rq_chunk_seed_cards) ?? {}).length ? (
+              <div className="mt-2">
+                <p className="mb-1 text-white/40">RQ → chunk seed cards</p>
+                <TraceJson value={pool.rq_chunk_seed_cards} />
+              </div>
+            ) : null}
+            {pool.per_parent_budget_status ? <div className="mt-2"><p className="mb-1 text-white/40">逐父预算</p><TraceJson value={pool.per_parent_budget_status} /></div> : null}
+            {pool.candidate_dedupe_budget_audit ? <div className="mt-2"><p className="mb-1 text-white/40">候选去重预算</p><TraceJson value={pool.candidate_dedupe_budget_audit} /></div> : null}
+          </div>
+        ))
+      ) : (
+        <p className="text-xs text-white/38">没有候选池记录。</p>
+      )}
+      {pools.candidate_dedupe_budget ? <div><p className="mb-1 text-xs text-white/40">全局候选池去重 hard interrupt</p><TraceJson value={pools.candidate_dedupe_budget} /></div> : null}
+    </div>
+  );
+}
+
+export function SearchTraceDetails({
+  traceId,
+  contextPackageId,
+  trace,
+  contextPackage,
+  isLoading,
+  error,
+}: {
+  traceId: string | null;
+  contextPackageId: string | null;
+  trace?: RetrievalTraceStepsResponse;
+  contextPackage?: ContextPackageResponse;
+  isLoading: boolean;
+  error: Error | null;
+}) {
+  const [rawPayloadOpen, setRawPayloadOpen] = useState(false);
+  if (!traceId) return null;
+  if (isLoading && !trace) return <LoadingBlock rows={3} />;
+  if (error && !trace) {
+    const status = (error as Error & { status?: number }).status;
+    return status === 409
+      ? <GrayZoneAuditFailure title="Gray-zone 持久化轨迹校验冲突" message={`HTTP 409 · ${error.message}`} />
+      : <ErrorBlock message={error.message} />;
+  }
+  if (!trace) return null;
+
+  const stageQueues = Object.entries(trace.stage_queues ?? {});
+  const topKSelections = Object.entries(trace.topk_selection ?? {});
+  const thresholdHits = trace.path_distance_threshold_hits ?? [];
+  const grayAuditInspection = inspectGrayZoneTrace(trace);
+  const dedupeKeys = contextPackage?.dedupe_keys ?? [];
+  const packageContexts = contextPackage?.contexts ?? [];
+
+  return (
+    <section data-testid="search-trace-details" className="rounded-[1.7rem] border border-white/10 bg-white/[0.025] p-5 shadow-[0_18px_70px_rgba(0,0,0,0.18)]">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold text-white">完整分层检索轨迹与证据包</p>
+          <p className="mt-1 text-xs leading-5 text-white/45">可回放入口、frontier、逐父下钻、候选合并、剪枝、确定性灰区规则、收敛和结构恢复。</p>
+        </div>
+        <div className="flex flex-wrap gap-2 text-xs">
+          <span className="kg-micro-chip rounded-full px-2.5 py-1">Trace {trace.trace_id}</span>
+          <span className="kg-micro-chip rounded-full px-2.5 py-1">Package {contextPackage?.id ?? contextPackageId ?? "无"}</span>
+          <span className="kg-micro-chip rounded-full px-2.5 py-1">{retrievalGranularityLabel(trace.retrieval_granularity)}</span>
+          <span className={cn("rounded-full border px-2.5 py-1", grayAuditInspection.ok ? "border-emerald-300/20 bg-emerald-300/[0.07] text-emerald-100/78" : "border-red-300/30 bg-red-300/10 text-red-100")}>
+            {grayAuditInspection.ok ? `Gray 模型调用 ${grayAuditInspection.modelCallCount}` : "Gray 审计失败"}
+          </span>
+        </div>
+      </div>
+
+      <div className="mt-5 grid gap-3 xl:grid-cols-2">
+        <TraceSection title="查询面与入口节点" count={trace.entry_nodes?.length ?? 0}>
+          <div className="mb-3 grid gap-2 text-xs text-white/58 sm:grid-cols-3">
+            <span>模式：{traceText(trace.retrieval_mode)}</span>
+            <span>粒度：{traceText(trace.retrieval_granularity)}</span>
+            <span>Gray 协议：{traceText(trace.gray_zone_protocol)}</span>
+          </div>
+          <TraceJson value={trace.query_facets} />
+          <div className="mt-3">
+            <QueryFacetPosteriorAudit calibration={trace.trace_diagnostics.query_facet_posterior_calibration} />
+          </div>
+          {trace.trace_diagnostics.query_rq_seed_audit ? (
+            <div className="mt-3">
+              <p className="mb-1 text-xs text-white/40">Query → RQ seed authority audit</p>
+              <TraceJson value={trace.trace_diagnostics.query_rq_seed_audit} />
+            </div>
+          ) : null}
+          <div className="mt-3 space-y-2">
+            {(trace.entry_nodes ?? []).map((entry, index) => (
+              <div key={`${entry.layer}:${entry.node_id}:${index}`} className="rounded-xl border border-white/7 bg-black/15 p-3 text-xs text-white/58">
+                <div className="flex flex-wrap gap-2"><span className="text-cyan-100/74">{entry.layer}</span><code>{entry.node_id}</code><span>强度 {traceText(entry.entry_strength)}</span></div>
+                <div className="mt-2"><TraceIdList values={entry.roles} empty="无角色" /></div>
+                {entry.rq_prefix_id || Object.keys(entry.metadata ?? {}).length ? <div className="mt-2"><TraceJson value={{ rq_prefix_id: entry.rq_prefix_id, metadata: entry.metadata }} /></div> : null}
+              </div>
+            ))}
+          </div>
+        </TraceSection>
+
+        <TraceSection title="Stage 队列" count={stageQueues.length}>
+          <div className="space-y-2">
+            {stageQueues.map(([layer, queue]) => (
+              <div key={layer} className="rounded-xl border border-white/7 bg-black/15 p-3 text-xs text-white/58">
+                <div className="flex flex-wrap gap-3 text-white/74"><span className="font-medium">{layer}</span><span>入口上限 {traceText(queue.initial_top_k)}</span><span>输出 Top-K {traceText(queue.top_k)}</span><span>Frontier pops {traceText(queue.frontier_pop_count)}</span><span>原因 {traceText(queue.reason ?? queue.skipped_by_granularity)}</span></div>
+                <div className="mt-2 grid gap-2 lg:grid-cols-3">
+                  <div><p className="mb-1 text-white/40">入口</p><TraceIdList values={queue.entry_ids} /></div>
+                  <div><p className="mb-1 text-white/40">选择</p><TraceIdList values={queue.selected_ids} /></div>
+                  <div><p className="mb-1 text-white/40">接受</p><TraceIdList values={queue.accepted_ids} /></div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </TraceSection>
+
+        <TraceSection title="Frontier expansion timeline" count={trace.frontier?.length ?? 0}>
+          <ol className="space-y-2">
+            {(trace.frontier ?? []).map((snapshot, index) => {
+              const popped = asRecord(snapshot.popped) ?? {};
+              return (
+                <li key={`${traceText(popped.node_id)}:${index}`} className="rounded-xl border border-white/7 bg-black/15 p-3 text-xs text-white/58">
+                  <div className="flex flex-wrap gap-3 text-white/74"><span>#{index + 1}</span><span>{traceText(snapshot.layer ?? popped.layer)}</span><code>{traceText(popped.node_id)}</code><span>队列剩余 {snapshot.queue_size_after_pop}</span><span>深度 {traceText(popped.depth)}</span><span>距离 {traceText(popped.distance_so_far)}</span><span>奖励 {traceText(popped.reward_so_far)}</span><span>分区 {traceText(popped.distance_zone)}</span></div>
+                  <div className="mt-2"><p className="mb-1 text-white/40">路径</p><TraceIdList values={popped.path} /></div>
+                  <div className="mt-2"><p className="mb-1 text-white/40">展开边 / 距离 / 类型</p><TraceJson value={{ edge_ids: popped.path_edge_ids, distances: popped.path_edge_distances, edge_types: popped.path_edge_types, support_refs: popped.support_refs, queue_key: snapshot.key }} /></div>
+                </li>
+              );
+            })}
+          </ol>
+        </TraceSection>
+
+        <TraceSection title="逐父候选池、合并与去重"><CandidatePoolCards trace={trace} /></TraceSection>
+
+        <TraceSection title="Top-K selections" count={topKSelections.length}>
+          <div className="space-y-2">
+            {topKSelections.map(([layer, selection]) => (
+              <div key={layer} className="rounded-xl border border-white/7 bg-black/15 p-3 text-xs text-white/58">
+                <div className="flex flex-wrap gap-3 text-white/74"><span>{layer}</span><span>候选 {selection.candidate_count ?? 0}</span><span>Top-K {traceText(selection.top_k)}</span><span>入口模式 {traceText(selection.entry_mode)}</span><span>停止 {traceText(selection.stop_reason)}</span></div>
+                <div className="mt-2"><TraceIdList values={selection.selected_ids} /></div>
+              </div>
+            ))}
+          </div>
+        </TraceSection>
+
+        <TraceSection title="持久化检索步骤" count={trace.steps.length}>
+          <ol className="space-y-2">
+            {trace.steps.map((step) => (
+              <li key={step.id} className="rounded-xl border border-white/7 bg-black/15 p-3 text-xs text-white/58">
+                <div className="flex flex-wrap gap-3 text-white/74"><span>#{step.step_index}</span><span>{step.layer}</span><span>{step.action_type}</span><span>父 {traceText(step.parent_layer)} / {traceText(step.parent_node_id)}</span><span>支配剪枝 {step.dominance_pruned_count ?? 0}</span><span>cycle reward {traceText(step.cycle_distance_reward)}</span><span>停止 {traceText(step.stop_reason)}</span></div>
+                <div className="mt-2 grid gap-2 lg:grid-cols-3">
+                  <div><p className="mb-1 text-white/40">候选</p><TraceIdList values={step.candidate_pool_ids} /></div>
+                  <div><p className="mb-1 text-white/40">Top-K</p><TraceIdList values={step.selected_topk_ids} /></div>
+                  <div><p className="mb-1 text-white/40">展开边</p><TraceIdList values={step.expanded_edge_ids} /></div>
+                </div>
+                <details className="mt-2"><summary className="cursor-pointer text-white/48">输入 / 输出 / 逐父预算 / 诊断</summary><div className="mt-2"><TraceJson value={{ input: step.input, output: step.output, per_parent_budget_status: step.per_parent_budget_status, popped_frontier_state: step.popped_frontier_state, diagnostics: step.diagnostics }} /></div></details>
+              </li>
+            ))}
+          </ol>
+        </TraceSection>
+
+        <TraceSection
+          title="Multi-path contribution union"
+          count={(trace.node_contributions?.length ?? 0) + (contextPackage?.reached_by_paths.length ?? 0)}
+        >
+          <div className="grid gap-3 lg:grid-cols-2">
+            <div><p className="mb-1 text-xs text-white/40">Trace node contribution summaries</p><TraceJson value={trace.node_contributions} /></div>
+            <div><p className="mb-1 text-xs text-white/40">Context reached paths and why-selected union</p><TraceJson value={{ reached_by_paths: contextPackage?.reached_by_paths ?? [], node_contributions: contextPackage?.node_contributions ?? [], why_selected: contextPackage?.why_selected ?? {} }} /></div>
+          </div>
+        </TraceSection>
+
+        <GrayZoneAuditDetails trace={trace} />
+
+        <TraceSection title="Path distance threshold hits" count={thresholdHits.length}>
+          <div className="space-y-2">
+            {thresholdHits.map((decision, index) => (
+              <div key={`${decision.edge_id ?? "threshold"}:${index}`} className="rounded-xl border border-red-300/12 bg-red-300/[0.035] p-3 text-xs text-white/58">
+                <div className="flex flex-wrap gap-3 text-white/74"><span>{traceText(decision.layer)}</span><code>{traceText(decision.edge_id)}</code><span>分区 {traceText(decision.distance_zone)}</span><span>距离 {traceText(decision.path_distance)}</span><span>结果 {decision.decision}</span></div>
+              </div>
+            ))}
+          </div>
+        </TraceSection>
+
+        <TraceSection title="Drilldown path 与 convergence" count={trace.path_labels?.length ?? 0}>
+          <div className="grid gap-3">
+            <div><p className="mb-1 text-xs text-white/40">coarse → mid → chunk 路径标签</p><TraceJson value={trace.path_labels} /></div>
+            <div><p className="mb-1 text-xs text-white/40">收敛、支配剪枝、cycle distance reward 与 hard interrupt</p><TraceJson value={trace.convergence} /></div>
+          </div>
+        </TraceSection>
+
+        <TraceSection title="Context Package 去重与结构恢复" count={packageContexts.length}>
+          {contextPackage ? (
+            <div className="space-y-3 text-xs text-white/58">
+              <div className="flex flex-wrap gap-3 text-white/74"><span>Token {contextPackage.token_count ?? 0} / {contextPackage.token_budget}</span><span>命中 {(contextPackage.hit_chunk_ids ?? []).length}</span><span>恢复 {(contextPackage.restored_chunk_ids ?? []).length}</span><span>桥接 {(contextPackage.bridge_chunk_ids ?? []).length}</span><span>去重键 {dedupeKeys.length} / 唯一 {new Set(dedupeKeys).size}</span><span>cycle convergence {traceText(contextPackage.cycle_convergence_score)}</span></div>
+              <div className="grid gap-2 lg:grid-cols-2"><div><p className="mb-1 text-white/40">Hit / restored / bridge chunks</p><TraceJson value={{ hit: contextPackage.hit_chunk_ids, restored: contextPackage.restored_chunk_ids, bridge: contextPackage.bridge_chunk_ids }} /></div><div><p className="mb-1 text-white/40">结构闭包与 graph path</p><TraceJson value={{ parent_structure_node_ids: contextPackage.parent_structure_node_ids, graph_path_ids: contextPackage.graph_path_ids, graph_expansion_paths: contextPackage.graph_expansion_paths }} /></div></div>
+              <div><p className="mb-1 text-white/40">why_selected / covered facets / dedupe keys</p><TraceJson value={{ why_selected: contextPackage.why_selected, covered_facets: contextPackage.covered_facets, dedupe_keys: dedupeKeys }} /></div>
+              <div><p className="mb-1 text-white/40">citation-ready raw spans</p><TraceJson value={contextPackage.citation_spans} /></div>
+              <div><p className="mb-1 text-white/40">Public package hash proof</p><TraceJson value={{ package_hash: contextPackage.package_hash, package_hash_card: contextPackage.package_hash_card }} /></div>
+              <div className="space-y-2">
+                {packageContexts.map((context, index) => {
+                  const metadata = asRecord(context.metadata) ?? {};
+                  return <div key={`${traceText(context.chunk_id)}:${index}`} className="rounded-xl border border-white/7 bg-black/15 p-3"><div className="flex flex-wrap gap-2 text-white/74"><code>{traceText(context.chunk_id)}</code><span>{traceText(context.document_title)}</span><span>角色 {traceText(metadata.role)}</span><span>dedupe {traceText(metadata.dedupe_key)}</span></div><p className="mt-2 whitespace-pre-wrap leading-5 text-white/55">{traceText(context.snippet ?? context.content)}</p><details className="mt-2"><summary className="cursor-pointer text-white/42">结构路径、span 与选择理由</summary><div className="mt-2"><TraceJson value={metadata} /></div></details></div>;
+                })}
+              </div>
+              <TraceJson value={contextPackage.diagnostics} />
+            </div>
+          ) : isLoading && contextPackageId ? <LoadingBlock rows={2} /> : error ? <ErrorBlock message={error.message} /> : <p className="text-xs text-white/38">当前 trace 没有关联的 context package。</p>}
+        </TraceSection>
+      </div>
+
+      <details
+        className="rounded-2xl border border-white/8 bg-white/[0.025] p-4"
+        onToggle={(event) => setRawPayloadOpen(event.currentTarget.open)}
+      >
+        <summary className="cursor-pointer select-none text-sm font-semibold text-white/82">原始保真 payload</summary>
+        <div className="mt-3">
+          {rawPayloadOpen ? (
+            <div className="grid gap-3 xl:grid-cols-2"><TraceJson value={trace} /><TraceJson value={contextPackage ?? { context_package_id: contextPackageId }} /></div>
+          ) : (
+            <p className="text-xs text-white/38">展开后渲染完整 API payload。</p>
+          )}
+        </div>
+      </details>
+    </section>
   );
 }
 
@@ -431,7 +664,7 @@ function ResultSkeleton() {
   );
 }
 
-function ResultRow({
+export function ResultRow({
   result,
   active,
   index,
@@ -444,9 +677,7 @@ function ResultRow({
   onHover: (result: SearchResult | null, anchor?: HTMLButtonElement | null) => void;
   onSelect: (result: SearchResult) => void;
 }) {
-  const rq = resultRq(result);
   const traversal = resultTraversal(result);
-  const evidenceRoles = traversalTextList(traversal.evidence_roles).slice(0, 4);
   const coveredFacets = traversalTextList(traversal.covered_facets).slice(0, 4);
   return (
     <motion.button
@@ -470,37 +701,19 @@ function ResultRow({
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm font-medium text-white">{result.document_title ?? result.citations[0]?.document_title ?? "资料来源"}</span>
+            <span className="text-sm font-medium text-white">{resultDisplayTitle(result)}</span>
             <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultSourceType(result)}</span>
-            <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultPartition(result)}</span>
           </div>
           <MarkdownRenderer content={result.snippet} compact className="mt-3 line-clamp-2 text-white/62" />
         </div>
         <div className="flex shrink-0 flex-col items-end gap-2">
-          <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">
-            遍历分 <span className="font-mono text-cyan-100">{result.score.toFixed(3)}</span>
-          </span>
+          <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">相关证据</span>
           <ArrowUpRight className="text-white/32 transition group-hover:text-cyan-100" />
         </div>
       </div>
       <div className="mt-4 flex flex-wrap gap-2">
-        <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">距离 {traversalMetric(result, "distance_so_far")}</span>
-        <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">Cycle {traversalMetric(result, "reward_so_far")}</span>
-        <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">{pathEdgeBadge(result)}</span>
         {coveredFacets.length ? (
-          <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">覆盖 {coveredFacets.join("/")}</span>
-        ) : null}
-        {evidenceRoles.map((role) => (
-          <span key={role} className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">
-            {role}
-          </span>
-        ))}
-        {rq ? (
-          <>
-            <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">RQ 路径 {rqPath(rq.candidate_rq_path)}</span>
-            <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">公共前缀 {String(rq.lcp_depth ?? "无")}</span>
-            <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">残差 {String(rq.residual_distance ?? "无")}</span>
-          </>
+          <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">相关主题：{coveredFacets.join(" / ")}</span>
         ) : null}
       </div>
     </motion.button>
@@ -539,7 +752,7 @@ function ResultStream({
             </div>
             <h4 className="mt-5 text-lg font-medium text-white">尚未发起检索</h4>
             <p className="mx-auto mt-2 max-w-md text-sm leading-7 text-white/52">
-              发起一次图遍历检索后，这里会展示排序片段、frontier 路径和关联图谱上下文。
+              发起检索后，这里会展示相关片段、来源和简要主题关系。
             </p>
           </div>
         ) : (
@@ -582,12 +795,11 @@ function HoverPreviewOverlay({ preview }: { preview: HoverPreviewState | null })
             <div className="flex items-center justify-between gap-3">
               <p className="text-xs uppercase tracking-[0.22em] text-cyan-100/55">悬停预览</p>
               <div className="flex flex-wrap gap-2">
-                <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultPartition(preview.result)}</span>
                 <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultSourceType(preview.result)}</span>
               </div>
             </div>
             <p className="mt-3 text-sm font-medium text-white">
-              {preview.result.document_title ?? preview.result.citations[0]?.document_title ?? "资料来源"}
+              {resultDisplayTitle(preview.result)}
             </p>
             <MarkdownRenderer content={preview.result.snippet} compact className="mt-3 line-clamp-4 text-white/76" />
           </motion.div>
@@ -609,7 +821,7 @@ function GraphCanvasPanel({
   error: Error | null;
   hasTrace: boolean;
 }) {
-  const emptyMessage = hasTrace ? "当前检索 trace 未返回可展示的中层探索节点。" : "发起检索后，这里只显示本次探索到的中层概念节点。";
+  const emptyMessage = hasTrace ? "本次检索没有返回可展示的相关主题。" : "发起检索后，这里会显示与结果相关的主题。";
 
   return (
     <section className="kg-glass-line kg-scroll-shell relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-[2rem] bg-[rgba(4,8,22,0.28)]">
@@ -618,17 +830,17 @@ function GraphCanvasPanel({
         <div>
           <p className="section-kicker">知识画布</p>
           <h3 className="mt-1 text-xl font-semibold text-white">中层概念图谱</h3>
-          <p className="mt-1 text-sm text-white/42">仅显示本次检索探索到的中层节点</p>
+          <p className="mt-1 text-sm text-white/42">显示与本次结果相关的主题</p>
         </div>
         <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
           <GitBranch data-icon="inline-start" />
-          探索中层图
+          相关主题
         </span>
       </div>
       <div className="relative z-10 flex min-h-0 flex-1 px-2 pb-2">
         {isLoading ? (
           <div className="kg-shimmer mx-3 grid h-full min-h-0 w-full flex-1 place-items-center rounded-[1.5rem] border border-white/7 bg-white/[0.025] text-sm text-white/54">
-            正在加载本次探索到的中层节点...
+            正在加载相关主题...
           </div>
         ) : error ? (
           <div className="mx-3 flex min-h-0 w-full flex-1 items-stretch">
@@ -649,27 +861,22 @@ function GraphCanvasPanel({
 }
 
 function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | null; open: boolean; onOpenChange: (open: boolean) => void }) {
-  const rq = result ? resultRq(result) : null;
   const traversal = result ? resultTraversal(result) : {};
+  const coveredFacets = traversalTextList(traversal.covered_facets).slice(0, 6);
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="w-full border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-xl">
         <SheetHeader className="border-b border-white/8 p-6">
           <SheetTitle>结果详情</SheetTitle>
-          <SheetDescription>片段证据、图遍历路径和来源元数据。</SheetDescription>
+          <SheetDescription>命中片段、来源和选择原因。</SheetDescription>
         </SheetHeader>
         {result ? (
           <div className="custom-scrollbar flex-1 overflow-y-auto p-6">
             <div className="flex flex-wrap gap-2">
-              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{resultPartition(result)}</span>
               <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{resultSourceType(result)}</span>
-              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">遍历分 {result.score.toFixed(3)}</span>
+              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">相关证据</span>
             </div>
-            <h3 className="mt-5 text-2xl font-semibold text-white">{result.document_title ?? result.citations[0]?.document_title ?? "资料来源"}</h3>
-            <p className="mt-3 flex items-center gap-2 truncate text-sm text-white/42">
-              <FileText />
-              {result.source_path ?? result.citations[0]?.source_path}
-            </p>
+            <h3 className="mt-5 text-2xl font-semibold text-white">{resultDisplayTitle(result)}</h3>
             <div className="kg-flow-line my-6" />
             <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-5">
               <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">命中证据</p>
@@ -681,36 +888,10 @@ function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | n
                 <MarkdownRenderer content={result.content} className="mt-4 text-white/70" />
               </div>
             ) : null}
-            <div className="mt-5 grid grid-cols-2 gap-3">
-              {[
-                ["distance_so_far", "路径距离"],
-                ["reward_so_far", "Cycle reward"],
-                ["covered_facets", "覆盖 facets"],
-                ["path_edge_ids", "关系边/入口"],
-              ].map(([key, label]) => (
-                <div key={key} className="rounded-2xl border border-white/8 bg-white/[0.025] p-4">
-                  <p className="text-xs uppercase tracking-[0.2em] text-white/38">{label}</p>
-                  <p className="mt-2 break-words font-mono text-sm text-cyan-100">{key === "path_edge_ids" ? pathEdgeSummary(result) : traversalMetric(result, key)}</p>
-                </div>
-              ))}
-            </div>
-            {Array.isArray(traversal.path) && traversal.path.length ? (
+            {coveredFacets.length ? (
               <div className="mt-5 rounded-2xl border border-white/8 bg-white/[0.03] p-5">
-                <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Graph Path</p>
-                <p className="mt-4 break-words font-mono text-xs leading-6 text-white/62">{traversalTextList(traversal.path).join(" -> ")}</p>
-              </div>
-            ) : null}
-            {rq ? (
-              <div className="mt-5 rounded-2xl border border-white/8 bg-white/[0.03] p-5">
-                <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">RQ-KMeans 残差路由</p>
-                <div className="mt-4 grid gap-2 text-sm text-white/62">
-                  <p>查询路径：{rqPath(rq.query_rq_path)}</p>
-                  <p>候选路径：{rqPath(rq.candidate_rq_path)}</p>
-                  <p>公共前缀深度：{String(rq.lcp_depth ?? "无")}</p>
-                  <p>残差距离：{String(rq.residual_distance ?? "无")}</p>
-                  <p>RQ 分数：{String(rq.rq_score ?? "无")}</p>
-                  <p>漂移惩罚：{String(rq.rq_drift_penalty ?? "无")}</p>
-                </div>
+                <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">为什么命中</p>
+                {coveredFacets.length ? <p className="mt-4 text-sm leading-7 text-white/62">相关主题：{coveredFacets.join("、")}</p> : null}
               </div>
             ) : null}
           </div>
@@ -807,7 +988,13 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
         },
     }),
     onSuccess: (data, searchText) => {
-      setSearchResults({ results: data.results, degraded_mode: Boolean(data.degraded_mode), model_audit: data.model_audit });
+      setSearchResults({
+        results: data.results,
+        degraded_mode: Boolean(data.degraded_mode),
+        model_audit: data.model_audit,
+        retrieval_trace_id: data.retrieval_trace_id ?? data.model_audit.retrieval_trace_id ?? null,
+        context_package_id: data.context_package_id ?? data.model_audit.context_package_id ?? null,
+      });
       setSearchHistory((current) => [searchText, ...current.filter((item) => item !== searchText)].slice(0, 50));
       const firstResult = data.results[0];
       setSelectedChunkId(firstResult?.chunk_id ?? null);
@@ -820,7 +1007,7 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
 
   const partitionOptions = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title).filter((title): title is string => Boolean(title)) ?? [], [dashboardQuery.data]);
   const results = searchResults?.results ?? emptySearchResults;
-  const retrievalTraceId = searchResults?.model_audit?.retrieval_trace_id || null;
+  const retrievalTraceId = searchResults?.retrieval_trace_id ?? searchResults?.model_audit?.retrieval_trace_id ?? null;
   const midConceptGraphQuery = useQuery({
     queryKey: ["search-mid-concept-graph", selectedKnowledgeBaseId],
     queryFn: () => fetchGraph(selectedKnowledgeBaseId, "mid-concepts", "overview"),
@@ -923,8 +1110,6 @@ function SearchWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
         onClearSource={() => setSourceType("")}
         degradedMode={Boolean(searchResults?.degraded_mode)}
       />
-      <SearchTraceSummary audit={searchResults?.model_audit} />
-
       {searchMutation.error ? (
         <ErrorBlock message={(searchMutation.error as Error).message || "检索请求失败，请检查模型 API、Qdrant 和后端日志。"} />
       ) : null}

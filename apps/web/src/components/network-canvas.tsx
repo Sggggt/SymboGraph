@@ -53,9 +53,9 @@ const communityPalette = [
 
 function colorForNode(node: GraphResponse["nodes"][number]): string {
   const category = node.category ?? node.type ?? "chunk";
-  const metadataCommunity = node.metadata?.community_id;
-  if ((category === "mid_concept" || category === "coarse_concept" || category === "rq_prefix") && typeof metadataCommunity === "number") {
-    return communityPalette[Math.abs(metadataCommunity) % communityPalette.length];
+  if (category === "mid_concept" || category === "coarse_concept" || category === "rq_prefix") {
+    const stableIndex = Array.from(node.id).reduce((sum, character) => sum + character.codePointAt(0)!, 0);
+    return communityPalette[stableIndex % communityPalette.length];
   }
   return palette[category] ?? "#63cbff";
 }
@@ -87,6 +87,10 @@ type NetworkCanvasProps = {
   onNodeClick?: (nodeId: string, category: string) => void;
   onNodeDoubleClick?: (nodeId: string, category: string) => void;
 };
+
+export function isUsableChartInstance(instance: ECharts | null): instance is ECharts {
+  return Boolean(instance && !instance.isDisposed());
+}
 
 type NodePosition = readonly [number, number];
 type NodePositionMap = Map<string, NodePosition>;
@@ -201,7 +205,7 @@ export function buildBaseOption(graph: GraphResponse): EChartsOption {
         edgeLabel: { show: false },
         data: graph.nodes.map((node) => ({
           ...node,
-          name: node.name ?? node.label ?? node.id,
+          name: node.name ?? node.label ?? "名称缺失",
           category: node.category ?? node.type ?? "chunk",
           draggable: true,
           fixed: false,
@@ -252,7 +256,7 @@ export const NetworkCanvas = forwardRef<NetworkCanvasHandle, NetworkCanvasProps>
 
   const setOption = useCallback((nextOption: EChartsOption, opts?: SetOptionOpts) => {
     const instance = chartRef.current;
-    if (!instance) {
+    if (!isUsableChartInstance(instance)) {
       return;
     }
     instance.setOption(nextOption, opts);
@@ -261,7 +265,7 @@ export const NetworkCanvas = forwardRef<NetworkCanvasHandle, NetworkCanvasProps>
   const resizeChart = useCallback(() => {
     const instance = chartRef.current;
     const host = hostRef.current;
-    if (!instance || !host) {
+    if (!isUsableChartInstance(instance) || !host) {
       return;
     }
 
@@ -276,7 +280,7 @@ export const NetworkCanvas = forwardRef<NetworkCanvasHandle, NetworkCanvasProps>
   const getCurrentNodePositions = useCallback((): NodePositionMap => {
     const positions: NodePositionMap = new Map();
     const instance = chartRef.current;
-    if (!instance) {
+    if (!isUsableChartInstance(instance)) {
       return positions;
     }
 
@@ -301,6 +305,9 @@ export const NetworkCanvas = forwardRef<NetworkCanvasHandle, NetworkCanvasProps>
 
   const getRuntimeState = useCallback(() => {
     const instance = chartRef.current;
+    if (!isUsableChartInstance(instance)) {
+      return null;
+    }
     const runtimeChart = instance as unknown as RuntimeChart | null;
     const seriesModel = runtimeChart?.getModel?.().getSeriesByIndex?.(0);
     const graphView = seriesModel ? runtimeChart?.getViewOfSeriesModel?.(seriesModel) : undefined;
@@ -308,7 +315,7 @@ export const NetworkCanvas = forwardRef<NetworkCanvasHandle, NetworkCanvasProps>
     const data = seriesModel?.getData?.();
     const runtimeGraph = seriesModel?.getGraph?.();
 
-    if (!instance || !seriesModel || !graphView || !forceLayout || !data || !runtimeGraph) {
+    if (!seriesModel || !graphView || !forceLayout || !data || !runtimeGraph) {
       return null;
     }
 
@@ -318,7 +325,7 @@ export const NetworkCanvas = forwardRef<NetworkCanvasHandle, NetworkCanvasProps>
   const syncHighlight = useCallback(
     (nodeId: string | null) => {
       const instance = chartRef.current;
-      if (!instance) {
+      if (!isUsableChartInstance(instance)) {
         return;
       }
 
@@ -354,7 +361,7 @@ export const NetworkCanvas = forwardRef<NetworkCanvasHandle, NetworkCanvasProps>
 
   const fitView = useCallback(() => {
     const instance = chartRef.current;
-    if (!instance) {
+    if (!isUsableChartInstance(instance)) {
       return;
     }
     resizeChart();
@@ -419,6 +426,12 @@ export const NetworkCanvas = forwardRef<NetworkCanvasHandle, NetworkCanvasProps>
     }),
     [fitView, resetView, toggleLayoutLock],
   );
+
+  useEffect(() => {
+    return () => {
+      chartRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     syncHighlight(selectedNodeId);

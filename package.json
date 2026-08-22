@@ -12,5 +12,8 @@
     "lint:web": "npm run lint --workspace web",
     "typecheck:web": "npm run typecheck --workspace web",
     "test:web": "npm run test --workspace web"
+  },
+  "devDependencies": {
+    "@playwright/cli": "0.1.17"
   }
 }

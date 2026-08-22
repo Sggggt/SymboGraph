@@ -1,99 +1,136 @@
 import { describe, expect, it } from "vitest";
 
-import type { GraphResponse, RetrievalTraceStepsResponse, SearchResult } from "@course-kg/shared";
-import { exploredMidNodeIdsFromTrace, pathEdgeSummary, toExploredMidConceptGraph } from "@/components/search-workspace";
+import type { GraphResponse, ModelAudit, SearchResult } from "@course-kg/shared";
+import { exploredMidNodeIdsFromTrace, pathEdgeSummary, semanticEntryAuditLabels, toExploredMidConceptGraph } from "@/components/search-workspace";
+import {
+  makeGraphResponse,
+  makeMidConceptNode,
+  makeRelationEdge,
+  makeRetrievalStep,
+  makeSupportRefs,
+  makeTraceResponse,
+  makeTraversalState,
+} from "@/test/public-contract-fixtures";
+
+describe("semanticEntryAuditLabels", () => {
+  it("shows a locally selected semantic entry without granting gray-zone authority", () => {
+    expect(semanticEntryAuditLabels({
+      semantic_entry_query_selection_source: "validated_required_facet",
+      semantic_entry_query_gray_zone_decision_authority: false,
+    } as ModelAudit)).toEqual({
+      source: "已去除交互指令",
+      grayAuthority: "无",
+    });
+  });
+
+  it("fails visibly when the gray-zone authority audit is absent", () => {
+    expect(semanticEntryAuditLabels()).toEqual({
+      source: "原始问题",
+      grayAuthority: "未审计",
+    });
+  });
+});
 
 describe("toExploredMidConceptGraph", () => {
   it("shows only mid concept nodes explored by the current retrieval trace", () => {
-    const graph: GraphResponse = {
+    const graph = makeGraphResponse({
       graph_type: "mid-concepts",
-      schema_version: "context_graph_v1",
       counts: { mid_concepts: 3, mid_concept_edges: 2 },
       sampled_counts: { nodes: 3, edges: 2 },
-      node_counts: { mid_concept: 3 },
-      edge_counts: { concept_relation: 2 },
-      freshness: { is_stale: false },
       nodes: [
-        { id: "mid:m1", name: "平面图性质", category: "mid_concept", metadata: { support_active_chunk_ids: ["c1"] } },
-        { id: "mid:m2", name: "欧拉公式", category: "mid_concept" },
-        { id: "mid:m3", name: "未探索概念", category: "mid_concept" },
+        makeMidConceptNode("mid:m1", { name: "平面图性质", support_active_chunk_ids: ["c1"] }),
+        makeMidConceptNode("mid:m2", { name: "欧拉公式" }),
+        makeMidConceptNode("mid:m3", { name: "未探索概念" }),
       ],
       edges: [
-        { source: "mid:m1", target: "mid:m2", label: "related", category: "concept_relation" },
-        { source: "mid:m2", target: "mid:m3", label: "unseen", category: "concept_relation" },
+        makeRelationEdge("mid:m1", "mid:m2", { label: "related" }),
+        makeRelationEdge("mid:m2", "mid:m3", { label: "unseen" }),
       ],
-    };
-    const trace: RetrievalTraceStepsResponse = {
+    });
+    const trace = makeTraceResponse({
       trace_id: "trace-1",
-      stage_queues: { mid: { accepted_ids: ["mid:m1"] } },
-      topk_selection: { mid: { selected_ids: ["mid:m2"] } },
+      stage_queues: { mid: { entry_ids: [], forced_entry_ids: [], forced_downstream_entry_ids: [], selected_ids: [], accepted_ids: ["mid:m1"] } },
+      topk_selection: { mid: { candidate_count: 1, selected_ids: ["mid:m2"], forced_selected_ids: [] } },
       steps: [
-        {
+        makeRetrievalStep({
+          id: "step-mid",
+          step_index: 1,
           layer: "mid",
-          input: { entry_nodes: [{ node_id: "mid:m1" }] },
-          output: { accepted_nodes: ["mid:m1", "mid:m2"] },
+          input: {
+            entry_node_ids: ["mid:m1"], coarse_entry_ids: [], mid_entry_ids: ["mid:m1"],
+            rq_membership_entry_ids: [], query_rq_path: [], result_chunk_ids: [], hit_chunk_ids: [],
+          },
+          output: {
+            accepted_node_ids: ["mid:m1", "mid:m2"], selected_node_ids: ["mid:m1", "mid:m2"],
+            accepted_chunk_ids: [], source_span_count: 0,
+          },
           selected_topk_ids: ["mid:m2"],
-          popped_frontier_state: { node_id: "mid:m1", path: ["mid:m1", "mid:m2"] },
-        },
+          popped_frontier_state: makeTraversalState({ node_id: "mid:m1", path: ["mid:m1", "mid:m2"] }),
+        }),
       ],
-    };
+    });
 
     const contextGraph = toExploredMidConceptGraph(graph, trace);
 
     expect(contextGraph?.graph_type).toBe("mid-concepts");
     expect(contextGraph?.nodes.map((node: GraphResponse["nodes"][number]) => node.id)).toEqual(["mid:m1", "mid:m2"]);
-    expect(contextGraph?.nodes[0].metadata).toMatchObject({ support_active_chunk_ids: ["c1"] });
+    expect(contextGraph?.nodes[0].support_active_chunk_ids).toEqual(["c1"]);
     expect(contextGraph?.edges.map((edge: GraphResponse["edges"][number]) => edge.label)).toEqual(["related"]);
-    expect(contextGraph?.node_counts).toEqual({ mid_concept: 2 });
-    expect(contextGraph?.edge_counts).toEqual({ concept_relation: 1 });
+    expect(contextGraph?.node_counts).toEqual({ sampled: 2, full: 3 });
+    expect(contextGraph?.edge_counts).toEqual({ sampled: 1, full: 2 });
   });
 
   it("returns an empty display graph before a retrieval trace is available", () => {
-    const graph: GraphResponse = {
+    const graph = makeGraphResponse({
       graph_type: "mid-concepts",
       counts: { mid_concepts: 1 },
       sampled_counts: { nodes: 1, edges: 0 },
-      node_counts: { mid_concept: 1 },
-      edge_counts: { concept_relation: 0 },
-      freshness: { is_stale: false },
-      nodes: [{ id: "mid:m1", name: "平面图性质", category: "mid_concept" }],
+      nodes: [makeMidConceptNode("mid:m1", { name: "平面图性质" })],
       edges: [],
-    };
+    });
 
     const contextGraph = toExploredMidConceptGraph(graph, undefined);
 
     expect(contextGraph?.nodes).toEqual([]);
     expect(contextGraph?.edges).toEqual([]);
     expect(contextGraph?.sampled_counts).toMatchObject({ nodes: 0, edges: 0 });
-    expect(contextGraph?.diagnostics?.filtered_to_explored_mid_nodes).toBe(true);
+    expect(contextGraph?.node_counts.sampled).toBe(0);
   });
 });
 
 describe("exploredMidNodeIdsFromTrace", () => {
   it("collects explored mid ids from queue, top-k, step and path-label diagnostics", () => {
-    const ids = exploredMidNodeIdsFromTrace({
+    const ids = exploredMidNodeIdsFromTrace(makeTraceResponse({
       trace_id: "trace-1",
-      entry_nodes: [{ node_id: "mid:entry" }],
-      stage_queues: { mid: { selected_ids: ["mid:selected"], accepted_ids: ["mid:accepted"] } },
-      topk_selection: { mid: { selected_ids: ["mid:topk"] } },
-      path_labels: [{ node_id: "mid:path-node", path: ["mid:path-a", "mid:path-b"] }],
+      entry_nodes: [{ layer: "mid", node_id: "mid:entry", roles: [], metadata: { rq_path_prefix: [], representative_terms: [] } }],
+      stage_queues: { mid: { entry_ids: [], forced_entry_ids: [], forced_downstream_entry_ids: [], selected_ids: ["mid:selected"], accepted_ids: ["mid:accepted"] } },
+      topk_selection: { mid: { candidate_count: 1, selected_ids: ["mid:topk"], forced_selected_ids: [] } },
+      path_labels: [{
+        layer: "mid", node_id: "mid:path-node", path: ["mid:path-a", "mid:path-b"],
+        path_edge_ids: [], path_edge_types: [], expanded_edge_ids: [], covered_facets: [], evidence_roles: [],
+        support_refs: makeSupportRefs(), entry_parent_refs: [], path_edge_type_multiset: {}, edge_reuse_counts: {},
+      }],
       steps: [
-        { layer: "chunk", selected_topk_ids: ["chunk:1"] },
-        {
+        makeRetrievalStep({ id: "step-chunk", step_index: 0, layer: "chunk", selected_topk_ids: ["chunk:1"] }),
+        makeRetrievalStep({
+          id: "step-mid",
+          step_index: 1,
           layer: "mid",
-          input: { entry_nodes: [{ node_id: "mid:step-entry" }] },
-          output: { accepted_nodes: ["mid:step-accepted"] },
+          input: {
+            entry_node_ids: [], coarse_entry_ids: [], mid_entry_ids: ["mid:step-entry"],
+            rq_membership_entry_ids: [], query_rq_path: [], result_chunk_ids: [], hit_chunk_ids: [],
+          },
+          output: {
+            accepted_node_ids: ["mid:step-accepted"], selected_node_ids: [], accepted_chunk_ids: [], source_span_count: 0,
+          },
           selected_topk_ids: ["mid:step-topk"],
-          popped_frontier_state: { node_id: "mid:popped", path: ["mid:popped", "mid:path-c"] },
-          diagnostics: { path_labels: [{ node_id: "mid:diag-node", path: ["mid:diag-path"] }] },
-        },
+          popped_frontier_state: makeTraversalState({ node_id: "mid:popped", path: ["mid:popped", "mid:path-c"] }),
+        }),
       ],
-    } as RetrievalTraceStepsResponse);
+    }));
 
     expect([...ids].sort()).toEqual([
       "mid:accepted",
-      "mid:diag-node",
-      "mid:diag-path",
       "mid:entry",
       "mid:path-a",
       "mid:path-b",

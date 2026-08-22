@@ -3,7 +3,21 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -13,6 +27,12 @@ def generate_uuid() -> str:
     return str(uuid.uuid4())
 
 
+def generate_unmanaged_source_slot_key() -> str:
+    """Keep direct ORM fixtures distinct without granting them a managed slot."""
+
+    return f"unmanaged:{uuid.uuid4().hex}"
+
+
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -20,11 +40,27 @@ class TimestampMixin:
 
 class KnowledgeBase(TimestampMixin, Base):
     __tablename__ = "knowledge_bases"
+    __table_args__ = (
+        CheckConstraint(
+            "lifecycle_status IN ('active','deleting','delete_manual_review')",
+            name="ck_knowledge_bases_lifecycle_status",
+        ),
+        UniqueConstraint(
+            "source_root",
+            name="uq_knowledge_bases_source_root",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_root: Mapped[str] = mapped_column(Text)
+    lifecycle_status: Mapped[str] = mapped_column(
+        String(32),
+        default="active",
+        server_default="active",
+        index=True,
+    )
     current_chunk_version: Mapped[int] = mapped_column(Integer, default=0, index=True)
     active_profile_id: Mapped[str | None] = mapped_column(ForeignKey("strategy_profiles.id", ondelete="SET NULL"), nullable=True, index=True)
 
@@ -47,11 +83,27 @@ class StrategyProfile(TimestampMixin, Base):
 
 class SourceFile(TimestampMixin, Base):
     __tablename__ = "source_files"
+    __table_args__ = (
+        UniqueConstraint(
+            "knowledge_base_id",
+            "logical_source_slot_key",
+            name="uq_source_files_kb_logical_source_slot",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
     document_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id", ondelete="SET NULL"), nullable=True, index=True)
     source_path: Mapped[str] = mapped_column(Text)
+    logical_source_slot_key: Mapped[str] = mapped_column(
+        String(1024),
+        default=generate_unmanaged_source_slot_key,
+    )
+    source_slot_protocol_version: Mapped[str] = mapped_column(
+        String(64),
+        default="unmanaged_opaque_v1",
+        index=True,
+    )
     checksum: Mapped[str] = mapped_column(String(64), index=True)
     source_type: Mapped[str] = mapped_column(String(50), default="unknown", index=True)
     size_bytes: Mapped[int] = mapped_column(Integer, default=0)
@@ -79,14 +131,52 @@ class ParseJob(TimestampMixin, Base):
 
 class Document(TimestampMixin, Base):
     __tablename__ = "documents"
-    __table_args__ = (Index("ix_documents_kb_source", "knowledge_base_id", "source_path"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "id",
+            "knowledge_base_id",
+            name="uq_documents_id_knowledge_base_id",
+        ),
+        CheckConstraint(
+            "language_confidence IS NULL OR (language_confidence >= 0 AND language_confidence <= 1)",
+            name="ck_documents_language_confidence_range",
+        ),
+        CheckConstraint(
+            "language_source IS NULL OR language_source IN ('explicit_metadata','deterministic_detection','unknown')",
+            name="ck_documents_language_source",
+        ),
+        UniqueConstraint(
+            "knowledge_base_id",
+            "logical_source_slot_key",
+            name="uq_documents_kb_logical_source_slot",
+        ),
+        Index("ix_documents_kb_source", "knowledge_base_id", "source_path"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
     title: Mapped[str] = mapped_column(String(255))
     source_path: Mapped[str] = mapped_column(Text)
+    logical_source_slot_key: Mapped[str] = mapped_column(
+        String(1024),
+        default=generate_unmanaged_source_slot_key,
+    )
+    source_slot_protocol_version: Mapped[str] = mapped_column(
+        String(64),
+        default="unmanaged_opaque_v1",
+        index=True,
+    )
     source_type: Mapped[str] = mapped_column(String(50), index=True)
     language: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    language_source: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    language_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    language_detection_protocol_version: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    language_detection_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    language_metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     difficulty: Mapped[str | None] = mapped_column(String(64), nullable=True)
     checksum: Mapped[str] = mapped_column(String(64), index=True)
@@ -99,7 +189,34 @@ class Document(TimestampMixin, Base):
 
 class DocumentVersion(Base):
     __tablename__ = "document_versions"
-    __table_args__ = (UniqueConstraint("document_id", "version", name="uq_document_version"),)
+    # A selected-file reparse stays on the knowledge-base chunk version.  Keep
+    # each parse attempt as a separate row so a failed attempt can
+    # reactivate the exact pre-parse version instead of overwriting it.
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="ck_document_versions_version_positive"),
+        CheckConstraint(
+            "language_confidence IS NULL OR (language_confidence >= 0 AND language_confidence <= 1)",
+            name="ck_document_versions_language_confidence_range",
+        ),
+        CheckConstraint(
+            "language_source IS NULL OR language_source IN ('explicit_metadata','deterministic_detection','unknown')",
+            name="ck_document_versions_language_source",
+        ),
+        UniqueConstraint(
+            "id",
+            "document_id",
+            "version",
+            name="uq_document_versions_id_document_id_version",
+        ),
+        Index("ix_document_versions_document_version", "document_id", "version"),
+        Index(
+            "uq_document_versions_one_active_per_document",
+            "document_id",
+            unique=True,
+            postgresql_where=text("is_active IS TRUE"),
+            sqlite_where=text("is_active = 1"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     document_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
@@ -108,6 +225,16 @@ class DocumentVersion(Base):
     storage_path: Mapped[str] = mapped_column(Text)
     extracted_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     parse_protocol_version: Mapped[str] = mapped_column(String(64), default="parser_v1", index=True)
+    language: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    language_source: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    language_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    language_detection_protocol_version: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    language_detection_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    language_metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
@@ -116,7 +243,10 @@ class DocumentVersion(Base):
 
 class ChunkVersion(Base):
     __tablename__ = "chunk_versions"
-    __table_args__ = (UniqueConstraint("knowledge_base_id", "chunk_version", name="uq_chunk_version_kb_version"),)
+    __table_args__ = (
+        CheckConstraint("chunk_version >= 1", name="ck_chunk_versions_chunk_version_positive"),
+        UniqueConstraint("knowledge_base_id", "chunk_version", name="uq_chunk_version_kb_version"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
@@ -135,8 +265,31 @@ class ChunkVersion(Base):
 class Chunk(Base):
     __tablename__ = "chunks"
     __table_args__ = (
+        CheckConstraint("chunk_version >= 1", name="ck_chunks_chunk_version_positive"),
+        UniqueConstraint("id", "knowledge_base_id", name="uq_chunks_id_knowledge_base_id"),
         UniqueConstraint("document_version_id", "chunk_version", "chunk_index", name="uq_chunk_version_index"),
+        ForeignKeyConstraint(
+            ["document_id", "knowledge_base_id"],
+            ["documents.id", "documents.knowledge_base_id"],
+            name="fk_chunks_document_knowledge_base_provenance",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["document_version_id", "document_id", "chunk_version"],
+            ["document_versions.id", "document_versions.document_id", "document_versions.version"],
+            name="fk_chunks_document_version_provenance",
+            ondelete="CASCADE",
+        ),
         Index("ix_chunks_kb_state_version", "knowledge_base_id", "state", "chunk_version"),
+        Index(
+            "uq_chunks_active_document_version_index",
+            "document_id",
+            "chunk_version",
+            "chunk_index",
+            unique=True,
+            postgresql_where=text("state = 'active'"),
+            sqlite_where=text("state = 'active'"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
@@ -200,9 +353,9 @@ class ChunkContextText(Base):
     chunk_id: Mapped[str] = mapped_column(ForeignKey("chunks.id", ondelete="CASCADE"), index=True)
     raw_text: Mapped[str] = mapped_column(Text)
     contextual_text: Mapped[str] = mapped_column(Text)
-    embedding_text_version: Mapped[str] = mapped_column(String(64), default="contextual_text_v1", index=True)
+    embedding_text_version: Mapped[str] = mapped_column(String(64), default="contextual_text_v2", index=True)
     context_hash: Mapped[str] = mapped_column(String(64), index=True)
-    prompt_protocol_version: Mapped[str] = mapped_column(String(64), default="contextual_text_v1", index=True)
+    prompt_protocol_version: Mapped[str] = mapped_column(String(64), default="contextual_text_v2", index=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
@@ -257,6 +410,15 @@ class ChunkStructureMapping(Base):
     overlap_chars: Mapped[int] = mapped_column(Integer, default=0)
     overlap_tokens: Mapped[int] = mapped_column(Integer, default=0)
     coverage_ratio: Mapped[float] = mapped_column(Float, default=0.0)
+    span_overlap: Mapped[float] = mapped_column(Float, default=0.0)
+    bbox_iou: Mapped[float | None] = mapped_column(Float, nullable=True)
+    path_match: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mapping_weight: Mapped[float] = mapped_column(Float, default=0.0)
+    mapping_protocol_version: Mapped[str] = mapped_column(
+        String(64),
+        default="structure_mapping_span_bbox_path_v2",
+        index=True,
+    )
     bbox_intersection_json: Mapped[dict] = mapped_column(JSON, default=dict)
     mapping_role: Mapped[str] = mapped_column(String(64), default="overlap", index=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -277,8 +439,28 @@ class ChunkRelationGraphState(Base):
     edge_distance_protocol_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     edge_type_calibration_protocol_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     runtime_settings_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    auto_tpe_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    auto_tpe_best_trial_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    auto_tpe_run_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey(
+            "auto_tpe_runs.id",
+            name="fk_chunk_relation_graph_states_auto_tpe_run_id",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        nullable=True,
+        index=True,
+    )
+    auto_tpe_best_trial_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey(
+            "auto_tpe_trials.id",
+            name="fk_chunk_relation_graph_states_auto_tpe_best_trial_id",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        nullable=True,
+        index=True,
+    )
     active_chunk_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     stats_json: Mapped[dict] = mapped_column(JSON, default=dict)
     diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -378,6 +560,56 @@ class RQPrefixDiagnostic(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
+class RQPrefixPairDiagnostic(Base):
+    __tablename__ = "rq_prefix_pair_diagnostics"
+    __table_args__ = (
+        UniqueConstraint(
+            "graph_state_id",
+            "source_rq_prefix_id",
+            "target_rq_prefix_id",
+            "edge_type",
+            name="uq_rq_prefix_pair_diagnostic",
+        ),
+        CheckConstraint(
+            "source_rq_prefix_id <> target_rq_prefix_id",
+            name="ck_rq_prefix_pair_distinct_endpoints",
+        ),
+        Index(
+            "ix_rq_prefix_pair_state_type",
+            "graph_state_id",
+            "edge_type",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    graph_state_id: Mapped[str] = mapped_column(
+        ForeignKey("chunk_relation_graph_states.id", ondelete="CASCADE"),
+        index=True,
+    )
+    knowledge_base_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        index=True,
+    )
+    source_rq_prefix_id: Mapped[str] = mapped_column(
+        ForeignKey("rq_prefixes.id", ondelete="CASCADE"),
+        index=True,
+    )
+    target_rq_prefix_id: Mapped[str] = mapped_column(
+        ForeignKey("rq_prefixes.id", ondelete="CASCADE"),
+        index=True,
+    )
+    edge_type: Mapped[str] = mapped_column(String(64), index=True)
+    diagnostic_strength: Mapped[float] = mapped_column(Float, default=0.0)
+    support_membership_mass: Mapped[float] = mapped_column(Float, default=0.0)
+    support_chunk_ids_sample_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    support_chunk_edge_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source_algorithm: Mapped[str] = mapped_column(String(96), index=True)
+    protocol_version: Mapped[str] = mapped_column(String(64), index=True)
+    diagnostic_hash: Mapped[str] = mapped_column(String(64), index=True)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 class MidConceptState(Base):
     __tablename__ = "mid_concept_states"
 
@@ -460,6 +692,17 @@ class MidConceptEdge(Base):
     raw_strength_summary_json: Mapped[dict] = mapped_column(JSON, default=dict)
     projection_normalization_stats_json: Mapped[dict] = mapped_column(JSON, default=dict)
     edge_projection_protocol_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    source_algorithm: Mapped[str] = mapped_column(
+        String(96),
+        default="membership_weighted_bottom_edge_projection",
+        index=True,
+    )
+    protocol_version: Mapped[str] = mapped_column(
+        String(64),
+        default="membership_q15_layer_type_calibrated_v3",
+        index=True,
+    )
+    state_hash: Mapped[str] = mapped_column(String(64), index=True)
     network_evidence_score: Mapped[float] = mapped_column(Float, default=0.0)
     llm_confidence: Mapped[float] = mapped_column(Float, default=0.0)
     support_rq_prefix_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
@@ -565,6 +808,18 @@ class CoarseConceptEdge(Base):
     raw_strength_summary_json: Mapped[dict] = mapped_column(JSON, default=dict)
     projection_normalization_stats_json: Mapped[dict] = mapped_column(JSON, default=dict)
     edge_projection_protocol_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    source_algorithm: Mapped[str] = mapped_column(
+        String(96),
+        default="membership_weighted_bottom_edge_projection",
+        index=True,
+    )
+    protocol_version: Mapped[str] = mapped_column(
+        String(64),
+        default="membership_q15_layer_type_calibrated_v3",
+        index=True,
+    )
+    state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    support_rq_prefix_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     support_mid_concept_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     support_mid_edge_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     support_chunk_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
@@ -628,16 +883,48 @@ class ContextGraphFreshness(Base):
 
 class VectorRecord(Base):
     __tablename__ = "vector_records"
-    __table_args__ = (UniqueConstraint("chunk_id", "embedding_text_version", name="uq_vector_chunk_text_version"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "chunk_id",
+            "embedding_model",
+            "embedding_dimension",
+            "embedding_text_version",
+            "chunk_schema_version",
+            name="uq_vector_chunk_model_dimension_text_schema_version",
+        ),
+        CheckConstraint(
+            "embedding_dimension > 0",
+            name="ck_vector_records_embedding_dimension_positive",
+        ),
+        ForeignKeyConstraint(
+            ["chunk_id", "knowledge_base_id"],
+            ["chunks.id", "chunks.knowledge_base_id"],
+            name="fk_vector_records_chunk_knowledge_base_provenance",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "ix_vector_records_reconcile_keyset",
+            "knowledge_base_id",
+            "collection_name",
+            "id",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    # Keep the legacy single-column FK as a redundant existence/cascade gate;
+    # the composite FK above is the authoritative same-KB provenance gate.
     chunk_id: Mapped[str] = mapped_column(ForeignKey("chunks.id", ondelete="CASCADE"), index=True)
     qdrant_point_id: Mapped[str] = mapped_column(String(64), index=True)
     collection_name: Mapped[str] = mapped_column(String(255), index=True)
     embedding_model: Mapped[str] = mapped_column(String(128), index=True)
-    embedding_dimension: Mapped[int] = mapped_column(Integer, default=0)
+    embedding_dimension: Mapped[int] = mapped_column(Integer)
     embedding_text_version: Mapped[str] = mapped_column(String(64), index=True)
+    chunk_schema_version: Mapped[str] = mapped_column(
+        String(64),
+        default="chunk_schema_v1",
+        index=True,
+    )
     payload_hash: Mapped[str] = mapped_column(String(64), index=True)
     vector_status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -739,6 +1026,20 @@ class ContextPackage(Base):
 
 class QASession(TimestampMixin, Base):
     __tablename__ = "qa_sessions"
+    __table_args__ = (
+        CheckConstraint(
+            "conversation_state_protocol_version = 'conversation_state_v1'",
+            name="ck_qa_sessions_conversation_state_protocol",
+        ),
+        CheckConstraint(
+            "conversation_state_revision >= 0",
+            name="ck_qa_sessions_conversation_state_revision",
+        ),
+        CheckConstraint(
+            "length(conversation_state_hash) = 64",
+            name="ck_qa_sessions_conversation_state_hash_length",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
@@ -746,6 +1047,20 @@ class QASession(TimestampMixin, Base):
     last_question: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     transcript: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    conversation_state_protocol_version: Mapped[str] = mapped_column(
+        String(64),
+        default="conversation_state_v1",
+        index=True,
+    )
+    conversation_state_revision: Mapped[int] = mapped_column(Integer, default=0)
+    active_user_constraints_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    task_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    history_references_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    conversation_state_hash: Mapped[str] = mapped_column(
+        String(64),
+        default="959a95f2683e19efd10a1296ed82dac31d14c77a74caac4f5e0c12cfd062bd5e",
+        index=True,
+    )
 
 
 class AnswerSession(Base):
@@ -833,10 +1148,471 @@ class RuntimeSettingsVersion(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     version_hash: Mapped[str] = mapped_column(String(64), index=True)
-    settings_json: Mapped[dict] = mapped_column(JSON, default=dict)
     changed_keys_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     source: Mapped[str] = mapped_column(String(64), default="api", index=True)
+    managed_env_identity_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class RuntimeSettingsAudit(TimestampMixin, Base):
+    """Non-authoritative audit metadata for one root ``.env`` write.
+
+    Runtime values and secret-presence snapshots are deliberately absent.  The
+    repository-root ``.env`` is the only configuration authority; this row
+    records only what changed, its lifecycle, delivery state and file identity.
+    """
+
+    __tablename__ = "runtime_settings_audits"
+    __table_args__ = (
+        UniqueConstraint(
+            "version_hash", name="uq_runtime_settings_audits_hash"
+        ),
+        CheckConstraint(
+            "protocol_version = 'runtime_settings_audit_v1'",
+            name="ck_runtime_settings_audits_protocol",
+        ),
+        CheckConstraint(
+            "status IN ('written','applied','pending_lifecycle','failed')",
+            name="ck_runtime_settings_audits_status",
+        ),
+        Index(
+            "ix_runtime_settings_audits_status_created",
+            "status",
+            "created_at",
+        ),
+        Index("ix_rs_audit_prior_runtime", "prior_runtime_version_hash"),
+        Index("ix_rs_audit_env_identity", "env_identity_hash"),
+        Index("ix_rs_audit_runtime", "runtime_version_hash"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    protocol_version: Mapped[str] = mapped_column(
+        String(64), default="runtime_settings_audit_v1"
+    )
+    version_hash: Mapped[str] = mapped_column(String(64), index=True)
+    prior_runtime_version_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    changed_keys_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    lifecycle_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    field_status_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(
+        String(32), default="written", index=True
+    )
+    env_identity_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    runtime_version_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    source: Mapped[str] = mapped_column(String(64), default="api", index=True)
+    last_error_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+
+
+class RuntimeSettingsCandidate(TimestampMixin, Base):
+    __tablename__ = "runtime_settings_candidates"
+    __table_args__ = (
+        UniqueConstraint("candidate_hash", name="uq_runtime_settings_candidates_hash"),
+        CheckConstraint(
+            "protocol_version IN ('runtime_settings_vector_candidate_v1',"
+            "'runtime_settings_candidate_v2')",
+            name="ck_runtime_settings_candidates_protocol",
+        ),
+        CheckConstraint(
+            "lifecycle_scope = 'rebuild_required'",
+            name="ck_runtime_settings_candidates_lifecycle_scope",
+        ),
+        CheckConstraint(
+            "status IN ('staged','building','evaluating','evaluation_passed','promotion_blocked',"
+            "'promoting','promoted','rejected','failed','rolled_back','superseded')",
+            name="ck_runtime_settings_candidates_status",
+        ),
+        Index("ix_runtime_candidates_base_version", "base_runtime_version_hash"),
+        Index("ix_runtime_settings_candidates_status_created", "status", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    protocol_version: Mapped[str] = mapped_column(
+        String(64),
+        default="runtime_settings_vector_candidate_v1",
+    )
+    candidate_hash: Mapped[str] = mapped_column(String(64))
+    base_runtime_version_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    settings_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    changed_keys_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    target_knowledge_base_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    lifecycle_scope: Mapped[str] = mapped_column(String(32), default="rebuild_required")
+    status: Mapped[str] = mapped_column(String(32), default="staged")
+    source: Mapped[str] = mapped_column(String(64), default="api")
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    blocking_reasons_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class RuntimeSettingsShadowBuild(TimestampMixin, Base):
+    """Durable per-KB build/evaluation facts for a rebuild-required candidate.
+
+    Vector artifacts stay owned by ``VectorShadowBuild``.  This row binds the
+    wider runtime candidate to its frozen active before-state, optional shadow
+    rechunk scope, four-layer graph result and measured evaluation.
+    """
+
+    __tablename__ = "runtime_settings_shadow_builds"
+    __table_args__ = (
+        UniqueConstraint(
+            "runtime_settings_candidate_id",
+            "knowledge_base_id",
+            name="uq_runtime_settings_shadow_builds_candidate_kb",
+        ),
+        CheckConstraint(
+            "protocol_version = 'runtime_settings_shadow_build_v1'",
+            name="ck_runtime_settings_shadow_builds_protocol",
+        ),
+        CheckConstraint(
+            "status IN ('staged','dry_run_passed','building','shadow_ready','evaluating',"
+            "'evaluation_passed','promotion_blocked','promoting','promoted','failed',"
+            "'rolled_back','superseded')",
+            name="ck_runtime_settings_shadow_builds_status",
+        ),
+        CheckConstraint(
+            "base_chunk_version >= 0 AND candidate_chunk_version >= 0",
+            name="ck_runtime_settings_shadow_builds_chunk_versions_nonnegative",
+        ),
+        Index(
+            "ix_runtime_settings_shadow_builds_kb_status",
+            "knowledge_base_id",
+            "status",
+        ),
+        Index(
+            "ix_runtime_settings_shadow_builds_vector_build",
+            "vector_shadow_build_id",
+        ),
+        Index(
+            "ix_rs_shadow_candidate_chunk_schema",
+            "candidate_chunk_schema_version",
+        ),
+        Index(
+            "uq_runtime_settings_shadow_builds_one_live_per_kb",
+            "knowledge_base_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('staged','dry_run_passed','building','shadow_ready','evaluating',"
+                "'evaluation_passed','promotion_blocked','promoting')"
+            ),
+            sqlite_where=text(
+                "status IN ('staged','dry_run_passed','building','shadow_ready','evaluating',"
+                "'evaluation_passed','promotion_blocked','promoting')"
+            ),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    runtime_settings_candidate_id: Mapped[str] = mapped_column(
+        ForeignKey("runtime_settings_candidates.id", ondelete="CASCADE"),
+    )
+    knowledge_base_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+    )
+    vector_shadow_build_id: Mapped[str | None] = mapped_column(
+        ForeignKey("vector_shadow_builds.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    protocol_version: Mapped[str] = mapped_column(
+        String(64), default="runtime_settings_shadow_build_v1"
+    )
+    status: Mapped[str] = mapped_column(String(32), default="staged")
+    base_runtime_version_hash: Mapped[str] = mapped_column(String(64), index=True)
+    base_chunk_scope_hash: Mapped[str] = mapped_column(String(64), index=True)
+    base_vector_state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    base_graph_bundle_hash: Mapped[str] = mapped_column(String(64), index=True)
+    base_graph_state_ids_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    base_chunk_version: Mapped[int] = mapped_column(Integer, default=0)
+    candidate_chunk_version: Mapped[int] = mapped_column(Integer, default=0)
+    candidate_chunk_schema_version: Mapped[str] = mapped_column(String(64))
+    candidate_chunk_scope_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    candidate_chunk_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    candidate_document_version_ids_json: Mapped[list[str]] = mapped_column(
+        JSON, default=list
+    )
+    shadow_context_graph_state_id: Mapped[str | None] = mapped_column(
+        ForeignKey("context_graph_states.id", ondelete="SET NULL"), nullable=True
+    )
+    shadow_chunk_relation_graph_state_id: Mapped[str | None] = mapped_column(
+        ForeignKey("chunk_relation_graph_states.id", ondelete="SET NULL"), nullable=True
+    )
+    shadow_mid_concept_state_id: Mapped[str | None] = mapped_column(
+        ForeignKey("mid_concept_states.id", ondelete="SET NULL"), nullable=True
+    )
+    shadow_coarse_concept_state_id: Mapped[str | None] = mapped_column(
+        ForeignKey("coarse_concept_states.id", ondelete="SET NULL"), nullable=True
+    )
+    dry_run_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    dry_run_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    build_metrics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    build_result_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    evaluation_protocol_version: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    evaluation_input_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    evaluation_result_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    evaluation_result_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    promotion_audit_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    rollback_audit_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    blocking_reasons_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    shadow_ready_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    evaluated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class RuntimeSettingsActivationIntent(TimestampMixin, Base):
+    """Recoverable post-commit shared-env/version activation or rollback intent."""
+
+    __tablename__ = "runtime_settings_activation_intents"
+    __table_args__ = (
+        UniqueConstraint(
+            "runtime_settings_candidate_id",
+            "direction",
+            name="uq_runtime_settings_activation_candidate_direction",
+        ),
+        CheckConstraint(
+            "protocol_version = 'runtime_settings_activation_intent_v1'",
+            name="ck_runtime_settings_activation_intents_protocol",
+        ),
+        CheckConstraint(
+            "direction IN ('promotion','rollback')",
+            name="ck_runtime_settings_activation_intents_direction",
+        ),
+        CheckConstraint(
+            "status IN ('pending','applying','applied','failed','superseded')",
+            name="ck_runtime_settings_activation_intents_status",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_runtime_settings_activation_intents_attempt_nonnegative",
+        ),
+        Index(
+            "ix_runtime_settings_activation_intents_status_created",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    runtime_settings_candidate_id: Mapped[str] = mapped_column(
+        ForeignKey("runtime_settings_candidates.id", ondelete="CASCADE")
+    )
+    protocol_version: Mapped[str] = mapped_column(
+        String(64), default="runtime_settings_activation_intent_v1"
+    )
+    direction: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    settings_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    settings_hash: Mapped[str] = mapped_column(String(64), index=True)
+    changed_keys_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    expected_candidate_status: Mapped[str] = mapped_column(String(32))
+    runtime_version_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    audit_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    last_error_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class KnowledgeBaseVectorRuntimeState(TimestampMixin, Base):
+    __tablename__ = "knowledge_base_vector_runtime_states"
+    __table_args__ = (
+        UniqueConstraint("knowledge_base_id", name="uq_kb_vector_runtime_states_kb"),
+        CheckConstraint(
+            "embedding_dimension > 0",
+            name="ck_kb_vector_runtime_states_dimension_positive",
+        ),
+        CheckConstraint(
+            "protocol_version = 'knowledge_base_vector_runtime_state_v1'",
+            name="ck_kb_vector_runtime_states_protocol",
+        ),
+        CheckConstraint(
+            "distance_metric = 'cosine'",
+            name="ck_kb_vector_runtime_states_distance_metric",
+        ),
+        CheckConstraint(
+            "activation_generation >= 1",
+            name="ck_kb_vector_runtime_states_generation_positive",
+        ),
+        Index("ix_kb_vector_runtime_candidate", "runtime_settings_candidate_id"),
+        Index("ix_kb_vector_runtime_collection", "collection_name"),
+        Index("ix_kb_vector_runtime_schema_hash", "vector_schema_hash"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+    )
+    runtime_settings_candidate_id: Mapped[str | None] = mapped_column(
+        ForeignKey("runtime_settings_candidates.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    protocol_version: Mapped[str] = mapped_column(
+        String(64),
+        default="knowledge_base_vector_runtime_state_v1",
+    )
+    embedding_model: Mapped[str] = mapped_column(String(128))
+    embedding_dimension: Mapped[int] = mapped_column(Integer)
+    distance_metric: Mapped[str] = mapped_column(String(32), default="cosine")
+    embedding_text_version: Mapped[str] = mapped_column(String(64))
+    chunk_schema_version: Mapped[str] = mapped_column(String(64))
+    collection_identity_protocol_version: Mapped[str] = mapped_column(String(96))
+    collection_identity_digest: Mapped[str] = mapped_column(String(64))
+    collection_name: Mapped[str] = mapped_column(String(255))
+    vector_schema_hash: Mapped[str] = mapped_column(String(64))
+    state_hash: Mapped[str] = mapped_column(String(64))
+    activation_generation: Mapped[int] = mapped_column(Integer, default=1)
+    active_context_graph_state_id: Mapped[str | None] = mapped_column(
+        ForeignKey("context_graph_states.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    active_chunk_relation_graph_state_id: Mapped[str | None] = mapped_column(
+        ForeignKey("chunk_relation_graph_states.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    active_mid_concept_state_id: Mapped[str | None] = mapped_column(
+        ForeignKey("mid_concept_states.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    active_coarse_concept_state_id: Mapped[str | None] = mapped_column(
+        ForeignKey("coarse_concept_states.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    previous_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    promotion_audit_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class VectorShadowBuild(TimestampMixin, Base):
+    __tablename__ = "vector_shadow_builds"
+    __table_args__ = (
+        UniqueConstraint(
+            "runtime_settings_candidate_id",
+            "knowledge_base_id",
+            name="uq_vector_shadow_builds_candidate_kb",
+        ),
+        CheckConstraint(
+            "status IN ('staged','building','shadow_ready','evaluating','evaluation_passed',"
+            "'promotion_blocked','promotion_pending','promoted','rejected','failed','rolled_back',"
+            "'superseded')",
+            name="ck_vector_shadow_builds_status",
+        ),
+        CheckConstraint(
+            "protocol_version = 'vector_shadow_build_v1'",
+            name="ck_vector_shadow_builds_protocol",
+        ),
+        CheckConstraint(
+            "embedding_dimension > 0",
+            name="ck_vector_shadow_builds_dimension_positive",
+        ),
+        CheckConstraint(
+            "distance_metric = 'cosine'",
+            name="ck_vector_shadow_builds_distance_metric",
+        ),
+        CheckConstraint(
+            "expected_point_count >= 0 AND ready_point_count >= 0",
+            name="ck_vector_shadow_builds_counts_nonnegative",
+        ),
+        Index("ix_vector_shadow_builds_schema_hash", "candidate_vector_schema_hash"),
+        Index("ix_vector_shadow_builds_collection", "collection_name"),
+        Index("ix_vector_shadow_builds_context_state", "shadow_context_graph_state_id"),
+        Index("ix_vector_shadow_builds_kb_status", "knowledge_base_id", "status"),
+        Index(
+            "uq_vector_shadow_builds_one_live_per_kb",
+            "knowledge_base_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('staged','building','shadow_ready','evaluating','evaluation_passed',"
+                "'promotion_blocked','promotion_pending')"
+            ),
+            sqlite_where=text(
+                "status IN ('staged','building','shadow_ready','evaluating','evaluation_passed',"
+                "'promotion_blocked','promotion_pending')"
+            ),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    runtime_settings_candidate_id: Mapped[str] = mapped_column(
+        ForeignKey("runtime_settings_candidates.id", ondelete="CASCADE"),
+    )
+    knowledge_base_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+    )
+    protocol_version: Mapped[str] = mapped_column(
+        String(64),
+        default="vector_shadow_build_v1",
+    )
+    status: Mapped[str] = mapped_column(String(32), default="staged")
+    base_vector_state_hash: Mapped[str] = mapped_column(String(64))
+    candidate_vector_schema_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    candidate_vector_schema_hash: Mapped[str] = mapped_column(String(64))
+    embedding_model: Mapped[str] = mapped_column(String(128))
+    embedding_dimension: Mapped[int] = mapped_column(Integer)
+    distance_metric: Mapped[str] = mapped_column(String(32), default="cosine")
+    embedding_text_version: Mapped[str] = mapped_column(String(64))
+    chunk_schema_version: Mapped[str] = mapped_column(String(64))
+    collection_identity_protocol_version: Mapped[str] = mapped_column(String(96))
+    collection_identity_digest: Mapped[str] = mapped_column(String(64))
+    collection_name: Mapped[str] = mapped_column(String(255))
+    shadow_context_graph_state_id: Mapped[str | None] = mapped_column(
+        ForeignKey("context_graph_states.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    shadow_chunk_relation_graph_state_id: Mapped[str | None] = mapped_column(
+        ForeignKey("chunk_relation_graph_states.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    shadow_mid_concept_state_id: Mapped[str | None] = mapped_column(
+        ForeignKey("mid_concept_states.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    shadow_coarse_concept_state_id: Mapped[str | None] = mapped_column(
+        ForeignKey("coarse_concept_states.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    chunk_scope_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    expected_point_count: Mapped[int] = mapped_column(Integer, default=0)
+    ready_point_count: Mapped[int] = mapped_column(Integer, default=0)
+    vector_record_set_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    qdrant_proof_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    qdrant_proof_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    evaluation_protocol_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    evaluation_input_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    evaluation_result_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    evaluation_result_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    promotion_audit_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    rollback_audit_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    blocking_reasons_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    shadow_ready_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    evaluated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class AutoTpeRun(TimestampMixin, Base):
@@ -844,6 +1620,20 @@ class AutoTpeRun(TimestampMixin, Base):
     __table_args__ = (
         Index("ix_auto_tpe_runs_scope", "knowledge_base_id", "chunk_version", "chat_model", "embedding_model", "embedding_text_version"),
         Index("ix_auto_tpe_runs_kb_status", "knowledge_base_id", "status"),
+        CheckConstraint(
+            "status IN ('running','selected_pending_graph_commit','completed','failed','cancelled','skipped')",
+            name="ck_auto_tpe_runs_status",
+        ),
+        CheckConstraint(
+            "selected_graph_runtime_settings_hash IS NULL "
+            "OR length(selected_graph_runtime_settings_hash) = 64",
+            name="ck_auto_tpe_runs_graph_runtime_hash_length",
+        ),
+        CheckConstraint(
+            "status NOT IN ('selected_pending_graph_commit','completed') "
+            "OR selected_graph_runtime_settings_hash IS NOT NULL",
+            name="ck_auto_tpe_runs_selected_graph_runtime_required",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
@@ -854,6 +1644,7 @@ class AutoTpeRun(TimestampMixin, Base):
     chunk_scope_hash: Mapped[str] = mapped_column(String(64), index=True)
     graph_operating_point_protocol: Mapped[str] = mapped_column(String(64), index=True)
     protocol_hash: Mapped[str] = mapped_column(String(64), index=True)
+    tpe_search_space_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     chat_model: Mapped[str] = mapped_column(String(128), index=True)
     embedding_model: Mapped[str] = mapped_column(String(128), index=True)
     embedding_text_version: Mapped[str] = mapped_column(String(64), index=True)
@@ -864,16 +1655,40 @@ class AutoTpeRun(TimestampMixin, Base):
     good_quantile_gamma: Mapped[float] = mapped_column(Float, default=0.25)
     probe_query_budget: Mapped[int] = mapped_column(Integer, default=0)
     candidate_pool_size: Mapped[int] = mapped_column(Integer, default=0)
-    best_trial_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    best_trial_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey(
+            "auto_tpe_trials.id",
+            name="fk_auto_tpe_runs_best_trial_id",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        nullable=True,
+        index=True,
+    )
     best_objective_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     selected_theta_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     selected_theta_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    selected_edge_distance_protocol: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    selected_edge_distance_protocol_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    selected_edge_type_calibration_protocol: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    selected_edge_type_calibration_protocol_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    selected_calibration_params_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    selected_calibration_params_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    selected_edge_type_calibration_config_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     sampler_state_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     probe_set_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     hard_gate_json: Mapped[dict] = mapped_column(JSON, default=dict)
     objective_components_json: Mapped[dict] = mapped_column(JSON, default=dict)
     blocking_reasons_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     runtime_settings_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    selected_graph_runtime_settings_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        index=True,
+    )
+    selected_gate_profile_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    selected_gate_profile_json: Mapped[dict] = mapped_column(JSON, default=dict)
     diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
     failure_code: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -886,15 +1701,45 @@ class AutoTpeTrial(Base):
     __table_args__ = (
         UniqueConstraint("run_id", "trial_index", name="uq_auto_tpe_trial_run_index"),
         Index("ix_auto_tpe_trials_run_status", "run_id", "status"),
+        CheckConstraint(
+            "status IN ('queued','running','completed','blocked','failed','cancelled')",
+            name="ck_auto_tpe_trials_status",
+        ),
+        Index(
+            "ix_auto_tpe_trials_scope",
+            "knowledge_base_id",
+            "chunk_scope_hash",
+            "embedding_model",
+            "embedding_text_version",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     run_id: Mapped[str] = mapped_column(ForeignKey("auto_tpe_runs.id", ondelete="CASCADE"), index=True)
     knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    build_batch_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ingestion_batches.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    chunk_scope_hash: Mapped[str] = mapped_column(String(64), index=True)
+    embedding_model: Mapped[str] = mapped_column(String(128), index=True)
+    embedding_text_version: Mapped[str] = mapped_column(String(64), index=True)
     trial_index: Mapped[int] = mapped_column(Integer, index=True)
     sampled_theta_json: Mapped[dict] = mapped_column(JSON, default=dict)
     theta_hash: Mapped[str] = mapped_column(String(64), index=True)
+    tpe_search_space_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    edge_distance_protocol: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    edge_distance_protocol_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    edge_type_calibration_protocol: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    edge_type_calibration_protocol_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    calibration_params_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    calibration_params_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    edge_type_calibration_config_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     sampler_state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    runtime_settings_hash: Mapped[str] = mapped_column(String(64), index=True)
+    gate_profile_hash: Mapped[str] = mapped_column(String(64), index=True)
+    gate_profile_json: Mapped[dict] = mapped_column(JSON, default=dict)
     candidate_adjacency_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     probe_set_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     hard_gate_json: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -909,6 +1754,13 @@ class AutoTpeTrial(Base):
 
 class IngestionBatch(TimestampMixin, Base):
     __tablename__ = "ingestion_batches"
+    __table_args__ = (
+        UniqueConstraint(
+            "id",
+            "knowledge_base_id",
+            name="uq_ingestion_batches_id_kb",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
@@ -931,14 +1783,209 @@ class IngestionBatch(TimestampMixin, Base):
     jobs: Mapped[list["IngestionJob"]] = relationship(back_populates="batch", cascade="all, delete-orphan")
 
 
+class IngestionBatchRecovery(TimestampMixin, Base):
+    """Durable batch cancellation/restart boundary.
+
+    The row is written before the first file mutation.  It deliberately keeps
+    the pre-batch active scope separate from per-file write sets so recovery
+    never has to infer an old version with ``target_version - 1``.
+    """
+
+    __tablename__ = "ingestion_batch_recoveries"
+    __table_args__ = (
+        UniqueConstraint("batch_id", name="uq_ingestion_batch_recoveries_batch"),
+        UniqueConstraint(
+            "id",
+            "knowledge_base_id",
+            name="uq_ingestion_batch_recoveries_id_kb",
+        ),
+        ForeignKeyConstraint(
+            ["batch_id", "knowledge_base_id"],
+            ["ingestion_batches.id", "ingestion_batches.knowledge_base_id"],
+            name="fk_ingestion_batch_recoveries_batch_kb",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "protocol_version = 'ingestion_batch_cancel_compensation_v1'",
+            name="ck_ingestion_batch_recoveries_protocol",
+        ),
+        CheckConstraint(
+            "status IN ('prepared','parsing','parse_compensation_pending','parse_compensating',"
+            "'parse_compensated','graph_building','graph_compensation_pending',"
+            "'graph_compensated','completed','completed_no_writes','manual_review')",
+            name="ck_ingestion_batch_recoveries_status",
+        ),
+        CheckConstraint(
+            "v_before_batch >= 0 AND target_version >= v_before_batch",
+            name="ck_ingestion_batch_recoveries_versions_ordered",
+        ),
+        CheckConstraint(
+            "((NOT parse_committed) AND status IN ("
+            "'prepared','parsing','parse_compensation_pending','parse_compensating',"
+            "'parse_compensated','completed_no_writes','manual_review')) OR "
+            "(parse_committed AND status IN ("
+            "'graph_building','graph_compensation_pending','graph_compensated',"
+            "'completed','manual_review'))",
+            name="ck_ingestion_batch_recoveries_parse_state",
+        ),
+        Index(
+            "ix_ingestion_batch_recoveries_kb_status",
+            "knowledge_base_id",
+            "status",
+        ),
+        Index(
+            "uq_ingestion_batch_recovery_active_kb",
+            "knowledge_base_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('prepared','parsing','parse_compensation_pending',"
+                "'parse_compensating','graph_building','graph_compensation_pending',"
+                "'manual_review')"
+            ),
+            sqlite_where=text(
+                "status IN ('prepared','parsing','parse_compensation_pending',"
+                "'parse_compensating','graph_building','graph_compensation_pending',"
+                "'manual_review')"
+            ),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    batch_id: Mapped[str] = mapped_column(String(36), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True
+    )
+    protocol_version: Mapped[str] = mapped_column(
+        String(64), default="ingestion_batch_cancel_compensation_v1", index=True
+    )
+    status: Mapped[str] = mapped_column(String(40), default="prepared", index=True)
+    v_before_batch: Mapped[int] = mapped_column(Integer, default=0)
+    target_version: Mapped[int] = mapped_column(Integer, default=0)
+    full_reparse: Mapped[bool] = mapped_column(Boolean, default=False)
+    parse_committed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    before_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    before_state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    graph_before_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    graph_before_state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    graph_write_set_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    graph_write_set_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    compensation_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class IngestionFileStage(TimestampMixin, Base):
+    """One immutable before-image plus the exact committed write set per file."""
+
+    __tablename__ = "ingestion_file_stages"
+    __table_args__ = (
+        UniqueConstraint(
+            "batch_recovery_id",
+            "source_path",
+            name="uq_ingestion_file_stages_recovery_source",
+        ),
+        UniqueConstraint(
+            "batch_recovery_id",
+            "sequence_index",
+            name="uq_ingestion_file_stages_recovery_sequence",
+        ),
+        CheckConstraint("sequence_index >= 1", name="ck_ingestion_file_stages_sequence_positive"),
+        CheckConstraint(
+            "status IN ('prepared','parsing','indexed_committed','failed','cancel_observed',"
+            "'compensation_pending','compensating','compensated','retained_after_parse_commit',"
+            "'manual_review')",
+            name="ck_ingestion_file_stages_status",
+        ),
+        CheckConstraint(
+            "(status = 'prepared' AND phase = 'prepared') OR "
+            "(status = 'parsing' AND phase = 'parsing') OR "
+            "(status = 'indexed_committed' AND phase = 'indexed') OR "
+            "(status = 'failed' AND phase = 'failed') OR "
+            "(status = 'cancel_observed' AND phase = 'cancel_observed') OR "
+            "(status = 'compensation_pending' AND phase = 'qdrant_compensation') OR "
+            "(status = 'compensating' AND phase = 'database_restore') OR "
+            "(status = 'compensated' AND phase = 'compensated') OR "
+            "(status = 'retained_after_parse_commit' AND phase = 'context_graph') OR "
+            "(status = 'manual_review' AND phase = 'manual_review')",
+            name="ck_ingestion_file_stages_status_phase",
+        ),
+        ForeignKeyConstraint(
+            ["batch_recovery_id", "knowledge_base_id"],
+            [
+                "ingestion_batch_recoveries.id",
+                "ingestion_batch_recoveries.knowledge_base_id",
+            ],
+            name="fk_ingestion_file_stages_recovery_kb",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["ingestion_job_id", "knowledge_base_id"],
+            ["ingestion_jobs.id", "ingestion_jobs.knowledge_base_id"],
+            name="fk_ingestion_file_stages_job_kb",
+        ),
+        ForeignKeyConstraint(
+            ["document_id", "knowledge_base_id"],
+            ["documents.id", "documents.knowledge_base_id"],
+            name="fk_ingestion_file_stages_document_kb",
+        ),
+        Index(
+            "ix_ingestion_file_stages_recovery_status",
+            "batch_recovery_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    batch_recovery_id: Mapped[str] = mapped_column(String(36), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True
+    )
+    ingestion_job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ingestion_jobs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    document_id: Mapped[str | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_path: Mapped[str] = mapped_column(Text)
+    sequence_index: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(40), default="prepared", index=True)
+    phase: Mapped[str] = mapped_column(String(40), default="prepared", index=True)
+    before_state_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    before_state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    write_set_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    write_set_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    compensation_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class IngestionJob(TimestampMixin, Base):
     __tablename__ = "ingestion_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "id",
+            "knowledge_base_id",
+            name="uq_ingestion_jobs_id_kb",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
     batch_id: Mapped[str | None] = mapped_column(ForeignKey("ingestion_batches.id", ondelete="SET NULL"), nullable=True, index=True)
     document_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id", ondelete="SET NULL"), nullable=True, index=True)
     source_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    logical_source_slot_key: Mapped[str | None] = mapped_column(
+        String(1024),
+        nullable=True,
+        index=True,
+    )
+    source_slot_protocol_version: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        index=True,
+    )
     trigger_source: Mapped[str] = mapped_column(String(64), default="upload")
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -973,6 +2020,48 @@ class IngestionCompensationLog(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class StorageMaintenanceIntent(Base):
+    """Durable storage/Qdrant work that must outlive knowledge-base facts."""
+
+    __tablename__ = "storage_maintenance_intents"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('intent_committed','external_deleting','external_applied',"
+            "'facts_deleted','cache_invalidation_pending','completed','manual_review')",
+            name="ck_storage_maintenance_intents_status",
+        ),
+        Index(
+            "uq_storage_maintenance_intents_active_operation_scope",
+            "operation",
+            "scope_key",
+            unique=True,
+            postgresql_where=text("status <> 'completed'"),
+            sqlite_where=text("status <> 'completed'"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    # Deliberately no FK: full-KB deletion must retain its tombstone after the
+    # knowledge_bases row and every cascading fact have been removed.
+    knowledge_base_id: Mapped[str] = mapped_column(String(36), index=True)
+    knowledge_base_name: Mapped[str] = mapped_column(String(255))
+    operation: Mapped[str] = mapped_column(String(64), index=True)
+    protocol_version: Mapped[str] = mapped_column(String(96))
+    scope_key: Mapped[str] = mapped_column(String(128))
+    target_root: Mapped[str | None] = mapped_column(Text, nullable=True)
+    inventory_hash: Mapped[str] = mapped_column(String(64), index=True)
+    payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        default="intent_committed",
+        server_default="intent_committed",
+        index=True,
+    )
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class AgentRun(Base):
     __tablename__ = "agent_runs"
 
@@ -994,9 +2083,21 @@ class AgentRun(Base):
 
 class AgentTraceEvent(Base):
     __tablename__ = "agent_trace_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "sequence_index",
+            name="uq_agent_trace_events_run_sequence",
+        ),
+        CheckConstraint(
+            "sequence_index >= 0",
+            name="ck_agent_trace_events_sequence_nonnegative",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True)
+    sequence_index: Mapped[int] = mapped_column(Integer)
     node: Mapped[str] = mapped_column(String(64), index=True)
     status: Mapped[str] = mapped_column(String(32), default="completed", index=True)
     input_summary: Mapped[str | None] = mapped_column(Text, nullable=True)

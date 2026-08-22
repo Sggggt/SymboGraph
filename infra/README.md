@@ -1,5 +1,41 @@
 # Infra
 
+## Default recovery scheduler
+
+The default stack runs `course-kg-beat` as a separate Celery Beat process. It
+publishes `reconcile_interrupted_ingestion_batches` every 60 seconds; the
+`course-kg-worker` process only consumes tasks and never embeds Beat. The Beat
+health check verifies both the PID 1 command and the persistent schedule file.
+
+```powershell
+docker compose -f infra/docker-compose.yml ps beat
+docker logs --tail 100 course-kg-beat
+```
+
+## Application data volume
+
+The default API and worker `DATA_ROOT=/app/data` is a shared Docker managed
+volume (`symbograph-data`), not the Windows-host `../data` bind mount. Existing
+bytes under `../data` are deliberately **not** migrated automatically when this
+layout is adopted; stop the stack and use an explicit, verified maintenance
+copy only when old application data must be retained.
+
+Raw sample files remain available through the separate read-only
+`/app/import/sample` bind. A clean clone uses the tracked, intentionally empty
+`infra/sample-import/` directory, so Compose startup never depends on ignored
+local data. Every import root must contain `raw-manifest.json` using
+`symbograph_raw_source_manifest_v1`; the manifest names one relative
+`raw_root` and lists every accepted raw file with its exact SHA-256. Import
+enumeration consumes only those entries and rejects unlisted recursive
+discovery, path/symlink escapes, checksum drift, and casefold/NFKC collisions.
+For the real main-database sample run, set `SAMPLE_IMPORT_PATH` explicitly to
+an operator-prepared raw-only directory containing that manifest. Never point
+it at `../data/Sample`, a legacy `ingestion`/snapshot tree, candidate/backup
+tree, or other mutable application state. This import mount is never a
+production `DATA_ROOT`.
+
+资料导入统一使用 Upload API/前端或当前 `rebuild_chunks.py` 运维入口；不再提供绑定固定 Sample manifest 的专用脚本。
+
 ## 项目简介
 
 `infra` 保存 SymboGraph 默认 Docker Compose 运行环境，包含 API、Worker、Web、PostgreSQL、Redis 和 Qdrant。
@@ -37,7 +73,7 @@ flowchart TB
     W["course-kg-worker"] --> R
     W --> PG
     W --> Q
-    API --> M["OpenAI-compatible models"]
+    API --> M["OpenAI-compatible / Anthropic models"]
     W --> M
 ```
 
@@ -53,12 +89,15 @@ Copy-Item .env.example .env
 
 ```env
 CHAT_API_KEY=...
+CHAT_API_PROTOCOL=openai
 CHAT_BASE_URL=https://your-chat-endpoint/v1
 CHAT_MODEL=your-chat-model
 GRAPH_API_KEY=...
+GRAPH_API_PROTOCOL=openai
 GRAPH_BASE_URL=https://your-graph-endpoint/v1
 GRAPH_MODEL=your-graph-model
 EMBEDDING_API_KEY=...
+EMBEDDING_API_PROTOCOL=openai
 EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1
 EMBEDDING_MODEL=your-embedding-model
 EMBEDDING_DIMENSIONS=1024
@@ -66,10 +105,55 @@ ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 ```
 
+`CHAT_API_PROTOCOL`, `GRAPH_API_PROTOCOL`, and `EMBEDDING_API_PROTOCOL` are independent. For Anthropic chat/graph, use the provider root/path prefix and do not end the base URL in `/v1` or `/v1/messages`; the client and bridge append `/v1/messages`. OpenAI-compatible chat/graph append `/chat/completions`. Embedding currently accepts only `EMBEDDING_API_PROTOCOL=openai`, appends `/embeddings`, and is rebuild-required; Anthropic Messages is not an embedding protocol.
+
+### Single root runtime env
+
+The repository-root `.env` is the only configuration authority. Compose uses
+it for initial process injection and bind-mounts the repository at `/workspace`;
+API, Worker and Beat all set `RUNTIME_ENV_FILE=/workspace/.env`. The API mount
+is writable so the Settings endpoint can atomically replace that exact file;
+Worker and Beat mounts are read-only. No runtime-config volume, `desired.env`,
+service-local env file or database value snapshot exists.
+
+The Settings endpoint validates the complete prospective configuration before
+an atomic root-file replacement. Hot-reloadable keys are applied to the current
+API process and broadcast through Redis. Rebuild-required keys remain pending
+until the candidate/shadow/evaluation/promotion lifecycle completes. Service-
+recreate-required keys are visible in `.env` immediately but the running
+process keeps its startup value until explicit Compose recreation.
+
+An in-process version refresh reverse-applies only keys declared by the
+runtime-settings lifecycle. Deployment settings such as `DATA_ROOT`,
+`DATABASE_URL`, and `REDIS_URL` are never overwritten from this file during a
+refresh. A process-local value changed explicitly after the preceding managed
+refresh is preserved only when it is outside that lifecycle set. Runtime keys
+remain root-file authoritative, and sibling API/Worker processes consume
+the same file independently at their own task/request refresh boundary.
+
+The local settings cache token binds the normalized source path, strong file
+identity (`device`/`inode`/size/mtime/ctime), and a process-keyed content
+digest. Consequently an equal-size atomic replacement with a preserved mtime
+still invalidates `get_settings()`. The keyed digest is used only in process
+and never exposes an env value or a reusable unkeyed secret hash.
+
+When the API mirrors its own successful runtime-settings save into
+`os.environ`, it updates the same managed-value tracker used by later version
+refreshes. A subsequent Worker/API writer can therefore advance that process
+again; the process does not mistake its own previous save for an operator
+override.
+
+The writer lock lives in the operating-system temporary directory and contains
+no settings. Atomic-write temporaries exist only for the duration of a same-
+directory replace; no persistent sibling copy or recovery file is created.
+
 容器内固定覆盖：
 
 ```text
-DATABASE_URL=postgresql+psycopg://postgres:postgres@postgres:5432/symbograph
+POSTGRES_USER=symbograph
+POSTGRES_PASSWORD=<local-random-password>
+POSTGRES_DB=symbograph
+DATABASE_URL=postgresql+psycopg://symbograph:<local-random-password>@postgres:5432/symbograph
 QDRANT_URL=http://qdrant:6333
 REDIS_URL=redis://redis:6379/0
 DATA_ROOT=/app/data
@@ -95,7 +179,7 @@ docker compose -f infra/docker-compose.yml ps
 | --- | --- |
 | 镜像与端口 | `API_IMAGE`, `WEB_IMAGE`, `API_HOST_PORT`, `WEB_HOST_PORT` |
 | 数据服务 | `DATABASE_URL`, `QDRANT_URL`, `QDRANT_COLLECTION`, `REDIS_URL` |
-| 数据目录 | `DATA_ROOT`, `STORAGE_ROOT`, `INGESTION_ROOT` |
+| 数据目录 | `DATA_ROOT`, `STORAGE_ROOT`, `INGESTION_ROOT`, `SAMPLE_IMPORT_PATH`（相对 `infra/docker-compose.yml` 的 raw-only 只读挂载） |
 | 模型 | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT`, `MODEL_BRIDGE_ADMIN_TOKEN`, `CHAT_*`, `EMBEDDING_*` |
 | Auto TPE | `ENABLE_AUTO_TPE`, `TPE_TRIAL_BUDGET`, `TPE_STARTUP_RANDOM_TRIALS`, `TPE_GOOD_QUANTILE_GAMMA`, `TPE_PROBE_QUERY_BUDGET`, `TPE_TRIAL_TIMEOUT_SECONDS`, `TPE_CANDIDATE_POOL_SIZE`, `OPERATING_POINT_HARD_GATE_*` |
 | Worker | `WORKER_CONCURRENCY`, `INGESTION_TASK_QUEUE` |
@@ -114,9 +198,14 @@ docker exec -w /app/apps/api course-kg-api python -m pytest tests
 ```powershell
 docker compose -f infra/docker-compose.yml logs -f api
 docker compose -f infra/docker-compose.yml logs -f worker
-docker compose -f infra/docker-compose.yml restart api worker
+docker compose -f infra/docker-compose.yml logs -f beat
+docker compose -f infra/docker-compose.yml restart api worker beat
 python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
+python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --execute
 ```
+
+不带 `--execute` 的 smoke 只做 GET 预检并输出精确 POST 计划；确认 KB、query、
+`/search`、`/qa` 和持久化影响后，才运行第二条完整验收命令。
 
 ## 文档
 

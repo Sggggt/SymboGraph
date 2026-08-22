@@ -1,4 +1,4 @@
-import type { AgentTraceEventPayload, AgentTraceNode } from "@course-kg/shared";
+import type { AgentTraceEventPayload, AgentTraceNode, AgentTraceScores } from "@course-kg/shared";
 
 export const contextGraphTraceFallbackSteps: AgentTraceNode[] = [
   "query_understanding",
@@ -21,6 +21,10 @@ const traceNodeLabels: Record<AgentTraceNode, string> = {
   query_facet_extraction: "查询 facets",
   agent_planner: "智能体规划",
   typed_action_validation: "动作校验",
+  typed_action_executor: "动作执行",
+  evidence_evaluator: "证据充分性评估",
+  replan_no_progress: "停止重复规划",
+  evidence_gate: "证据门禁",
   entry_selection: "分阶段入口",
   layer_drilldown: "逐父下钻",
   frontier_traversal: "队列遍历",
@@ -32,6 +36,8 @@ const traceNodeLabels: Record<AgentTraceNode, string> = {
   citation_verification: "引用验证",
   repair_executed: "修复执行",
   reward_event: "奖励观测",
+  cancelled: "已取消",
+  agent_admission: "Agent 准入",
   error: "错误",
 };
 
@@ -58,7 +64,7 @@ export function traceNodeLabel(node: string): string {
 }
 
 export function traceGroupForNode(node: string): TraceGroupKey {
-  if (node === "query_understanding" || node === "query_facet_extraction" || node === "agent_planner" || node === "typed_action_validation" || node === "entry_selection") {
+  if (node === "query_understanding" || node === "query_facet_extraction" || node === "agent_planner" || node === "typed_action_validation" || node === "replan_no_progress" || node === "entry_selection") {
     return "entry";
   }
   if (node === "layer_drilldown" || node === "layered_retrieval") {
@@ -132,41 +138,104 @@ function formatAuditValue(key: string, value: unknown): string {
   return Array.isArray(value) ? value.join("/") : String(value);
 }
 
-export function traceAuditSummary(scores: Record<string, unknown> | undefined): string[] {
-  const audit = scores?.audit && typeof scores.audit === "object" ? (scores.audit as Record<string, unknown>) : undefined;
-  const data = audit ?? scores ?? {};
-  const entries: Array<[string, string]> = [
-    ["retrieval_granularity", "检索模式"],
-    ["coarse_concepts", "粗概念"],
-    ["coarse_entries", "粗入口"],
-    ["mid_concepts", "中概念"],
-    ["mid_entries", "中入口"],
-    ["stage_queue_count", "Stage 队列"],
-    ["mid_topk_selected", "中概念 TopK"],
-    ["chunk_topk_selected", "片段 TopK"],
-    ["rq_prefixes", "RQ 前缀"],
-    ["rq_membership_entries", "RQ 归属"],
-    ["frontier_pops", "Frontier pop"],
-    ["frontier_expansion_count", "扩展边数"],
-    ["gray_zone_decision_count", "灰区观测"],
-    ["red_zone_pruned_count", "红区剪枝"],
-    ["hard_stop_pruned_count", "硬停剪枝"],
-    ["dominance_pruned_count", "支配剪枝"],
-    ["convergence_reason", "收敛原因"],
-    ["query_rq_path", "RQ 路径"],
-    ["base_candidate_count", "基础候选"],
-    ["recalled_chunks", "召回片段"],
-    ["structure_neighbors", "结构邻居"],
-    ["bridge_chunks", "桥接片段"],
-    ["context_chunks", "上下文片段"],
-    ["citation_count", "引用"],
-    ["citation_pass_rate", "引用通过率"],
-    ["verification_pass_rate", "验证通过率"],
-    ["retrieval_trace_id", "检索轨迹"],
-    ["context_package_id", "证据包"],
-    ["plan_id", "规划"],
-  ];
+export function traceAuditSummary(scores: AgentTraceScores | undefined): string[] {
+  if (!scores) return [];
+  let entries: Array<[string, string, unknown]> = [];
+  switch (scores.audit_kind) {
+    case "query_understanding":
+      entries = [
+        ["retrieval_granularity", "检索模式", scores.retrieval_granularity],
+        ["top_k", "结果上限", scores.top_k],
+      ];
+      break;
+    case "query_facets":
+      entries = [
+        ["retrieval_granularity", "检索模式", scores.retrieval_granularity],
+      ];
+      break;
+    case "planner":
+      entries = [
+        ["retrieval_granularity", "检索模式", scores.retrieval_granularity],
+        ["plan_id", "规划", scores.plan_id],
+        ["plan_index", "规划轮次", scores.plan_index],
+      ];
+      break;
+    case "typed_action_validation":
+    case "typed_action_executor":
+    case "evidence_evaluator":
+      entries = [
+        ["plan_id", "规划", scores.plan_id],
+        ["plan_index", "规划轮次", scores.plan_index],
+        [
+          "retrieval_trace_id",
+          "检索轨迹",
+          scores.audit_kind === "typed_action_executor"
+            ? scores.retrieval_trace_id
+            : undefined,
+        ],
+      ];
+      break;
+    case "retrieval_stage":
+      entries = [
+        ["retrieval_granularity", "检索模式", scores.retrieval_granularity],
+        ["coarse_entries", "粗入口", scores.coarse_entries],
+        ["stage_queue_count", "Stage 队列", scores.stage_queue_count],
+        ["mid_topk_selected", "中概念 TopK", scores.mid_topk_selected],
+        ["chunk_topk_selected", "片段 TopK", scores.chunk_topk_selected],
+        ["frontier_pops", "Frontier pop", scores.frontier_pops],
+        ["dominance_pruned_count", "支配剪枝", scores.dominance_pruned_count],
+        ["query_rq_path", "RQ 路径", scores.query_rq_path],
+        ["retrieval_trace_id", "检索轨迹", scores.retrieval_trace_id],
+      ];
+      break;
+    case "layered_retrieval":
+      entries = [
+        [
+          "retrieval_granularity",
+          "检索模式",
+          scores.retrieval_audit?.retrieval_granularity,
+        ],
+        [
+          "frontier_pops",
+          "Frontier pop",
+          scores.retrieval_audit?.frontier_pops,
+        ],
+        [
+          "retrieval_trace_id",
+          "检索轨迹",
+          scores.retrieval_audit?.retrieval_trace_id,
+        ],
+      ];
+      break;
+    case "context_restoration":
+      entries = [
+        ["hit_chunks", "命中片段", scores.hit_chunks],
+        ["restored_chunks", "恢复片段", scores.restored_chunks],
+        ["bridge_chunks", "桥接片段", scores.bridge_chunks],
+        ["context_package_id", "证据包", scores.context_package_id],
+      ];
+      break;
+    case "context_package":
+      entries = [
+        ["context_package_id", "证据包", scores.context_package_id],
+        ["token_count", "Token", scores.token_count],
+      ];
+      break;
+    case "citation_verification":
+      entries = [
+        ["citation_pass_rate", "引用通过率", scores.citation_pass_rate],
+        [
+          "raw_citation_pass_rate",
+          "原始引用通过率",
+          scores.raw_citation_pass_rate,
+        ],
+        ["returned_citation_count", "返回引用", scores.returned_citation_count],
+      ];
+      break;
+    default:
+      break;
+  }
   return entries
-    .filter(([key]) => data[key] !== undefined && data[key] !== null)
-    .map(([key, label]) => `${label}: ${formatAuditValue(key, data[key])}`);
+    .filter(([, , value]) => value !== undefined && value !== null)
+    .map(([key, label, value]) => `${label}: ${formatAuditValue(key, value)}`);
 }

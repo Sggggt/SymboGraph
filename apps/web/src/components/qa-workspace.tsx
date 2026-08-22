@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import type { AgentResponse, AgentTraceEventPayload, Citation, ModelSettingsResponse, ModelSettingsUpdate, RetrievalGranularity, SessionSummary } from "@course-kg/shared";
+import type { AgentResponse, AgentTraceEventPayload, AnswerModelAudit, Citation, ConversationStatePayload, ModelSettingsResponse, ModelSettingsUpdate, RetrievalGranularity, SessionMessage, SessionSummary } from "@course-kg/shared";
 import { motion } from "framer-motion";
 import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -41,13 +41,17 @@ import { cancelAgentRun, deleteSession, fetchDashboard, fetchModelSettings, fetc
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 
-type ChatTurn = {
+export type ChatTurn = {
   role: "user" | "assistant";
   content: string;
   run_id?: string | null;
   route?: string | null;
   citations?: Citation[];
   trace?: AgentTraceEventPayload[];
+  retrieval_trace_id?: string | null;
+  context_package_id?: string | null;
+  citation_replay_status?: "not_present" | "valid" | "unavailable";
+  citation_replay_reason?: "persisted_citation_contract_mismatch" | null;
 };
 
 type ActiveStreamState = {
@@ -60,6 +64,10 @@ type ActiveStreamState = {
 
 type AgentSettingsForm = {
   query_facet_bilingual_enabled: boolean;
+  query_facet_posterior_enabled: boolean;
+  query_facet_posterior_observation_budget: string;
+  query_facet_posterior_round_budget: string;
+  query_facet_posterior_convergence_epsilon: string;
   context_package_token_budget: string;
   retrieval_result_top_k_default: string;
   agent_coarse_initial_budget: string;
@@ -80,6 +88,7 @@ type AgentSettingsForm = {
   agent_path_distance_green_threshold: string;
   agent_path_distance_gray_threshold: string;
   agent_path_distance_hard_threshold: string;
+  traversal_observation_budget: string;
   agent_structure_restore_per_chunk_budget: string;
   context_path_summary_budget: string;
   agent_planning_round_budget: string;
@@ -88,7 +97,10 @@ type AgentSettingsForm = {
   agent_verification_budget: string;
 };
 
-type AgentNumberSettingKey = Exclude<keyof AgentSettingsForm, "query_facet_bilingual_enabled">;
+type AgentNumberSettingKey = Exclude<
+  keyof AgentSettingsForm,
+  "query_facet_bilingual_enabled" | "query_facet_posterior_enabled"
+>;
 
 type AgentNumberField = {
   key: AgentNumberSettingKey;
@@ -100,11 +112,39 @@ type AgentNumberField = {
 
 const userCancelledMessage = "已取消当前对话";
 
+export function legacyQaPayloadStorageKeys(scope: string): string[] {
+  return [
+    "turns",
+    "draftAnswer",
+    "citations",
+    "trace",
+    "latestRun",
+    "conversationState",
+  ].map((field) => `qa.${field}.${scope}`);
+}
+
+export function productQaErrorMessage(value: unknown): string {
+  const message = value instanceof Error ? value.message : String(value ?? "");
+  if (message === "cancelled_by_user" || message === userCancelledMessage) {
+    return userCancelledMessage;
+  }
+  if (/openai-compatible|anthropic|model[_ -]?bridge|provider[_ -]?error|http[_ -]?status|\b(?:429|5\d\d)\b/i.test(message)) {
+    return "模型服务暂时不可用，请稍后重试。";
+  }
+  if (/failed to fetch|networkerror|connection|timeout/i.test(message)) {
+    return "问答服务暂时无法连接，请稍后重试。";
+  }
+  return "本次问答未能完成，请稍后重试。";
+}
+
 const agentSettingsInputClass = "h-11 rounded-xl border-white/10 bg-white/[0.045] px-3 text-white placeholder:text-white/28";
 const agentParameterNameClass = "text-xs font-medium uppercase tracking-[0.16em] text-cyan-100/52";
 
 export const AGENT_PARAMETER_HELP: Record<string, string> = {
   模型双语查询词面: "开启后，查询词面提取会要求模型为显式概念补充中英文别名；只影响下一次检索路由，不写入事实证据，也不触发图谱重建。",
+  "Query facet posterior 观察预算": "单次检索最多读取多少条确定性候选观察来校准 facet 权重；这是 hot_reloadable hard cap，只影响下一次 search、QA 或 repair retrieval，不调用模型、不触发图谱重建。",
+  "Query facet posterior 轮次预算": "当前协议最多使用 dense entry 与 merged chunk 两个固定 checkpoint；达到预算立即停止，不扩大 top-k 或模型预算。",
+  "Query facet posterior 收敛阈值": "相邻两轮 posterior 的 L1 变化不超过该值时提前停止。posterior 只在相同未覆盖 facet 数量内做 tie-break，不是事实概率。",
   证据包令牌预算: "上下文证据包可容纳的令牌上限。证据包是回答生成的唯一证据输入，预算不足时会优先保留更强支撑。",
   结果保留数量默认值: "搜索、问答和智能体请求未显式指定结果数量时使用的默认返回上限；它不是裸召回规模。",
   粗概念起点数量: "摘要模式下从全部粗概念候选中选入图探索的起点数量；普通模式不使用这个参数。",
@@ -123,8 +163,9 @@ export const AGENT_PARAMETER_HELP: Record<string, string> = {
   闭环奖励上限: "单条路径最多可获得的闭环收敛奖励。奖励只辅助短而强的收敛路径，不能替代证据。",
   闭环奖励距离阈值: "只有总距离足够短的闭环路径才会得到收敛奖励，长而弱的环不会提升路径价值。",
   路径绿色阈值: "路径距离小于该值时视为高置信路径，通常可继续确定性扩展。",
-  路径灰区阈值: "路径距离落入灰区时可交给智能体评估器做继续、下钻或停止的类型化裁决。",
+  路径灰区阈值: "路径距离落入灰区时，由 executor 基于有界观测和版本化本地规则确定性裁决继续、下钻、走桥或停止；LLM 与证据评估器不参与、覆盖或补判。",
   路径硬中断阈值: "路径距离超过该值时执行器直接剪枝，不允许模型绕过硬阈值继续扩展。",
+  扩展观察总预算: "单次图遍历允许持久化的完整 gray-zone 有界观测总量。达到预算后仍逐路径执行同一本地确定性规则，但只保留最小审计包并记录 hard interrupt；该参数 hot_reloadable，模型调用预算始终为 0。",
   每个片段结构恢复数量: "对每个最终命中片段最多追加多少前后文或桥接上下文；不改变片段检索命中数量。",
   路径摘要预算: "证据包中可保留的图路径摘要数量上限，用于解释证据从粗层到中层再到片段的来源。",
   规划轮次预算: "智能体可进行规划和评估的最大轮数，用来控制单次任务内的推理成本。",
@@ -142,6 +183,12 @@ const commonRetrievalFields: AgentNumberField[] = [
   { key: "agent_chunk_top_k", label: "片段最终保留数量", min: 1, max: 1000 },
   { key: "agent_structure_restore_per_chunk_budget", label: "每个片段结构恢复数量", min: 1, max: 200 },
   { key: "candidate_pool_dedupe_budget", label: "候选去重池预算", min: 1, max: 5000 },
+];
+
+const queryFacetPosteriorFields: AgentNumberField[] = [
+  { key: "query_facet_posterior_observation_budget", label: "Query facet posterior 观察预算", min: 1, max: 1024 },
+  { key: "query_facet_posterior_round_budget", label: "Query facet posterior 轮次预算", min: 1, max: 2 },
+  { key: "query_facet_posterior_convergence_epsilon", label: "Query facet posterior 收敛阈值", min: 0, max: 1, step: 0.001 },
 ];
 
 const midModeRetrievalFields: AgentNumberField[] = [
@@ -164,6 +211,7 @@ const agentControlFields: AgentNumberField[] = [
   { key: "agent_path_distance_green_threshold", label: "路径绿色阈值", min: 0, max: 20, step: 0.01 },
   { key: "agent_path_distance_gray_threshold", label: "路径灰区阈值", min: 0, max: 20, step: 0.01 },
   { key: "agent_path_distance_hard_threshold", label: "路径硬中断阈值", min: 0, max: 40, step: 0.01 },
+  { key: "traversal_observation_budget", label: "扩展观察总预算", min: 1, max: 20000 },
   { key: "context_path_summary_budget", label: "路径摘要预算", min: 1, max: 500 },
   { key: "agent_planning_round_budget", label: "规划轮次预算", min: 1, max: 10 },
   { key: "agent_max_typed_actions_per_round", label: "每轮动作上限", min: 1, max: 50 },
@@ -205,6 +253,10 @@ function stringSetting(value: number | undefined, fallback: number): string {
 function agentSettingsFormFromSettings(settings?: ModelSettingsResponse | null): AgentSettingsForm {
   return {
     query_facet_bilingual_enabled: settings?.query_facet_bilingual_enabled ?? false,
+    query_facet_posterior_enabled: settings?.query_facet_posterior_enabled ?? true,
+    query_facet_posterior_observation_budget: stringSetting(settings?.query_facet_posterior_observation_budget, 64),
+    query_facet_posterior_round_budget: stringSetting(settings?.query_facet_posterior_round_budget, 2),
+    query_facet_posterior_convergence_epsilon: stringSetting(settings?.query_facet_posterior_convergence_epsilon, 0.02),
     context_package_token_budget: stringSetting(settings?.context_package_token_budget, 12000),
     retrieval_result_top_k_default: stringSetting(settings?.retrieval_result_top_k_default, 12),
     agent_coarse_initial_budget: stringSetting(settings?.agent_coarse_initial_budget ?? settings?.agent_coarse_total_budget, 5),
@@ -228,6 +280,7 @@ function agentSettingsFormFromSettings(settings?: ModelSettingsResponse | null):
     agent_path_distance_green_threshold: stringSetting(settings?.agent_path_distance_green_threshold, 0.45),
     agent_path_distance_gray_threshold: stringSetting(settings?.agent_path_distance_gray_threshold, 1.35),
     agent_path_distance_hard_threshold: stringSetting(settings?.agent_path_distance_hard_threshold, 2.4),
+    traversal_observation_budget: stringSetting(settings?.traversal_observation_budget, 64),
     agent_structure_restore_per_chunk_budget: stringSetting(settings?.agent_structure_restore_per_chunk_budget ?? settings?.agent_structure_restore_budget, 16),
     context_path_summary_budget: stringSetting(settings?.context_path_summary_budget, 32),
     agent_planning_round_budget: stringSetting(settings?.agent_planning_round_budget, 2),
@@ -240,6 +293,10 @@ function agentSettingsFormFromSettings(settings?: ModelSettingsResponse | null):
 function buildAgentSettingsPayload(form: AgentSettingsForm, retrievalGranularity: RetrievalGranularity): ModelSettingsUpdate {
   const payload: ModelSettingsUpdate = {
     query_facet_bilingual_enabled: form.query_facet_bilingual_enabled,
+    query_facet_posterior_enabled: form.query_facet_posterior_enabled,
+    query_facet_posterior_observation_budget: parseIntField(form.query_facet_posterior_observation_budget),
+    query_facet_posterior_round_budget: parseIntField(form.query_facet_posterior_round_budget),
+    query_facet_posterior_convergence_epsilon: parseFloatField(form.query_facet_posterior_convergence_epsilon),
     context_package_token_budget: parseIntField(form.context_package_token_budget),
     retrieval_result_top_k_default: parseIntField(form.retrieval_result_top_k_default),
     agent_mid_top_k: parseIntField(form.agent_mid_top_k),
@@ -255,6 +312,7 @@ function buildAgentSettingsPayload(form: AgentSettingsForm, retrievalGranularity
     agent_path_distance_green_threshold: parseFloatField(form.agent_path_distance_green_threshold),
     agent_path_distance_gray_threshold: parseFloatField(form.agent_path_distance_gray_threshold),
     agent_path_distance_hard_threshold: parseFloatField(form.agent_path_distance_hard_threshold),
+    traversal_observation_budget: parseIntField(form.traversal_observation_budget),
     agent_structure_restore_per_chunk_budget: parseIntField(form.agent_structure_restore_per_chunk_budget),
     context_path_summary_budget: parseIntField(form.context_path_summary_budget),
     agent_planning_round_budget: parseIntField(form.agent_planning_round_budget),
@@ -280,6 +338,38 @@ const fallbackSuggestions = [
   "基于资料引用给我一份阅读路线",
 ];
 
+export function answerAuditFromTrace(
+  trace: AgentTraceEventPayload[] | undefined,
+): AnswerModelAudit | null {
+  const grounded = [...(trace ?? [])]
+    .reverse()
+    .find((event) => event.node === "grounded_answer");
+  const scores = grounded?.scores as
+    | { answer_model_audit?: AnswerModelAudit | null }
+    | undefined;
+  return scores?.answer_model_audit ?? null;
+}
+
+export function answerUsageLabel(
+  audit: AgentResponse["answer_model_audit"] | null | undefined,
+): string | null {
+  const usage = audit?.provider_call?.usage;
+  if (!usage?.usage_present) {
+    return null;
+  }
+  const counters = [
+    usage.input_tokens != null ? `输入 ${usage.input_tokens}` : null,
+    usage.output_tokens != null ? `输出 ${usage.output_tokens}` : null,
+    usage.cache_read_input_tokens != null
+      ? `缓存读取 ${usage.cache_read_input_tokens}`
+      : null,
+  ].filter((value): value is string => Boolean(value));
+  if (!counters.length) {
+    return null;
+  }
+  return `Provider tokens：${counters.join(" · ")}${usage.cache_hit ? " · 缓存命中" : ""}`;
+}
+
 function answerModelLabel(latestRun: AgentResponse | null, configuredChatModel?: string | null): string {
   const audit = latestRun?.answer_model_audit;
   if (!audit) {
@@ -288,18 +378,18 @@ function answerModelLabel(latestRun: AgentResponse | null, configuredChatModel?:
   if (audit.external_called) {
     return `模型：${audit.model ?? audit.chat_model ?? audit.provider}`;
   }
-  if (audit.skipped_reason === "clarify_route") {
-    return "模型：澄清分支未调用";
-  }
-  if (audit.skipped_reason === "direct_answer_route") {
-    return "模型：直接回答分支未调用";
-  }
   return "模型：未调用";
 }
 
 function buildKnowledgeBaseSuggestions(tree: Array<{ title?: string; children?: Array<{ title?: string }> }> | undefined): string[] {
-  const partitions = tree?.map((node) => node.title).filter((title): title is string => Boolean(title)) ?? [];
-  const documents = tree?.flatMap((node) => node.children?.map((child) => child.title) ?? []).filter((title): title is string => Boolean(title)) ?? [];
+  const isProductTitle = (title: string | undefined): title is string =>
+    Boolean(
+      title &&
+        !/^[0-9a-f]{64}$/i.test(title) &&
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(title),
+    );
+  const partitions = tree?.map((node) => node.title).filter(isProductTitle) ?? [];
+  const documents = tree?.flatMap((node) => node.children?.map((child) => child.title) ?? []).filter(isProductTitle) ?? [];
   const suggestions = [
     partitions[0] ? `总结 ${partitions[0]} 的核心内容` : "",
     partitions[1] ? `比较 ${partitions[0]} 和 ${partitions[1]} 的联系` : "",
@@ -309,15 +399,71 @@ function buildKnowledgeBaseSuggestions(tree: Array<{ title?: string; children?: 
   return suggestions.length ? suggestions.slice(0, 4) : fallbackSuggestions;
 }
 
-function normalizeMessages(messages: Array<Record<string, unknown>>): ChatTurn[] {
-  return messages
+export function normalizeMessages(messages: SessionMessage[] | Array<Record<string, unknown>>, conversationState?: ConversationStatePayload | null): ChatTurn[] {
+  const referencesByRunId = new Map(conversationState?.history_references.map((reference) => [reference.run_id, reference]) ?? []);
+  return (messages as Array<Record<string, unknown>>)
     .filter((item) => item.role === "user" || item.role === "assistant")
-    .map((item) => ({
-      role: item.role as "user" | "assistant",
-      content: String(item.content ?? ""),
-      run_id: typeof item.run_id === "string" ? item.run_id : null,
-      citations: Array.isArray(item.citations) ? (item.citations as Citation[]) : undefined,
-    }));
+    .map((item) => {
+      const messageCitations = Array.isArray(item.citations) ? (item.citations as Citation[]) : undefined;
+      const citationTraceId = messageCitations?.find((citation) => typeof citation.retrieval_trace_id === "string")?.retrieval_trace_id;
+      const citationPackageId = messageCitations?.find((citation) => typeof citation.context_package_id === "string")?.context_package_id;
+      const runId = typeof item.run_id === "string" ? item.run_id : null;
+      const historyReference = runId ? referencesByRunId.get(runId) : undefined;
+      return {
+        role: item.role as "user" | "assistant",
+        content: String(item.content ?? ""),
+        run_id: runId,
+        route: typeof item.route === "string" ? item.route : null,
+        citations: messageCitations,
+        trace: Array.isArray(item.trace) ? (item.trace as AgentTraceEventPayload[]) : undefined,
+        retrieval_trace_id: typeof item.retrieval_trace_id === "string" ? item.retrieval_trace_id : citationTraceId ?? historyReference?.retrieval_trace_id ?? null,
+        context_package_id: typeof item.context_package_id === "string" ? item.context_package_id : citationPackageId ?? historyReference?.context_package_id ?? null,
+        citation_replay_status:
+          item.citation_replay_status === "valid" || item.citation_replay_status === "unavailable"
+            ? item.citation_replay_status
+            : "not_present",
+        citation_replay_reason:
+          item.citation_replay_reason === "persisted_citation_contract_mismatch"
+            ? item.citation_replay_reason
+            : null,
+      };
+    });
+}
+
+export function preserveTurnTraces(nextTurns: ChatTurn[], currentTurns: ChatTurn[]): ChatTurn[] {
+  const traceByRunId = new Map(
+    currentTurns
+      .filter((turn) => turn.role === "assistant" && turn.run_id && turn.trace?.length)
+      .map((turn) => [turn.run_id as string, turn.trace as AgentTraceEventPayload[]]),
+  );
+  return nextTurns.map((turn) => ({
+    ...turn,
+    trace: turn.trace?.length
+      ? turn.trace
+      : turn.run_id
+        ? traceByRunId.get(turn.run_id)
+        : undefined,
+  }));
+}
+
+async function hydrateHistoricalTurnTraces(turns: ChatTurn[]): Promise<ChatTurn[]> {
+  const hydrated = turns.map((turn) => ({ ...turn }));
+  const candidates = hydrated
+    .map((turn, index) => ({ turn, index }))
+    .filter(({ turn }) => turn.role === "assistant" && Boolean(turn.run_id) && !turn.trace?.length)
+    .slice(-8);
+  for (const { turn, index } of candidates) {
+    try {
+      const status = await fetchTaskStatus(turn.run_id as string);
+      if (status.trace?.length) {
+        hydrated[index] = { ...turn, trace: status.trace };
+      }
+    } catch {
+      // Historical trace replay is an optional product projection. The
+      // persisted answer and citations remain usable when a run is too old.
+    }
+  }
+  return hydrated;
 }
 
 function ChatHeader({
@@ -531,6 +677,44 @@ function AgentSettingsDialog({
                   </button>
                 </div>
 
+                <section className="grid gap-4 rounded-xl border border-cyan-200/12 bg-cyan-200/[0.025] p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-4">
+                    <div className="min-w-[14rem] flex-1">
+                      <p className="text-sm font-semibold text-white">Query facet posterior calibration</p>
+                      <p className="mt-1 text-xs leading-5 text-white/52">
+                        hot_reloadable · 影响下一次 search / QA / repair retrieval · 不触发切块、Qdrant 或图谱重建。仅使用确定性有界图观察，LLM sample budget 固定为 0。
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-label="Query facet posterior calibration"
+                      aria-checked={form.query_facet_posterior_enabled}
+                      disabled={disabled}
+                      onClick={() => onChange("query_facet_posterior_enabled", !form.query_facet_posterior_enabled)}
+                      className={`relative h-8 w-16 rounded-full border transition ${
+                        form.query_facet_posterior_enabled ? "border-cyan-100/40 bg-cyan-300/70" : "border-white/14 bg-white/10"
+                      } disabled:cursor-not-allowed disabled:opacity-60`}
+                    >
+                      <span className={`absolute top-1 size-6 rounded-full bg-white shadow transition ${form.query_facet_posterior_enabled ? "left-9" : "left-1"}`} />
+                    </button>
+                  </div>
+                  <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                    {queryFacetPosteriorFields.map((field) => (
+                      <AgentSettingsField
+                        key={field.key}
+                        field={field}
+                        value={form[field.key]}
+                        onChange={(value) => onChange(field.key, value)}
+                        disabled={disabled || !form.query_facet_posterior_enabled}
+                      />
+                    ))}
+                  </div>
+                  <p className="text-xs leading-5 text-amber-100/62">
+                    posterior 不是事实证据、引用来源或 gray-zone authority；它只能在未覆盖 facet 数量相同的候选之间做确定性 tie-break。
+                  </p>
+                </section>
+
                 <section className="grid gap-3 rounded-lg border border-white/8 bg-white/[0.025] p-4">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div className="min-w-[14rem]">
@@ -683,7 +867,7 @@ function EmptyChatState({ suggestions, onPick }: { suggestions: string[]; onPick
           开始一轮有证据支撑的资料问答
         </h3>
         <p className="mx-auto mt-3 max-w-[21rem] text-sm leading-7 text-white/56 sm:max-w-2xl">
-          系统会按粗概念、中概念、RQ 前缀和片段结构逐层寻址，组装上下文证据包后生成带引用的回答。
+          系统会从资料中寻找相关内容、补充必要上下文，并生成带来源的回答。
         </p>
         <div className="mt-7">
           <SuggestionChips suggestions={suggestions} onPick={onPick} />
@@ -693,7 +877,16 @@ function EmptyChatState({ suggestions, onPick }: { suggestions: string[]; onPick
   );
 }
 
-function MessageBubble({ turn, index, onOpenCitations }: { turn: ChatTurn; index: number; onOpenCitations: () => void }) {
+export function MessageBubble({
+  turn,
+  index,
+  onOpenCitations,
+}: {
+  turn: ChatTurn;
+  index: number;
+  onOpenCitations: (citations: Citation[]) => void;
+  defaultContextExpanded?: boolean;
+}) {
   const isUser = turn.role === "user";
   return (
     <motion.div
@@ -712,14 +905,22 @@ function MessageBubble({ turn, index, onOpenCitations }: { turn: ChatTurn; index
       >
         <div className="mb-3 flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-white/38">
           {isUser ? <CircleDot /> : <BrainCircuit />}
-          {isUser ? "你" : turn.route ? `智能体 / ${turn.route}` : "智能体"}
+          {isUser ? "你" : "智能体"}
         </div>
         {!isUser && turn.trace?.length ? <AgentTraceStream trace={turn.trace} compact className="mb-5" /> : null}
         <MarkdownRenderer content={turn.content} className={cn(isUser ? "text-white/78" : "text-white/74")} />
+        {!isUser && turn.citation_replay_status === "unavailable" ? (
+          <div
+            data-testid="citation-replay-unavailable"
+            className="mt-4 rounded-xl border border-amber-300/20 bg-amber-300/[0.055] px-4 py-3 text-sm leading-6 text-amber-50/80"
+          >
+            该历史回答的来源信息已过期，暂不展示。你可以重新提问以获得可核验的新引用。
+          </div>
+        ) : null}
         {!isUser && turn.citations?.length ? (
-          <button type="button" onClick={onOpenCitations} className="kg-micro-chip mt-4 rounded-full px-3 py-2 text-xs transition hover:border-cyan-200/30 hover:text-white">
+          <button type="button" onClick={() => onOpenCitations(turn.citations ?? [])} className="kg-micro-chip mt-4 rounded-full px-3 py-2 text-xs transition hover:border-cyan-200/30 hover:text-white">
             <FileText />
-            {turn.citations.length} 条已验证来源
+            {turn.citations.length} 条来源 · 查看
           </button>
         ) : null}
       </div>
@@ -727,7 +928,7 @@ function MessageBubble({ turn, index, onOpenCitations }: { turn: ChatTurn; index
   );
 }
 
-function GeneratingBubble({ content, trace }: { content: string; trace: AgentTraceEventPayload[] }) {
+export function GeneratingBubble({ content, trace }: { content: string; trace: AgentTraceEventPayload[] }) {
   return (
     <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="flex justify-start">
       <div className="w-full max-w-[min(860px,92%)] border-l border-cyan-200/18 px-5 py-4 text-white">
@@ -749,7 +950,7 @@ function GeneratingBubble({ content, trace }: { content: string; trace: AgentTra
               <span />
               <span />
             </span>
-            正在路由、检索并验证引用...
+            正在查找资料并核对来源...
           </div>
         )}
       </div>
@@ -757,7 +958,7 @@ function GeneratingBubble({ content, trace }: { content: string; trace: AgentTra
   );
 }
 
-function MessageList({
+export function MessageList({
   turns,
   isGenerating,
   draftAnswer,
@@ -771,7 +972,7 @@ function MessageList({
   draftAnswer: string;
   trace: AgentTraceEventPayload[];
   onPickSuggestion: (value: string) => void;
-  onOpenCitations: () => void;
+  onOpenCitations: (citations: Citation[]) => void;
   suggestions: string[];
 }) {
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -808,7 +1009,12 @@ function MessageList({
       ) : (
         <div className="mx-auto flex max-w-5xl flex-col gap-8 px-1 pb-6 pt-4">
           {turns.map((turn, index) => (
-            <MessageBubble key={`${turn.role}-${index}-${turn.run_id ?? "local"}`} turn={turn} index={index} onOpenCitations={onOpenCitations} />
+            <MessageBubble
+              key={`${turn.role}-${index}-${turn.run_id ?? "local"}`}
+              turn={turn}
+              index={index}
+              onOpenCitations={onOpenCitations}
+            />
           ))}
           {isGenerating ? <GeneratingBubble content={draftAnswer} trace={trace} /> : null}
           <div ref={bottomRef} className="h-52 shrink-0 md:h-56" />
@@ -883,7 +1089,7 @@ export function RetrievalGranularitySelector({
           );
         })}
       </div>
-      <span className="min-w-0 truncate text-[11px] text-white/42">{activeOption.value === "mid" ? "中层入口" : "粗层入口"}</span>
+      <span className="min-w-0 truncate text-[11px] text-white/42">{activeOption.value === "mid" ? "适合具体问题" : "适合主题总览"}</span>
       {tooltipMode ? (
         <div
           role="tooltip"
@@ -943,7 +1149,7 @@ function ChatComposer({
                 资料库上下文
               </span>
               <span className="kg-micro-chip max-w-full truncate rounded-full px-2.5 py-1 text-[11px]">
-                会话 {activeSessionId ? activeSessionId.slice(0, 8) : "新建"}
+                {activeSessionId ? "会话已建立" : "新建会话"}
               </span>
               <RetrievalGranularitySelector value={retrievalGranularity} onChange={onRetrievalGranularityChange} disabled={isPending} />
             </div>
@@ -1091,7 +1297,7 @@ function CitationsDrawer({
       <SheetContent className="w-full border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-xl">
         <SheetHeader className="border-b border-white/8 p-6">
           <SheetTitle>引用</SheetTitle>
-          <SheetDescription>智能体回答使用的已验证证据卡片。</SheetDescription>
+          <SheetDescription>查看回答所依据的资料片段、页码和章节位置。</SheetDescription>
         </SheetHeader>
         <ScrollArea className="h-[calc(100dvh-8rem)] p-6">
           <div className="flex flex-col gap-3">
@@ -1107,6 +1313,52 @@ function CitationsDrawer({
         </ScrollArea>
       </SheetContent>
     </Sheet>
+  );
+}
+
+export function ConversationStatePanel({ state }: { state: ConversationStatePayload | null }) {
+  if (!state) {
+    return null;
+  }
+
+  const filters = Object.entries(state.active_user_constraints.retrieval_filters).filter(([, value]) => {
+    if (Array.isArray(value)) {
+      return value.length > 0;
+    }
+    return value !== null && value !== undefined && value !== "";
+  });
+  const taskStatusLabels: Record<string, string> = {
+    active: "进行中",
+    waiting_user: "等待你的下一步",
+    completed: "已完成",
+    cancelled: "已取消",
+    failed: "未完成",
+  };
+  const taskStepLabels: Record<string, string> = {
+    awaiting_user: "等待下一问题",
+    retrieving: "查找资料",
+    answering: "整理回答",
+    verifying: "核对来源",
+  };
+  const taskStatusLabel =
+    taskStatusLabels[state.task_state.status] ?? "进行中";
+  const currentStepLabel = state.task_state.current_step
+    ? taskStepLabels[state.task_state.current_step] ?? "继续当前问答"
+    : "等待你的问题";
+  return (
+    <section
+      data-testid="conversation-state-panel"
+      className="mb-4 flex flex-wrap items-center gap-2 border-l border-cyan-200/18 py-1 pl-4 text-xs text-white/52"
+    >
+      <span className="kg-micro-chip rounded-full px-3 py-1.5">{taskStatusLabel} · {currentStepLabel}</span>
+      {state.task_state.objective ? <span className="max-w-xl truncate">{state.task_state.objective}</span> : null}
+      {state.active_user_constraints.instructions.slice(0, 2).map((instruction) => (
+        <span key={instruction} className="max-w-sm truncate rounded-full border border-white/8 px-2.5 py-1">{instruction}</span>
+      ))}
+      {filters.length ? <span>已应用资料范围</span> : null}
+      <span>已有 {state.history_references.length} 轮回答</span>
+      <span className="text-amber-100/62">事实仍以资料来源为准</span>
+    </section>
   );
 }
 
@@ -1126,21 +1378,86 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
   const modelSettingsQuery = useQuery({ queryKey: ["model-settings"], queryFn: fetchModelSettings });
   const [question, setQuestion] = useLocalStorage(`qa.question.${storageScope}`, "");
   const [activeSessionId, setActiveSessionId] = useLocalStorage<string | null>(`qa.sessionId.${storageScope}`, null);
-  const [turns, setTurns] = useLocalStorage<ChatTurn[]>(`qa.turns.${storageScope}`, []);
-  const [draftAnswer, setDraftAnswer] = useLocalStorage(`qa.draftAnswer.${storageScope}`, "");
-  const [citations, setCitations] = useLocalStorage<Citation[]>(`qa.citations.${storageScope}`, []);
-  const [trace, setTrace] = useLocalStorage<AgentTraceEventPayload[]>(`qa.trace.${storageScope}`, []);
-  const [latestRun, setLatestRun] = useLocalStorage<AgentResponse | null>(`qa.latestRun.${storageScope}`, null);
+  // PostgreSQL session/answer/trace rows are the durable conversation source.
+  // Large citations, trace audits and AgentResponse payloads must stay in
+  // memory; persisting them redundantly in localStorage exceeds browser quota
+  // and can prevent the final turn from rendering.
+  const [turns, setTurns] = useState<ChatTurn[]>([]);
+  const [draftAnswer, setDraftAnswer] = useState("");
+  const [citations, setCitations] = useState<Citation[]>([]);
+  const [trace, setTrace] = useState<AgentTraceEventPayload[]>([]);
+  const [latestRun, setLatestRun] = useState<AgentResponse | null>(null);
+  const [conversationState, setConversationState] = useState<ConversationStatePayload | null>(null);
   const [activeStream, setActiveStream] = useLocalStorage<ActiveStreamState | null>(`qa.activeStream.${storageScope}`, null);
   const [retrievalGranularity, setRetrievalGranularity] = useLocalStorage<RetrievalGranularity>(`qa.retrievalGranularity.${storageScope}`, "mid");
   const [streamError, setStreamError] = useState<string | null>(null);
   const streamAbortControllerRef = useRef<AbortController | null>(null);
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [citationsOpen, setCitationsOpen] = useState(false);
+  const [citationDrawerCitations, setCitationDrawerCitations] = useState<Citation[]>([]);
   const [agentSettingsOpen, setAgentSettingsOpen] = useState(false);
   const [agentSettingsForm, setAgentSettingsForm] = useState<AgentSettingsForm | null>(null);
   const [agentSettingsSavedMessage, setAgentSettingsSavedMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  const hydratedSessionIdRef = useRef<string | null>(null);
   const activeRunId = activeStream?.runId ?? null;
+  const openCitationDrawer = (items: Citation[]) => {
+    setCitationDrawerCitations(items);
+    setCitationsOpen(true);
+  };
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    for (const key of legacyQaPayloadStorageKeys(storageScope)) {
+      window.localStorage.removeItem(key);
+    }
+  }, [storageScope]);
+
+  useEffect(() => {
+    if (
+      !activeSessionId
+      || activeRunId
+      || hydratedSessionIdRef.current === activeSessionId
+    ) {
+      return;
+    }
+    let cancelled = false;
+    hydratedSessionIdRef.current = activeSessionId;
+    void (async () => {
+      try {
+        const response = await fetchSessionMessages(activeSessionId);
+        const nextTurns = await hydrateHistoricalTurnTraces(
+          normalizeMessages(response.messages, response.conversation_state),
+        );
+        if (cancelled) {
+          return;
+        }
+        setTurns(nextTurns);
+        setConversationState(response.conversation_state);
+        const latestAssistant = [...nextTurns]
+          .reverse()
+          .find((turn) => turn.role === "assistant");
+        setCitations(latestAssistant?.citations ?? []);
+        setTrace(latestAssistant?.trace ?? []);
+      } catch (error) {
+        if (!cancelled) {
+          hydratedSessionIdRef.current = null;
+          setStreamError(productQaErrorMessage(error));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      // React Strict Mode replays effects in development.  Releasing the
+      // in-flight marker lets the replayed effect perform the authoritative
+      // server hydration instead of treating the cancelled first pass as a
+      // completed session load.
+      if (hydratedSessionIdRef.current === activeSessionId) {
+        hydratedSessionIdRef.current = null;
+      }
+    };
+  }, [activeRunId, activeSessionId]);
+
   const runStatusQuery = useQuery({
     queryKey: ["agent-run", activeRunId],
     queryFn: () => fetchTaskStatus(activeRunId as string),
@@ -1148,7 +1465,6 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
     refetchInterval: activeRunId ? 1500 : false,
     retry: false,
   });
-
   const saveAgentSettingsMutation = useMutation({
     mutationFn: (payload: ModelSettingsUpdate) => updateModelSettings(payload),
     onSuccess: async (settings) => {
@@ -1169,13 +1485,14 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
         setTrace(status.trace);
       }
       const runState = status.status ?? status.state;
-      if (runState === "failed") {
-        setStreamError(status.error === "cancelled_by_user" ? userCancelledMessage : status.error ?? "回答生成已停止");
+      if (runState === "failed" || runState === "cancelled") {
+        setStreamError(productQaErrorMessage(status.error ?? "回答生成已停止"));
       }
       void queryClient.invalidateQueries({ queryKey: ["agent-run", status.run_id] });
+      void queryClient.invalidateQueries({ queryKey: ["agent-pe-audit", status.run_id] });
     },
     onError: (error) => {
-      setStreamError(error instanceof Error ? error.message : String(error));
+      setStreamError(productQaErrorMessage(error));
     },
   });
 
@@ -1188,6 +1505,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
       setStreamError(null);
       setDraftAnswer("");
       setCitations([]);
+      setCitationDrawerCitations([]);
       setTrace([]);
       setLatestRun(null);
       setActiveStream({ question: nextQuestion, retrievalGranularity, startedAt: new Date().toISOString() });
@@ -1228,6 +1546,8 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
             onFinal: (response) => {
               const finalTrace = response.trace.length ? response.trace : nextTraceEvents;
               setLatestRun(response);
+              setConversationState(response.conversation_state ?? null);
+              hydratedSessionIdRef.current = response.session_id;
               setActiveSessionId(response.session_id);
               setCitations(response.citations);
               setDraftAnswer("");
@@ -1241,21 +1561,24 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
                   route: response.route,
                   citations: response.citations,
                   trace: finalTrace,
+                  retrieval_trace_id: response.retrieval_trace_id,
+                  context_package_id: response.context_package_id,
                 },
               ]);
               setActiveStream(null);
+              void queryClient.invalidateQueries({ queryKey: ["agent-pe-audit", response.run_id] });
               void queryClient.invalidateQueries({ queryKey: ["sessions", selectedKnowledgeBaseId] });
               void queryClient.invalidateQueries({ queryKey: ["session-messages", response.session_id] });
             },
             onError: (message) => {
-              setStreamError(message === "cancelled_by_user" ? userCancelledMessage : message);
+              setStreamError(productQaErrorMessage(message));
               setActiveStream(null);
             },
           },
           { signal: controller.signal },
         );
       } catch (error) {
-        setStreamError(isAbortError(error) ? userCancelledMessage : error instanceof Error ? error.message : String(error));
+        setStreamError(isAbortError(error) ? userCancelledMessage : productQaErrorMessage(error));
         setActiveStream(null);
       } finally {
         if (streamAbortControllerRef.current === controller) {
@@ -1288,47 +1611,59 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
       }
     }
     if (status.trace?.length) {
-      setTrace(status.trace);
+      const statusTrace = status.trace;
+      queueMicrotask(() => setTrace(statusTrace));
     }
     const runState = status.status ?? status.state;
     if (runState === "completed") {
+      void queryClient.invalidateQueries({ queryKey: ["agent-pe-audit", status.run_id] });
       const sessionId = status.session_id ?? activeStream.sessionId;
-      setDraftAnswer("");
-      setActiveStream(null);
+      queueMicrotask(() => {
+        setDraftAnswer("");
+        setActiveStream(null);
+        if (!sessionId && status.answer) {
+          setTurns((current) =>
+            current.some((turn) => turn.run_id === status.run_id && turn.role === "assistant")
+              ? current
+              : [
+                  ...current,
+                  {
+                    role: "assistant",
+                    content: status.answer ?? "",
+                    run_id: status.run_id,
+                    route: status.route,
+                    trace: status.trace ?? [],
+                  },
+                ],
+          );
+        }
+      });
       if (sessionId) {
         void (async () => {
           const response = await fetchSessionMessages(sessionId);
-          const nextTurns = normalizeMessages(response.messages);
-          setTurns(nextTurns);
+          const nextTurns = normalizeMessages(response.messages, response.conversation_state);
+          const statusBoundTurns = nextTurns.map((turn) => (
+            turn.role === "assistant" && turn.run_id === status.run_id && status.trace?.length
+              ? { ...turn, trace: status.trace }
+              : turn
+          ));
+          setTurns((current) => preserveTurnTraces(statusBoundTurns, current));
+          hydratedSessionIdRef.current = sessionId;
+          setConversationState(response.conversation_state);
           const latestAssistant = [...nextTurns].reverse().find((turn) => turn.role === "assistant");
           setCitations(latestAssistant?.citations ?? []);
           await queryClient.invalidateQueries({ queryKey: ["sessions", selectedKnowledgeBaseId] });
           await queryClient.invalidateQueries({ queryKey: ["session-messages", sessionId] });
         })();
-      } else if (status.answer) {
-        setTurns((current) =>
-          current.some((turn) => turn.run_id === status.run_id && turn.role === "assistant")
-            ? current
-            : [
-                ...current,
-                {
-                  role: "assistant",
-                  content: status.answer ?? "",
-                  run_id: status.run_id,
-                  route: status.route,
-                  trace: status.trace ?? [],
-                },
-              ],
-        );
       }
-    } else if (runState === "failed") {
+    } else if (runState === "failed" || runState === "cancelled") {
       window.queueMicrotask(() => {
         if (status.error === "cancelled_by_user") {
           setStreamError(userCancelledMessage);
           setActiveStream(null);
           return;
         }
-        setStreamError(status.error ?? "回答生成失败");
+        setStreamError(productQaErrorMessage(status.error ?? "回答生成失败"));
         setActiveStream(null);
       });
     }
@@ -1340,6 +1675,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
     setActiveSessionId,
     setActiveStream,
     setCitations,
+    setConversationState,
     setDraftAnswer,
     setTrace,
     setTurns,
@@ -1349,12 +1685,15 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
     mutationFn: (sessionId: string) => deleteSession(sessionId),
     onSuccess: async (_data, sessionId) => {
       if (sessionId === activeSessionId) {
+        hydratedSessionIdRef.current = null;
         setActiveSessionId(null);
         setTurns([]);
         setDraftAnswer("");
         setCitations([]);
+        setCitationDrawerCitations([]);
         setTrace([]);
         setLatestRun(null);
+        setConversationState(null);
         setActiveStream(null);
         setQuestion("");
       }
@@ -1401,20 +1740,21 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
         <ChatHeader latestRun={latestRun} configuredChatModel={modelSettingsQuery.data?.chat_model} />
         <ChatActionRail
           onOpenSessions={() => setSessionsOpen(true)}
-          onOpenCitations={() => setCitationsOpen(true)}
+          onOpenCitations={() => openCitationDrawer(citations)}
           onOpenAgentSettings={openAgentSettingsDialog}
           citationsCount={citations.length}
         />
 
         <main className="mx-auto w-full max-w-6xl">
           {streamError ? <ErrorBlock message={streamError} /> : null}
+          <ConversationStatePanel state={conversationState} />
           <MessageList
             turns={turns}
             isGenerating={isGenerating}
             draftAnswer={draftAnswer}
             trace={trace}
             onPickSuggestion={setQuestion}
-            onOpenCitations={() => setCitationsOpen(true)}
+            onOpenCitations={openCitationDrawer}
             suggestions={suggestions}
           />
         </main>
@@ -1443,25 +1783,33 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
         activeSessionId={activeSessionId}
         onDelete={(sessionId) => deleteSessionMutation.mutate(sessionId)}
         onSelect={async (sessionId) => {
+          hydratedSessionIdRef.current = sessionId;
           setActiveSessionId(sessionId);
           setDraftAnswer("");
           setCitations([]);
+          setCitationDrawerCitations([]);
           setTrace([]);
           setLatestRun(null);
           setActiveStream(null);
           const response = await fetchSessionMessages(sessionId);
-          const nextTurns = normalizeMessages(response.messages);
-          setTurns(nextTurns);
+          const nextTurns = await hydrateHistoricalTurnTraces(
+            normalizeMessages(response.messages, response.conversation_state),
+          );
+          setTurns((current) => preserveTurnTraces(nextTurns, current));
+          setConversationState(response.conversation_state);
           const latestAssistant = [...nextTurns].reverse().find((turn) => turn.role === "assistant");
           setCitations(latestAssistant?.citations ?? []);
         }}
         onNew={() => {
+          hydratedSessionIdRef.current = null;
           setActiveSessionId(null);
           setTurns([]);
           setDraftAnswer("");
           setCitations([]);
+          setCitationDrawerCitations([]);
           setTrace([]);
           setLatestRun(null);
+          setConversationState(null);
           setActiveStream(null);
           setQuestion("");
           setRetrievalGranularity("mid");
@@ -1486,7 +1834,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
         isSaving={saveAgentSettingsMutation.isPending}
         savedMessage={agentSettingsSavedMessage}
       />
-      <CitationsDrawer open={citationsOpen} onOpenChange={setCitationsOpen} citations={citations} />
+      <CitationsDrawer open={citationsOpen} onOpenChange={setCitationsOpen} citations={citationDrawerCitations} />
     </div>
   );
 }

@@ -13,9 +13,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    args = parse_args()
+
     from app.services.runtime_settings import current_runtime_settings_version, publish_runtime_settings_version, refresh_runtime_settings_if_needed
 
-    args = parse_args()
     before = current_runtime_settings_version()
     message = None
     refresh = None

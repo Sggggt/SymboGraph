@@ -6,7 +6,7 @@ import { useQuery } from "@tanstack/react-query";
 import { motion } from "framer-motion";
 import { ArrowRight, Orbit, Radar, Sparkles, Zap } from "lucide-react";
 
-import { fetchDashboard } from "@/lib/api";
+import { fetchDashboard, fetchGraph } from "@/lib/api";
 import { NetworkCanvas } from "@/components/network-canvas";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
@@ -63,7 +63,12 @@ export function OverviewDashboard() {
   const { selectedKnowledgeBaseId } = useKnowledgeBaseContext();
   const { data, isLoading, error } = useQuery({
     queryKey: ["dashboard", selectedKnowledgeBaseId],
-    queryFn: () => fetchDashboard(selectedKnowledgeBaseId),
+    queryFn: () => fetchDashboard(selectedKnowledgeBaseId, { includeGraph: false }),
+    enabled: Boolean(selectedKnowledgeBaseId),
+  });
+  const graphQuery = useQuery({
+    queryKey: ["overview-graph", selectedKnowledgeBaseId],
+    queryFn: () => fetchGraph(selectedKnowledgeBaseId, "chunk-relation", "overview"),
     enabled: Boolean(selectedKnowledgeBaseId),
   });
 
@@ -128,13 +133,21 @@ export function OverviewDashboard() {
               <p className="section-kicker">实时图谱</p>
               <div className="mt-1.5 flex flex-wrap items-center gap-2">
                 <h3 className="text-xl font-semibold text-white">四层图谱热区</h3>
-                <GraphStaleBadge isStale={data.graph.freshness?.is_stale} />
+                <GraphStaleBadge isStale={graphQuery.data?.freshness?.is_stale} />
               </div>
             </div>
             <Orbit className="size-5 text-cyan-200" />
           </div>
           <div className="min-h-0 flex-1">
-            <NetworkCanvas graph={data.graph} height={340} />
+            {graphQuery.isLoading ? (
+              <div className="flex h-[340px] items-center justify-center rounded-[24px] border border-white/8 bg-white/[0.02] text-sm text-white/55">
+                图谱正在加载，概览数据已就绪
+              </div>
+            ) : graphQuery.error ? (
+              <ErrorBlock message={(graphQuery.error as Error).message} />
+            ) : (
+              <NetworkCanvas graph={graphQuery.data ?? data.graph} height={340} />
+            )}
           </div>
         </motion.div>
       </section>

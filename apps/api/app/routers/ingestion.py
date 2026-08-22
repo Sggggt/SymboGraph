@@ -4,8 +4,9 @@ import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, UploadFile, File
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -13,19 +14,33 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.db import get_db
 from app.models import Chunk, IngestionBatch, IngestionJob
-from app.schemas import BatchLogTokenResponse, BatchStartResponse, IngestionBatchSummary, JobStatusResponse, ParseUploadedFilesRequest, UploadFileResponse
+from app.schemas import (
+    BatchLogTokenResponse,
+    BatchStartResponse,
+    IngestionBatchSummary,
+    JobStatusResponse,
+    ParseUploadedFilesRequest,
+    StorageMaintenanceRecoveryHealth,
+    UploadFileResponse,
+    UploadReplacementRecoveryHealth,
+)
 from app.services.ingestion import (
     collect_source_documents,
     create_sync_batch,
     create_uploaded_files_batch,
     get_batch_status,
     get_job_status,
+    ingestion_job_language_identity_summary,
     register_uploaded_file,
     request_batch_cancel_control,
     resolve_knowledge_base,
     run_batch_ingestion,
     run_ingestion_job,
     run_uploaded_files_ingestion,
+)
+from app.services.language_metadata import (
+    InvalidExplicitLanguageMetadata,
+    normalize_explicit_language_tag,
 )
 from app.services.ingestion_logs import (
     TERMINAL_LOG_EVENTS,
@@ -35,9 +50,52 @@ from app.services.ingestion_logs import (
     unsubscribe_ingestion_logs,
     validate_log_stream_token,
 )
-from app.services.storage import save_upload
+from app.services.ingestion_resource_lock import (
+    IngestionResourceBusyError,
+    IngestionResourceLockReleaseError,
+    knowledge_base_ingestion_resource_lock,
+)
+from app.services.storage import (
+    UploadTooLargeError,
+    UploadValidationError,
+    run_bounded_source_io,
+)
+from app.services.storage_maintenance import (
+    reconcile_pending_storage_maintenance_startup,
+    storage_maintenance_recovery_health,
+)
+from app.services.upload_replacement import (
+    UPLOAD_SOURCE_REPLACEMENT_PROTOCOL_VERSION,
+    UploadReplacementRecoveryError,
+    begin_upload_source_replacement,
+    complete_upload_replacement_after_database_commit,
+    mark_upload_replacement_database_committed,
+    record_postcommit_lock_release_failure,
+    rollback_upload_replacement,
+    upload_replacement_registration_is_committed,
+    reconcile_pending_upload_replacements_startup,
+    upload_replacement_recovery_health,
+)
 
 router = APIRouter()
+
+
+@router.post(
+    "/maintenance/upload-replacements/reconcile",
+    response_model=UploadReplacementRecoveryHealth,
+)
+async def reconcile_upload_replacements_maintenance() -> dict:
+    await reconcile_pending_upload_replacements_startup()
+    return upload_replacement_recovery_health()
+
+
+@router.post(
+    "/maintenance/storage-intents/reconcile",
+    response_model=StorageMaintenanceRecoveryHealth,
+)
+async def reconcile_storage_maintenance_intents() -> dict:
+    await reconcile_pending_storage_maintenance_startup()
+    return storage_maintenance_recovery_health()
 
 
 def get_requested_knowledge_base(db: Session, knowledge_base_id: str | None = None):
@@ -156,16 +214,133 @@ def enqueue_uploaded_batch_background(batch_id: str, file_paths: list[str], forc
 async def upload_file(
     knowledge_base_id: str | None = None,
     upload: UploadFile = File(...),
+    language: Annotated[str | None, Form()] = None,
+    expected_sha256: Annotated[str | None, Form()] = None,
     db: Session = Depends(get_db),
 ) -> dict:
     knowledge_base = get_requested_knowledge_base(db, knowledge_base_id)
-    stored_path = await save_upload(upload, knowledge_base.name)
     try:
-        document, job = register_uploaded_file(db, knowledge_base, stored_path)
-    except Exception:
-        stored_path.unlink(missing_ok=True)
-        raise
-    return {"document_id": document.id, "job_id": job.id, "status": "queued", "source_path": str(stored_path)}
+        explicit_language = normalize_explicit_language_tag(language)
+    except InvalidExplicitLanguageMetadata as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_language_metadata", "message": str(exc)},
+        ) from exc
+    registration_committed = False
+    replacement = None
+    cleanup_result: dict = {"status": "not_started", "phase": "not_started"}
+    lock_release_audit: dict | None = None
+    lock_release_diagnostics: dict | None = None
+    try:
+        async with knowledge_base_ingestion_resource_lock(
+            db,
+            knowledge_base.id,
+            operation="upload_registration",
+        ) as resource_lock:
+            try:
+                replacement = await begin_upload_source_replacement(
+                    db,
+                    knowledge_base,
+                    upload,
+                    expected_checksum=expected_sha256,
+                )
+                stored_path = replacement.target
+            except UploadTooLargeError as exc:
+                raise HTTPException(status_code=413, detail={"code": "upload_too_large", "message": str(exc)}) from exc
+            except UploadValidationError as exc:
+                raise HTTPException(status_code=400, detail={"code": "invalid_upload", "message": str(exc)}) from exc
+            except UploadReplacementRecoveryError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "upload_recovery_pending", "message": str(exc)},
+                ) from exc
+            try:
+                document, job = await run_bounded_source_io(
+                    register_uploaded_file,
+                    db,
+                    knowledge_base,
+                    stored_path,
+                    explicit_language=explicit_language,
+                    logical_source_slot_key=replacement.logical_source_slot_key,
+                    display_filename=replacement.display_filename,
+                    commit=False,
+                )
+                job.stats = {
+                    **(job.stats or {}),
+                    "ingestion_resource_lock": resource_lock.diagnostics(),
+                    "upload_content_validation": dict(
+                        replacement.content_validation or {}
+                    ),
+                }
+                mark_upload_replacement_database_committed(
+                    db,
+                    replacement,
+                    document_id=document.id,
+                    job_id=job.id,
+                )
+                db.commit()
+                registration_committed = True
+            except BaseException as registration_exc:
+                db.rollback()
+                try:
+                    recovery = await run_bounded_source_io(
+                        rollback_upload_replacement,
+                        db,
+                        replacement,
+                    )
+                except BaseException as rollback_exc:
+                    if upload_replacement_registration_is_committed(db, replacement):
+                        registration_committed = True
+                        recovery = {"status": "manual_review"}
+                    else:
+                        rollback_exc.add_note(
+                            "Upload registration also failed before rollback; the durable intent remains fail-closed"
+                        )
+                        raise rollback_exc from registration_exc
+                if recovery["status"] in {"completed", "cleanup_pending"}:
+                    registration_committed = True
+                if not registration_committed:
+                    raise
+            cleanup_result = await run_bounded_source_io(
+                complete_upload_replacement_after_database_commit,
+                db,
+                replacement,
+            )
+    except IngestionResourceBusyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ingestion_resource_busy",
+                "message": str(exc),
+                "resource_lock": exc.diagnostics,
+            },
+        ) from exc
+    except IngestionResourceLockReleaseError as exc:
+        if not registration_committed or replacement is None:
+            raise
+        lock_release_diagnostics = exc.diagnostics
+        lock_release_audit = record_postcommit_lock_release_failure(
+            db,
+            replacement,
+            exc.diagnostics,
+        )
+    return {
+        "document_id": document.id,
+        "job_id": job.id,
+        "status": "queued",
+        "source_path": str(stored_path),
+        "language_identity": ingestion_job_language_identity_summary(job),
+        "upload_replacement": {
+            "protocol_version": UPLOAD_SOURCE_REPLACEMENT_PROTOCOL_VERSION,
+            "intent_id": replacement.intent_id,
+            "status": cleanup_result.get("status"),
+            "phase": cleanup_result.get("phase"),
+            "database_committed": registration_committed,
+            "cleanup_pending": cleanup_result.get("status") != "completed",
+            "postcommit_lock_release_failure": lock_release_diagnostics,
+            "lock_release_audit": lock_release_audit,
+        },
+    }
 
 
 @router.post("/ingestion/parse-uploaded-files", response_model=BatchStartResponse)
@@ -176,7 +351,11 @@ async def parse_uploaded_files(
     db: Session = Depends(get_db),
 ) -> dict:
     knowledge_base = get_requested_knowledge_base(db, knowledge_base_id)
-    storage_root = Path(get_settings().knowledge_base_paths_for_name(knowledge_base.name)["storage_root"]).resolve()
+    storage_root = Path(
+        get_settings().knowledge_base_paths_for_source_root(
+            knowledge_base.source_root
+        )["storage_root"]
+    ).resolve()
     requested_paths = request.file_paths or [str(path) for path in collect_source_documents(storage_root)]
     if not requested_paths:
         raise HTTPException(status_code=400, detail="No files found in knowledge base storage")
@@ -211,7 +390,11 @@ async def parse_uploaded_files(
 @router.post("/ingestion/parse-storage", response_model=BatchStartResponse)
 async def parse_storage_directory(background_tasks: BackgroundTasks, knowledge_base_id: str | None = None, db: Session = Depends(get_db)) -> dict:
     knowledge_base = get_requested_knowledge_base(db, knowledge_base_id)
-    root = Path(get_settings().knowledge_base_paths_for_name(knowledge_base.name)["storage_root"])
+    root = Path(
+        get_settings().knowledge_base_paths_for_source_root(
+            knowledge_base.source_root
+        )["storage_root"]
+    )
     if not root.exists():
         raise HTTPException(status_code=404, detail=f"Storage root not found: {root}")
     batch = create_sync_batch(db, knowledge_base.id, root, trigger_source="storage")

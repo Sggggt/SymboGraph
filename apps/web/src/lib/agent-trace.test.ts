@@ -1,6 +1,33 @@
 import { describe, expect, it } from "vitest";
+import type { AgentTraceEventPayload, AgentTraceScores } from "@course-kg/shared";
 
 import { contextGraphTraceFallbackSteps, groupTraceEvents, traceAuditSummary, traceNodeLabel } from "./agent-trace";
+
+function traceScores(overrides: Partial<AgentTraceScores> = {}): AgentTraceScores {
+  return {
+    contract_version: "agent_trace_scores_public_v1",
+    audit_kind: "retrieval_stage",
+    query_rq_path: [],
+    chunk_ids: [],
+    ...overrides,
+  } as AgentTraceScores;
+}
+
+function traceEvent(node: AgentTraceEventPayload["node"]): AgentTraceEventPayload {
+  return {
+    contract_version: "agent_trace_event_public_v1",
+    type: "trace",
+    run_id: "run:test",
+    sequence_index: 0,
+    node,
+    status: "completed",
+    input_summary: "",
+    output_summary: "",
+    document_ids: [],
+    scores: traceScores(),
+    duration_ms: 1,
+  };
+}
 
 describe("agent trace helpers", () => {
   it("uses four-layer P&E fallback steps", () => {
@@ -35,33 +62,36 @@ describe("agent trace helpers", () => {
   it("groups trace events by QA workflow stage", () => {
     expect(
       groupTraceEvents([
-        { node: "entry_selection", status: "completed", document_ids: [], scores: {}, duration_ms: 1 },
-        { node: "frontier_traversal", status: "completed", document_ids: [], scores: {}, duration_ms: 1 },
-        { node: "citation_verification", status: "completed", document_ids: [], scores: {}, duration_ms: 1 },
+        traceEvent("entry_selection"),
+        traceEvent("frontier_traversal"),
+        traceEvent("citation_verification"),
       ]).map((group) => group.label),
     ).toEqual(["分阶段入口", "队列遍历", "引用验证"]);
   });
 
   it("summarizes context graph audit scores including RQ path", () => {
-    expect(
-      traceAuditSummary({
-        audit: {
-          coarse_entries: 2,
-          mid_entries: 3,
-          rq_membership_entries: 4,
-          frontier_pops: 5,
-          red_zone_pruned_count: 2,
-          query_rq_path: [1, 2, 3],
-          recalled_chunks: 10,
-          structure_neighbors: 6,
-          context_package_id: "pkg-1",
-        },
-      }),
-    ).toEqual(["粗入口: 2", "中入口: 3", "RQ 归属: 4", "Frontier pop: 5", "红区剪枝: 2", "RQ 路径: 1/2/3", "召回片段: 10", "结构邻居: 6", "证据包: pkg-1"]);
+    const retrievalSummary = traceAuditSummary({
+        contract_version: "agent_trace_scores_public_v1",
+        audit_kind: "retrieval_stage",
+        coarse_entries: 2,
+        stage_queue_count: 3,
+        frontier_pops: 5,
+        dominance_pruned_count: 2,
+        query_rq_path: [1, 2, 3],
+        chunk_ids: [],
+      });
+    const contextSummary = traceAuditSummary({
+        contract_version: "agent_trace_scores_public_v1",
+        audit_kind: "context_restoration",
+        hit_chunks: 10,
+        restored_chunks: 6,
+        context_package_id: "pkg-1",
+      });
+    expect([...retrievalSummary, ...contextSummary]).toEqual(["粗入口: 2", "Stage 队列: 3", "Frontier pop: 5", "支配剪枝: 2", "RQ 路径: 1/2/3", "命中片段: 10", "恢复片段: 6", "证据包: pkg-1"]);
   });
 
   it("renders retrieval granularity in Chinese", () => {
-    expect(traceAuditSummary({ audit: { retrieval_granularity: "mid" } })).toContain("检索模式: 普通模式");
-    expect(traceAuditSummary({ audit: { retrieval_granularity: "coarse" } })).toContain("检索模式: 摘要模式");
+    expect(traceAuditSummary(traceScores({ retrieval_granularity: "mid" }))).toContain("检索模式: 普通模式");
+    expect(traceAuditSummary(traceScores({ retrieval_granularity: "coarse" }))).toContain("检索模式: 摘要模式");
   });
 });

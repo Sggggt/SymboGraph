@@ -9,8 +9,11 @@ from watchdog.observers import Observer
 from worker_app.bootstrap import API_ROOT  # noqa: F401
 from worker_app.tasks import ingest_path
 from app.core.config import get_settings
-from app.services.ingestion import should_include_source
-from app.services.storage import compute_checksum
+from app.services.ingestion import should_include_file
+from app.services.storage import (
+    ensure_storage_durability_ready,
+    validate_source_content_path,
+)
 
 
 class KnowledgeBaseEventHandler(FileSystemEventHandler):
@@ -28,10 +31,18 @@ class KnowledgeBaseEventHandler(FileSystemEventHandler):
             self._handle(Path(event.src_path))
 
     def _handle(self, path: Path) -> None:
-        if not should_include_source(path) or not path.exists():
+        if not should_include_file(
+            path,
+            authorized_root=self.settings.storage_root_path,
+        ) or not path.exists():
             return
         stat = path.stat()
-        checksum = compute_checksum(path)
+        validation = validate_source_content_path(
+            path,
+            self.settings.storage_root_path,
+            max_bytes=self.settings.upload_max_bytes,
+        )
+        checksum = validation.checksum
         cached = self.cache.get(str(path))
         snapshot = (stat.st_mtime, checksum)
         if cached == snapshot:
@@ -42,8 +53,8 @@ class KnowledgeBaseEventHandler(FileSystemEventHandler):
 
 def main() -> None:
     settings = get_settings()
+    ensure_storage_durability_ready(settings=settings, force_probe=True)
     storage_root = settings.storage_root_path
-    storage_root.mkdir(parents=True, exist_ok=True)
     observer = Observer()
     handler = KnowledgeBaseEventHandler()
     observer.schedule(handler, str(storage_root), recursive=True)

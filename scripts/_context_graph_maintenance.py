@@ -13,6 +13,7 @@ if str(API_ROOT) not in sys.path:
     sys.path.insert(0, str(API_ROOT))
 
 OUTPUT_ROOT = REPO_ROOT / "output"
+KNOWLEDGE_BASE_RESOLUTION_SAMPLE_LIMIT = 8
 
 
 def utc_stamp() -> str:
@@ -40,10 +41,9 @@ def session_scope():
 
 
 def resolve_knowledge_base(db, *, knowledge_base_id: str | None = None, knowledge_base_name: str | None = None):
-    from sqlalchemy import select
+    from sqlalchemy import func, select
 
-    from app.models import KnowledgeBase
-    from app.services.ingestion import resolve_knowledge_base as resolve_default
+    from app.models import Chunk, KnowledgeBase
 
     if knowledge_base_id:
         knowledge_base = db.get(KnowledgeBase, knowledge_base_id)
@@ -55,18 +55,72 @@ def resolve_knowledge_base(db, *, knowledge_base_id: str | None = None, knowledg
         if knowledge_base is None:
             raise SystemExit(f"Knowledge base not found: {knowledge_base_name}")
         return knowledge_base
-    knowledge_bases = db.scalars(select(KnowledgeBase)).all()
-    def rank_key(item):
-        changed_at = getattr(item[1], "updated_at", None) or getattr(item[1], "created_at", None)
-        return (item[0], changed_at.isoformat() if changed_at else "")
-
-    ranked = sorted(
-        ((active_chunk_count(db, knowledge_base.id), knowledge_base) for knowledge_base in knowledge_bases),
-        key=rank_key,
-        reverse=True,
+    active_counts = (
+        select(
+            Chunk.knowledge_base_id.label("knowledge_base_id"),
+            func.count(Chunk.id).label("active_chunk_count"),
+        )
+        .where(Chunk.state == "active")
+        .group_by(Chunk.knowledge_base_id)
+        .subquery()
     )
-    if ranked and ranked[0][0] > 0:
-        return ranked[0][1]
+    active_chunk_count_expr = func.coalesce(
+        active_counts.c.active_chunk_count,
+        0,
+    )
+    changed_at_expr = func.coalesce(
+        KnowledgeBase.updated_at,
+        KnowledgeBase.created_at,
+    )
+    bounded_rows = list(
+        db.execute(
+            select(
+                KnowledgeBase,
+                active_chunk_count_expr.label("active_chunk_count"),
+                changed_at_expr.label("changed_at"),
+            )
+            .outerjoin(
+                active_counts,
+                active_counts.c.knowledge_base_id == KnowledgeBase.id,
+            )
+            .where(active_chunk_count_expr > 0)
+            .order_by(
+                active_chunk_count_expr.desc(),
+                changed_at_expr.desc(),
+                KnowledgeBase.id.asc(),
+            )
+            .limit(KNOWLEDGE_BASE_RESOLUTION_SAMPLE_LIMIT + 1)
+        )
+    )
+    if bounded_rows:
+        best_knowledge_base, best_count, best_changed_at = bounded_rows[0]
+        tied_rows = [
+            row
+            for row in bounded_rows
+            if int(row[1]) == int(best_count) and row[2] == best_changed_at
+        ]
+        if len(tied_rows) > 1:
+            sampled_rows = tied_rows[:KNOWLEDGE_BASE_RESOLUTION_SAMPLE_LIMIT]
+            sample = [
+                {
+                    "id": str(row[0].id),
+                    "name": str(row[0].name),
+                    "active_chunk_count": int(row[1]),
+                    "changed_at": row[2].isoformat() if row[2] else None,
+                }
+                for row in sampled_rows
+            ]
+            sample_truncated = (
+                len(tied_rows) > KNOWLEDGE_BASE_RESOLUTION_SAMPLE_LIMIT
+            )
+            raise SystemExit(
+                "Knowledge base selection is ambiguous; specify --knowledge-base-id or "
+                f"--knowledge-base-name. candidate_sample={json.dumps(sample, ensure_ascii=False)}; "
+                f"sample_truncated={str(sample_truncated).lower()}"
+            )
+        return best_knowledge_base
+    from app.services.ingestion import resolve_knowledge_base as resolve_default
+
     try:
         return resolve_default(db, None)
     except LookupError as exc:
@@ -81,9 +135,34 @@ def active_chunk_count(db, knowledge_base_id: str) -> int:
     return db.scalar(select(func.count(Chunk.id)).where(Chunk.knowledge_base_id == knowledge_base_id, Chunk.state == "active")) or 0
 
 
-def storage_files(knowledge_base_name: str) -> list[Path]:
+def active_chunk_max_version(db, knowledge_base_id: str) -> int:
+    from sqlalchemy import func, select
+
+    from app.models import Chunk
+
+    return int(
+        db.scalar(
+            select(func.max(Chunk.chunk_version)).where(
+                Chunk.knowledge_base_id == knowledge_base_id,
+                Chunk.state == "active",
+            )
+        )
+        or 0
+    )
+
+
+def knowledge_base_storage_root(knowledge_base_source_root: str | Path) -> Path:
     from app.core.config import get_settings
+
+    return Path(
+        get_settings().knowledge_base_paths_for_source_root(
+            knowledge_base_source_root
+        )["storage_root"]
+    )
+
+
+def storage_files(knowledge_base_source_root: str | Path) -> list[Path]:
     from app.services.ingestion import collect_source_documents
 
-    root = get_settings().knowledge_base_paths_for_name(knowledge_base_name)["storage_root"]
+    root = knowledge_base_storage_root(knowledge_base_source_root)
     return collect_source_documents(root)

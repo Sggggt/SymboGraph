@@ -1,5 +1,6 @@
 ﻿import type {
   AgentResponse,
+  AgentPEAuditResponse,
   AgentTraceEventPayload,
   BatchLogTokenResponse,
   BatchStartResponse,
@@ -26,6 +27,9 @@
   ContextPackageResponse,
   RetrievalTraceStepsResponse,
   RuntimeCheckResponse,
+  RuntimeSettingsCandidateActionRequest,
+  RuntimeSettingsCandidateCreate,
+  RuntimeSettingsCandidateResponse,
   SearchRequest,
   SearchResponse,
   SessionMessagesResponse,
@@ -182,6 +186,53 @@ export async function updateModelSettings(payload: ModelSettingsUpdate): Promise
     body: JSON.stringify(payload),
   });
   return parseResponse<ModelSettingsResponse>(response);
+}
+
+export async function createRuntimeSettingsCandidate(
+  payload: RuntimeSettingsCandidateCreate,
+): Promise<RuntimeSettingsCandidateResponse> {
+  const response = await fetch(buildApiUrl("/settings/runtime-candidates"), {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<RuntimeSettingsCandidateResponse>(response);
+}
+
+export async function fetchRuntimeSettingsCandidate(
+  candidateId: string,
+): Promise<RuntimeSettingsCandidateResponse> {
+  const response = await fetch(
+    buildApiUrl(`/settings/runtime-candidates/${encodeURIComponent(candidateId)}`),
+    { cache: "no-store", headers: authHeaders() },
+  );
+  return parseResponse<RuntimeSettingsCandidateResponse>(response);
+}
+
+export async function runRuntimeSettingsCandidateAction(
+  candidateId: string,
+  action: "build" | "evaluate" | "rollback",
+  payload: RuntimeSettingsCandidateActionRequest = {},
+): Promise<RuntimeSettingsCandidateResponse> {
+  const response = await fetch(
+    buildApiUrl(`/settings/runtime-candidates/${encodeURIComponent(candidateId)}/${action}`),
+    {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify(payload),
+    },
+  );
+  return parseResponse<RuntimeSettingsCandidateResponse>(response);
+}
+
+export async function promoteRuntimeSettingsCandidate(
+  candidateId: string,
+): Promise<RuntimeSettingsCandidateResponse> {
+  const response = await fetch(
+    buildApiUrl(`/settings/runtime-candidates/${encodeURIComponent(candidateId)}/promote`),
+    { method: "POST", headers: jsonHeaders() },
+  );
+  return parseResponse<RuntimeSettingsCandidateResponse>(response);
 }
 
 export async function fetchStrategyProfiles(): Promise<StrategyProfileSummary[]> {
@@ -362,7 +413,15 @@ export async function rebuildGraph(
 }
 
 export async function fetchGraph(knowledgeBaseId: string | null | undefined, graphType: GraphType, view: GraphResponse["view"] = "overview"): Promise<GraphResponse> {
-  const response = await fetch(buildApiUrl("/knowledge_bases/current/graph", { knowledge_base_id: knowledgeBaseId, graph_type: graphType, view }), { cache: "no-store", headers: authHeaders() });
+  const response = await fetch(buildApiUrl("/knowledge_bases/current/graph", {
+    knowledge_base_id: knowledgeBaseId,
+    graph_type: graphType,
+    view,
+    // The overview is an interactive sample; the response still carries the
+    // complete node/edge counts and graph hashes. Keep the browser payload
+    // bounded while PostgreSQL admission continues to replay full facts.
+    limit: "100",
+  }), { cache: "no-store", headers: authHeaders() });
   return parseResponse<GraphResponse>(response);
 }
 
@@ -475,6 +534,14 @@ export async function fetchAutoTpeStatus(knowledgeBaseId: string): Promise<AutoT
 export async function fetchTaskStatus(runId: string): Promise<TaskStatusResponse> {
   const response = await fetch(buildApiUrl(`/tasks/${encodeURIComponent(runId)}`), { cache: "no-store", headers: authHeaders() });
   return parseResponse<TaskStatusResponse>(response);
+}
+
+export async function fetchAgentPEAudit(runId: string): Promise<AgentPEAuditResponse> {
+  const response = await fetch(
+    buildApiUrl(`/agent/runs/${encodeURIComponent(runId)}/pe-audit`),
+    { cache: "no-store", headers: authHeaders() },
+  );
+  return parseResponse<AgentPEAuditResponse>(response);
 }
 
 export async function cancelAgentRun(runId: string): Promise<TaskStatusResponse> {

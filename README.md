@@ -8,7 +8,7 @@
 
 ## 项目简介
 
-SymboGraph 是一个本地通用智能知识库系统。系统采用 Four-Layer Context Graph RAG：固定 token chunk 提供稳定索引和引用地址，Chunk Structure Graph 只保存原文结构和上下文恢复路径，Chunk Relation Graph 保存可复算的底层语义关系和 RQ chunk-pair evidence，Mid Concept Graph 严格由 RQ L3 prefix packet 投影，Coarse Concept Graph 严格由 RQ L2 prefix packet 投影，检索与问答通过 context package 和 citation verification 保持答案接地。
+SymboGraph 是一个本地通用智能知识库系统。系统采用 Four-Layer Context Graph RAG：固定 token chunk 提供稳定索引和引用地址，Chunk Structure Graph 保存原文结构和上下文恢复路径，Chunk Relation Graph 保存可复算的底层语义关系和 RQ chunk-pair evidence。RQ fuzzy membership 只负责路由和诊断；Mid Concept Graph 与 Coarse Concept Graph 分别由 RQ L3、L2 prefix packet 经过确定性 eligibility 规则压缩产生，并保持 `Mid≤chunks`、`Coarse≤Mid`。检索与问答只使用 context package，答案必须通过 citation verification。
 
 ## 目录
 
@@ -42,7 +42,7 @@ SymboGraph 面向本地资料库、课程资料、技术文档和研究资料的
 | 存储 | PostgreSQL 16, Qdrant 1.17.1, Redis 7 |
 | 异步任务 | Celery, Redis broker |
 | 检索 | Dense embedding, dense-only chunk relation graph, RQ membership, staged layered traversal |
-| 模型接口 | OpenAI-compatible chat 和 embedding endpoint |
+| 模型接口 | 可选 OpenAI-compatible / Anthropic Messages 的 chat、graph endpoint；embedding 固定 OpenAI-compatible |
 | 前端 | Next.js 16.2.4, React 19.2.4, TypeScript, TanStack Query, Tailwind CSS, ECharts |
 | 运维 | Docker Compose, Python maintenance scripts, pytest, Vitest, ESLint |
 
@@ -76,22 +76,32 @@ source files
 Copy-Item .env.example .env
 ```
 
-至少配置 chat、graph 和 embedding endpoint：
+至少配置 PostgreSQL、chat、graph 和 embedding endpoint。数据库密码必须是本地生成值，不能提交：
 
 ```env
+POSTGRES_USER=symbograph
+POSTGRES_PASSWORD=<local-random-password>
+POSTGRES_DB=symbograph
+DATABASE_URL=postgresql+psycopg://symbograph:<local-random-password>@localhost:5432/symbograph
+
 CHAT_API_KEY=...
+CHAT_API_PROTOCOL=openai
 CHAT_BASE_URL=https://your-chat-endpoint/v1
 CHAT_MODEL=your-chat-model
 
 GRAPH_API_KEY=...
+GRAPH_API_PROTOCOL=openai
 GRAPH_BASE_URL=https://your-graph-endpoint/v1
 GRAPH_MODEL=your-graph-model
 
 EMBEDDING_API_KEY=...
+EMBEDDING_API_PROTOCOL=openai
 EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1
 EMBEDDING_MODEL=your-embedding-model
 EMBEDDING_DIMENSIONS=1024
 ```
+
+三个协议字段彼此独立。`CHAT_API_PROTOCOL` 与 `GRAPH_API_PROTOCOL` 可分别选择 `openai` 或 `anthropic`；选择 `anthropic` 时，对应 base 必须填写 provider 根地址或路径前缀，不能以 `/v1` 或 `/v1/messages` 结尾，客户端固定追加 `/v1/messages`。选择 `openai` 时固定追加 `/chat/completions`。`EMBEDDING_API_PROTOCOL` 当前只允许 `openai`，固定追加 `/embeddings`；Anthropic Messages 没有 embedding 契约，不能用于向量模型。向量协议属于 `rebuild_required`，只能通过 candidate、shadow build、evaluation 和 promotion 生效。
 
 正常运行路径保持 fallback 关闭：
 
@@ -100,10 +110,26 @@ ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 ```
 
+设置页保存的是完整 desired 配置。`hot_reloadable` 字段会发布到 active 运行时；`rebuild_required` 与 `service_recreate_required` 字段分别等待显式重建/promotion 或服务重建，不会因页面保存而静默改写 active 图谱或容器拓扑。真实 endpoint、模型名、API key、资料 manifest 和授权回执只保存在被 Git 忽略的本地配置或 `output/` 中，仓库示例只能使用占位符或 `.invalid` 合成 fixture。
+
 ## 快速启动
 
 ```powershell
-docker compose -f infra/docker-compose.yml up -d --build
+.\start-app.ps1
+```
+
+启动器会用可变本地 tag 重建 API/Web 镜像；worker 复用 API 镜像。`.env`
+中的 `API_IMAGE=name@sha256:...` 只表示锁定运行引用，不能作为 Docker build
+输出 tag，`rebuild-images.ps1` 会显式覆盖它：
+
+```powershell
+# 只重建本地开发镜像
+.\rebuild-images.ps1
+
+# 已存在的 digest 只允许运行，不参与 build
+.\start-app.ps1 -SkipBuild `
+  -ApiImage "course-kg-api@sha256:<digest>" `
+  -WebImage "course-kg-web@sha256:<digest>"
 ```
 
 访问：
@@ -111,7 +137,7 @@ docker compose -f infra/docker-compose.yml up -d --build
 ```text
 Web: http://127.0.0.1:3000
 API: http://127.0.0.1:8000/api
-Health: http://127.0.0.1:8000/api/health
+Readiness: http://127.0.0.1:8000/api/ready
 ```
 
 默认容器：
@@ -135,9 +161,9 @@ course-kg-qdrant
 | 基础设施 | `DATABASE_URL`, `QDRANT_URL`, `QDRANT_COLLECTION`, `REDIS_URL`, `CORS_ORIGINS`, `API_KEYS` |
 | 数据目录 | `KNOWLEDGE_BASE_NAME`, `DATA_ROOT`, `STORAGE_ROOT`, `INGESTION_ROOT` |
 | 模型桥接 | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT`, `MODEL_BRIDGE_ADMIN_TOKEN` |
-| 对话模型 | `CHAT_API_KEY`, `CHAT_BASE_URL`, `CHAT_RESOLVE_IP`, `CHAT_MODEL` |
-| 图构建模型 | `GRAPH_API_KEY`, `GRAPH_BASE_URL`, `GRAPH_RESOLVE_IP`, `GRAPH_MODEL` |
-| 向量模型 | `EMBEDDING_API_KEY`, `EMBEDDING_BASE_URL`, `EMBEDDING_RESOLVE_IP`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_BATCH_SIZE` |
+| 对话模型 | `CHAT_API_KEY`, `CHAT_API_PROTOCOL`, `CHAT_BASE_URL`, `CHAT_RESOLVE_IP`, `CHAT_MODEL` |
+| 图构建模型 | `GRAPH_API_KEY`, `GRAPH_API_PROTOCOL`, `GRAPH_BASE_URL`, `GRAPH_RESOLVE_IP`, `GRAPH_MODEL` |
+| 向量模型 | `EMBEDDING_API_KEY`, `EMBEDDING_API_PROTOCOL` (`openai`), `EMBEDDING_BASE_URL`, `EMBEDDING_RESOLVE_IP`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_BATCH_SIZE` |
 | 并发与资源 | `WORKER_CONCURRENCY`, `WORKER_MAX_TASKS_PER_CHILD`, `MODEL_REQUEST_CONCURRENCY`, `MODEL_REQUEST_TIMEOUT_SECONDS`, `INGESTION_MEMORY_SOFT_LIMIT_RATIO`, `INGESTION_MEMORY_HARD_LIMIT_RATIO`, `INGESTION_MEMORY_CRITICAL_LIMIT_RATIO` |
 | 片段与上下文 | `FIXED_CHUNK_SIZE_TOKENS`, `FIXED_CHUNK_OVERLAP_TOKENS`, `CONTEXT_PACKAGE_TOKEN_BUDGET` |
 | 中概念抽取 | `MID_CONCEPT_EXTRACTION_MAX_MODEL_BATCHES`, `MID_CONCEPT_EXTRACTION_MAX_CANDIDATES_PER_BATCH`, `MID_CONCEPT_EXTRACTION_MAX_TOKENS_PER_BATCH`, `MID_CONCEPT_CANDIDATE_KEEP_THRESHOLD` |
@@ -172,7 +198,22 @@ Docker smoke：
 
 ```powershell
 python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
+python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --execute
 ```
+
+第一条命令只执行 GET 预检并打印精确 KB、query、`POST /search`、
+`POST /qa` 目标与影响；第二条命令才允许发送会写审计状态的 POST。
+
+提交或推送前还应执行：
+
+```powershell
+git status --short
+git diff --check
+git ls-files -o --exclude-standard
+git ls-files -ci --exclude-standard
+```
+
+确认 `.env`、本地数据库、资料文件、`output/`、浏览器 trace、证书和私钥均未被跟踪；检查待推送的所有 commit，而不只是工作区最新 diff。仓库内测试凭据必须使用明显的 `unit-test-*` 或 `.invalid` fixture，禁止复制真实 endpoint、模型桥 token、个人文件名或私有资料 hash。
 
 ## 运维测试
 
@@ -181,14 +222,15 @@ python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
 ```powershell
 python scripts/diagnose_context_graph.py
 python scripts/evaluate_layered_retrieval.py
+python scripts/evaluate_layered_retrieval.py --query "<query>" --execute
 python scripts/check_context_package_quality.py
 python scripts/evaluate_agent_trace.py
 python scripts/check_technical_spec_compliance.py --knowledge-base-name 贝叶斯
 python scripts/reconcile_vector_records.py
-python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
+python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --execute
 ```
 
-写数据脚本默认提供 dry-run 或要求显式 `--execute`。生成的诊断、benchmark、smoke 输出和验收报告写入 `output/`。
+`evaluate_layered_retrieval.py` 默认只重放 PostgreSQL 中已有 trace；新检索必须同时提供显式 query 和 `--execute`。写数据脚本默认提供 dry-run 或要求显式 `--execute`。生成的诊断、benchmark、smoke 输出和验收报告写入 `output/`。
 
 ## 文档
 
@@ -205,7 +247,7 @@ python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
 - `chunks` 是索引、引用、检索、问答和图谱关联的主单位。
 - 结构图只保存原文地图和上下文恢复路径，不进入 chunk relation edge 创建、保留或加权。
 - Chunk relation graph 只表达内容语义关系和允许的 RQ chunk-pair evidence。
-- Mid concepts 与 RQ L3 prefixes 一一投影，Coarse concepts 与 RQ L2 prefixes 一一投影；上层边必须由底层 chunk relation edge support 投影。
+- RQ fuzzy membership 只提供路由与投影权重；Mid/Coarse concept eligibility 由确定性规则控制并产生语义压缩，上层边必须由底层 chunk relation edge support 投影。
 - QA 只使用 context package，不直接使用裸 search results。
 - Citation 必须指向 raw chunk span。
 - Qdrant 和 Redis 均为 active 派生或运行态存储，必须能从 PostgreSQL 重建或刷新。

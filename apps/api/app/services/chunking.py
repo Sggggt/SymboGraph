@@ -2,17 +2,28 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
-from app.services.parsers import ParsedSection
+from app.services.parsers import (
+    PARSER_LAYOUT_PROTOCOL_VERSION,
+    ParsedLayoutItem,
+    ParsedSection,
+    ParsedStructureObject,
+)
 
 
 DEFAULT_CHUNK_SIZE = 512
 DEFAULT_CHUNK_OVERLAP = 80
 TOKENIZER_VERSION = "symbograph_regex_tokenizer_v1"
 CHUNK_SCHEMA_VERSION = "chunk_schema_v1"
-CURRENT_EMBEDDING_TEXT_VERSION = "contextual_text_v1"
+CHUNK_TEXT_HASH_PROTOCOL_VERSION = "chunk_text_sha256_normalized_v1"
+CURRENT_EMBEDDING_TEXT_VERSION = "contextual_text_v2"
+CONTEXTUAL_TEXT_PROTOCOL_VERSION = "contextual_text_v2"
+CONTEXTUAL_TEXT_HASH_PROTOCOL_VERSION = "contextual_text_hash_v2"
+LOCAL_CONTEXT_HINT_PROTOCOL_VERSION = "local_context_hint_previous_next_nonoverlap_v1"
+LOCAL_CONTEXT_HINT_NEIGHBOR_TOKEN_BUDGET = 48
+LOCAL_CONTEXT_HINT_TOTAL_TOKEN_BUDGET = 96
 
 
 def normalize_text(text: str) -> str:
@@ -73,6 +84,9 @@ class PreparedDocument:
     text: str
     section_offsets: list[dict[str, Any]]
     protected_spans: list[ProtectedSpan]
+    layout_coordinates: list[ParsedLayoutItem] = field(default_factory=list)
+    structure_objects: list[ParsedStructureObject] = field(default_factory=list)
+    parser_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class FixedTokenChunker:
@@ -98,6 +112,9 @@ class FixedTokenChunker:
         parts: list[str] = []
         offsets: list[dict[str, Any]] = []
         protected: list[ProtectedSpan] = []
+        layout_coordinates: list[ParsedLayoutItem] = []
+        structure_objects: list[ParsedStructureObject] = []
+        parser_sections: list[dict[str, Any]] = []
         cursor = 0
         for index, section in enumerate(sections):
             section_text = normalize_text(section.text)
@@ -121,10 +138,99 @@ class FixedTokenChunker:
                     "char_start": start,
                     "char_end": end,
                     "metadata": metadata,
+                    "parser_metadata": dict(section.parser_metadata or {}),
+                }
+            )
+            local_layout_items = list(section.layout_items or [])
+            if not local_layout_items:
+                local_layout_items = [
+                    ParsedLayoutItem(
+                        layout_id=f"section:{index}:flow",
+                        text=section_text,
+                        char_start=0,
+                        char_end=len(section_text),
+                        page_number=section.page_number,
+                        coordinate_system="text_flow_v1",
+                        region_type=str(metadata.get("content_kind") or "text"),
+                        reading_order=0,
+                        metadata={
+                            "parser_source": "section_flow_fallback",
+                            "native_geometry": False,
+                            "layout_protocol_version": PARSER_LAYOUT_PROTOCOL_VERSION,
+                        },
+                    )
+                ]
+            for layout_item in local_layout_items:
+                local_start, local_end, aligned_text = _artifact_span_in_normalized_section(
+                    section_text,
+                    layout_item.text,
+                    layout_item.char_start,
+                    layout_item.char_end,
+                )
+                if local_end <= local_start:
+                    continue
+                layout_coordinates.append(
+                    replace(
+                        layout_item,
+                        layout_id=f"section:{index}:{layout_item.layout_id}",
+                        text=aligned_text,
+                        char_start=start + local_start,
+                        char_end=start + local_end,
+                        page_number=layout_item.page_number if layout_item.page_number is not None else section.page_number,
+                        metadata={**dict(layout_item.metadata or {}), "section_index": index},
+                    )
+                )
+            for structure_object in section.structure_objects or []:
+                local_start, local_end, aligned_text = _artifact_span_in_normalized_section(
+                    section_text,
+                    structure_object.text,
+                    structure_object.char_start,
+                    structure_object.char_end,
+                )
+                if local_end <= local_start:
+                    continue
+                structure_objects.append(
+                    replace(
+                        structure_object,
+                        structure_id=f"section:{index}:{structure_object.structure_id}",
+                        text=aligned_text,
+                        char_start=start + local_start,
+                        char_end=start + local_end,
+                        page_number=(
+                            structure_object.page_number
+                            if structure_object.page_number is not None
+                            else section.page_number
+                        ),
+                        path=structure_object.path or heading,
+                        metadata={**dict(structure_object.metadata or {}), "section_index": index},
+                    )
+                )
+            parser_sections.append(
+                {
+                    "section_index": index,
+                    "source_type": (section.parser_metadata or {}).get("source_type") or metadata.get("source_type"),
+                    "parser": (section.parser_metadata or {}).get("parser"),
+                    "native_layout_available": bool((section.parser_metadata or {}).get("native_layout_available")),
+                    "layout_item_count": len(local_layout_items),
+                    "structure_object_count": len(section.structure_objects or []),
                 }
             )
             protected.extend(_protected_spans_for_section(section_text, base=start, metadata=metadata))
-        return PreparedDocument(text="".join(parts).strip(), section_offsets=offsets, protected_spans=protected)
+        return PreparedDocument(
+            text="".join(parts).strip(),
+            section_offsets=offsets,
+            protected_spans=protected,
+            layout_coordinates=layout_coordinates,
+            structure_objects=structure_objects,
+            parser_metadata={
+                "layout_protocol_version": PARSER_LAYOUT_PROTOCOL_VERSION,
+                "section_count": len(offsets),
+                "layout_item_count": len(layout_coordinates),
+                "structure_object_count": len(structure_objects),
+                "native_layout_available": any(bool(item.bbox) for item in layout_coordinates),
+                "sections": parser_sections,
+            },
+        )
 
     def split_sections(self, sections: list[ParsedSection], *, title: str) -> tuple[list[FixedChunk], PreparedDocument]:
         prepared = self.prepare_document(sections, title=title)
@@ -159,6 +265,16 @@ class FixedTokenChunker:
                     }
                 )
                 content_kind = "code" if "code" in kinds else "formula" if "formula" in kinds else "table" if "table" in kinds else "text"
+                layout_coordinates = [
+                    asdict(item)
+                    for item in prepared.layout_coordinates
+                    if _overlap(char_start, char_end, item.char_start, item.char_end) > 0
+                ]
+                structure_object_ids = [
+                    item.structure_id
+                    for item in prepared.structure_objects
+                    if _overlap(char_start, char_end, item.char_start, item.char_end) > 0
+                ]
                 chunks.append(
                     FixedChunk(
                         chunk_index=index,
@@ -171,6 +287,7 @@ class FixedTokenChunker:
                         page_start=min(page_numbers) if page_numbers else None,
                         page_end=max(page_numbers) if page_numbers else None,
                         metadata={
+                            "chunk_schema_version": CHUNK_SCHEMA_VERSION,
                             "tokenizer_version": self.tokenizer_version,
                             "chunk_size": self.chunk_size,
                             "chunk_overlap": self.overlap,
@@ -180,6 +297,9 @@ class FixedTokenChunker:
                             "has_caption": "caption" in kinds,
                             "content_kind": content_kind,
                             "section_indices": [item["index"] for item in sections],
+                            "layout_protocol_version": prepared.parser_metadata.get("layout_protocol_version"),
+                            "layout_coordinates": layout_coordinates,
+                            "structure_object_ids": structure_object_ids,
                         },
                     )
                 )
@@ -240,6 +360,26 @@ def _overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> int:
     return max(0, min(a_end, b_end) - max(a_start, b_start))
 
 
+def _artifact_span_in_normalized_section(
+    section_text: str,
+    artifact_text: str,
+    char_start: int,
+    char_end: int,
+) -> tuple[int, int, str]:
+    fragment = normalize_text(artifact_text)
+    hinted_start = max(0, min(len(section_text), int(char_start or 0)))
+    if fragment and section_text[hinted_start : hinted_start + len(fragment)] == fragment:
+        return hinted_start, hinted_start + len(fragment), fragment
+    found = section_text.find(fragment, hinted_start) if fragment else -1
+    if found < 0 and fragment:
+        found = section_text.find(fragment)
+    if found >= 0:
+        return found, found + len(fragment), fragment
+    start = hinted_start
+    end = min(len(section_text), max(start, int(char_end or start)))
+    return start, end, section_text[start:end]
+
+
 def _sections_for_span(section_offsets: list[dict[str, Any]], char_start: int, char_end: int) -> list[dict[str, Any]]:
     matched = [
         item
@@ -277,10 +417,24 @@ def build_contextual_text(
     if region_hint:
         parts.append(f"Region hints: {region_hint}")
     if local_hint:
-        parts.append(f"Local hint: {local_hint}")
+        parts.append(f"Local hint:\n{local_hint}")
     parts.extend(["Raw chunk:", raw_text])
     return "\n".join(parts)
 
 
-def contextual_text_hash(contextual_text: str) -> str:
-    return text_hash(contextual_text)
+def contextual_text_hash(
+    contextual_text: str,
+    *,
+    embedding_text_version: str = CURRENT_EMBEDDING_TEXT_VERSION,
+    local_hint_protocol_version: str = LOCAL_CONTEXT_HINT_PROTOCOL_VERSION,
+    local_hint_hash: str,
+) -> str:
+    return stable_hash(
+        {
+            "protocol_version": CONTEXTUAL_TEXT_HASH_PROTOCOL_VERSION,
+            "contextual_text": normalize_text(contextual_text),
+            "embedding_text_version": embedding_text_version,
+            "local_hint_protocol_version": local_hint_protocol_version,
+            "local_hint_hash": local_hint_hash,
+        }
+    )

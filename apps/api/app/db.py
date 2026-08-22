@@ -96,9 +96,34 @@ def build_engine():
 
 
 engine = build_engine()
+_engine_process_id = os.getpid()
 _original_SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
 _db_context_var = contextvars.ContextVar("db_session", default=None)
 _active_sessions = contextvars.ContextVar("active_sessions", default=None)
+
+
+def reset_database_engine_after_fork(*, force: bool = False) -> bool:
+    """Detach inherited DBAPI connections before a child opens a Session.
+
+    A SQLAlchemy pool created in the Celery parent may contain a live psycopg
+    connection from the startup availability probe.  Reusing that socket in
+    prefork children corrupts connection-local prepared-statement state.  The
+    child must replace the pool without asking it to close the parent's file
+    descriptors; all subsequent ``SessionLocal`` calls still bind to the same
+    Engine object and therefore use its fresh, child-owned pool.
+    """
+
+    global _engine_process_id
+    current_process_id = os.getpid()
+    if not force and current_process_id == _engine_process_id:
+        return False
+    engine.dispose(close=False)
+    _engine_process_id = current_process_id
+    return True
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=reset_database_engine_after_fork)
 
 class ContextSessionWrapper:
     def __init__(self, session):

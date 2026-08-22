@@ -15,11 +15,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def main() -> None:
+async def main(args: argparse.Namespace | None = None) -> None:
+    if args is None:
+        args = parse_args()
     from app.services.context_graph import context_graph_stats, rebuild_context_graph
 
-    args = parse_args()
-    model_io_runtime = prepare_runtime_for_model_io()
+    model_io_runtime = (
+        prepare_runtime_for_model_io() if args.execute else None
+    )
     with session_scope() as db:
         knowledge_base = resolve_knowledge_base(db, knowledge_base_id=args.knowledge_base_id, knowledge_base_name=args.knowledge_base_name)
         payload = {
@@ -29,7 +32,7 @@ async def main() -> None:
             "active_chunks": active_chunk_count(db, knowledge_base.id),
             "model_io_runtime": model_io_runtime,
             "execute": args.execute,
-            "impact": "replace relation graph plus dependent RQ membership/mid/coarse/context states" if args.execute else "no writes",
+            "impact": "replace relation graph plus dependent RQ membership/mid/coarse/context states" if args.execute else "no writes and no model/provider calls",
         }
         if args.execute:
             state = await rebuild_context_graph(db, knowledge_base.id)
@@ -42,4 +45,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(parse_args()))

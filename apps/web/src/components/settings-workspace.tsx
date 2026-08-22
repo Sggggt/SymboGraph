@@ -1,7 +1,14 @@
 "use client";
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import type { ModelSettingsUpdate, RuntimeIssue, StrategyProfileDetail, StructuredApiErrorBody } from "@course-kg/shared";
+import type {
+  ModelSettingsResponse,
+  ModelSettingsUpdate,
+  RuntimeIssue,
+  RuntimeSettingsCandidateResponse,
+  StrategyProfileDetail,
+  StructuredApiErrorBody,
+} from "@course-kg/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
@@ -39,18 +46,25 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   bindStrategyProfile,
   copyStrategyProfile,
+  createRuntimeSettingsCandidate,
   createStrategyProfile,
   deleteStrategyProfile,
   fetchModelSettings,
   fetchRuntimeCheck,
+  fetchRuntimeSettingsCandidate,
   fetchStrategyProfile,
   fetchStrategyProfiles,
+  promoteRuntimeSettingsCandidate,
+  runRuntimeSettingsCandidateAction,
   streamProfileAssistant,
   updateModelSettings,
   updateStrategyProfile,
 } from "@/lib/api";
 
 type SettingsForm = {
+  chat_api_protocol: "openai" | "anthropic";
+  graph_api_protocol: "openai" | "anthropic";
+  embedding_api_protocol: "openai";
   chat_base_url: string;
   graph_base_url: string;
   embedding_base_url: string;
@@ -65,6 +79,13 @@ type SettingsForm = {
   worker_concurrency: string;
   model_request_concurrency: string;
   model_request_timeout_seconds: string;
+  chat_json_max_tokens: string;
+  agent_request_concurrency: string;
+  source_io_concurrency: string;
+  agent_request_queue_limit: string;
+  agent_request_queue_timeout_seconds: string;
+  agent_request_lease_ttl_seconds: string;
+  upload_max_bytes: string;
   concept_i18n_enabled: boolean;
   fixed_chunk_size_tokens: string;
   fixed_chunk_overlap_tokens: string;
@@ -79,9 +100,15 @@ type SettingsForm = {
   mid_concept_extraction_max_candidates_per_batch: string;
   mid_concept_extraction_max_tokens_per_batch: string;
   mid_concept_candidate_keep_threshold: string;
-  rq_kmeans_levels: string;
   rq_kmeans_max_k: string;
   rq_residual_tau: string;
+  edge_distance_protocol: "edge_distance_log_calibrated_strength_v2";
+  rq_membership_protocol: "rq_fuzzy_softmax_gamma_product_v1";
+  edge_projection_protocol: "membership_q15_layer_type_calibrated_v3";
+  edge_type_calibration_protocol: "type_local_winsorized_minmax_v1";
+  rq_membership_temperature: string;
+  rq_membership_top_m: string;
+  rq_membership_probability_threshold: string;
   dense_knn_k_min: string;
   dense_knn_k_max: string;
   dense_reverse_b_min_base: string;
@@ -107,6 +134,22 @@ type ErrorDialogState = {
   issues: RuntimeIssue[];
   fixCommands: string[];
 };
+
+type AgentAdmissionSettingsValues = Pick<
+  SettingsForm,
+  "agent_request_concurrency" | "agent_request_queue_limit" | "agent_request_queue_timeout_seconds" | "agent_request_lease_ttl_seconds"
+>;
+
+type GraphProtocolSettingsValues = Pick<
+  SettingsForm,
+  | "edge_distance_protocol"
+  | "rq_membership_protocol"
+  | "edge_projection_protocol"
+  | "edge_type_calibration_protocol"
+  | "rq_membership_temperature"
+  | "rq_membership_top_m"
+  | "rq_membership_probability_threshold"
+>;
 
 type FieldProps = {
   label: string;
@@ -135,13 +178,20 @@ type SwitchRowProps = {
 const inputClass = "h-11 rounded-xl border-white/10 bg-white/[0.04] px-3 text-white placeholder:text-white/28";
 const sectionClass = "rounded-2xl border border-white/10 bg-white/[0.035] p-5";
 const parameterNameClass = "text-xs uppercase tracking-[0.2em] text-cyan-100/46";
+export const UPLOAD_MAX_BYTES_LIMITS = { defaultValue: 104_857_600, min: 1, max: 10_737_418_240 } as const;
+export const RUNTIME_ENV_AUTHORITY_NOTE =
+  "仓库根 .env 是唯一配置来源。保存后所有参数立即写入该文件；热加载参数立即作用于下一次请求，重建参数等待显式重建与晋升，服务参数在重启后生效。";
+export const RQ_KMEANS_PROTOCOL_DEPTH = 3 as const;
 
 export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   资料库类型: "标记当前配置档适用的资料库类别，只影响提示词、界面标签和对话偏好，不参与切块、构图或检索参数。",
   名称: "配置档在设置页和资料库绑定列表里的显示名称，便于区分不同交互风格。",
   模型桥: "开启后 API 和 worker 容器优先通过本机模型桥访问聊天与向量端点，适合宿主机运行本地模型服务的场景。",
-  聊天基础地址: "OpenAI 兼容对话接口的 base URL；只影响下一次问答、检索规划、引用验证和 Profile 助手调用。",
-  图谱基础地址: "OpenAI 兼容图谱构建接口的 base URL；只影响下一次构图中的概念命名、粗概念和双语派生调用。",
+  聊天接口协议: "选择 openai 时调用 /chat/completions；选择 anthropic 时调用 /v1/messages。只影响对话模型，不改变 gray-zone 判定。",
+  图谱接口协议: "选择 openai 时调用 /chat/completions；选择 anthropic 时调用 /v1/messages。它只决定后续构图模型传输，不参与图检索判定。",
+  向量接口协议: "Embedding 当前仅支持 OpenAI-compatible 协议。该字段是独立 rebuild identity，不复用聊天或图谱协议，也不表示已支持 Anthropic embedding。",
+  聊天基础地址: "对话接口的 base URL；协议为 anthropic 时填写服务根地址，由系统固定追加 /v1/messages。只影响下一次问答、检索规划、引用验证和 Profile 助手调用。",
+  图谱基础地址: "图谱构建接口的 base URL；协议为 anthropic 时填写服务根地址，由系统固定追加 /v1/messages。只影响下一次构图中的概念命名、粗概念和双语派生调用。",
   向量基础地址: "Embedding 接口的 base URL；后续解析、重嵌入和图谱重建会用它生成 contextual embedding。",
   "聊天 DNS 覆盖 IP": "仅对对话端点使用的 DNS 覆盖；需要固定解析到指定 IP 时填写，留空则使用系统 DNS。",
   "图谱 DNS 覆盖 IP": "仅对图谱构建端点使用的 DNS 覆盖；需要固定解析到指定 IP 时填写，留空则使用系统 DNS。",
@@ -157,10 +207,23 @@ export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   清除当前向量接口密钥: "勾选后保存会删除当前向量密钥；删除后解析、重嵌入和检索向量生成会因缺少凭据而失败。",
   模型请求并发: "限制同时发起的模型请求数量，用于控制概念生成、Agent 判断和回答生成的吞吐与外部端点压力。",
   模型超时秒数: "单次模型请求等待上限；超过该时间会快速失败并进入可诊断错误，不做静默降级。",
+  "源文件 I/O 并发": "限制解析、校验和持久化源文件时同时运行的阻塞 I/O 数量；通过有界 semaphore 热加载，防止文件线程无界扩张。",
+  "Agent 请求并发": "普通 Agent 与 SSE 请求共用的全局并发上限；Redis 租约跨 API 进程协调，不以进程内任务表作为正确性边界。",
+  "Agent 等待队列上限": "全局并发已满时允许进入 Redis FIFO 等待队列的请求数；队列满后立即返回可重试的 429 诊断。",
+  "Agent 排队超时秒数": "请求在有界队列内允许等待的最长时间；等待期间不会创建数据库会话、Agent 审计记录或后台任务。",
+  "Agent 租约 TTL 秒数": "活跃请求的 Redis 租约失效时间；心跳持续续租，进程崩溃后由 TTL 自动回收占用。",
   "Embedding 批大小": "每批提交给向量端点的文本数量；较大批次提升吞吐，但会增加单次请求体积和失败重试成本。",
+  "单文件上传上限（字节）": "上传流允许的最大字节数；服务逐块计数并在越界时立即中断、清理临时文件，不会把超限内容注册为资料。",
   "证据包 token 预算": "Context Package 可容纳的证据 token 上限；它约束进入回答生成的唯一证据输入规模。",
   中粗层双语派生: "开启后，下一次图谱重建会对 mid/coarse 概念节点和高层概念边额外生成中英双语派生 metadata；关闭时不会产生这部分模型调用成本。",
   "LLM 双语查询面": "开启后，QA 查询面提取会要求 LLM 为显式领域和过程 facet 生成中英双语 aliases；它只影响下一次检索路由，不写事实证据，也不触发图谱重建。",
+  "边距离协议": "本地 allowlist 的关系强度到累计距离转换协议。它改变 active relation graph 语义，只能经 candidate、shadow rebuild、evaluation 和 promotion 生效。",
+  "RQ membership 协议": "本地 allowlist 的 RQ 模糊归属协议。LLM、prompt 和自由表达式都不能成为协议值；变更必须重建 RQ 与下游概念图。",
+  "边投影协议": "底层 chunk relation edge 向 mid/coarse 概念边投影的本地协议；support ids 与 gray predicates 都由确定性实现约束。",
+  "边类型校准协议": "按 edge type 独立校准 raw strength 的本地协议；变更必须重新校准并重建 active relation graph。",
+  "RQ softmax 温度": "逐层完整 codebook softmax 的温度 τ_l；它改变 RQ fuzzy membership，必须通过 candidate 重建与 promotion 生效。",
+  "RQ 每层候选上限": "每层保留的非主 code 稀疏候选上限；主 residual trajectory 始终保留，不受该值裁掉。",
+  "RQ 概率裁剪阈值": "仅裁剪非主 code 的原始完整 softmax 概率阈值；membership 不重归一、不设人工下限。",
   粗概念起点数量: "摘要模式下从全部粗概念候选中选入图探索的起点数量；普通模式不使用这个参数。",
   粗概念保留数量: "摘要模式下粗概念图探索后保留并继续下钻的粗概念数量。",
   每个粗概念中概念预算: "对每个已保留粗概念分别下钻的 mid candidate 数量上限，保证逐父节点探索而不是全局裸 top-k。",
@@ -177,9 +240,9 @@ export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   边复用上限: "同一条图边在单条路径中可被重复使用的次数上限，防止环路反复放大。",
   "Cycle reward 上限": "同一条路径最多获得的环收敛奖励；奖励只辅助短而强的收敛路径，不能替代证据。",
   "Cycle reward 距离阈值": "只有总距离足够短的环才会得到收敛奖励，长而弱的环不会提升路径价值。",
-  "路径 green 阈值": "路径距离小于该值时视为可继续的高置信路径，通常不需要 LLM 灰区判停。",
-  "路径 gray 阈值": "路径距离落在 green 与 gray 之间时进入灰区，可由 LLM evaluator 输出 typed decision。",
-  "路径 hard 阈值": "路径距离超过该值时 executor 直接剪枝，不允许 LLM 绕过硬阈值继续扩展。",
+  "路径 green 阈值": "路径累计距离落入 green 区时，由 deterministic executor 按版本化协议处理；LLM 不参与路径分区或判停。",
+  "路径 gray 阈值": "路径累计距离落入 gray 区时，executor 只根据 bounded observation 和版本化 deterministic local rule 输出 typed decision；模型调用数必须为 0。",
+  "路径 hard 阈值": "路径累计距离命中 hard-stop 时 executor 直接剪枝；LLM、Profile 和 Policy 均不能绕过或覆盖该决定。",
   每个片段结构恢复数量: "对每个最终命中 chunk 最多追加多少 previous/next 或 bridge-neighbor 上下文。",
   路径摘要预算: "Context Package 中可保留的图路径摘要数量上限，用于解释证据从 coarse 到 mid 再到 chunk 的来源。",
   规划轮次预算: "QA Agent 可进行 Planner/Evaluator 规划的轮次数上限，控制单次任务内的推理成本。",
@@ -193,7 +256,7 @@ export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   "每批 L3 前缀数": "每个概念生成批次最多处理的 RQ L3 prefix packet 数量，影响 mid concept 生成吞吐。",
   "每批概念 token 上限": "单个概念生成批次允许传入模型的 token 上限，防止 prompt 过大。",
   候选诊断阈值: "mid concept 候选保留诊断的 membership/质量阈值，用于标记低置信候选而不是直接制造事实。",
-  "RQ-KMeans 层数": "残差量化地址树的层数；当前四层图谱用 L3 对齐 mid concept、L2 对齐 coarse concept。",
+  "RQ-KMeans 协议深度": "当前 Four-Layer active protocol 固定为 3：L3 对齐 mid concept、L2 对齐 coarse concept。该值不是可调构图参数。",
   "RQ-KMeans 最大 K": "每层 RQ-KMeans 聚类的最大分支数，影响 RQ prefix 地址空间粒度。",
   "RQ 残差 Tau": "控制 RQ fuzzy membership 的残差距离温度；值越小，membership 越集中。",
   "Dense KNN 最小 K": "每个 chunk 生成 dense relation 候选时的最小出边候选数，保障低证据节点仍有基本候选。",
@@ -356,12 +419,174 @@ function SettingField({
   );
 }
 
+export function ModelProtocolSelect({
+  label,
+  value,
+  onChange,
+  disabled,
+  lifecycle,
+}: {
+  label: "聊天接口协议" | "图谱接口协议";
+  value: "openai" | "anthropic";
+  onChange: (value: "openai" | "anthropic") => void;
+  disabled?: boolean;
+  lifecycle: string;
+}) {
+  return (
+    <label className="flex flex-col gap-2">
+      <ParameterName label={label} />
+      <select
+        value={value}
+        onChange={(event) =>
+          onChange(event.target.value as "openai" | "anthropic")
+        }
+        disabled={disabled}
+        className={`${inputClass} appearance-none`}
+      >
+        <option value="openai">OpenAI-compatible</option>
+        <option value="anthropic">Anthropic Messages</option>
+      </select>
+      <span className="text-xs leading-5 text-cyan-50/52">{lifecycle}</span>
+    </label>
+  );
+}
+
+export function EmbeddingProtocolSelect({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: "openai";
+  onChange: (value: "openai") => void;
+  disabled?: boolean;
+}) {
+  return (
+    <label className="flex flex-col gap-2">
+      <ParameterName label="向量接口协议" />
+      <select
+        value={value}
+        onChange={() => onChange("openai")}
+        disabled={disabled}
+        className={`${inputClass} appearance-none`}
+      >
+        <option value="openai">OpenAI-compatible（当前唯一支持）</option>
+      </select>
+      <span className="text-xs leading-5 text-cyan-50/52">
+        rebuild_required · stage as candidate, then rebuild embedding/graph artifacts and promote
+      </span>
+    </label>
+  );
+}
+
 function BoundaryNote({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <p className="mt-2 text-xs leading-5 text-cyan-50/52">
       <span className="font-medium text-cyan-50/70">{title}</span>{" "}
       {children}
     </p>
+  );
+}
+
+export function SourceIoConcurrencyField({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <SettingField
+      label="源文件 I/O 并发"
+      type="number"
+      min={1}
+      max={64}
+      value={value}
+      onChange={onChange}
+    />
+  );
+}
+
+export function UploadSecuritySettingsSection({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  return (
+    <section className={sectionClass}>
+      <p className="text-sm font-semibold text-white">上传安全参数</p>
+      <BoundaryNote title="生效边界：下一次上传请求">
+        单文件上限会热加载；上传服务逐块执行硬限制，超限或读取失败时清理未提交的临时文件，不触发资料库重建。
+      </BoundaryNote>
+      <div className="mt-5 grid gap-4 md:grid-cols-3">
+        <SettingField
+          label="单文件上传上限（字节）"
+          type="number"
+          min={UPLOAD_MAX_BYTES_LIMITS.min}
+          max={UPLOAD_MAX_BYTES_LIMITS.max}
+          value={value}
+          onChange={onChange}
+        />
+      </div>
+    </section>
+  );
+}
+
+export function RqProtocolDepthField() {
+  return (
+    <SettingField
+      label="RQ-KMeans 协议深度"
+      type="number"
+      min={RQ_KMEANS_PROTOCOL_DEPTH}
+      max={RQ_KMEANS_PROTOCOL_DEPTH}
+      value={String(RQ_KMEANS_PROTOCOL_DEPTH)}
+      onChange={() => undefined}
+      disabled
+    />
+  );
+}
+
+export function GraphProtocolSettingsSection({
+  values,
+  onChange,
+}: {
+  values: GraphProtocolSettingsValues;
+  onChange: (key: keyof GraphProtocolSettingsValues, value: string) => void;
+}) {
+  return (
+    <section className={sectionClass}>
+      <p className="text-sm font-semibold text-white">构图协议与 RQ membership</p>
+      <BoundaryNote title="生效边界：candidate → shadow rebuild → evaluation → promotion">
+        普通保存会立即写入根 .env，但不会提前改写已有图；请在下方候选生命周期面板完成 dry-run、真实 shadow build、数值评估和原子 promotion。
+      </BoundaryNote>
+      <div className="mt-5 grid gap-4 md:grid-cols-2">
+        <SettingField label="边距离协议" value={values.edge_distance_protocol} onChange={() => undefined} disabled />
+        <SettingField label="RQ membership 协议" value={values.rq_membership_protocol} onChange={() => undefined} disabled />
+        <SettingField label="边投影协议" value={values.edge_projection_protocol} onChange={() => undefined} disabled />
+        <SettingField label="边类型校准协议" value={values.edge_type_calibration_protocol} onChange={() => undefined} disabled />
+        <SettingField label="RQ softmax 温度" type="number" min={0.01} max={10} step={0.01} value={values.rq_membership_temperature} onChange={(value) => onChange("rq_membership_temperature", value)} />
+        <SettingField label="RQ 每层候选上限" type="number" min={1} max={6} value={values.rq_membership_top_m} onChange={(value) => onChange("rq_membership_top_m", value)} />
+        <SettingField label="RQ 概率裁剪阈值" type="number" min={0} max={1} step={0.01} value={values.rq_membership_probability_threshold} onChange={(value) => onChange("rq_membership_probability_threshold", value)} />
+      </div>
+    </section>
+  );
+}
+
+export function AgentAdmissionSettingsSection({
+  values,
+  onChange,
+}: {
+  values: AgentAdmissionSettingsValues;
+  onChange: (key: keyof AgentAdmissionSettingsValues, value: string) => void;
+}) {
+  return (
+    <section className={sectionClass}>
+      <p className="text-sm font-semibold text-white">Agent 请求准入</p>
+      <BoundaryNote title="生效边界：下一次普通 Agent 或 SSE 请求">
+        四项参数会热加载。Redis 统一执行跨进程并发与有界 FIFO 排队；Redis 不可用时请求会快速失败，不启用本地降级。
+      </BoundaryNote>
+      <div className="mt-5 grid gap-4 md:grid-cols-4">
+        <SettingField label="Agent 请求并发" type="number" min={1} max={128} value={values.agent_request_concurrency} onChange={(value) => onChange("agent_request_concurrency", value)} />
+        <SettingField label="Agent 等待队列上限" type="number" min={0} max={1000} value={values.agent_request_queue_limit} onChange={(value) => onChange("agent_request_queue_limit", value)} />
+        <SettingField label="Agent 排队超时秒数" type="number" min={1} max={3600} value={values.agent_request_queue_timeout_seconds} onChange={(value) => onChange("agent_request_queue_timeout_seconds", value)} />
+        <SettingField label="Agent 租约 TTL 秒数" type="number" min={5} max={7200} value={values.agent_request_lease_ttl_seconds} onChange={(value) => onChange("agent_request_lease_ttl_seconds", value)} />
+      </div>
+    </section>
   );
 }
 
@@ -812,7 +1037,6 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
           <div className="mt-3 space-y-2 text-sm leading-6 text-white/62">
             <p>资料库：{selectedKnowledgeBase?.name ?? "未选择"}</p>
             <p>配置档：{activeProfile?.name ?? selectedKnowledgeBase?.active_profile_name ?? "未绑定"}</p>
-            <p className="break-all">哈希：{selectedKnowledgeBase?.active_profile_hash ?? "缺失"}</p>
           </div>
           {hashMismatch ? (
             <p className="mt-4 rounded-xl border border-amber-200/20 bg-amber-200/[0.06] p-3 text-sm leading-6 text-amber-100">
@@ -1042,8 +1266,365 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
   );
 }
 
+export function bindEmbeddingProtocolToCandidateSettings(
+  changedSettings: Record<string, unknown>,
+  embeddingApiProtocol: "openai",
+): Record<string, unknown> {
+  if (!Object.keys(changedSettings).length) {
+    return {};
+  }
+  return {
+    ...changedSettings,
+    embedding_api_protocol: embeddingApiProtocol,
+  };
+}
+
+export function candidateChangedKeysForDisplay(
+  candidateSettings: Record<string, unknown>,
+  activeEmbeddingApiProtocol: "openai" | undefined,
+): string[] {
+  const activeProtocol = activeEmbeddingApiProtocol ?? "openai";
+  return Object.keys(candidateSettings)
+    .filter(
+      (key) =>
+        key !== "embedding_api_protocol" ||
+        candidateSettings[key] !== activeProtocol,
+    )
+    .sort();
+}
+
+type HotReloadSettingsForm = Pick<
+  SettingsForm,
+  | "chat_api_protocol"
+  | "chat_base_url"
+  | "chat_resolve_ip"
+  | "chat_model"
+  | "embedding_batch_size"
+  | "worker_concurrency"
+  | "model_request_concurrency"
+  | "model_request_timeout_seconds"
+  | "chat_json_max_tokens"
+  | "agent_request_concurrency"
+  | "source_io_concurrency"
+  | "agent_request_queue_limit"
+  | "agent_request_queue_timeout_seconds"
+  | "agent_request_lease_ttl_seconds"
+  | "upload_max_bytes"
+  | "concept_i18n_enabled"
+  | "chat_api_key"
+  | "clear_chat_api_key"
+  | "graph_api_key"
+  | "clear_graph_api_key"
+  | "embedding_api_key"
+  | "clear_embedding_api_key"
+  | "model_bridge_enabled"
+>;
+
+export function buildHotReloadSettingsPayload(
+  form: HotReloadSettingsForm,
+): ModelSettingsUpdate {
+  return {
+    chat_api_protocol: form.chat_api_protocol,
+    chat_base_url: form.chat_base_url.trim(),
+    chat_resolve_ip: form.chat_resolve_ip.trim() || null,
+    chat_model: form.chat_model.trim(),
+    embedding_batch_size: parseIntField(form.embedding_batch_size),
+    worker_concurrency: parseIntField(form.worker_concurrency),
+    model_request_concurrency: parseIntField(form.model_request_concurrency),
+    model_request_timeout_seconds: parseIntField(form.model_request_timeout_seconds),
+    chat_json_max_tokens: parseIntField(form.chat_json_max_tokens),
+    agent_request_concurrency: parseIntField(form.agent_request_concurrency),
+    source_io_concurrency: parseIntField(form.source_io_concurrency),
+    agent_request_queue_limit: parseIntField(form.agent_request_queue_limit),
+    agent_request_queue_timeout_seconds: parseIntField(form.agent_request_queue_timeout_seconds),
+    agent_request_lease_ttl_seconds: parseIntField(form.agent_request_lease_ttl_seconds),
+    upload_max_bytes: parseIntField(form.upload_max_bytes),
+    concept_i18n_enabled: form.concept_i18n_enabled,
+    chat_api_key: form.chat_api_key.trim() || null,
+    clear_chat_api_key: form.clear_chat_api_key,
+    graph_api_key: form.graph_api_key.trim() || null,
+    clear_graph_api_key: form.clear_graph_api_key,
+    embedding_api_key: form.embedding_api_key.trim() || null,
+    clear_embedding_api_key: form.clear_embedding_api_key,
+    model_bridge_enabled: form.model_bridge_enabled,
+  };
+}
+
+export function buildRuntimeSettingsPayload(form: SettingsForm): ModelSettingsUpdate {
+  return {
+    ...buildHotReloadSettingsPayload(form),
+    embedding_api_protocol: form.embedding_api_protocol,
+    fixed_chunk_size_tokens: parseIntField(form.fixed_chunk_size_tokens),
+    fixed_chunk_overlap_tokens: parseIntField(form.fixed_chunk_overlap_tokens),
+    embedding_base_url: form.embedding_base_url.trim(),
+    embedding_resolve_ip: form.embedding_resolve_ip.trim() || null,
+    embedding_model: form.embedding_model.trim(),
+    embedding_dimensions: parseIntField(form.embedding_dimensions),
+    graph_base_url: form.graph_base_url.trim(),
+    graph_api_protocol: form.graph_api_protocol,
+    graph_resolve_ip: form.graph_resolve_ip.trim() || null,
+    graph_model: form.graph_model.trim(),
+    edge_distance_protocol: form.edge_distance_protocol,
+    rq_membership_protocol: form.rq_membership_protocol,
+    edge_projection_protocol: form.edge_projection_protocol,
+    edge_type_calibration_protocol: form.edge_type_calibration_protocol,
+    rq_kmeans_max_k: parseIntField(form.rq_kmeans_max_k),
+    rq_residual_tau: parseFloatField(form.rq_residual_tau),
+    rq_membership_temperature: parseFloatField(form.rq_membership_temperature),
+    rq_membership_top_m: parseIntField(form.rq_membership_top_m),
+    rq_membership_probability_threshold: parseFloatField(form.rq_membership_probability_threshold),
+    dense_knn_k_min: parseIntField(form.dense_knn_k_min),
+    dense_knn_k_max: parseIntField(form.dense_knn_k_max),
+    dense_reverse_b_min_base: parseIntField(form.dense_reverse_b_min_base),
+    dense_reverse_b_max_base: parseIntField(form.dense_reverse_b_max_base),
+    dense_reverse_b_min_doc: parseIntField(form.dense_reverse_b_min_doc),
+    dense_reverse_b_max_doc: parseIntField(form.dense_reverse_b_max_doc),
+    dense_reverse_b_min_lang: parseIntField(form.dense_reverse_b_min_lang),
+    dense_reverse_b_max_lang: parseIntField(form.dense_reverse_b_max_lang),
+    dense_min_cosine: parseFloatField(form.dense_min_cosine),
+    dense_strong_cosine: parseFloatField(form.dense_strong_cosine),
+    cross_doc_out_quota_min: parseIntField(form.cross_doc_out_quota_min),
+    cross_doc_out_quota_max: parseIntField(form.cross_doc_out_quota_max),
+    cross_doc_min_cosine: parseFloatField(form.cross_doc_min_cosine),
+    cross_language_out_quota_min: parseIntField(form.cross_language_out_quota_min),
+    cross_language_out_quota_max: parseIntField(form.cross_language_out_quota_max),
+    cross_language_min_cosine: parseFloatField(form.cross_language_min_cosine),
+    mid_concept_extraction_max_model_batches: parseIntField(form.mid_concept_extraction_max_model_batches),
+    mid_concept_extraction_max_candidates_per_batch: parseIntField(form.mid_concept_extraction_max_candidates_per_batch),
+    mid_concept_extraction_max_tokens_per_batch: parseIntField(form.mid_concept_extraction_max_tokens_per_batch),
+    mid_concept_candidate_keep_threshold: parseFloatField(form.mid_concept_candidate_keep_threshold),
+  };
+}
+
+function rebuildCandidateSettings(
+  form: SettingsForm,
+  activeSettings: ModelSettingsResponse,
+): Record<string, unknown> {
+  const requested: Record<string, unknown> = {
+    fixed_chunk_size_tokens: parseIntField(form.fixed_chunk_size_tokens),
+    fixed_chunk_overlap_tokens: parseIntField(form.fixed_chunk_overlap_tokens),
+    embedding_base_url: form.embedding_base_url.trim(),
+    embedding_resolve_ip: form.embedding_resolve_ip.trim() || null,
+    embedding_model: form.embedding_model.trim(),
+    embedding_dimensions: parseIntField(form.embedding_dimensions),
+    graph_base_url: form.graph_base_url.trim(),
+    graph_api_protocol: form.graph_api_protocol,
+    graph_resolve_ip: form.graph_resolve_ip.trim() || null,
+    graph_model: form.graph_model.trim(),
+    edge_distance_protocol: form.edge_distance_protocol,
+    rq_membership_protocol: form.rq_membership_protocol,
+    edge_projection_protocol: form.edge_projection_protocol,
+    edge_type_calibration_protocol: form.edge_type_calibration_protocol,
+    rq_kmeans_max_k: parseIntField(form.rq_kmeans_max_k),
+    rq_residual_tau: parseFloatField(form.rq_residual_tau),
+    rq_membership_temperature: parseFloatField(form.rq_membership_temperature),
+    rq_membership_top_m: parseIntField(form.rq_membership_top_m),
+    rq_membership_probability_threshold: parseFloatField(form.rq_membership_probability_threshold),
+    dense_knn_k_min: parseIntField(form.dense_knn_k_min),
+    dense_knn_k_max: parseIntField(form.dense_knn_k_max),
+    dense_reverse_b_min_base: parseIntField(form.dense_reverse_b_min_base),
+    dense_reverse_b_max_base: parseIntField(form.dense_reverse_b_max_base),
+    dense_reverse_b_min_doc: parseIntField(form.dense_reverse_b_min_doc),
+    dense_reverse_b_max_doc: parseIntField(form.dense_reverse_b_max_doc),
+    dense_reverse_b_min_lang: parseIntField(form.dense_reverse_b_min_lang),
+    dense_reverse_b_max_lang: parseIntField(form.dense_reverse_b_max_lang),
+    dense_min_cosine: parseFloatField(form.dense_min_cosine),
+    dense_strong_cosine: parseFloatField(form.dense_strong_cosine),
+    cross_doc_out_quota_min: parseIntField(form.cross_doc_out_quota_min),
+    cross_doc_out_quota_max: parseIntField(form.cross_doc_out_quota_max),
+    cross_doc_min_cosine: parseFloatField(form.cross_doc_min_cosine),
+    cross_language_out_quota_min: parseIntField(form.cross_language_out_quota_min),
+    cross_language_out_quota_max: parseIntField(form.cross_language_out_quota_max),
+    cross_language_min_cosine: parseFloatField(form.cross_language_min_cosine),
+    mid_concept_extraction_max_model_batches: parseIntField(form.mid_concept_extraction_max_model_batches),
+    mid_concept_extraction_max_candidates_per_batch: parseIntField(form.mid_concept_extraction_max_candidates_per_batch),
+    mid_concept_extraction_max_tokens_per_batch: parseIntField(form.mid_concept_extraction_max_tokens_per_batch),
+    mid_concept_candidate_keep_threshold: parseFloatField(form.mid_concept_candidate_keep_threshold),
+  };
+  const active = activeSettings as unknown as Record<string, unknown>;
+  const pendingRebuild = new Set(activeSettings.pending_rebuild_changes ?? []);
+  const changedSettings = Object.fromEntries(
+    Object.entries(requested).filter(([key, value]) => {
+      if (value === undefined) {
+        return false;
+      }
+      if (pendingRebuild.has(key)) {
+        return true;
+      }
+      const activeValue = active[key] === "" ? null : active[key];
+      return JSON.stringify(value) !== JSON.stringify(activeValue);
+    }),
+  );
+  return bindEmbeddingProtocolToCandidateSettings(
+    changedSettings,
+    form.embedding_api_protocol,
+  );
+}
+
+function RuntimeSettingsCandidatePanel({
+  knowledgeBaseId,
+  knowledgeBaseName,
+  settings,
+  form,
+  onError,
+}: {
+  knowledgeBaseId: string | null;
+  knowledgeBaseName?: string | null;
+  settings: ModelSettingsResponse;
+  form: SettingsForm;
+  onError: (error: unknown) => void;
+}) {
+  const queryClient = useQueryClient();
+  const [candidateId, setCandidateId] = useState<string | null>(null);
+  const [lastResult, setLastResult] = useState<RuntimeSettingsCandidateResponse | null>(null);
+  const candidateSettings = useMemo(
+    () => rebuildCandidateSettings(form, settings),
+    [form, settings],
+  );
+  const changedKeys = candidateChangedKeysForDisplay(
+    candidateSettings,
+    settings.embedding_api_protocol,
+  );
+  const candidateQuery = useQuery({
+    queryKey: ["runtime-settings-candidate", candidateId],
+    queryFn: () => fetchRuntimeSettingsCandidate(String(candidateId)),
+    enabled: Boolean(candidateId),
+    refetchInterval: 3000,
+  });
+  const current = candidateQuery.data ?? lastResult;
+  const candidate = current?.candidate ?? null;
+  const build = candidate?.builds?.[0];
+  const evaluation = build?.evaluation ?? {};
+  const hardGates = (evaluation.hard_gates ?? {}) as Record<string, boolean>;
+
+  const createMutation = useMutation({
+    mutationFn: (dryRunOnly: boolean) => {
+      if (!knowledgeBaseId) {
+        throw new Error("请先选择资料库。");
+      }
+      if (!changedKeys.length) {
+        throw new Error("没有待验证的 rebuild_required 参数变更。");
+      }
+      return createRuntimeSettingsCandidate({
+        knowledge_base_ids: [knowledgeBaseId],
+        settings: candidateSettings,
+        dry_run_only: dryRunOnly,
+        source: "settings_ui",
+      });
+    },
+    onSuccess: async (result) => {
+      setLastResult(result);
+      if (result.candidate?.id) {
+        setCandidateId(result.candidate.id);
+      }
+      await queryClient.invalidateQueries({ queryKey: ["runtime-settings-candidate"] });
+    },
+    onError,
+  });
+
+  const actionMutation = useMutation({
+    mutationFn: ({ action, reason }: { action: "build" | "evaluate" | "promote" | "rollback"; reason?: string }) => {
+      if (!candidateId) {
+        throw new Error("请先创建 Runtime Settings candidate。");
+      }
+      return action === "promote"
+        ? promoteRuntimeSettingsCandidate(candidateId)
+        : runRuntimeSettingsCandidateAction(candidateId, action, {
+            reason: reason ?? null,
+          });
+    },
+    onSuccess: async (result) => {
+      setLastResult(result);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["runtime-settings-candidate", candidateId] }),
+        queryClient.invalidateQueries({ queryKey: ["model-settings"] }),
+        queryClient.invalidateQueries({ queryKey: ["runtime-check"] }),
+        queryClient.invalidateQueries({ queryKey: ["knowledgeBases"] }),
+      ]);
+    },
+    onError,
+  });
+
+  const pending = createMutation.isPending || actionMutation.isPending;
+  const preview = current?.preview ?? lastResult?.preview;
+  const buildReady = build?.status === "shadow_ready";
+  const evaluationPassed = build?.status === "evaluation_passed" && candidate?.status === "evaluation_passed";
+
+  return (
+    <section className={sectionClass} aria-label="Runtime Settings candidate 生命周期">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold text-white">Runtime Settings candidate 生命周期</p>
+          <BoundaryNote title="强制流程：dry-run → shadow build → measured evaluation → atomic promotion">
+            active PostgreSQL/Qdrant/图指针在 promotion 前保持不变；失败只保留可审计的 shadow 事实。灰区路径继续/停止始终由版本化本地规则判定，模型调用数为 0。
+          </BoundaryNote>
+        </div>
+        <StatusPill ok={Boolean(knowledgeBaseId)}>{knowledgeBaseName || "未选择资料库"}</StatusPill>
+      </div>
+
+      <div className="mt-4 rounded-2xl border border-white/10 bg-black/10 p-4 text-sm leading-6 text-white/62">
+        <p>待变更 rebuild_required 字段：{changedKeys.length ? changedKeys.join("、") : "无"}</p>
+        {candidate ? (
+          <p className="mt-1 break-all">
+            候选配置状态：{candidate.status}
+          </p>
+        ) : null}
+        {build ? (
+          <p className="mt-1 break-all">
+            影子重建状态：{build.status} · 候选片段版本 {build.candidate_chunk_version ?? "-"}
+          </p>
+        ) : null}
+      </div>
+
+      <div className="mt-4 flex flex-wrap gap-2">
+        <Button type="button" variant="outline" className="rounded-full" disabled={pending || !knowledgeBaseId || !changedKeys.length} onClick={() => createMutation.mutate(true)}>
+          Dry-run
+        </Button>
+        <Button type="button" variant="outline" className="rounded-full" disabled={pending || !knowledgeBaseId || !changedKeys.length} onClick={() => createMutation.mutate(false)}>
+          Stage candidate
+        </Button>
+        <Button type="button" variant="outline" className="rounded-full" disabled={pending || !candidate || !["staged", "failed"].includes(candidate.status)} onClick={() => actionMutation.mutate({ action: "build" })}>
+          Build shadow
+        </Button>
+        <Button type="button" variant="outline" className="rounded-full" disabled={pending || !buildReady} onClick={() => actionMutation.mutate({ action: "evaluate" })}>
+          Evaluate
+        </Button>
+        <Button type="button" className="rounded-full" disabled={pending || !evaluationPassed} onClick={() => actionMutation.mutate({ action: "promote" })}>
+          Promote atomically
+        </Button>
+        <Button type="button" variant="outline" className="rounded-full" disabled={pending || candidate?.status !== "promoted"} onClick={() => actionMutation.mutate({ action: "rollback", reason: "settings_ui_explicit_rollback" })}>
+          Roll back
+        </Button>
+        {pending ? <Loader2 className="size-5 animate-spin text-cyan-100" /> : null}
+      </div>
+
+      {preview ? (
+        <div className="mt-4 grid gap-2 text-xs text-white/56 md:grid-cols-3">
+          <p>Shadow rechunk: {String(preview.requires_shadow_rechunk ?? false)}</p>
+          <p>Vector shadow: {String(preview.requires_vector_shadow ?? false)}</p>
+          <p>Gray-zone model calls: {String(preview.gray_zone_rule_decision_model_call_count ?? 0)}</p>
+        </div>
+      ) : null}
+      {Object.keys(hardGates).length ? (
+        <div className="mt-4">
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-100/60">Measured hard gates</p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {Object.entries(hardGates).map(([name, passed]) => (
+              <StatusPill key={name} ok={passed}>{name}</StatusPill>
+            ))}
+          </div>
+        </div>
+      ) : null}
+      {candidate?.blocking_reasons?.length ? (
+        <p className="mt-4 text-sm leading-6 text-rose-100/80">阻断：{candidate.blocking_reasons.join("；")}</p>
+      ) : null}
+    </section>
+  );
+}
+
 export function SettingsWorkspace() {
   const queryClient = useQueryClient();
+  const { selectedKnowledgeBaseId, selectedKnowledgeBase } = useKnowledgeBaseContext();
   const settingsQuery = useQuery({ queryKey: ["model-settings"], queryFn: fetchModelSettings });
   const runtimeQuery = useQuery({ queryKey: ["runtime-check"], queryFn: () => fetchRuntimeCheck(), retry: false });
   const [form, setForm] = useState<SettingsForm | null>(null);
@@ -1058,55 +1639,72 @@ export function SettingsWorkspace() {
     if (!settingsQuery.data) {
       return;
     }
+    const displayedSettings = settingsQuery.data;
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setForm({
-      chat_base_url: settingsQuery.data.chat_base_url ?? "",
-      graph_base_url: settingsQuery.data.graph_base_url ?? "",
-      embedding_base_url: settingsQuery.data.embedding_base_url ?? "",
-      chat_resolve_ip: settingsQuery.data.chat_resolve_ip ?? "",
-      graph_resolve_ip: settingsQuery.data.graph_resolve_ip ?? "",
-      embedding_resolve_ip: settingsQuery.data.embedding_resolve_ip ?? "",
-      embedding_model: settingsQuery.data.embedding_model ?? "",
-      chat_model: settingsQuery.data.chat_model ?? "",
-      graph_model: settingsQuery.data.graph_model ?? "",
-      embedding_dimensions: String(settingsQuery.data.embedding_dimensions ?? 1024),
-      embedding_batch_size: String(settingsQuery.data.embedding_batch_size ?? 10),
-      worker_concurrency: String(settingsQuery.data.worker_concurrency ?? 3),
-      model_request_concurrency: String(settingsQuery.data.model_request_concurrency ?? 3),
-      model_request_timeout_seconds: String(settingsQuery.data.model_request_timeout_seconds ?? 240),
-      concept_i18n_enabled: settingsQuery.data.concept_i18n_enabled ?? false,
-      fixed_chunk_size_tokens: String(settingsQuery.data.fixed_chunk_size_tokens ?? 512),
-      fixed_chunk_overlap_tokens: String(settingsQuery.data.fixed_chunk_overlap_tokens ?? 80),
+      chat_api_protocol: displayedSettings.chat_api_protocol ?? "openai",
+      graph_api_protocol: displayedSettings.graph_api_protocol ?? "openai",
+      embedding_api_protocol: displayedSettings.embedding_api_protocol ?? "openai",
+      chat_base_url: displayedSettings.chat_base_url ?? "",
+      graph_base_url: displayedSettings.graph_base_url ?? "",
+      embedding_base_url: displayedSettings.embedding_base_url ?? "",
+      chat_resolve_ip: displayedSettings.chat_resolve_ip ?? "",
+      graph_resolve_ip: displayedSettings.graph_resolve_ip ?? "",
+      embedding_resolve_ip: displayedSettings.embedding_resolve_ip ?? "",
+      embedding_model: displayedSettings.embedding_model ?? "",
+      chat_model: displayedSettings.chat_model ?? "",
+      graph_model: displayedSettings.graph_model ?? "",
+      embedding_dimensions: String(displayedSettings.embedding_dimensions ?? 1024),
+      embedding_batch_size: String(displayedSettings.embedding_batch_size ?? 10),
+      worker_concurrency: String(displayedSettings.worker_concurrency ?? 3),
+      model_request_concurrency: String(displayedSettings.model_request_concurrency ?? 3),
+      model_request_timeout_seconds: String(displayedSettings.model_request_timeout_seconds ?? 240),
+      chat_json_max_tokens: String(displayedSettings.chat_json_max_tokens ?? 12000),
+      agent_request_concurrency: String(displayedSettings.agent_request_concurrency ?? 4),
+      source_io_concurrency: String(displayedSettings.source_io_concurrency ?? 4),
+      agent_request_queue_limit: String(displayedSettings.agent_request_queue_limit ?? 8),
+      agent_request_queue_timeout_seconds: String(displayedSettings.agent_request_queue_timeout_seconds ?? 30),
+      agent_request_lease_ttl_seconds: String(displayedSettings.agent_request_lease_ttl_seconds ?? 300),
+      upload_max_bytes: String(displayedSettings.upload_max_bytes ?? UPLOAD_MAX_BYTES_LIMITS.defaultValue),
+      concept_i18n_enabled: displayedSettings.concept_i18n_enabled ?? false,
+      fixed_chunk_size_tokens: String(displayedSettings.fixed_chunk_size_tokens ?? 512),
+      fixed_chunk_overlap_tokens: String(displayedSettings.fixed_chunk_overlap_tokens ?? 80),
       chat_api_key: "",
       clear_chat_api_key: false,
       graph_api_key: "",
       clear_graph_api_key: false,
       embedding_api_key: "",
       clear_embedding_api_key: false,
-      model_bridge_enabled: settingsQuery.data.model_bridge_enabled ?? true,
-      mid_concept_extraction_max_model_batches: String(settingsQuery.data.mid_concept_extraction_max_model_batches ?? 4),
-      mid_concept_extraction_max_candidates_per_batch: String(settingsQuery.data.mid_concept_extraction_max_candidates_per_batch ?? 8),
-      mid_concept_extraction_max_tokens_per_batch: String(settingsQuery.data.mid_concept_extraction_max_tokens_per_batch ?? 2400),
-      mid_concept_candidate_keep_threshold: String(settingsQuery.data.mid_concept_candidate_keep_threshold ?? 0.62),
-      rq_kmeans_levels: String(settingsQuery.data.rq_kmeans_levels ?? 3),
-      rq_kmeans_max_k: String(settingsQuery.data.rq_kmeans_max_k ?? 6),
-      rq_residual_tau: String(settingsQuery.data.rq_residual_tau ?? 0.65),
-      dense_knn_k_min: String(settingsQuery.data.dense_knn_k_min ?? 5),
-      dense_knn_k_max: String(settingsQuery.data.dense_knn_k_max ?? 24),
-      dense_reverse_b_min_base: String(settingsQuery.data.dense_reverse_b_min_base ?? 2),
-      dense_reverse_b_max_base: String(settingsQuery.data.dense_reverse_b_max_base ?? 8),
-      dense_reverse_b_min_doc: String(settingsQuery.data.dense_reverse_b_min_doc ?? 1),
-      dense_reverse_b_max_doc: String(settingsQuery.data.dense_reverse_b_max_doc ?? 6),
-      dense_reverse_b_min_lang: String(settingsQuery.data.dense_reverse_b_min_lang ?? 1),
-      dense_reverse_b_max_lang: String(settingsQuery.data.dense_reverse_b_max_lang ?? 4),
-      dense_min_cosine: String(settingsQuery.data.dense_min_cosine ?? 0.58),
-      dense_strong_cosine: String(settingsQuery.data.dense_strong_cosine ?? 0.72),
-      cross_doc_out_quota_min: String(settingsQuery.data.cross_doc_out_quota_min ?? 1),
-      cross_doc_out_quota_max: String(settingsQuery.data.cross_doc_out_quota_max ?? 4),
-      cross_doc_min_cosine: String(settingsQuery.data.cross_doc_min_cosine ?? 0.62),
-      cross_language_out_quota_min: String(settingsQuery.data.cross_language_out_quota_min ?? 0),
-      cross_language_out_quota_max: String(settingsQuery.data.cross_language_out_quota_max ?? 3),
-      cross_language_min_cosine: String(settingsQuery.data.cross_language_min_cosine ?? 0.65),
+      model_bridge_enabled: displayedSettings.model_bridge_enabled ?? true,
+      mid_concept_extraction_max_model_batches: String(displayedSettings.mid_concept_extraction_max_model_batches ?? 4),
+      mid_concept_extraction_max_candidates_per_batch: String(displayedSettings.mid_concept_extraction_max_candidates_per_batch ?? 8),
+      mid_concept_extraction_max_tokens_per_batch: String(displayedSettings.mid_concept_extraction_max_tokens_per_batch ?? 2400),
+      mid_concept_candidate_keep_threshold: String(displayedSettings.mid_concept_candidate_keep_threshold ?? 0.62),
+      rq_kmeans_max_k: String(displayedSettings.rq_kmeans_max_k ?? 6),
+      rq_residual_tau: String(displayedSettings.rq_residual_tau ?? 0.65),
+      edge_distance_protocol: displayedSettings.edge_distance_protocol ?? "edge_distance_log_calibrated_strength_v2",
+      rq_membership_protocol: displayedSettings.rq_membership_protocol ?? "rq_fuzzy_softmax_gamma_product_v1",
+      edge_projection_protocol: displayedSettings.edge_projection_protocol ?? "membership_q15_layer_type_calibrated_v3",
+      edge_type_calibration_protocol: displayedSettings.edge_type_calibration_protocol ?? "type_local_winsorized_minmax_v1",
+      rq_membership_temperature: String(displayedSettings.rq_membership_temperature ?? 0.35),
+      rq_membership_top_m: String(displayedSettings.rq_membership_top_m ?? 2),
+      rq_membership_probability_threshold: String(displayedSettings.rq_membership_probability_threshold ?? 0.05),
+      dense_knn_k_min: String(displayedSettings.dense_knn_k_min ?? 5),
+      dense_knn_k_max: String(displayedSettings.dense_knn_k_max ?? 24),
+      dense_reverse_b_min_base: String(displayedSettings.dense_reverse_b_min_base ?? 2),
+      dense_reverse_b_max_base: String(displayedSettings.dense_reverse_b_max_base ?? 8),
+      dense_reverse_b_min_doc: String(displayedSettings.dense_reverse_b_min_doc ?? 1),
+      dense_reverse_b_max_doc: String(displayedSettings.dense_reverse_b_max_doc ?? 6),
+      dense_reverse_b_min_lang: String(displayedSettings.dense_reverse_b_min_lang ?? 1),
+      dense_reverse_b_max_lang: String(displayedSettings.dense_reverse_b_max_lang ?? 4),
+      dense_min_cosine: String(displayedSettings.dense_min_cosine ?? 0.58),
+      dense_strong_cosine: String(displayedSettings.dense_strong_cosine ?? 0.72),
+      cross_doc_out_quota_min: String(displayedSettings.cross_doc_out_quota_min ?? 1),
+      cross_doc_out_quota_max: String(displayedSettings.cross_doc_out_quota_max ?? 4),
+      cross_doc_min_cosine: String(displayedSettings.cross_doc_min_cosine ?? 0.62),
+      cross_language_out_quota_min: String(displayedSettings.cross_language_out_quota_min ?? 0),
+      cross_language_out_quota_max: String(displayedSettings.cross_language_out_quota_max ?? 3),
+      cross_language_min_cosine: String(displayedSettings.cross_language_min_cosine ?? 0.65),
     });
     setApiKeyEditing(false);
     setGraphApiKeyEditing(false);
@@ -1115,11 +1713,21 @@ export function SettingsWorkspace() {
 
   const saveMutation = useMutation({
     mutationFn: (payload: ModelSettingsUpdate) => updateModelSettings(payload),
-    onSuccess: async () => {
+    onSuccess: async (result) => {
       setApiKeyEditing(false);
       setGraphApiKeyEditing(false);
       setEmbeddingApiKeyEditing(false);
-      setSavedMessage("已保存");
+      const pendingRebuild = result.pending_rebuild_changes ?? [];
+      const pendingService = result.pending_service_recreate_changes ?? [];
+      setSavedMessage(
+        result.apply_error_type
+          ? `.env 已写入；运行时刷新待重试：${result.apply_error_type}`
+          : pendingService.length
+            ? `.env 已写入；${pendingService.length} 项重启后生效，${pendingRebuild.length} 项待图谱/索引重建`
+            : pendingRebuild.length
+              ? `.env 已写入；${pendingRebuild.length} 项待图谱/索引重建`
+              : ".env 已写入并生效",
+      );
       window.setTimeout(() => setSavedMessage(null), 1800);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["model-settings"] }),
@@ -1135,6 +1743,9 @@ export function SettingsWorkspace() {
   const showGraphApiKeyMask = Boolean(settings?.has_graph_api_key && !graphApiKeyEditing && !form?.clear_graph_api_key);
   const showEmbeddingApiKeyMask = Boolean(settings?.has_embedding_api_key && !embeddingApiKeyEditing && !form?.clear_embedding_api_key);
   const envSynced = Boolean(runtimeQuery.data?.env_sync?.synced);
+  const settingsFileSynced = Boolean(settings?.settings_file_synced);
+  const pendingRebuildCount = settings?.pending_rebuild_changes?.length ?? 0;
+  const pendingServiceCount = settings?.pending_service_recreate_changes?.length ?? 0;
   const runtimeWarnings = runtimeQuery.data?.warnings ?? [];
   const bridgeStatus = settings?.model_bridge_status;
   const bridgeHealthy =
@@ -1153,7 +1764,7 @@ export function SettingsWorkspace() {
       : "不可达";
   const bridgeWarnings = bridgeStatus?.warnings ?? [];
 
-  if (settingsQuery.isLoading || !form) {
+  if (settingsQuery.isLoading || !form || !settings) {
     return <LoadingBlock rows={4} />;
   }
   if (settingsQuery.error) {
@@ -1164,55 +1775,7 @@ export function SettingsWorkspace() {
     setForm((current) => (current ? { ...current, [key]: value } : current));
   };
 
-  const buildPayload = (): ModelSettingsUpdate => ({
-    chat_base_url: form.chat_base_url.trim(),
-    graph_base_url: form.graph_base_url.trim(),
-    embedding_base_url: form.embedding_base_url.trim(),
-    chat_resolve_ip: form.chat_resolve_ip.trim() || null,
-    graph_resolve_ip: form.graph_resolve_ip.trim() || null,
-    embedding_resolve_ip: form.embedding_resolve_ip.trim() || null,
-    embedding_model: form.embedding_model.trim(),
-    chat_model: form.chat_model.trim(),
-    graph_model: form.graph_model.trim(),
-    embedding_dimensions: parseIntField(form.embedding_dimensions),
-    embedding_batch_size: parseIntField(form.embedding_batch_size),
-    worker_concurrency: parseIntField(form.worker_concurrency),
-    model_request_concurrency: parseIntField(form.model_request_concurrency),
-    model_request_timeout_seconds: parseIntField(form.model_request_timeout_seconds),
-    concept_i18n_enabled: form.concept_i18n_enabled,
-    fixed_chunk_size_tokens: parseIntField(form.fixed_chunk_size_tokens),
-    fixed_chunk_overlap_tokens: parseIntField(form.fixed_chunk_overlap_tokens),
-    chat_api_key: form.chat_api_key.trim() || null,
-    clear_chat_api_key: form.clear_chat_api_key,
-    graph_api_key: form.graph_api_key.trim() || null,
-    clear_graph_api_key: form.clear_graph_api_key,
-    embedding_api_key: form.embedding_api_key.trim() || null,
-    clear_embedding_api_key: form.clear_embedding_api_key,
-    model_bridge_enabled: form.model_bridge_enabled,
-    mid_concept_extraction_max_model_batches: parseIntField(form.mid_concept_extraction_max_model_batches),
-    mid_concept_extraction_max_candidates_per_batch: parseIntField(form.mid_concept_extraction_max_candidates_per_batch),
-    mid_concept_extraction_max_tokens_per_batch: parseIntField(form.mid_concept_extraction_max_tokens_per_batch),
-    mid_concept_candidate_keep_threshold: parseFloatField(form.mid_concept_candidate_keep_threshold),
-    rq_kmeans_levels: parseIntField(form.rq_kmeans_levels),
-    rq_kmeans_max_k: parseIntField(form.rq_kmeans_max_k),
-    rq_residual_tau: parseFloatField(form.rq_residual_tau),
-    dense_knn_k_min: parseIntField(form.dense_knn_k_min),
-    dense_knn_k_max: parseIntField(form.dense_knn_k_max),
-    dense_reverse_b_min_base: parseIntField(form.dense_reverse_b_min_base),
-    dense_reverse_b_max_base: parseIntField(form.dense_reverse_b_max_base),
-    dense_reverse_b_min_doc: parseIntField(form.dense_reverse_b_min_doc),
-    dense_reverse_b_max_doc: parseIntField(form.dense_reverse_b_max_doc),
-    dense_reverse_b_min_lang: parseIntField(form.dense_reverse_b_min_lang),
-    dense_reverse_b_max_lang: parseIntField(form.dense_reverse_b_max_lang),
-    dense_min_cosine: parseFloatField(form.dense_min_cosine),
-    dense_strong_cosine: parseFloatField(form.dense_strong_cosine),
-    cross_doc_out_quota_min: parseIntField(form.cross_doc_out_quota_min),
-    cross_doc_out_quota_max: parseIntField(form.cross_doc_out_quota_max),
-    cross_doc_min_cosine: parseFloatField(form.cross_doc_min_cosine),
-    cross_language_out_quota_min: parseIntField(form.cross_language_out_quota_min),
-    cross_language_out_quota_max: parseIntField(form.cross_language_out_quota_max),
-    cross_language_min_cosine: parseFloatField(form.cross_language_min_cosine),
-  });
+  const buildPayload = (): ModelSettingsUpdate => buildRuntimeSettingsPayload(form);
 
   const handleSubmit = async () => {
     saveMutation.mutate(buildPayload());
@@ -1253,6 +1816,9 @@ export function SettingsWorkspace() {
               <p className="mt-4 max-w-xl text-sm leading-7 text-cyan-50/62">
                 这里只保留当前 active path 实际消费的参数，并按下一次调用、重建后、重启服务后三类边界标注。
               </p>
+              <p className="mt-3 max-w-xl text-xs leading-6 text-white/45">
+                {RUNTIME_ENV_AUTHORITY_NOTE}
+              </p>
             </div>
 
             <div className="flex flex-wrap gap-2">
@@ -1260,12 +1826,14 @@ export function SettingsWorkspace() {
               <StatusPill ok={Boolean(settings?.has_graph_api_key)}>图谱密钥 {settings?.has_graph_api_key ? "已配置" : "未配置"}</StatusPill>
               <StatusPill ok={Boolean(settings?.has_embedding_api_key)}>向量密钥 {settings?.has_embedding_api_key ? "已配置" : "未配置"}</StatusPill>
               <StatusPill ok={bridgeHealthy}>模型桥 {bridgeStatusText}</StatusPill>
-              <StatusPill ok={envSynced}>{envSynced ? ".env 已同步" : ".env 需检查"}</StatusPill>
+              <StatusPill ok={settingsFileSynced && envSynced}>{settingsFileSynced && envSynced ? "根 .env 已同步" : "根 .env 需检查"}</StatusPill>
+              <StatusPill ok={pendingRebuildCount === 0}>待重建 {pendingRebuildCount}</StatusPill>
+              <StatusPill ok={pendingServiceCount === 0}>待重启 {pendingServiceCount}</StatusPill>
               <StatusPill ok={!settings?.enable_model_fallback && !settings?.enable_database_fallback}>回退已禁用</StatusPill>
               <StatusPill ok={!settings?.concept_i18n_enabled}>双语派生 {settings?.concept_i18n_enabled ? "已开启" : "已关闭"}</StatusPill>
               <StatusPill ok={Boolean(settings?.lifecycle?.hot_reloadable?.length)}>热加载 {settings?.lifecycle?.hot_reloadable?.length ?? 0}</StatusPill>
               <StatusPill ok={Boolean(settings?.lifecycle?.rebuild_required?.length)}>需重建 {settings?.lifecycle?.rebuild_required?.length ?? 0}</StatusPill>
-              <StatusPill ok={Boolean(settings?.runtime_settings_version)}>运行时 {settings?.runtime_settings_version ? settings.runtime_settings_version.slice(0, 12) : "等待中"}</StatusPill>
+              <StatusPill ok={Boolean(settings?.runtime_settings_version)}>运行时 {settings?.runtime_settings_version ? "已同步" : "等待中"}</StatusPill>
             </div>
 
             <div className={sectionClass}>
@@ -1306,14 +1874,11 @@ export function SettingsWorkspace() {
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="font-semibold text-white">模型桥转发状态</span>
                     <StatusPill ok={bridgeHealthy}>{bridgeStatusText}</StatusPill>
-                    {bridgeStatus?.config_version ? <span className="text-xs text-cyan-100/50">版本 {bridgeStatus.config_version.slice(0, 12)}</span> : null}
                   </div>
                   <div className="mt-3 grid gap-2 md:grid-cols-2">
                     <p className="min-w-0 break-words">聊天 effective 地址：{settings?.effective_chat_base_url || "未读取"}</p>
                     <p className="min-w-0 break-words">图谱 effective 地址：{settings?.effective_graph_base_url || "未读取"}</p>
                     <p className="min-w-0 break-words">向量 effective 地址：{settings?.effective_embedding_base_url || "未读取"}</p>
-                    <p className="min-w-0 break-words">聊天目标 hash：{bridgeStatus?.chat_target_hash?.slice(0, 12) || "未知"}</p>
-                    <p className="min-w-0 break-words">向量目标 hash：{bridgeStatus?.embedding_target_hash?.slice(0, 12) || "未知"}</p>
                   </div>
                   {bridgeStatus?.last_reload ? (
                     <p className={bridgeStatus.last_reload.ok ? "mt-3 text-emerald-100/75" : "mt-3 text-rose-100/80"}>
@@ -1338,7 +1903,26 @@ export function SettingsWorkspace() {
                   checked={form.model_bridge_enabled}
                   onChange={() => updateForm("model_bridge_enabled", !form.model_bridge_enabled)}
                   disabled={saveMutation.isPending}
-                  badge="下一次调用"
+                  badge="保存后待重建服务"
+                />
+                <ModelProtocolSelect
+                  label="聊天接口协议"
+                  value={form.chat_api_protocol}
+                  onChange={(value) => updateForm("chat_api_protocol", value)}
+                  disabled={saveMutation.isPending}
+                  lifecycle="hot_reloadable · applies to the next model call"
+                />
+                <ModelProtocolSelect
+                  label="图谱接口协议"
+                  value={form.graph_api_protocol}
+                  onChange={(value) => updateForm("graph_api_protocol", value)}
+                  disabled={saveMutation.isPending}
+                  lifecycle="rebuild_required · stage as candidate, then shadow rebuild, evaluate and promote"
+                />
+                <EmbeddingProtocolSelect
+                  value={form.embedding_api_protocol}
+                  onChange={(value) => updateForm("embedding_api_protocol", value)}
+                  disabled={saveMutation.isPending}
                 />
                 <SettingField label="聊天基础地址" value={form.chat_base_url} onChange={(value) => updateForm("chat_base_url", value)} className="md:col-span-2" />
                 <SettingField label="图谱基础地址" value={form.graph_base_url} onChange={(value) => updateForm("graph_base_url", value)} className="md:col-span-2" />
@@ -1475,19 +2059,46 @@ export function SettingsWorkspace() {
             <section className={sectionClass}>
               <p className="text-sm font-semibold text-white">模型调用参数</p>
               <BoundaryNote title="生效边界：下一次请求或下一次模型调用">
-                模型请求并发、超时和 embedding 批大小会热加载；已开始的请求或批次按启动时快照继续执行。
+                模型请求并发、源文件 I/O 并发、超时和 embedding 批大小会热加载；已开始的请求或批次按启动时快照继续执行。
               </BoundaryNote>
-              <div className="mt-5 grid gap-4 md:grid-cols-3">
+              <div className="mt-5 grid gap-4 md:grid-cols-5">
                 <SettingField label="模型请求并发" type="number" min={1} max={16} value={form.model_request_concurrency} onChange={(value) => updateForm("model_request_concurrency", value)} />
+                <SourceIoConcurrencyField value={form.source_io_concurrency} onChange={(value) => updateForm("source_io_concurrency", value)} />
+                <SettingField label="Chat JSON token 上限" type="number" min={256} max={32768} value={form.chat_json_max_tokens} onChange={(value) => updateForm("chat_json_max_tokens", value)} />
                 <SettingField label="模型超时秒数" type="number" min={5} max={600} value={form.model_request_timeout_seconds} onChange={(value) => updateForm("model_request_timeout_seconds", value)} />
                 <SettingField label="Embedding 批大小" type="number" min={1} max={10} value={form.embedding_batch_size} onChange={(value) => updateForm("embedding_batch_size", value)} />
               </div>
             </section>
 
+            <AgentAdmissionSettingsSection
+              values={{
+                agent_request_concurrency: form.agent_request_concurrency,
+                agent_request_queue_limit: form.agent_request_queue_limit,
+                agent_request_queue_timeout_seconds: form.agent_request_queue_timeout_seconds,
+                agent_request_lease_ttl_seconds: form.agent_request_lease_ttl_seconds,
+              }}
+              onChange={(key, value) => updateForm(key, value)}
+            />
+
+            <UploadSecuritySettingsSection value={form.upload_max_bytes} onChange={(value) => updateForm("upload_max_bytes", value)} />
+
+            <GraphProtocolSettingsSection
+              values={{
+                edge_distance_protocol: form.edge_distance_protocol,
+                rq_membership_protocol: form.rq_membership_protocol,
+                edge_projection_protocol: form.edge_projection_protocol,
+                edge_type_calibration_protocol: form.edge_type_calibration_protocol,
+                rq_membership_temperature: form.rq_membership_temperature,
+                rq_membership_top_m: form.rq_membership_top_m,
+                rq_membership_probability_threshold: form.rq_membership_probability_threshold,
+              }}
+              onChange={(key, value) => updateForm(key, value)}
+            />
+
             <section className={sectionClass}>
               <p className="text-sm font-semibold text-white">重建参数</p>
               <BoundaryNote title="生效边界：新任务会读取，但已有 active 数据不会改变">
-                固定切块、向量维度、RQ-KMeans 和概念批处理参数必须通过重解析或图谱重建，才能影响已有资料库的 chunk、向量、关系图和概念图；L3 到中粒度、L2 到粗粒度始终全量投影。
+                固定切块、向量维度、RQ-KMeans 分支与残差参数和概念批处理参数必须通过重解析或图谱重建，才能影响已有资料库的 chunk、向量、关系图和概念图；RQ 地址深度固定为 3，L3 到中粒度、L2 到粗粒度始终全量投影。
               </BoundaryNote>
               <div className="mt-5">
                 <SwitchRow
@@ -1508,8 +2119,8 @@ export function SettingsWorkspace() {
                 <SettingField label="每批 L3 前缀数" type="number" min={1} max={500} value={form.mid_concept_extraction_max_candidates_per_batch} onChange={(value) => updateForm("mid_concept_extraction_max_candidates_per_batch", value)} />
                 <SettingField label="每批概念 token 上限" type="number" min={500} max={50000} value={form.mid_concept_extraction_max_tokens_per_batch} onChange={(value) => updateForm("mid_concept_extraction_max_tokens_per_batch", value)} />
                 <SettingField label="候选诊断阈值" type="number" min={0} max={1} step={0.01} value={form.mid_concept_candidate_keep_threshold} onChange={(value) => updateForm("mid_concept_candidate_keep_threshold", value)} />
-                <SettingField label="RQ-KMeans 层数" type="number" min={1} max={8} value={form.rq_kmeans_levels} onChange={(value) => updateForm("rq_kmeans_levels", value)} />
-                <SettingField label="RQ-KMeans 最大 K" type="number" min={1} max={64} value={form.rq_kmeans_max_k} onChange={(value) => updateForm("rq_kmeans_max_k", value)} />
+                <RqProtocolDepthField />
+                <SettingField label="RQ-KMeans 最大 K（精确 pair 域上限 6）" type="number" min={1} max={6} value={form.rq_kmeans_max_k} onChange={(value) => updateForm("rq_kmeans_max_k", value)} />
                 <SettingField label="RQ 残差 Tau" type="number" min={0.01} max={10} step={0.01} value={form.rq_residual_tau} onChange={(value) => updateForm("rq_residual_tau", value)} />
                 <SettingField label="Dense KNN 最小 K" type="number" min={1} max={200} value={form.dense_knn_k_min} onChange={(value) => updateForm("dense_knn_k_min", value)} />
                 <SettingField label="Dense KNN 最大 K" type="number" min={1} max={500} value={form.dense_knn_k_max} onChange={(value) => updateForm("dense_knn_k_max", value)} />
@@ -1530,6 +2141,14 @@ export function SettingsWorkspace() {
               </div>
             </section>
 
+            <RuntimeSettingsCandidatePanel
+              knowledgeBaseId={selectedKnowledgeBaseId}
+              knowledgeBaseName={selectedKnowledgeBase?.name}
+              settings={settings}
+              form={form}
+              onError={(error) => setErrorDialog(errorDialogFromUnknown(error))}
+            />
+
             <section className={sectionClass}>
               <p className="text-sm font-semibold text-white">服务重启参数</p>
               <BoundaryNote title="生效边界：必须重启或重建 worker 服务">
@@ -1542,7 +2161,7 @@ export function SettingsWorkspace() {
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/8 pt-5">
               <p className="text-xs leading-6 text-white/42">
-                保存会先规范化 .env 并广播运行时版本；回退开关不在页面开放开启，生产路径必须保持禁用。
+                保存会立即写入仓库根 .env；热加载参数马上刷新，重建参数和服务参数分别保持待重建、待重启状态。回退开关不在页面开放开启。
               </p>
               <div className="flex items-center gap-2">
                 {savedMessage ? <span className="text-sm text-emerald-100">{savedMessage}</span> : null}

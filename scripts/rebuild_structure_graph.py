@@ -16,13 +16,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def main() -> None:
+async def main(args: argparse.Namespace | None = None) -> None:
+    if args is None:
+        args = parse_args()
     from app.services.ingestion import create_uploaded_files_batch, run_uploaded_files_ingestion
 
-    args = parse_args()
     with session_scope() as db:
         knowledge_base = resolve_knowledge_base(db, knowledge_base_id=args.knowledge_base_id, knowledge_base_name=args.knowledge_base_name)
-        files = storage_files(knowledge_base.name)
+        files = storage_files(knowledge_base.source_root)
         chunks = active_chunk_count(db, knowledge_base.id)
         if chunks > 0 and not args.full_reparse:
             raise SystemExit("Structure graph rebuild touches chunk mappings; pass --full-reparse to make the version change explicit.")
@@ -44,4 +45,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(parse_args()))

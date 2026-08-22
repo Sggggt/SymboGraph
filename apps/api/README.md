@@ -4,6 +4,8 @@
 
 `apps/api` 是 SymboGraph 的 FastAPI 后端，负责知识库、上传、解析、固定 token chunk、Chunk Structure Graph、Chunk Relation Graph、RQ membership、Mid/Coarse Concept Graph、layered retrieval、context package、QA、citation verification、runtime settings 和维护入口。
 
+首次构图与普通重建复用同一 ingestion/context-graph 事务、补偿和恢复协议；模型配置只读取已生效的 Runtime Settings，不依赖仓库内的授权回执或 Sample 专用流程。
+
 ## 目录
 
 | 路径 | 职责 |
@@ -63,26 +65,31 @@ upload / source files
 API 从仓库根目录 `.env` 和 `apps/api/.env` 读取配置。Docker Compose 使用容器网络地址作为服务端连接：
 
 ```text
-DATABASE_URL=postgresql+psycopg://postgres:postgres@postgres:5432/symbograph
+DATABASE_URL=postgresql+psycopg://<user>:<local-password>@postgres:5432/<database>
 QDRANT_URL=http://qdrant:6333
 REDIS_URL=redis://redis:6379/0
 DATA_ROOT=/app/data
 ```
 
-模型 endpoint 使用 OpenAI-compatible 协议：
+对话、图谱、向量分别使用独立协议字段。对话与图谱可各自选择 `openai` 或 `anthropic`；向量当前只允许真实的 OpenAI-compatible 协议：
 
 ```text
 CHAT_API_KEY
+CHAT_API_PROTOCOL
 CHAT_BASE_URL
 CHAT_MODEL
 GRAPH_API_KEY
+GRAPH_API_PROTOCOL
 GRAPH_BASE_URL
 GRAPH_MODEL
 EMBEDDING_API_KEY
+EMBEDDING_API_PROTOCOL
 EMBEDDING_BASE_URL
 EMBEDDING_MODEL
 EMBEDDING_DIMENSIONS
 ```
+
+chat/graph 的 `anthropic` 模式使用 Anthropic Messages 契约：base 填 provider 根地址或路径前缀，不能以 `/v1` 或 `/v1/messages` 结尾，客户端固定追加 `/v1/messages`，并仅发送 `X-Api-Key`、固定 `Anthropic-Version` 与 JSON 头。chat/graph 的 `openai` 模式固定追加 `/chat/completions`。`EMBEDDING_API_PROTOCOL` 当前闭合为 `openai`，固定追加 `/embeddings`；它属于 `rebuild_required` candidate，不能通过普通 active settings PUT 热切换，也不能填写 `anthropic`。
 
 正常 active path 保持 `ENABLE_MODEL_FALLBACK=false` 和 `ENABLE_DATABASE_FALLBACK=false`。
 
@@ -105,9 +112,9 @@ Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health
 | 分类 | 参数 |
 | --- | --- |
 | 基础设施 | `DATABASE_URL`, `QDRANT_URL`, `QDRANT_COLLECTION`, `REDIS_URL`, `CORS_ORIGINS`, `API_KEYS` |
-| 对话模型 | `CHAT_API_KEY`, `CHAT_BASE_URL`, `CHAT_RESOLVE_IP`, `CHAT_MODEL` |
-| 图谱模型 | `GRAPH_API_KEY`, `GRAPH_BASE_URL`, `GRAPH_RESOLVE_IP`, `GRAPH_MODEL` |
-| 向量模型 | `EMBEDDING_API_KEY`, `EMBEDDING_BASE_URL`, `EMBEDDING_RESOLVE_IP`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_BATCH_SIZE` |
+| 对话模型 | `CHAT_API_KEY`, `CHAT_API_PROTOCOL` (`openai`/`anthropic`), `CHAT_BASE_URL`, `CHAT_RESOLVE_IP`, `CHAT_MODEL` |
+| 图谱模型 | `GRAPH_API_KEY`, `GRAPH_API_PROTOCOL` (`openai`/`anthropic`), `GRAPH_BASE_URL`, `GRAPH_RESOLVE_IP`, `GRAPH_MODEL` |
+| 向量模型 | `EMBEDDING_API_KEY`, `EMBEDDING_API_PROTOCOL` (`openai`), `EMBEDDING_BASE_URL`, `EMBEDDING_RESOLVE_IP`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_BATCH_SIZE` |
 | 模型桥接 | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT`, `MODEL_BRIDGE_ADMIN_TOKEN` |
 | 片段与图构建 | `FIXED_CHUNK_SIZE_TOKENS`, `FIXED_CHUNK_OVERLAP_TOKENS`, `RQ_KMEANS_LEVELS`, `RQ_KMEANS_MAX_K`, `RQ_RESIDUAL_TAU` |
 | 稠密关系运行点 | `DENSE_KNN_K_MIN`, `DENSE_KNN_K_MAX`, `DENSE_REVERSE_B_MIN_BASE`, `DENSE_REVERSE_B_MAX_BASE`, `DENSE_REVERSE_B_MIN_DOC`, `DENSE_REVERSE_B_MAX_DOC`, `DENSE_REVERSE_B_MIN_LANG`, `DENSE_REVERSE_B_MAX_LANG`, `DENSE_MIN_COSINE`, `DENSE_STRONG_COSINE`, `CROSS_DOC_OUT_QUOTA_MIN`, `CROSS_DOC_OUT_QUOTA_MAX`, `CROSS_DOC_MIN_COSINE`, `CROSS_LANGUAGE_OUT_QUOTA_MIN`, `CROSS_LANGUAGE_OUT_QUOTA_MAX`, `CROSS_LANGUAGE_MIN_COSINE` |
@@ -139,11 +146,18 @@ docker exec -w /app/apps/api course-kg-api python -m pytest tests
 
 ```powershell
 python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
+python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --execute
 python scripts/diagnose_context_graph.py
+python scripts/evaluate_layered_retrieval.py
+python scripts/evaluate_layered_retrieval.py --query "<query>" --execute
 python scripts/check_context_package_quality.py
 python scripts/check_technical_spec_compliance.py --knowledge-base-name 贝叶斯
 python scripts/reconcile_vector_records.py
 ```
+
+Docker smoke 第一条命令只执行 GET 预检；确认报告中的精确 KB/query/POST
+目标后才运行带 `--execute` 的第二条。Layered retrieval evaluator 默认只重放
+已持久化 trace，新检索必须显式提供 query 与 `--execute`。
 
 ## 文档
 

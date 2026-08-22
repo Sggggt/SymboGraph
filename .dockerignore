@@ -2,6 +2,7 @@
 .playwright-cli/
 .venv/
 venv/
+.agents/
 node_modules/
 apps/web/node_modules/
 apps/web/.next/
@@ -15,6 +16,12 @@ data/
 models/
 output/
 apps/api/output/
+tmp/
+temp/
+local_light_tests/
+infra/sample-import/*
+!infra/sample-import/.gitkeep
+apps/api/tmp/
 comparative_experiment/data/
 test-results/
 playwright-report/
@@ -26,6 +33,7 @@ coverage/
 .env.*
 !.env.example
 *.log
+*.har
 *.tmp
 *.db
 *.sqlite*
@@ -33,6 +41,13 @@ coverage/
 *.db-shm
 *.db-wal
 *.tsbuildinfo
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+.secrets/
+secrets/
 *.pyc
 __pycache__/
 .pytest_cache/

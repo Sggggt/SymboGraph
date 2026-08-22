@@ -10,6 +10,11 @@ SENSITIVE_VALUE_RE = re.compile(
     r"((?:api[_-]?key|token|secret|password)\s*[=:]\s*[\"']?)[^\s,;\"'}]+|"
     r"((?:api[_-]?key|token|secret|password)\"\s*:\s*\")[^\"]+"
 )
+SAFE_FAILURE_TOKEN_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,79}$")
+EXTERNAL_FAILURE_CLASSIFICATION_PROTOCOL_VERSION = (
+    "external_failure_classification_v1"
+)
+MAX_EXTERNAL_FAILURE_CAUSE_DEPTH = 8
 
 
 def sanitize_error_message(message: str | None, *, fallback: str = "External service request failed", max_length: int = 240) -> str:
@@ -60,6 +65,75 @@ class ExternalServiceError(RuntimeError):
         if self.unsupported_parameters:
             parts.append("unsupported_parameters=" + ",".join(sorted(self.unsupported_parameters)))
         return "; ".join(parts)
+
+
+def _safe_failure_token(value: Any, *, fallback: str) -> str:
+    token = str(value or "").strip().lower()
+    return token if SAFE_FAILURE_TOKEN_RE.fullmatch(token) else fallback
+
+
+def external_failure_classification(exc: BaseException) -> dict[str, Any]:
+    """Return bounded scalar evidence without persisting messages or responses."""
+
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    for depth in range(MAX_EXTERNAL_FAILURE_CAUSE_DEPTH):
+        if current is None or id(current) in visited:
+            break
+        visited.add(id(current))
+        if isinstance(current, ExternalServiceError):
+            status = (
+                int(current.status_code)
+                if type(current.status_code) is int
+                and 100 <= int(current.status_code) <= 599
+                else None
+            )
+            retryable = (
+                current.retryable if type(current.retryable) is bool else None
+            )
+            return {
+                "protocol_version": (
+                    EXTERNAL_FAILURE_CLASSIFICATION_PROTOCOL_VERSION
+                ),
+                "classified": True,
+                "classification_source": "external_service_error",
+                "outer_error_type": type(exc).__name__[:128],
+                "classified_error_type": type(current).__name__[:128],
+                "cause_depth": depth,
+                "service": _safe_failure_token(
+                    current.service, fallback="noncanonical_service"
+                ),
+                "phase": _safe_failure_token(
+                    current.phase, fallback="noncanonical_phase"
+                ),
+                "http_status": status,
+                "error_code": (
+                    _safe_failure_token(
+                        current.error_code,
+                        fallback="noncanonical_error_code",
+                    )
+                    if current.error_code is not None
+                    else None
+                ),
+                "retryable": retryable,
+            }
+        next_error = current.__cause__
+        if next_error is None or id(next_error) in visited:
+            next_error = current.__context__
+        current = next_error
+    return {
+        "protocol_version": EXTERNAL_FAILURE_CLASSIFICATION_PROTOCOL_VERSION,
+        "classified": False,
+        "classification_source": "none",
+        "outer_error_type": type(exc).__name__[:128],
+        "classified_error_type": None,
+        "cause_depth": None,
+        "service": None,
+        "phase": None,
+        "http_status": None,
+        "error_code": None,
+        "retryable": None,
+    }
 
 
 def public_exception_message(exc: Exception, *, fallback: str = "External service request failed") -> str:

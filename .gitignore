@@ -29,6 +29,8 @@ blob-report/
 .vite/
 .vitest/
 .runtime/
+tmp/
+temp/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
@@ -42,11 +44,15 @@ venv/
 .vscode/
 .idea/
 .vs/
+.agents/
 *.iml
 .direnv/
 .playwright-cli/
 output/
 local_light_tests/
+apps/api/tmp/
+infra/sample-import/*
+!infra/sample-import/.gitkeep
 retrieval_architecture.md
 models/
 *.pyc
@@ -60,6 +66,13 @@ models/
 *.tsbuildinfo
 *.log
 *.pem
+*.key
+*.p12
+*.pfx
+*.secret
+*.har
+.secrets/
+secrets/
 *.tmp
 *.swp
 *.swo
@@ -69,6 +82,8 @@ models/
 *.pid.lock
 *.seed
 *.prof
+*.pcap
+*.pcapng
 *.tgz
 *.bak
 *~

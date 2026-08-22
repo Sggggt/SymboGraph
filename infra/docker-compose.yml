@@ -1,6 +1,45 @@
 services:
+  model-bridge:
+    profiles: ["model-bridge"]
+    image: ${API_IMAGE:-course-kg-api:dev}
+    pull_policy: never
+    container_name: course-kg-model-bridge
+    env_file:
+      - ../.env
+    environment:
+      MODEL_BRIDGE_ADMIN_TOKEN: ${MODEL_BRIDGE_ADMIN_TOKEN:-}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        exec /app/apps/api/.venv/bin/python
+        /app/infra/model-bridge/model_bridge.py
+        --host 0.0.0.0
+        --allow-private-container-bind
+        --port "$${MODEL_BRIDGE_PORT:-8765}"
+        --chat-api-protocol "$${CHAT_API_PROTOCOL:-openai}"
+        --chat-target-base-url "$${CHAT_BASE_URL:-}"
+        --chat-resolve-ip "$${CHAT_RESOLVE_IP:-}"
+        --embedding-api-protocol "$${EMBEDDING_API_PROTOCOL:-openai}"
+        --embedding-target-base-url "$${EMBEDDING_BASE_URL:-}"
+        --embedding-resolve-ip "$${EMBEDDING_RESOLVE_IP:-}"
+        --timeout "$${MODEL_REQUEST_TIMEOUT_SECONDS:-180}"
+    expose:
+      - "${MODEL_BRIDGE_PORT:-8765}"
+    volumes:
+      - ../infra/model-bridge:/app/infra/model-bridge:ro
+    healthcheck:
+      test:
+        - CMD
+        - /app/apps/api/.venv/bin/python
+        - -c
+        - "import json,os,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('MODEL_BRIDGE_PORT','8765')+'/health', timeout=3))['status']=='ok'"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
   api:
-    image: ${API_IMAGE:-course-kg-api:local}
+    image: ${API_IMAGE:-course-kg-api:dev}
     build:
       context: ..
       dockerfile: apps/api/Dockerfile
@@ -9,16 +48,17 @@ services:
     env_file:
       - ../.env
     environment:
-      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/symbograph
+      APP_ENV: development
+      MODEL_BRIDGE_ADMIN_TOKEN: ${MODEL_BRIDGE_ADMIN_TOKEN:-}
+      MODEL_BRIDGE_CLIENT_HOST: model-bridge
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}
+      ALLOW_DESTRUCTIVE_MIGRATIONS: ${ALLOW_DESTRUCTIVE_MIGRATIONS:-}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379/0
       DATA_ROOT: /app/data
-      CHAT_BASE_URL: ${API_CHAT_BASE_URL:-${CHAT_BASE_URL:-https://api.openai.com/v1}}
-      CHAT_RESOLVE_IP: ${API_CHAT_RESOLVE_IP:-${CHAT_RESOLVE_IP:-}}
-      GRAPH_BASE_URL: ${API_GRAPH_BASE_URL:-${GRAPH_BASE_URL:-https://api.openai.com/v1}}
-      GRAPH_RESOLVE_IP: ${API_GRAPH_RESOLVE_IP:-${GRAPH_RESOLVE_IP:-}}
-      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
-      EMBEDDING_RESOLVE_IP: ${EMBEDDING_RESOLVE_IP:-}
+      RUNTIME_ENV_FILE: /workspace/.env
+      SAMPLE_IMPORT_ROOT: /app/import/sample
+      SAMPLE_IMPORT_MANIFEST: /app/import/sample/raw-manifest.json
       ENABLE_MODEL_FALLBACK: "false"
       ENABLE_DATABASE_FALLBACK: "false"
       INGESTION_EXECUTION_MODE: celery
@@ -27,17 +67,26 @@ services:
       PYTHONPATH: /app/apps/worker:/app/apps/api
     ports:
       - "${API_HOST_PORT:-8000}:8000"
+    command: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/apps/api/app"]
     volumes:
-      - ../data:/app/data
-      - ../.env:/app/.env
-      - ../.env.example:/app/.env.example:ro
+      - symbograph-data:/app/data
+      - type: bind
+        source: ${SAMPLE_IMPORT_PATH:-./sample-import}
+        target: /app/import/sample
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ..
+        target: /workspace
       - ../output:/app/output
-      - ../apps/api/app:/app/apps/api/app
-      - ../apps/api/migrations:/app/apps/api/migrations
-      - ../apps/api/tests:/app/apps/api/tests
-      - ../apps/worker/worker_app:/app/apps/worker/worker_app
-      - ../packages/shared/src:/app/packages/shared/src
-      - ../scripts:/app/scripts
+      - ../apps/api/app:/app/apps/api/app:ro
+      - ../apps/api/migrations:/app/apps/api/migrations:ro
+      - ../apps/api/tests:/app/apps/api/tests:ro
+      - ../apps/web/src:/app/apps/web/src:ro
+      - ../apps/worker/worker_app:/app/apps/worker/worker_app:ro
+      - ../packages/shared/src:/app/packages/shared/src:ro
+      - ../scripts:/app/scripts:ro
       - ../infra/model-bridge:/app/infra/model-bridge:ro
     depends_on:
       postgres:
@@ -47,14 +96,14 @@ services:
       qdrant:
         condition: service_started
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/api/health"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/api/ready"]
       interval: 10s
       timeout: 10s
       retries: 30
       start_period: 60s
 
   worker:
-    image: ${API_IMAGE:-course-kg-api:local}
+    image: ${API_IMAGE:-course-kg-api:dev}
     build:
       context: ..
       dockerfile: apps/api/Dockerfile
@@ -63,16 +112,16 @@ services:
     env_file:
       - ../.env
     environment:
-      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/symbograph
+      APP_ENV: development
+      MODEL_BRIDGE_ADMIN_TOKEN: ${MODEL_BRIDGE_ADMIN_TOKEN:-}
+      MODEL_BRIDGE_CLIENT_HOST: model-bridge
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379/0
       DATA_ROOT: /app/data
-      CHAT_BASE_URL: ${API_CHAT_BASE_URL:-${CHAT_BASE_URL:-https://api.openai.com/v1}}
-      CHAT_RESOLVE_IP: ${API_CHAT_RESOLVE_IP:-${CHAT_RESOLVE_IP:-}}
-      GRAPH_BASE_URL: ${API_GRAPH_BASE_URL:-${GRAPH_BASE_URL:-https://api.openai.com/v1}}
-      GRAPH_RESOLVE_IP: ${API_GRAPH_RESOLVE_IP:-${GRAPH_RESOLVE_IP:-}}
-      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
-      EMBEDDING_RESOLVE_IP: ${EMBEDDING_RESOLVE_IP:-}
+      RUNTIME_ENV_FILE: /workspace/.env
+      SAMPLE_IMPORT_ROOT: /app/import/sample
+      SAMPLE_IMPORT_MANIFEST: /app/import/sample/raw-manifest.json
       ENABLE_MODEL_FALLBACK: "false"
       ENABLE_DATABASE_FALLBACK: "false"
       INGESTION_EXECUTION_MODE: celery
@@ -80,18 +129,26 @@ services:
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
       PYTHONPATH: /app/apps/worker:/app/apps/api
     working_dir: /app/apps/worker
-    command: ["python", "-m", "celery", "-A", "worker_app.celery_app", "worker", "--loglevel=info", "--queues=${INGESTION_TASK_QUEUE:-course-kg-main-ingestion}", "--concurrency=${WORKER_CONCURRENCY:-1}", "--prefetch-multiplier=1", "--max-tasks-per-child=${WORKER_MAX_TASKS_PER_CHILD:-1}"]
+    command: ["watchfiles", "--filter", "python", "--target-type", "command", "python -m celery -A worker_app.celery_app worker --loglevel=info --queues=${INGESTION_TASK_QUEUE:-course-kg-main-ingestion} --concurrency=${WORKER_CONCURRENCY:-1} --prefetch-multiplier=1 --max-tasks-per-child=${WORKER_MAX_TASKS_PER_CHILD:-1}", "/app/apps/api/app", "/app/apps/worker/worker_app"]
     volumes:
-      - ../data:/app/data
-      - ../.env:/app/.env
-      - ../.env.example:/app/.env.example:ro
+      - symbograph-data:/app/data
+      - type: bind
+        source: ${SAMPLE_IMPORT_PATH:-./sample-import}
+        target: /app/import/sample
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ..
+        target: /workspace
+        read_only: true
       - ../output:/app/output
-      - ../apps/api/app:/app/apps/api/app
-      - ../apps/api/migrations:/app/apps/api/migrations
-      - ../apps/api/tests:/app/apps/api/tests
-      - ../apps/worker/worker_app:/app/apps/worker/worker_app
-      - ../packages/shared/src:/app/packages/shared/src
-      - ../scripts:/app/scripts
+      - ../apps/api/app:/app/apps/api/app:ro
+      - ../apps/api/migrations:/app/apps/api/migrations:ro
+      - ../apps/api/tests:/app/apps/api/tests:ro
+      - ../apps/worker/worker_app:/app/apps/worker/worker_app:ro
+      - ../packages/shared/src:/app/packages/shared/src:ro
+      - ../scripts:/app/scripts:ro
       - ../infra/model-bridge:/app/infra/model-bridge:ro
     depends_on:
       postgres:
@@ -102,6 +159,59 @@ services:
         condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "python -m celery -A worker_app.celery_app inspect ping -d celery@$$HOSTNAME | grep -q pong"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  beat:
+    image: ${API_IMAGE:-course-kg-api:dev}
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    pull_policy: never
+    container_name: course-kg-beat
+    env_file:
+      - ../.env
+    environment:
+      APP_ENV: development
+      MODEL_BRIDGE_ADMIN_TOKEN: ${MODEL_BRIDGE_ADMIN_TOKEN:-}
+      MODEL_BRIDGE_CLIENT_HOST: model-bridge
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
+      DATA_ROOT: /app/data
+      RUNTIME_ENV_FILE: /workspace/.env
+      ENABLE_MODEL_FALLBACK: "false"
+      ENABLE_DATABASE_FALLBACK: "false"
+      INGESTION_EXECUTION_MODE: celery
+      INGESTION_TASK_QUEUE: ${INGESTION_TASK_QUEUE:-course-kg-main-ingestion}
+      PYTHONPATH: /app/apps/worker:/app/apps/api
+    working_dir: /app/apps/worker
+    command: ["watchfiles", "--filter", "python", "--target-type", "command", "python -m celery -A worker_app.celery_app beat --loglevel=info --pidfile=/tmp/celerybeat.pid --schedule=/tmp/celerybeat-schedule", "/app/apps/api/app", "/app/apps/worker/worker_app"]
+    volumes:
+      - symbograph-data:/app/data
+      - type: bind
+        source: ..
+        target: /workspace
+        read_only: true
+      - ../output:/app/output
+      - ../apps/api/app:/app/apps/api/app:ro
+      - ../apps/api/migrations:/app/apps/api/migrations:ro
+      - ../apps/worker/worker_app:/app/apps/worker/worker_app:ro
+      - ../packages/shared/src:/app/packages/shared/src:ro
+      - ../scripts:/app/scripts:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      qdrant:
+        condition: service_started
+      worker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"from pathlib import Path; import sys; commands=[path.read_bytes() for path in Path('/proc').glob('[0-9]*/cmdline') if path.is_file()]; schedules=list(Path('/tmp').glob('celerybeat-schedule*')); sys.exit(0 if any(b'celery' in command and b'beat' in command for command in commands) and schedules else 1)\""]
       interval: 15s
       timeout: 10s
       retries: 20
@@ -123,20 +233,30 @@ services:
       - ../apps/web/src:/app/apps/web/src
       - ../packages/shared/src:/app/packages/shared/src
     command: ["npm", "run", "dev", "--", "--hostname", "0.0.0.0", "--port", "3000"]
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
 
   postgres:
     image: postgres:16
     container_name: course-kg-postgres
     environment:
-      POSTGRES_DB: symbograph
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     ports:
       - "5432:5432"
     volumes:
-      - ../data/postgres:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d symbograph"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 3s
       timeout: 5s
       retries: 10
@@ -147,7 +267,12 @@ services:
     ports:
       - "6379:6379"
     volumes:
-      - ../data/redis:/data
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
 
   qdrant:
     image: qdrant/qdrant:v1.17.1
@@ -159,4 +284,7 @@ services:
       - qdrant-data:/qdrant/storage
 
 volumes:
+  symbograph-data:
   qdrant-data:
+  postgres-data:
+  redis-data:

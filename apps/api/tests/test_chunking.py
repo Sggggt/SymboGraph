@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from app.services.chunking import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, FixedTokenChunker
+from app.services.chunking import (
+    CHUNK_TEXT_HASH_PROTOCOL_VERSION,
+    DEFAULT_CHUNK_OVERLAP,
+    DEFAULT_CHUNK_SIZE,
+    FixedTokenChunker,
+    text_hash,
+)
 from app.services.parsers import ParsedSection
 
 
@@ -38,3 +44,9 @@ def test_fixed_token_chunker_default_is_512_80():
     assert DEFAULT_CHUNK_OVERLAP == 80
     assert chunker.chunk_size == 512
     assert chunker.overlap == 80
+
+
+def test_chunk_text_hash_uses_the_versioned_normalized_sha256_protocol():
+    assert CHUNK_TEXT_HASH_PROTOCOL_VERSION == "chunk_text_sha256_normalized_v1"
+    assert text_hash(" alpha\x00  beta\r\n\r\n\r\n\r\ngamma ") == text_hash("alpha beta\n\n\ngamma")
+    assert text_hash("alpha beta") != text_hash("alpha gamma")
