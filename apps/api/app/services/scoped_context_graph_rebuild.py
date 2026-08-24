@@ -41,6 +41,28 @@ SCOPED_CONTEXT_GRAPH_CACHE_INVALIDATION_OPERATION = (
 SCOPED_CONTEXT_GRAPH_CACHE_INVALIDATION_SESSION_KEY = (
     "_scoped_context_graph_cache_invalidation_intents"
 )
+RQ_PROTOCOL_MIGRATION_ADMISSION_PROTOCOL_VERSION = (
+    "rq_scoped_rebuild_stale_lineage_admission_v1"
+)
+RQ_PROTOCOL_MIGRATION_ALLOWED_STALE_REASONS = frozenset(
+    {
+        "chunk_relation_protocol_runtime_identity_mismatch",
+        "coarse_concept_protocol_runtime_identity_mismatch",
+        "context_graph_canonical_composite_hash_stale",
+        "context_graph_canonical_protocol_identities_stale",
+        "context_graph_canonical_traversal_envelope_mismatch",
+        "context_graph_protocol_runtime_identity_mismatch",
+        "context_graph_rq_membership_protocol_mismatch",
+        "context_graph_rq_prefix_pair_protocol_mismatch",
+        "mid_concept_protocol_runtime_identity_mismatch",
+        "rq_membership_protocol_hash_mismatch",
+        "rq_prefix_pair_diagnostics_integrity_proof_mismatch",
+        "rq_prefix_pair_diagnostics_protocol_hash_mismatch",
+    }
+)
+RQ_PROTOCOL_MIGRATION_REQUIRED_STALE_REASONS = frozenset(
+    {"rq_membership_protocol_hash_mismatch"}
+)
 CONTEXT_PROTOCOL_IDENTITY_REFRESH_PROTOCOL_VERSION = (
     "context_protocol_identity_refresh_v1"
 )
@@ -270,22 +292,99 @@ def plan_context_protocol_identity_refresh(
     }
 
 
+def _rq_protocol_migration_admission(
+    reasons: Sequence[str],
+) -> dict[str, Any]:
+    actual = frozenset(str(reason) for reason in reasons if reason)
+    unrelated = sorted(
+        actual - RQ_PROTOCOL_MIGRATION_ALLOWED_STALE_REASONS
+    )
+    missing_required = sorted(
+        RQ_PROTOCOL_MIGRATION_REQUIRED_STALE_REASONS - actual
+    )
+    accepted = bool(
+        actual
+        and not unrelated
+        and not missing_required
+    )
+    audit = {
+        "protocol_version": (
+            RQ_PROTOCOL_MIGRATION_ADMISSION_PROTOCOL_VERSION
+        ),
+        "accepted": accepted,
+        "stale_reasons": sorted(actual),
+        "unrelated_stale_reasons": unrelated,
+        "missing_required_stale_reasons": missing_required,
+        "replaced_layers": [
+            "rq_membership_graph",
+            "mid_concept_graph",
+            "coarse_concept_graph",
+            "context_graph_state",
+        ],
+        "reused_layers": [
+            "chunk_structure_graph",
+            "chunk_relation_graph_business_facts",
+        ],
+        "model_call_count": 0,
+    }
+    audit["audit_hash"] = stable_hash(audit)
+    return audit
+
+
 def _bound_active_lineage(
     db: Session,
     knowledge_base_id: str,
     *,
     chunks: list[Chunk],
+    requested_scope: str,
 ) -> tuple[
     ContextGraphState,
     ChunkRelationGraphState,
     MidConceptState,
     CoarseConceptState,
+    dict[str, Any],
 ]:
-    current = context_graph.active_graph_admission_gate(
-        db,
-        knowledge_base_id,
-        chunks=chunks,
-    )
+    try:
+        current = context_graph.active_graph_admission_gate(
+            db,
+            knowledge_base_id,
+            chunks=chunks,
+        )
+    except context_graph.ActiveContextGraphAdmissionError as exc:
+        migration_admission = _rq_protocol_migration_admission(
+            exc.reasons
+        )
+        if (
+            requested_scope != "rq_membership"
+            or not migration_admission["accepted"]
+        ):
+            raise
+        current = context_graph.latest_context_graph_state(
+            db,
+            knowledge_base_id,
+        )
+        if (
+            current is None
+            or str(current.id) != str(exc.context_graph_state_id)
+        ):
+            raise ScopedContextGraphRebuildError(
+                "RQ protocol migration lost the rejected active lineage"
+            ) from exc
+    else:
+        migration_admission = {
+            "protocol_version": (
+                RQ_PROTOCOL_MIGRATION_ADMISSION_PROTOCOL_VERSION
+            ),
+            "accepted": False,
+            "reason": "active_lineage_fully_admitted",
+            "stale_reasons": [],
+            "unrelated_stale_reasons": [],
+            "missing_required_stale_reasons": [],
+            "model_call_count": 0,
+        }
+        migration_admission["audit_hash"] = stable_hash(
+            migration_admission
+        )
     if current is None:
         raise ScopedContextGraphRebuildError(
             "Scoped graph rebuild requires an admitted active context graph"
@@ -312,6 +411,13 @@ def _bound_active_lineage(
         raise ScopedContextGraphRebuildError(
             "Scoped graph rebuild requires a complete active relation/RQ/mid/coarse lineage"
         )
+    if any(
+        str(state.state) != "active"
+        for state in (current, relation, mid, coarse)
+    ):
+        raise ScopedContextGraphRebuildError(
+            "Scoped graph rebuild requires active lineage rows"
+        )
     if (
         str(relation.knowledge_base_id) != str(knowledge_base_id)
         or str(mid.knowledge_base_id) != str(knowledge_base_id)
@@ -320,7 +426,7 @@ def _bound_active_lineage(
         raise ScopedContextGraphRebuildError(
             "Scoped graph rebuild lineage escaped the requested knowledge base"
         )
-    return current, relation, mid, coarse
+    return current, relation, mid, coarse, migration_admission
 
 
 def _relation_card(relation: ChunkRelationGraphState) -> dict[str, Any]:
@@ -542,6 +648,9 @@ def _finalize_rq_relation_state(
     rq_prefixes: list[RQPrefix],
     vector_runtime_target: Any,
 ) -> None:
+    protocol_runtime_identity = (
+        context_graph.validate_active_graph_protocol_settings()
+    )
     pair_diagnostics = dict(
         (relation_state.diagnostics_json or {}).get(
             "rq_prefix_pair_diagnostics"
@@ -573,6 +682,15 @@ def _finalize_rq_relation_state(
         "singleton_rate": stats["singleton_rate"],
         "bridge_edge_count": stats["bridge_edges"],
         "protocol": context_graph.RELATION_PROTOCOL_VERSION,
+        "graph_protocol_runtime_identity_hash": (
+            protocol_runtime_identity["identity_hash"]
+        ),
+        "graph_protocols": dict(
+            protocol_runtime_identity["protocols"]
+        ),
+        "rq_membership_parameters": dict(
+            protocol_runtime_identity["rq_membership_parameters"]
+        ),
     }
     db.flush()
     relation_hash_card = context_graph.build_relation_state_hash_card(
@@ -1174,10 +1292,12 @@ async def _rebuild_scoped_context_graph(
             previous_relation,
             previous_mid,
             previous_coarse,
+            pre_rebuild_admission,
         ) = _bound_active_lineage(
             db,
             knowledge_base_id,
             chunks=chunks,
+            requested_scope=requested_scope,
         )
         before = _upstream_snapshot(
             db,
@@ -1206,6 +1326,7 @@ async def _rebuild_scoped_context_graph(
             "contextual_index_maintenance": (
                 inherited_contextual_index_maintenance
             ),
+            "pre_rebuild_admission": pre_rebuild_admission,
         }
         with _candidate_savepoint(db):
             relation_state = previous_relation
@@ -1337,6 +1458,7 @@ async def _rebuild_scoped_context_graph(
                 "gray_zone_thresholds_modified": False,
                 "gray_zone_rule_protocol_modified": False,
                 "gray_zone_model_call_count": 0,
+                "pre_rebuild_admission": pre_rebuild_admission,
                 "provider_semantic_reuse_protocol_version": (
                     context_graph.CONCEPT_DEFINITION_SEMANTIC_REUSE_PROTOCOL_VERSION
                 ),

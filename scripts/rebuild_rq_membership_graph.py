@@ -92,9 +92,10 @@ def _rollback_if_supported(db) -> None:
 def _failure_diagnostics(
     exc: BaseException,
     context_graph,
-) -> tuple[dict | None, dict | None]:
+) -> tuple[dict | None, dict | None, dict | None]:
     semantic_reuse: dict | None = None
     provider_budget: dict | None = None
+    active_admission: dict | None = None
     current: BaseException | None = exc
     visited: set[int] = set()
     for _depth in range(8):
@@ -111,11 +112,30 @@ def _failure_diagnostics(
             context_graph.ConceptProviderRequestBudgetExceeded,
         ):
             provider_budget = dict(current.diagnostics)
+        if isinstance(
+            current,
+            context_graph.ActiveContextGraphAdmissionError,
+        ):
+            active_admission = {
+                "reasons": list(current.reasons),
+                "context_graph_state_id": (
+                    current.context_graph_state_id
+                ),
+                "context_graph_hash": current.context_graph_hash,
+                "expected_freshness_hashes": dict(
+                    current.expected_freshness_hashes
+                ),
+                "checked_at": (
+                    current.checked_at.isoformat()
+                    if current.checked_at is not None
+                    else None
+                ),
+            }
         next_error = current.__cause__
         if next_error is None or id(next_error) in visited:
             next_error = current.__context__
         current = next_error
-    return semantic_reuse, provider_budget
+    return semantic_reuse, provider_budget, active_admission
 
 
 async def main(args: argparse.Namespace | None = None) -> None:
@@ -188,10 +208,11 @@ async def main(args: argparse.Namespace | None = None) -> None:
                     "provider_request_count": 0,
                     "provider_response_persisted": False,
                 }
-                reuse_failure, budget_failure = _failure_diagnostics(
-                    exc,
-                    context_graph,
-                )
+                (
+                    reuse_failure,
+                    budget_failure,
+                    admission_failure,
+                ) = _failure_diagnostics(exc, context_graph)
                 if reuse_failure is not None:
                     failure["semantic_reuse_diagnostics"] = reuse_failure
                 if budget_failure is not None:
@@ -199,6 +220,8 @@ async def main(args: argparse.Namespace | None = None) -> None:
                     failure["provider_request_count"] = int(
                         budget_failure.get("observed_requests") or 0
                     )
+                if admission_failure is not None:
+                    failure["active_admission"] = admission_failure
                 payload["failure"] = failure
                 payload["transaction"] = {
                     "database_committed": False,

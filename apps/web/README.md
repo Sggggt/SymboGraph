@@ -121,7 +121,7 @@ npm run test --workspace web
 python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
 ```
 
-截图、视觉 QA 和临时浏览器输出写入 `output/`，不提交。
+截图、视觉 QA 和临时浏览器输出写入被 Git 忽略的 `output/`，核验后清空。
 
 ## 文档
 

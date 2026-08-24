@@ -81,12 +81,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--api-image",
-        default="course-kg-api:dev",
+        default="course-kg-api:local",
         help="Runtime API image override; prevents stale digest values in .env from becoming build tags.",
     )
     parser.add_argument(
         "--web-image",
-        default="course-kg-web:dev",
+        default="course-kg-web:local",
         help="Runtime web image override used for Compose interpolation parity.",
     )
     parser.add_argument(

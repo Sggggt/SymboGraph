@@ -294,7 +294,6 @@ def test_startup_worker_and_compose_storage_gate_order_is_explicit() -> None:
     tasks_source = (repository_root / "apps/worker/worker_app/tasks.py").read_text(encoding="utf-8")
     watcher_source = (repository_root / "apps/worker/worker_app/watcher.py").read_text(encoding="utf-8")
     compose_source = (repository_root / "infra/docker-compose.yml").read_text(encoding="utf-8")
-    infra_readme = (repository_root / "infra/README.md").read_text(encoding="utf-8")
 
     early_gate = main_source.index("_EARLY_STORAGE_DURABILITY_CAPABILITY = ensure_storage_durability_ready")
     assert early_gate < main_source.index("from app.api import router")
@@ -309,15 +308,6 @@ def test_startup_worker_and_compose_storage_gate_order_is_explicit() -> None:
     assert "storage_root.mkdir" not in watcher_source
     assert "symbograph-data:/app/data" in compose_source
     assert "../data:/app/data" not in compose_source
-    assert compose_source.count("source: ${SAMPLE_IMPORT_PATH:-./sample-import}") == 2
-    assert "target: /app/import/sample" in compose_source
-    assert "read_only: true" in compose_source
-    assert (repository_root / "infra/sample-import/.gitkeep").is_file()
-    assert "set `SAMPLE_IMPORT_PATH` explicitly" in infra_readme
-    assert "../sample-raw-import" not in infra_readme
-    assert 'SAMPLE_IMPORT_PATH = "../data/Sample/storage"' not in infra_readme
-    assert "symbograph_raw_source_manifest_v1" in infra_readme
-    assert "Never point\nit at `../data/Sample`" in infra_readme
 
 
 @pytest.mark.skipif(

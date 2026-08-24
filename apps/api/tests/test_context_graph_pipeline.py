@@ -51,7 +51,6 @@ def test_relation_overview_rq_node_lookup_does_not_hydrate_heavy_membership_json
     assert len(captured_sql) == 1
     assert "support_chunk_edge_ids_json" not in captured_sql[0]
     assert "diagnostics_json" not in captured_sql[0]
-    assert "top_alternative_prefix_ids_json" not in captured_sql[0]
 
 
 def test_postgresql_projection_admission_uses_narrow_lateral_jsonb_fences():

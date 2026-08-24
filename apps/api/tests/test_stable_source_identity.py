@@ -34,8 +34,8 @@ def test_upload_reparse_recovers_original_title_from_logical_slot(
 
     digest = "a" * 64
     stored_path = tmp_path / f"{digest}.md"
-    stored_path.write_text("# 数据中心整体方案介绍 V6.0\n", encoding="utf-8")
-    logical_slot = normalize_upload_source_slot_key("数据中心整体方案介绍V6.0.md")
+    stored_path.write_text("# Synthetic knowledge guide\n", encoding="utf-8")
+    logical_slot = normalize_upload_source_slot_key("Unit Test Knowledge Guide.md")
     document = Document(
         knowledge_base_id=sample_knowledge_base.id,
         title=digest,
@@ -51,7 +51,7 @@ def test_upload_reparse_recovers_original_title_from_logical_slot(
 
     title = ingestion._document_display_title(stored_path, document=document)
 
-    assert title == "数据中心整体方案介绍v6.0"
+    assert title == "unit test knowledge guide"
 
 
 def test_upload_reparse_preserves_exact_existing_display_title(
@@ -70,16 +70,16 @@ def test_upload_reparse_preserves_exact_existing_display_title(
     stored_path = tmp_path / f"{digest}.md"
     document = Document(
         knowledge_base_id=sample_knowledge_base.id,
-        title="DataCenter V6.0",
+        title="Synthetic Guide V2",
         source_path=str(stored_path),
-        logical_source_slot_key=normalize_upload_source_slot_key("DATACENTER V6.0.md"),
+        logical_source_slot_key=normalize_upload_source_slot_key("SYNTHETIC GUIDE V2.md"),
         source_slot_protocol_version=UPLOAD_SOURCE_SLOT_PROTOCOL_VERSION,
         source_type="markdown",
         checksum=digest,
         is_active=True,
     )
 
-    assert ingestion._document_display_title(stored_path, document=document) == "DataCenter V6.0"
+    assert ingestion._document_display_title(stored_path, document=document) == "Synthetic Guide V2"
 
 
 def test_upload_reparse_recovers_exact_historical_display_title(
@@ -100,7 +100,7 @@ def test_upload_reparse_recovers_exact_historical_display_title(
         knowledge_base_id=sample_knowledge_base.id,
         title=digest,
         source_path=str(stored_path),
-        logical_source_slot_key=normalize_upload_source_slot_key("DATACENTER V6.0.md"),
+        logical_source_slot_key=normalize_upload_source_slot_key("SYNTHETIC GUIDE V2.md"),
         source_slot_protocol_version=UPLOAD_SOURCE_SLOT_PROTOCOL_VERSION,
         source_type="markdown",
         checksum=digest,
@@ -118,7 +118,7 @@ def test_upload_reparse_recovers_exact_historical_display_title(
             stats={
                 ingestion.DOCUMENT_METADATA_INTENT_KEY: {
                     "candidate_state": {
-                        "metadata": {"title": "DataCenter V6.0"}
+                        "metadata": {"title": "Synthetic Guide V2"}
                     }
                 }
             },
@@ -131,14 +131,14 @@ def test_upload_reparse_recovers_exact_historical_display_title(
         document,
     )
 
-    assert recovered == "DataCenter V6.0"
+    assert recovered == "Synthetic Guide V2"
     assert (
         ingestion._document_display_title(
             stored_path,
             document=document,
             display_title=recovered,
         )
-        == "DataCenter V6.0"
+        == "Synthetic Guide V2"
     )
 
 

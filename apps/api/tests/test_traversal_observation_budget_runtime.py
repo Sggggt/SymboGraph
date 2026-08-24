@@ -52,12 +52,10 @@ def test_settings_env_and_api_schema_bound_traversal_observation_budget():
         {
             "rq_kmeans_levels": 3,
             "edge_distance_protocol": "edge_distance_log_calibrated_strength_v2",
-            "rq_membership_protocol": "rq_fuzzy_softmax_gamma_product_v1",
+            "rq_membership_protocol": "rq_primary_chain_v1",
             "edge_projection_protocol": "membership_q15_layer_type_calibrated_v3",
             "edge_type_calibration_protocol": "type_local_winsorized_minmax_v1",
             "rq_membership_temperature": 0.35,
-            "rq_membership_top_m": 2,
-            "rq_membership_probability_threshold": 0.05,
             "gray_zone_rule_protocol": "deterministic_support_progress_v1",
             "gray_zone_observation_cadence": 1,
             "traversal_observation_budget": 64,

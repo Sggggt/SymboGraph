@@ -268,6 +268,10 @@ def static_checks() -> list[dict[str, Any]]:
         "apps/api/app/services/evidence_graph.py",
         "apps/api/app/services/evidence_graph_payload.py",
         "apps/api/app/services/evidence_signal_projection.py",
+        "apps/api/tests/test_rq_fuzzy_membership.py",
+        "apps/api/migrations/versions/20260821_0042_retire_development_artifacts.py",
+        "scripts/cleanup_orphan_mid_rq_memberships.py",
+        "scripts/destroy_legacy_derived_data.py",
     ]
     for rel_path in forbidden_files:
         if (REPO_ROOT / rel_path).exists():
@@ -381,6 +385,7 @@ def _check_policy_reward_consumption(
     from sqlalchemy import select
 
     from app.models import AgentRun, PolicyState, RewardEvent
+    from app.services.chunking import stable_hash
     from app.services.policy_reward import replay_policy_reward_event
 
     rewards = list(
@@ -471,6 +476,27 @@ def _check_policy_reward_consumption(
                 reward,
                 "agent_run_id must be a non-empty string or null",
                 agent_run_id_type=type(run_ref).__name__,
+            )
+            continue
+        if (
+            eligibility_present
+            and eligibility is False
+            and reason_present
+            and ineligible_reason == "retired_protocol_lineage"
+            and source == "context_graph_agent_v1"
+            and reward.policy_state_id is None
+        ):
+            run = db.get(AgentRun, run_ref)
+            if (
+                run is not None
+                and str(run.knowledge_base_id) == str(knowledge_base_id)
+            ):
+                audit_only_ids.append(str(reward.id))
+                continue
+            record_corruption(
+                reward,
+                "audit-only reward references an invalid AgentRun",
+                agent_run_id=run_ref,
             )
             continue
         if (
@@ -626,14 +652,21 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
         ChunkRelationGraphState,
         ChunkStructureNode,
         CoarseConcept,
+        CoarseConceptState,
         CitationVerification,
         RQPrefix,
         RQPrefixMembership,
         GraphRetrievalStep,
         MidConcept,
+        MidConceptState,
         RetrievalTrace,
     )
-    from app.services.context_graph import active_chunks_query, context_graph_stats, graph_layer_payload
+    from app.services.context_graph import (
+        CONCEPT_NODE_ELIGIBILITY_PROTOCOL_VERSION,
+        active_chunks_query,
+        context_graph_stats,
+        graph_layer_payload,
+    )
     from app.services.language_metadata import (
         language_identity_scope_diagnostics,
         load_chunk_language_identities,
@@ -722,10 +755,26 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
                 or 0
             )
             relation_state = db.get(ChunkRelationGraphState, relation_state_id)
+            rq_membership_diagnostics = dict(
+                ((relation_state.diagnostics_json or {}).get(
+                    "rq_membership"
+                ) or {})
+                if relation_state is not None
+                else {}
+            )
+            primary_membership = dict(
+                rq_membership_diagnostics.get("primary_membership") or {}
+            )
             summary["rq"] = {
                 "active_pair_edges": False,
                 "prefixes": rq_prefix_count,
                 "memberships": rq_memberships,
+                "membership_protocol_version": (
+                    rq_membership_diagnostics.get(
+                        "membership_protocol_version"
+                    )
+                ),
+                "primary_membership": primary_membership,
             }
             summary["dense_relation_edge_counts"] = dense_edge_counts
             cross_language_edges = list(
@@ -751,6 +800,37 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
                 "mid_concepts": mid_concept_count,
                 "rq_l2_prefixes": rq_l2_prefix_count,
                 "coarse_concepts": coarse_concept_count,
+            }
+            mid_state = (
+                db.get(MidConceptState, mid_state_id)
+                if mid_state_id
+                else None
+            )
+            coarse_state = (
+                db.get(CoarseConceptState, coarse_state_id)
+                if coarse_state_id
+                else None
+            )
+            mid_eligibility = dict(
+                ((mid_state.stats_json or {}).get(
+                    "concept_node_eligibility"
+                ) or {})
+                if mid_state is not None
+                else {}
+            )
+            coarse_eligibility = dict(
+                ((coarse_state.stats_json or {}).get(
+                    "concept_node_eligibility"
+                ) or {})
+                if coarse_state is not None
+                else {}
+            )
+            summary["concept_semantic_compression"] = {
+                "protocol_version": (
+                    CONCEPT_NODE_ELIGIBILITY_PROTOCOL_VERSION
+                ),
+                "mid": mid_eligibility,
+                "coarse": coarse_eligibility,
             }
             summary["bridge_edges"] = bridge_edges
             if forbidden_relation_edge_types:
@@ -781,10 +861,106 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
                 )
             if rq_prefix_count <= 0 or rq_memberships <= 0:
                 add_issue(issues, "blocker", "rq_graph_incomplete", "RQ is enabled but required RQ nodes/memberships are incomplete.", summary["rq"])
-            if mid_concept_count != rq_l3_prefix_count:
-                add_issue(issues, "blocker", "rq_l3_mid_projection_incomplete", "Active mid concepts must be a one-to-one projection of active RQ L3 prefixes.", summary["concept_projection_coverage"])
-            if coarse_concept_count != rq_l2_prefix_count:
-                add_issue(issues, "blocker", "rq_l2_coarse_projection_incomplete", "Active coarse concepts must be a one-to-one projection of active RQ L2 prefixes.", summary["concept_projection_coverage"])
+            primary_membership_valid = (
+                rq_membership_diagnostics.get(
+                    "membership_protocol_version"
+                )
+                == "rq_primary_chain_v1"
+                and int(primary_membership.get("chunk_count") or -1)
+                == len(active_chunks)
+                and int(
+                    primary_membership.get("primary_membership_count")
+                    or -1
+                )
+                == 3 * len(active_chunks)
+                and int(primary_membership.get("membership_count") or -1)
+                == int(rq_memberships)
+                and int(rq_memberships) == 3 * len(active_chunks)
+                and int(
+                    primary_membership.get(
+                        "non_primary_membership_count"
+                    )
+                    or 0
+                )
+                == 0
+                and int(
+                    primary_membership.get(
+                        "observed_max_memberships_per_chunk"
+                    )
+                    or -1
+                )
+                <= 3
+                and primary_membership.get(
+                    "all_primary_chains_complete"
+                )
+                is True
+                and primary_membership.get(
+                    "all_chunk_cardinalities_exact"
+                )
+                is True
+                and primary_membership.get(
+                    "cartesian_expansion_used"
+                )
+                is False
+                and primary_membership.get("model_call_count") == 0
+            )
+            if not primary_membership_valid:
+                add_issue(
+                    issues,
+                    "blocker",
+                    "rq_primary_membership_invalid",
+                    (
+                        "Active RQ membership must preserve exactly three "
+                        "primary prefixes per chunk, materialize exactly "
+                        "three memberships per chunk, and prohibit all "
+                        "second address-chain expansion."
+                    ),
+                    summary["rq"],
+                )
+            concept_compression_valid = (
+                mid_eligibility.get("protocol_version")
+                == CONCEPT_NODE_ELIGIBILITY_PROTOCOL_VERSION
+                and coarse_eligibility.get("protocol_version")
+                == CONCEPT_NODE_ELIGIBILITY_PROTOCOL_VERSION
+                and mid_eligibility.get(
+                    "primary_only_selection_authority"
+                )
+                is True
+                and coarse_eligibility.get(
+                    "primary_only_selection_authority"
+                )
+                is True
+                and mid_eligibility.get("model_call_count") == 0
+                and coarse_eligibility.get("model_call_count") == 0
+                and int(mid_eligibility.get("eligible_count") or -1)
+                == int(mid_concept_count)
+                and int(coarse_eligibility.get("eligible_count") or -1)
+                == int(coarse_concept_count)
+                and 0 < int(mid_concept_count) <= len(active_chunks)
+                and 0 < int(coarse_concept_count) <= int(mid_concept_count)
+                and (
+                    len(active_chunks) <= 1
+                    or int(mid_concept_count) < len(active_chunks)
+                )
+                and (
+                    int(mid_concept_count) <= 1
+                    or int(coarse_concept_count)
+                    < int(mid_concept_count)
+                )
+            )
+            if not concept_compression_valid:
+                add_issue(
+                    issues,
+                    "blocker",
+                    "concept_semantic_compression_invalid",
+                    (
+                        "Active Mid/Coarse concepts must use deterministic "
+                        "primary-only eligibility and satisfy "
+                        "Coarse<=Mid<=chunks with "
+                        "strict non-trivial compression."
+                    ),
+                    summary["concept_semantic_compression"],
+                )
             if bridge_edges <= 0:
                 add_issue(issues, "blocker", "bridge_edges_missing", "No retained bridge edges were found in the active relation graph.")
             missing_edge_metrics = db.scalar(
@@ -867,14 +1043,18 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
             if (db.scalar(select(func.count(AgentObservation.id)).where(AgentObservation.run_id.is_not(None))) or 0) <= 0:
                 add_issue(issues, "blocker", "agent_observations_missing", "Agent observations are missing.")
         else:
-            add_issue(issues, "warning", "no_agent_plan", "No Agent plans exist yet; run QA before final acceptance.")
+            add_issue(issues, "warning", "no_agent_plan", "No Agent plans exist yet; run QA before evaluating Agent coverage.")
         latest_verification = db.scalar(select(CitationVerification).where(CitationVerification.knowledge_base_id == knowledge_base.id).order_by(CitationVerification.created_at.desc()))
         if latest_verification and (latest_verification.diagnostics_json or {}).get("verification_method") == "context_package_span_presence_v1":
             add_issue(issues, "blocker", "old_citation_verification", "Latest citation verification still uses span-presence-only method.")
         if latest_verification:
             source_span = latest_verification.source_span_json or {}
             required_span_keys = {"document_version_id", "chunk_id", "char_span", "page_range", "section_path", "bbox", "context_package_id", "retrieval_trace_id", "verification_id"}
-            missing_span_keys = sorted(key for key in required_span_keys if not source_span.get(key))
+            missing_span_keys = sorted(
+                key
+                for key in required_span_keys
+                if key not in source_span or source_span.get(key) is None
+            )
             if missing_span_keys:
                 add_issue(issues, "blocker", "citation_source_span_incomplete", "CitationVerification.source_span_json is missing required raw span fields.", {"missing": missing_span_keys, "source_span": source_span})
             if (latest_verification.diagnostics_json or {}).get("verification_method") != "claim_structure_plus_llm_entailment_v2":

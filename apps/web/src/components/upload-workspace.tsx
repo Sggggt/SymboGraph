@@ -19,7 +19,7 @@ import {
   parseUploadedFiles,
   removeKnowledgeBaseFile,
   updateModelSettings,
-  uploadFile,
+  uploadFilesSequentially,
 } from "@/lib/api";
 import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
@@ -395,14 +395,14 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
       setUploadProgress({ completed: 0, total: files.length });
       const controller = new AbortController();
       uploadAbortControllerRef.current = controller;
-      const responses = await Promise.all(
-        files.map(async (file) => {
-          const response = await uploadFile(file, selectedKnowledgeBaseId, controller.signal);
-          setUploadProgress((progress) => ({ ...progress, completed: progress.completed + 1 }));
-          return response;
-        }),
+      return uploadFilesSequentially(
+        files,
+        selectedKnowledgeBaseId,
+        controller.signal,
+        (completed) => {
+          setUploadProgress((progress) => ({ ...progress, completed }));
+        },
       );
-      return responses;
     },
     onSuccess: (data) => {
       setUploadedFiles((current) => [

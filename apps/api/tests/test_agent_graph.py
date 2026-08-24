@@ -3058,7 +3058,7 @@ def test_replan_progress_signature_ignores_trace_ids_but_detects_new_spans():
                 },
             }
         ],
-        "covered_facets": ["DF数据集成"],
+        "covered_facets": ["示例数据集成"],
         "evidence_roles": ["definition"],
         "independent_support_path_count": 1,
         "citable_span_count": 1,
@@ -3087,7 +3087,7 @@ def test_replan_progress_signature_ignores_trace_ids_but_detects_new_spans():
     verdict = {
         "verdict": "need_mid_expansion",
         "target_ids": [],
-        "expected_evidence": {"required_facets": ["DF数据集成"]},
+        "expected_evidence": {"required_facets": ["示例数据集成"]},
     }
 
     no_progress = agent_graph.agent_replan_progress_audit(
@@ -3117,7 +3117,7 @@ def test_replan_progress_signature_ignores_trace_ids_but_detects_new_spans():
 
 
 @pytest.mark.asyncio
-async def test_df_definition_golden_evaluator_contract_accepts_direct_citable_span(
+async def test_direct_definition_evaluator_contract_accepts_citable_span(
     monkeypatch,
 ):
     from app.services import agent_graph
@@ -3146,7 +3146,7 @@ async def test_df_definition_golden_evaluator_contract_accepts_direct_citable_sp
         direct_definition_result,
     )
     decision = await agent_graph.evaluate_graph_evidence(
-        question="DF数据集成指的是什么",
+        question="示例数据集成指的是什么",
         history=[],
         observation={
             "result_count": 1,
@@ -3154,7 +3154,7 @@ async def test_df_definition_golden_evaluator_contract_accepts_direct_citable_sp
             "candidate_chunk_span_summaries": [
                 {
                     "chunk_id": "chunk-df",
-                    "text_excerpt": "DF数据集成是将多个来源的数据汇集并统一处理的能力。",
+                    "text_excerpt": "示例数据集成是将多个公开来源汇集并统一处理的能力。",
                     "source_span_address": {
                         "char_span": [0, 30],
                         "raw_span_text_hash": "a" * 64,
@@ -3948,7 +3948,7 @@ async def test_agent_uses_distinct_typed_repair_mechanisms_across_rounds(
     from sqlalchemy import select
 
     from app.models import AgentAction, AgentObservation, RetrievalTrace
-    from app.schemas import AgentRequest, SearchFilters
+    from app.schemas import AgentRequest, QAResponse, SearchFilters
     from app.services import agent_graph, policy_reward
     from app.services.embeddings import (
         ChatCallResult,
@@ -4128,6 +4128,17 @@ async def test_agent_uses_distinct_typed_repair_mechanisms_across_rounds(
     assert len({item["conversation_state_scope_hash"] for item in rounds}) == 1
     assert len({item["query_facets_hash"] for item in rounds}) == 1
     assert len({item["action_input_hash"] for item in rounds}) == 2
+    assert all(
+        item["repair_audit"]["candidate_reverted_to_last_valid_package"]
+        is True
+        for item in rounds
+    )
+    assert all(
+        len(item["repair_audit"]["candidate_semantic_progress_hash"])
+        == 64
+        for item in rounds
+    )
+    QAResponse.model_validate(response)
     assert response["model_audit"]["repair_rounds_used"] == 2
     assert response["model_audit"]["grounding_outcome"] == (
         "insufficient_evidence"

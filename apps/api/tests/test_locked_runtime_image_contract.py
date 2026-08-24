@@ -68,8 +68,6 @@ def test_api_image_contains_repository_contract_sources() -> None:
         "COPY apps/web/src /app/apps/web/src",
         "COPY packages/shared/src /app/packages/shared/src",
         "COPY package.json /app/package.json",
-        "COPY docs/todo.md /app/docs/todo.md",
-        "COPY infra/sample-import/.gitkeep /app/infra/sample-import/.gitkeep",
         "COPY start-app.bat /app/start-app.bat",
         "COPY rebuild-images.ps1 /app/rebuild-images.ps1",
         "COPY rebuild-images.bat /app/rebuild-images.bat",
@@ -123,11 +121,9 @@ def test_windows_launcher_uses_the_current_source_mounted_runtime_contract() -> 
     rebuild_wrapper = (REPO_ROOT / "rebuild-images.bat").read_text(encoding="utf-8")
 
     assert '[string]$ComposeProjectName = "knowledgegraph-dev-20260820"' in launcher
-    assert '[string]$ApiImage = "course-kg-api:dev"' in launcher
-    assert '[string]$WebImage = "course-kg-web:dev"' in launcher
+    assert '[string]$ApiImage = "course-kg-api:local"' in launcher
+    assert '[string]$WebImage = "course-kg-web:local"' in launcher
     assert 'RUNTIME_CONFIG_VOLUME_NAME' not in launcher
-    assert '$env:SAMPLE_IMPORT_PATH = $sampleImportPath' in launcher
-    assert 'Configured SAMPLE_IMPORT_PATH is absent' in launcher
     assert '"--project-name", $ComposeProjectName' in launcher
     assert '"--profile", "model-bridge"' in launcher
     assert '"config", "--quiet"' in launcher
@@ -151,8 +147,8 @@ def test_windows_launcher_uses_the_current_source_mounted_runtime_contract() -> 
     assert 'Get-DotEnvValue -Key "MODEL_BRIDGE_ADMIN_TOKEN"' in launcher
     assert 'set "START_APP_EXIT_CODE=%ERRORLEVEL%"' in wrapper
     assert 'exit /b %START_APP_EXIT_CODE%' in wrapper
-    assert '[string]$ApiBuildTag = "course-kg-api:dev"' in rebuild
-    assert '[string]$WebBuildTag = "course-kg-web:dev"' in rebuild
+    assert '[string]$ApiBuildTag = "course-kg-api:local"' in rebuild
+    assert '[string]$WebBuildTag = "course-kg-web:local"' in rebuild
     assert '$env:API_IMAGE = $ApiBuildTag' in rebuild
     assert '$env:WEB_IMAGE = $WebBuildTag' in rebuild
     assert '$buildArgs += @("api", "web")' in rebuild

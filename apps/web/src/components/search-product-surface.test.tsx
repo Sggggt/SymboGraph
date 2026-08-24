@@ -16,8 +16,8 @@ describe("Search product surface", () => {
       chunk_id: internalId,
       document_title: internalHash,
       partition: internalHash,
-      source_path: "C:/private/internal/source.md",
-      snippet: "# 数据中心整体方案\nDF 数据集成用于汇集并统一处理多个来源的数据。",
+      source_path: "C:/unit-test/synthetic-source.md",
+      snippet: "# 公开合成知识库\n示例数据集成用于汇集并统一处理多个公开输入。",
       score: 0.987,
       citations: [],
       metadata: {
@@ -26,7 +26,7 @@ describe("Search product surface", () => {
           path_edge_ids: [internalId],
           distance_so_far: 0.123,
           reward_so_far: 0.456,
-          covered_facets: ["DF 数据集成"],
+          covered_facets: ["示例数据集成"],
           evidence_roles: ["typed_action_forced_entry"],
           protocol_version: "internal_protocol_v1",
           state_hash: internalHash,
@@ -50,15 +50,15 @@ describe("Search product surface", () => {
     );
 
     const text = container.textContent ?? "";
-    expect(text).toContain("数据中心整体方案");
-    expect(text).toContain("DF 数据集成");
+    expect(text).toContain("公开合成知识库");
+    expect(text).toContain("示例数据集成");
     expect(text).not.toContain(internalId);
     expect(text).not.toContain(internalHash);
     expect(text).not.toContain("internal_protocol_v1");
     expect(text).not.toContain("typed_action_forced_entry");
     expect(text).not.toContain("0.123");
     expect(text).not.toContain("0.456");
-    expect(text).not.toContain("C:/private");
+    expect(text).not.toContain("C:/unit-test");
   });
 
   it("does not invent a local-file label when source identity is missing", () => {

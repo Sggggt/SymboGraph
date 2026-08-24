@@ -2157,7 +2157,10 @@ def _validate_trace_path_label_internal_fields(
         path_edge_ids=edge_ids,
         path_edge_distances=distances,
         path_edge_strengths=strengths,
-        reward_so_far=raw.get("reward_so_far", 0.0),
+        reward_so_far=raw.get(
+            "cycle_reward_so_far",
+            raw.get("reward_so_far", 0.0),
+        ),
         operating_envelope=operating_envelope,
     )
 

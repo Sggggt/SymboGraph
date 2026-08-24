@@ -390,7 +390,7 @@ describe("ConversationStatePanel", () => {
       <MessageBubble
         turn={{
           role: "assistant",
-          content: "DF 数据集成会汇集并统一处理多个来源的数据。",
+          content: "示例数据集成会汇集并统一处理多个公开来源。",
           route: "layered_context_graph",
           retrieval_trace_id: internalId,
           context_package_id: "66666666-6666-4666-8666-666666666666",
@@ -422,7 +422,7 @@ describe("ConversationStatePanel", () => {
     );
 
     const text = document.body.textContent ?? "";
-    expect(text).toContain("DF 数据集成");
+    expect(text).toContain("示例数据集成");
     expect(text).not.toContain(internalId);
     expect(text).not.toContain(internalHash);
     expect(text).not.toContain("internal_protocol_v1");

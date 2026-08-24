@@ -1193,6 +1193,12 @@ class RepairExecutionAudit(ClosedContractModel):
     gray_zone_protocol_and_thresholds_frozen: Literal[True]
     candidate_context_package_id: str | None = None
     candidate_retrieval_trace_id: str | None = None
+    candidate_semantic_progress_hash: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+    )
+    candidate_reverted_to_last_valid_package: Literal[True] | None = None
     supported_claim_regression_rejected: list[str] = Field(default_factory=list)
     regression_fail_closed: Literal[True] | None = None
 
@@ -3421,7 +3427,6 @@ class GraphEdgeMetadata(ClosedContractModel):
     membership_role: str | None = None
     membership_entropy: float | None = None
     membership_rank: int | None = None
-    top_alternative_prefix_ids: list[str] = Field(default_factory=list)
     rq_path: list[int] = Field(default_factory=list)
     residual_norm: float | None = None
     diagnostic_strength: float | None = None
@@ -4057,6 +4062,7 @@ class RetrievalTraversalState(ClosedContractModel):
     path_edge_types: list[str] = Field(default_factory=list)
     distance_so_far: float | None = None
     reward_so_far: float | None = None
+    cycle_reward_so_far: float = Field(default=0.0, ge=0.0)
     distance_zone: str | None = None
     covered_facets: list[str] = Field(default_factory=list)
     evidence_roles: list[str] = Field(default_factory=list)
@@ -4166,10 +4172,10 @@ class RetrievalRQRouteContribution(ClosedContractModel):
 
 
 QUERY_RQ_SEED_PROTOCOL_VERSION = (
-    "query_rq_fuzzy_membership_chunk_seed_v2"
+    "query_rq_primary_residual_mid_dense_v5"
 )
 QUERY_RQ_SEED_PROTOCOL_HASH = (
-    "144d218ea37a70f2aa85730624c5cec0807e20542078adc1574f832cbff017d8"
+    "0bd925993ad11bdc46cf852cfa17e2e62b014ff6f4cc2f5f3c73a5aecf6190bc"
 )
 CHUNK_FACET_PRIORITY_PROTOCOL_VERSION = (
     "validated_query_facet_posterior_chunk_priority_v2"
@@ -4195,12 +4201,11 @@ QueryRQStageScoreSource = Literal[
     "selected_mid_route_fallback",
 ]
 QueryRQChunkScoreSource = Literal[
-    "query_rq_fuzzy_membership",
+    "query_rq_primary_base",
     "mid_support_without_rq_membership",
 ]
 QueryRQMembershipRole = Literal[
     "primary_member",
-    "fuzzy_member",
     "boundary_member",
     "outlier_member",
     "noise_candidate",
@@ -4208,6 +4213,15 @@ QueryRQMembershipRole = Literal[
     "low_confidence_member",
     "mid_support_fallback",
 ]
+QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK = {
+    "primary_member": 0,
+    "boundary_member": 1,
+    "outlier_member": 2,
+    "noise_candidate": 3,
+    "bridge_member": 5,
+    "low_confidence_member": 5,
+    "mid_support_fallback": 6,
+}
 
 
 def _writer_stable_hash(value: Any) -> str:
@@ -4367,13 +4381,21 @@ class RetrievalRQChunkSeedCard(ClosedContractModel):
     chunk_membership_score: float = Field(
         ge=0.0, le=1.0, allow_inf_nan=False, strict=True
     )
-    fuzzy_membership_overlap_score: float = Field(
+    membership_overlap_diagnostic_score: float = Field(
         ge=0.0, le=1.0, allow_inf_nan=False, strict=True
     )
     rq_score: float = Field(
         ge=0.0, le=1.0, allow_inf_nan=False, strict=True
     )
+    residual_score: float = Field(
+        ge=0.0, le=1.0, allow_inf_nan=False, strict=True
+    )
     rq_relevance_component: float = Field(
+        ge=0.0, le=1.0, allow_inf_nan=False, strict=True
+    )
+    primary_membership: bool = Field(strict=True)
+    membership_overlap_used_in_effective_score: Literal[False]
+    query_membership_entropy: float = Field(
         ge=0.0, le=1.0, allow_inf_nan=False, strict=True
     )
     rq_drift_penalty: float | None = Field(
@@ -4420,39 +4442,29 @@ class RetrievalRQChunkSeedCard(ClosedContractModel):
             raise ValueError("RQ chunk seed LCP depth does not replay paths")
         if len(set(self.support_edge_ids)) != len(self.support_edge_ids):
             raise ValueError("RQ chunk support edge ids must be unique")
-        role_ranks = {
-            "primary_member": 0,
-            "fuzzy_member": 1,
-            "boundary_member": 2,
-            "outlier_member": 3,
-            "noise_candidate": 4,
-            "bridge_member": 5,
-            "low_confidence_member": 5,
-            "mid_support_fallback": 6,
-        }
-        if self.membership_role_tie_break_rank != role_ranks[
+        if self.membership_role_tie_break_rank != QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK[
             self.membership_role
         ]:
             raise ValueError("RQ chunk membership role rank mismatch")
-        if self.score_source == "query_rq_fuzzy_membership":
+        if self.score_source == "query_rq_primary_base":
             if self.rq_l3_prefix_id is None:
                 raise ValueError("RQ membership seed is missing its prefix")
             expected_weights = {
-                "rq_relevance": 0.7,
-                "mid_entry": 0.2,
-                "dense": 0.1,
+                "rq_relevance": 0.2,
+                "mid_entry": 0.5,
+                "dense": 0.3,
             }
-            expected_fuzzy = round(
+            expected_overlap = round(
                 math.sqrt(
                     self.query_prefix_score
                     * self.chunk_membership_score
                 ),
                 6,
             )
-            expected_relevance = round(
-                0.75 * self.rq_score
-                + 0.25 * self.fuzzy_membership_overlap_score,
-                6,
+            expected_relevance = (
+                self.residual_score
+                if self.primary_membership
+                else 0.0
             )
             if self.membership_role == "mid_support_fallback":
                 raise ValueError("RQ membership seed cannot use fallback role")
@@ -4462,7 +4474,7 @@ class RetrievalRQChunkSeedCard(ClosedContractModel):
                 "mid_entry": 0.8,
                 "dense": 0.2,
             }
-            expected_fuzzy = 0.0
+            expected_overlap = 0.0
             expected_relevance = 0.0
             if (
                 self.rq_l3_prefix_id is not None
@@ -4473,7 +4485,10 @@ class RetrievalRQChunkSeedCard(ClosedContractModel):
                 or self.query_prefix_score != 0.0
                 or self.chunk_membership_score != 0.0
                 or self.rq_score != 0.0
+                or self.residual_score != 0.0
                 or self.rq_drift_penalty is not None
+                or self.primary_membership
+                or self.query_membership_entropy != 1.0
                 or self.membership_role != "mid_support_fallback"
                 or self.membership_rank != 0
                 or self.membership_entropy is not None
@@ -4483,10 +4498,12 @@ class RetrievalRQChunkSeedCard(ClosedContractModel):
                 raise ValueError("RQ fallback seed contains membership facts")
         if self.component_weights != expected_weights:
             raise ValueError("RQ chunk seed component weights mismatch")
-        if self.fuzzy_membership_overlap_score != expected_fuzzy:
-            raise ValueError("RQ chunk fuzzy overlap does not replay inputs")
+        if self.membership_overlap_diagnostic_score != expected_overlap:
+            raise ValueError("RQ chunk membership overlap does not replay inputs")
         if self.rq_relevance_component != expected_relevance:
             raise ValueError("RQ relevance component does not replay inputs")
+        if self.membership_overlap_used_in_effective_score is not False:
+            raise ValueError("membership overlap cannot enter the base seed score")
         expected_effective = round(
             expected_weights["rq_relevance"]
             * self.rq_relevance_component
@@ -4934,6 +4951,7 @@ class RetrievalPathLabel(ClosedContractModel):
     evidence_roles: list[str] = Field(default_factory=list)
     distance_so_far: float | None = None
     reward_so_far: float | None = None
+    cycle_reward_so_far: float = Field(default=0.0, ge=0.0)
     root_node_id: str | None = None
     parent_layer: str | None = None
     parent_node_id: str | None = None
@@ -5188,7 +5206,7 @@ class GrayRQMembershipRoleInputs(ClosedContractModel):
         ge=0.0, allow_inf_nan=False, strict=True
     )
     rank: int = Field(ge=1, strict=True)
-    is_primary_leaf: bool = Field(strict=True)
+    is_primary_prefix: Literal[True]
     is_bridge_chunk: bool = Field(strict=True)
 
 
@@ -5200,7 +5218,6 @@ class GrayRQMembershipRoleEvaluation(ClosedContractModel):
         "low_confidence_member",
         "boundary_member",
         "primary_member",
-        "fuzzy_member",
     ]
     matched_flags: list[
         Literal[
@@ -5210,7 +5227,6 @@ class GrayRQMembershipRoleEvaluation(ClosedContractModel):
             "low_confidence_member",
             "boundary_member",
             "primary_member",
-            "fuzzy_member",
         ]
     ]
     primary_reason: Literal[
@@ -5220,9 +5236,8 @@ class GrayRQMembershipRoleEvaluation(ClosedContractModel):
         "low_confidence_member",
         "boundary_member",
         "primary_member",
-        "fuzzy_member",
     ]
-    protocol_version: Literal["rq_membership_role_entropy_boundary_v1"]
+    protocol_version: Literal["rq_membership_role_primary_entropy_boundary_v2"]
     protocol_hash: str = Field(min_length=64, max_length=64)
     thresholds: GrayRQMembershipRoleThresholds
     inputs: GrayRQMembershipRoleInputs
@@ -5259,10 +5274,13 @@ class GrayRQScore(ClosedContractModel):
     candidate_prefix_membership_score: float = Field(
         ge=0.0, le=1.0, allow_inf_nan=False, strict=True
     )
-    fuzzy_membership_overlap_score: float = Field(
+    membership_overlap_diagnostic_score: float = Field(
         ge=0.0, le=1.0, allow_inf_nan=False, strict=True
     )
     rq_score: float = Field(
+        ge=0.0, le=1.0, allow_inf_nan=False, strict=True
+    )
+    residual_score: float = Field(
         ge=0.0, le=1.0, allow_inf_nan=False, strict=True
     )
     rq_drift_penalty: float = Field(
@@ -5276,7 +5294,6 @@ class GrayRQScore(ClosedContractModel):
         "low_confidence_member",
         "boundary_member",
         "primary_member",
-        "fuzzy_member",
     ]
     membership_rank: int = Field(ge=1, strict=True)
     membership_entropy: float | None = Field(
@@ -5298,7 +5315,7 @@ class GrayRQScore(ClosedContractModel):
     )
     membership_role_evaluation: GrayRQMembershipRoleEvaluation | None = None
     membership_protocol_version: Literal[
-        "rq_fuzzy_softmax_gamma_product_v1"
+        "rq_primary_chain_v1"
     ] | None = None
     membership_protocol_hash: str | None = Field(
         default=None, min_length=64, max_length=64
@@ -5339,7 +5356,7 @@ class GrayProjectedRQDiagnostics(ClosedContractModel):
     residual_distance: float | None = None
     query_prefix_membership_score: float | None = None
     candidate_prefix_membership_score: float | None = None
-    fuzzy_membership_overlap_score: float | None = None
+    membership_overlap_diagnostic_score: float | None = None
     membership_reason: str | None = None
     membership_role: str | None = None
     membership_rank: int | None = Field(default=None, ge=0)
@@ -5739,6 +5756,7 @@ class RetrievalQueryRQSeedAudit(ClosedContractModel):
     explicit_query_relevance_precedence: Literal[True]
     selected_mid_route_fallback_only_when_missing: Literal[True]
     mid_support_baseline_may_mask_rq_seed: Literal[False]
+    membership_overlap_used_in_effective_score: Literal[False]
     node_weight_used_as_query_relevance: Literal[False]
     hard_path_lcp_used_as_score: Literal[False]
     is_evidence: Literal[False]
@@ -7569,14 +7587,12 @@ class ModelSettingsResponse(PublicResponseModel):
     rq_kmeans_max_k: int | None = None
     rq_residual_tau: float | None = None
     edge_distance_protocol: Literal["edge_distance_log_calibrated_strength_v2"]
-    rq_membership_protocol: Literal["rq_fuzzy_softmax_gamma_product_v1"]
+    rq_membership_protocol: Literal["rq_primary_chain_v1"]
     edge_projection_protocol: Literal[
         "membership_q15_layer_type_calibrated_v3"
     ]
     edge_type_calibration_protocol: Literal["type_local_winsorized_minmax_v1"]
     rq_membership_temperature: float = Field(gt=0.0, le=10.0)
-    rq_membership_top_m: int = Field(strict=True, ge=1, le=6)
-    rq_membership_probability_threshold: float = Field(ge=0.0, le=1.0)
     dense_knn_k_min: int | None = None
     dense_knn_k_max: int | None = None
     dense_reverse_b_min_base: int | None = None
@@ -7744,7 +7760,7 @@ class ModelSettingsUpdate(APIModel):
         "edge_distance_log_calibrated_strength_v2"
     ] | None = None
     rq_membership_protocol: Literal[
-        "rq_fuzzy_softmax_gamma_product_v1"
+        "rq_primary_chain_v1"
     ] | None = None
     edge_projection_protocol: Literal[
         "membership_q15_layer_type_calibrated_v3"
@@ -7757,18 +7773,6 @@ class ModelSettingsUpdate(APIModel):
         strict=True,
         gt=0.0,
         le=10.0,
-    )
-    rq_membership_top_m: int | None = Field(
-        default=None,
-        strict=True,
-        ge=1,
-        le=6,
-    )
-    rq_membership_probability_threshold: float | None = Field(
-        default=None,
-        strict=True,
-        ge=0.0,
-        le=1.0,
     )
     dense_knn_k_min: int | None = None
     dense_knn_k_max: int | None = None
@@ -7847,14 +7851,12 @@ class ModelSettingsUpdate(APIModel):
 
     @field_validator(
         "rq_membership_temperature",
-        "rq_membership_top_m",
-        "rq_membership_probability_threshold",
     )
     @classmethod
     def validate_rq_membership_setting_is_not_null(
         cls,
-        value: int | float | None,
-    ) -> int | float:
+        value: float | None,
+    ) -> float:
         if value is None:
             raise ValueError("RQ membership settings cannot be null")
         return value

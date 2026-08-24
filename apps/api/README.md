@@ -4,7 +4,7 @@
 
 `apps/api` 是 SymboGraph 的 FastAPI 后端，负责知识库、上传、解析、固定 token chunk、Chunk Structure Graph、Chunk Relation Graph、RQ membership、Mid/Coarse Concept Graph、layered retrieval、context package、QA、citation verification、runtime settings 和维护入口。
 
-首次构图与普通重建复用同一 ingestion/context-graph 事务、补偿和恢复协议；模型配置只读取已生效的 Runtime Settings，不依赖仓库内的授权回执或 Sample 专用流程。
+首次构图与普通重建复用同一 ingestion/context-graph 事务、补偿和恢复协议；模型配置只读取根 `.env` 中已按生命周期生效的 Runtime Settings。
 
 ## 目录
 
@@ -51,7 +51,7 @@ upload / source files
 -> contextual embedding and vector index
 -> optional automatic TPE operating point selection on chunk-version increments
 -> independent chunk relation graph
--> RQ prefix address tree and fuzzy membership
+-> RQ primary prefix address tree and membership
 -> RQ L3 mid concept graph / RQ L2 coarse concept graph
 -> context graph state
 -> layered search or Agent QA
@@ -151,7 +151,7 @@ python scripts/diagnose_context_graph.py
 python scripts/evaluate_layered_retrieval.py
 python scripts/evaluate_layered_retrieval.py --query "<query>" --execute
 python scripts/check_context_package_quality.py
-python scripts/check_technical_spec_compliance.py --knowledge-base-name 贝叶斯
+python scripts/check_technical_spec_compliance.py --knowledge-base-name "<knowledge-base-name>"
 python scripts/reconcile_vector_records.py
 ```
 

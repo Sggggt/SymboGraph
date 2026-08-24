@@ -474,6 +474,20 @@ export async function uploadFile(file: File, knowledgeBaseId?: string | null, si
   return parseResponse<UploadFileResponse>(response);
 }
 
+export async function uploadFilesSequentially(
+  files: File[],
+  knowledgeBaseId?: string | null,
+  signal?: AbortSignal,
+  onCompleted?: (completed: number) => void,
+): Promise<UploadFileResponse[]> {
+  const responses: UploadFileResponse[] = [];
+  for (const file of files) {
+    responses.push(await uploadFile(file, knowledgeBaseId, signal));
+    onCompleted?.(responses.length);
+  }
+  return responses;
+}
+
 export async function parseUploadedFiles(
   filePaths: string[],
   knowledgeBaseId?: string | null,

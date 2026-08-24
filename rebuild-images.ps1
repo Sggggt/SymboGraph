@@ -1,6 +1,7 @@
 param(
-  [string]$ApiBuildTag = "course-kg-api:dev",
-  [string]$WebBuildTag = "course-kg-web:dev",
+  [string]$ApiBuildTag = "course-kg-api:local",
+  [string]$WebBuildTag = "course-kg-web:local",
+  # Must match start-app.ps1 so image rebuilds address the existing local stack.
   [string]$ComposeProjectName = "knowledgegraph-dev-20260820",
   [switch]$NoCache,
   [switch]$DryRun
@@ -21,7 +22,7 @@ function Assert-BuildableImageTag {
     throw "$Name must be a non-empty Docker image tag."
   }
   if ($Value.Contains("@") -or $Value.StartsWith("sha256:", [StringComparison]::OrdinalIgnoreCase)) {
-    throw "$Name='$Value' is digest-qualified. Docker build outputs require a mutable image tag such as 'course-kg-api:dev'; use a digest only as a runtime image with start-app.ps1 -SkipBuild."
+    throw "$Name='$Value' is digest-qualified. Docker build outputs require a mutable image tag such as 'course-kg-api:local'; use a digest only as a runtime image with start-app.ps1 -SkipBuild."
   }
 }
 

@@ -15,26 +15,9 @@ docker logs --tail 100 course-kg-beat
 ## Application data volume
 
 The default API and worker `DATA_ROOT=/app/data` is a shared Docker managed
-volume (`symbograph-data`), not the Windows-host `../data` bind mount. Existing
-bytes under `../data` are deliberately **not** migrated automatically when this
-layout is adopted; stop the stack and use an explicit, verified maintenance
-copy only when old application data must be retained.
-
-Raw sample files remain available through the separate read-only
-`/app/import/sample` bind. A clean clone uses the tracked, intentionally empty
-`infra/sample-import/` directory, so Compose startup never depends on ignored
-local data. Every import root must contain `raw-manifest.json` using
-`symbograph_raw_source_manifest_v1`; the manifest names one relative
-`raw_root` and lists every accepted raw file with its exact SHA-256. Import
-enumeration consumes only those entries and rejects unlisted recursive
-discovery, path/symlink escapes, checksum drift, and casefold/NFKC collisions.
-For the real main-database sample run, set `SAMPLE_IMPORT_PATH` explicitly to
-an operator-prepared raw-only directory containing that manifest. Never point
-it at `../data/Sample`, a legacy `ingestion`/snapshot tree, candidate/backup
-tree, or other mutable application state. This import mount is never a
-production `DATA_ROOT`.
-
-资料导入统一使用 Upload API/前端或当前 `rebuild_chunks.py` 运维入口；不再提供绑定固定 Sample manifest 的专用脚本。
+volume (`symbograph-data`), not a host bind mount. Source documents enter the
+system through the Upload API/frontend or the guarded rebuild workflow; the
+Compose stack does not mount a repository-specific sample directory.
 
 ## 项目简介
 
@@ -49,7 +32,7 @@ production `DATA_ROOT`.
 
 ## 产品定位
 
-默认运行路径是 Docker Compose。涉及 PostgreSQL、Qdrant、Redis、模型接口和无 fallback 的集成路径必须在该栈内验证；`experiment` profile 不属于默认运行路径。
+默认运行路径是 Docker Compose。涉及 PostgreSQL、Qdrant、Redis、模型接口和无 fallback 的集成路径必须在该栈内验证。
 
 ## 技术栈
 
@@ -179,7 +162,7 @@ docker compose -f infra/docker-compose.yml ps
 | --- | --- |
 | 镜像与端口 | `API_IMAGE`, `WEB_IMAGE`, `API_HOST_PORT`, `WEB_HOST_PORT` |
 | 数据服务 | `DATABASE_URL`, `QDRANT_URL`, `QDRANT_COLLECTION`, `REDIS_URL` |
-| 数据目录 | `DATA_ROOT`, `STORAGE_ROOT`, `INGESTION_ROOT`, `SAMPLE_IMPORT_PATH`（相对 `infra/docker-compose.yml` 的 raw-only 只读挂载） |
+| 数据目录 | `DATA_ROOT`, `STORAGE_ROOT`, `INGESTION_ROOT` |
 | 模型 | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT`, `MODEL_BRIDGE_ADMIN_TOKEN`, `CHAT_*`, `EMBEDDING_*` |
 | Auto TPE | `ENABLE_AUTO_TPE`, `TPE_TRIAL_BUDGET`, `TPE_STARTUP_RANDOM_TRIALS`, `TPE_GOOD_QUANTILE_GAMMA`, `TPE_PROBE_QUERY_BUDGET`, `TPE_TRIAL_TIMEOUT_SECONDS`, `TPE_CANDIDATE_POOL_SIZE`, `OPERATING_POINT_HARD_GATE_*` |
 | Worker | `WORKER_CONCURRENCY`, `INGESTION_TASK_QUEUE` |
@@ -220,5 +203,5 @@ python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --execute
 - Compose 默认服务名保持 `course-kg-*`。
 - API 容器工作目录是 `/app/apps/api`，脚本挂载到 `/app/scripts`，数据目录挂载到 `/app/data`。
 - 模型桥启用时，容器内客户端地址使用 `host.docker.internal`，宿主机脚本使用 `127.0.0.1`，真实对话和向量 endpoint 保存在 `CHAT_BASE_URL`/`EMBEDDING_BASE_URL`；图谱构建 endpoint 独立保存在 `GRAPH_BASE_URL`。
-- 日志、smoke 输出和临时报告写入仓库根目录 `output/`。
+- 诊断与 smoke 输出写入被 Git 忽略的 `output/`，核验后可清空；不得写入凭据或 provider 原文。
 - 改动端口、镜像依赖、Celery pool/fork 规模等需要 service recreate 或 rebuild。

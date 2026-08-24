@@ -152,7 +152,6 @@ _UNORDERED_LIST_KEYS = {
     "low_confidence_mid_concept_ids",
     "cross_community_weak_ties",
     "cross_community_weak_ties_json",
-    "top_alternative_prefix_ids_json",
 }
 _DATABASE_ADDRESS_FIELD_NAMES = {
     "chunk",
@@ -1145,11 +1144,6 @@ def rq_membership_business_fact(
         "rq_path": [int(item) for item in (membership.rq_path or [])],
         "residual_norm": membership.residual_norm,
         "rank": int(membership.rank or 0),
-        "top_alternative_prefixes": _canonical_value(
-            membership.top_alternative_prefix_ids_json or [],
-            references=prefix_keys,
-            parent_key="top_alternative_prefix_ids_json",
-        ),
         "support_chunk_edges": _canonical_value(
             membership.support_chunk_edge_ids_json or [],
             references=edge_keys,

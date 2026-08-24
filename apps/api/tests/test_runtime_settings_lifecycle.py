@@ -438,16 +438,6 @@ def test_bridge_enabled_candidates_use_upstream_provider_identity_not_serving_ur
             if settings.rq_membership_temperature <= 9.95
             else settings.rq_membership_temperature - 0.05
         ),
-        "rq_membership_top_m": (
-            settings.rq_membership_top_m + 1
-            if settings.rq_membership_top_m < 6
-            else settings.rq_membership_top_m - 1
-        ),
-        "rq_membership_probability_threshold": (
-            settings.rq_membership_probability_threshold + 0.05
-            if settings.rq_membership_probability_threshold <= 0.95
-            else settings.rq_membership_probability_threshold - 0.05
-        ),
     }
     bridge_hashes: set[tuple[str, str]] = set()
     for key, value in graph_requests.items():
@@ -598,8 +588,6 @@ def test_runtime_graph_hash_excludes_hot_and_service_values_but_tracks_rebuild_v
     [
         "dense_knn_k_min",
         "rq_membership_temperature",
-        "rq_membership_top_m",
-        "rq_membership_probability_threshold",
         "mid_concept_extraction_max_model_batches",
     ],
 )
@@ -656,12 +644,7 @@ async def test_graph_only_candidate_build_evaluate_promote_activate_and_rollback
             if current_temperature <= 9.95
             else current_temperature - 0.05
         )
-    elif graph_setting == "rq_membership_top_m":
-        current_top_m = int(settings.rq_membership_top_m)
-        requested_value = (
-            current_top_m + 1 if current_top_m < 6 else current_top_m - 1
-        )
-    elif graph_setting == "mid_concept_extraction_max_model_batches":
+    else:
         current_max_batches = int(
             settings.mid_concept_extraction_max_model_batches
         )
@@ -669,15 +652,6 @@ async def test_graph_only_candidate_build_evaluate_promote_activate_and_rollback
             current_max_batches + 1
             if current_max_batches < 64
             else current_max_batches - 1
-        )
-    else:
-        current_threshold = float(
-            settings.rq_membership_probability_threshold
-        )
-        requested_value = (
-            current_threshold + 0.05
-            if current_threshold <= 0.95
-            else current_threshold - 0.05
         )
 
     candidate, builds = stage_runtime_settings_candidate(

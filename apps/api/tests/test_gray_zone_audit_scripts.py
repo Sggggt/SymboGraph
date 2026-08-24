@@ -901,7 +901,7 @@ def test_docker_smoke_gray_coverage_gate_is_explicit_cli_option(monkeypatch):
 
 def _smoke_trace(records: list[dict], trace_id: str) -> dict:
     trace = _trace(records, trace_id=trace_id)
-    rq_protocol = "query_rq_fuzzy_membership_chunk_seed_v2"
+    rq_protocol = "query_rq_primary_residual_mid_dense_v5"
     rq_protocol_hash = "a" * 64
     trace["trace_diagnostics"] = {
         **(trace.get("trace_diagnostics") or {}),

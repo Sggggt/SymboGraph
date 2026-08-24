@@ -93,7 +93,7 @@ def test_semantic_entry_uses_most_specific_validated_facet_without_gray_authorit
         query_facets=changed_facets,
     )
     assert components["cache_key_protocol_version"] == (
-        "layered_retrieval_full_identity_key_v3"
+        "layered_retrieval_full_identity_key_v5"
     )
     assert components["query"] == RAW_INSTRUCTION_QUERY
     assert components["semantic_entry_query"] == "技术必须被什么夹在中间"

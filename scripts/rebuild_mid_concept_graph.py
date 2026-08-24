@@ -125,6 +125,15 @@ async def main(args: argparse.Namespace | None = None) -> None:
                     failure["semantic_reuse_diagnostics"] = dict(
                         exc.diagnostics
                     )
+                if isinstance(
+                    exc,
+                    context_graph.ConceptProviderBatchError,
+                ):
+                    failure["provider_failure_card"] = (
+                        context_graph.concept_provider_output_failure_card(
+                            exc
+                        )
+                    )
                 payload["failure"] = failure
                 payload["transaction"] = {
                     "database_committed": False,

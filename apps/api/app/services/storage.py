@@ -32,10 +32,13 @@ ALLOWED_UPLOAD_SUFFIXES = frozenset(
 )
 UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 INVALID_FILENAME_CHARS = frozenset('<>:"/\\|?*')
-UPLOAD_FILENAME_VALIDATION_PROTOCOL_VERSION = "nfkc_closed_path_filename_v2"
+UPLOAD_FILENAME_VALIDATION_PROTOCOL_VERSION = (
+    "nfkc_security_shadow_display_colon_preservation_v3"
+)
 UPLOAD_MULTIPART_FILENAME_PROTOCOL_VERSION = (
     "raw_content_disposition_filename_preservation_v1"
 )
+UPLOAD_DISPLAY_NFKC_PRESERVED_CHARACTERS = frozenset({"\uff1a"})
 UPLOAD_CONTENT_SIGNATURE_PROTOCOL_VERSION = "upload_content_signature_v1"
 UPLOAD_CONTENT_SIGNATURE_MAX_HEADER_BYTES = 8 * 1024
 UPLOAD_CONTENT_SIGNATURE_MAX_ZIP_ENTRIES = 4096
@@ -1127,7 +1130,12 @@ def upload_filename_validation_protocol_hash() -> str:
     payload = {
         "protocol_version": UPLOAD_FILENAME_VALIDATION_PROTOCOL_VERSION,
         "multipart_protocol_version": UPLOAD_MULTIPART_FILENAME_PROTOCOL_VERSION,
-        "unicode_normalization": "NFKC",
+        "unicode_normalization": "NFKC_security_shadow_with_display_preservation",
+        "display_preserved_compatibility_codepoints": sorted(
+            f"U+{ord(character):04X}"
+            for character in UPLOAD_DISPLAY_NFKC_PRESERVED_CHARACTERS
+        ),
+        "security_shadow_uses": ["windows_reserved_stem"],
         "separator_confusable_codepoints": sorted(
             f"U+{ord(character):04X}"
             for character in PATH_SEPARATOR_CONFUSABLES
@@ -1311,7 +1319,26 @@ def normalize_upload_filename(filename: str | None) -> str:
         raise UploadValidationError(
             "Upload filename contains a path-separator confusable"
         )
-    normalized = unicodedata.normalize("NFKC", filename)
+    security_normalized = unicodedata.normalize("NFKC", filename)
+    normalized_parts: list[str] = []
+    compatibility_buffer: list[str] = []
+    for character in filename:
+        if character in UPLOAD_DISPLAY_NFKC_PRESERVED_CHARACTERS:
+            if compatibility_buffer:
+                normalized_parts.append(
+                    unicodedata.normalize(
+                        "NFKC", "".join(compatibility_buffer)
+                    )
+                )
+                compatibility_buffer = []
+            normalized_parts.append(character)
+        else:
+            compatibility_buffer.append(character)
+    if compatibility_buffer:
+        normalized_parts.append(
+            unicodedata.normalize("NFKC", "".join(compatibility_buffer))
+        )
+    normalized = "".join(normalized_parts)
     if not normalized or normalized in {".", ".."}:
         raise UploadValidationError("Upload filename is required")
     if len(normalized) > 255:
@@ -1345,7 +1372,7 @@ def normalize_upload_filename(filename: str | None) -> str:
         raise UploadValidationError("Upload filename must not contain a path")
     if Path(normalized).name != normalized:
         raise UploadValidationError("Upload filename must not contain a path")
-    reserved_stem = normalized.split(".", 1)[0].casefold()
+    reserved_stem = security_normalized.split(".", 1)[0].casefold()
     if reserved_stem in WINDOWS_RESERVED_FILENAME_STEMS:
         raise UploadValidationError(
             "Upload filename uses a reserved platform name"

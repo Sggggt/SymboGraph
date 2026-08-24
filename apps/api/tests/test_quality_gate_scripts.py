@@ -321,7 +321,7 @@ def _graph_fixture(module) -> dict:
                 "boundary_distance": 0.9,
                 "residual_outlier_threshold": 1.0,
                 "rank": 1,
-                "is_primary_leaf": True,
+                "is_primary_prefix": True,
                 "is_bridge_chunk": False,
             },
             "model_call_count": 0,
@@ -393,7 +393,7 @@ def _graph_fixture(module) -> dict:
                 [0.1, 0.1]
             ),
             "model_call_count": 0,
-            "renormalized_after_sparsification": False,
+            "renormalized_after_primary_selection": False,
             "artificial_membership_floor": False,
             "rq_pair_edges_active": False,
         },
@@ -722,6 +722,7 @@ def _retrieval_fixture() -> dict:
         "path_edge_type_multiset": {},
         "distance_so_far": 0.1,
         "reward_so_far": 0.0,
+        "cycle_reward_so_far": 0.0,
         "cycle_distance_rewards": [],
         "expanded_edge_ids": [],
     }
@@ -1242,7 +1243,7 @@ def _query_rq_chunk_seed_card(
     chunk_id: str,
     score_source: str,
 ) -> dict:
-    if score_source == "query_rq_fuzzy_membership":
+    if score_source == "query_rq_primary_base":
         source_fields = {
             "rq_l3_prefix_id": "rq-1",
             "query_rq_path": [],
@@ -1251,11 +1252,15 @@ def _query_rq_chunk_seed_card(
             "residual_distance": None,
             "query_prefix_score": 1.0,
             "chunk_membership_score": 1.0,
-            "fuzzy_membership_overlap_score": 1.0,
+            "membership_overlap_diagnostic_score": 1.0,
             "rq_score": 1.0,
+            "residual_score": 1.0,
             "rq_relevance_component": 1.0,
+            "primary_membership": True,
+            "membership_overlap_used_in_effective_score": False,
+            "query_membership_entropy": 0.1,
             "rq_drift_penalty": 0.0,
-            "membership_role": "fuzzy_member",
+            "membership_role": "primary_member",
             "membership_rank": 1,
             "membership_entropy": 0.1,
             "bridge_or_boundary_role": False,
@@ -1266,7 +1271,7 @@ def _query_rq_chunk_seed_card(
                 module.QUERY_RQ_CHUNK_SEED_COMPONENT_WEIGHTS
             ),
             "effective_score": 1.0,
-            "membership_role_tie_break_rank": 1,
+            "membership_role_tie_break_rank": 0,
         }
     else:
         source_fields = {
@@ -1277,9 +1282,13 @@ def _query_rq_chunk_seed_card(
             "residual_distance": None,
             "query_prefix_score": 0.0,
             "chunk_membership_score": 0.0,
-            "fuzzy_membership_overlap_score": 0.0,
+            "membership_overlap_diagnostic_score": 0.0,
             "rq_score": 0.0,
+            "residual_score": 0.0,
             "rq_relevance_component": 0.0,
+            "primary_membership": False,
+            "membership_overlap_used_in_effective_score": False,
+            "query_membership_entropy": 1.0,
             "rq_drift_penalty": None,
             "membership_role": "mid_support_fallback",
             "membership_rank": 0,
@@ -1293,7 +1302,9 @@ def _query_rq_chunk_seed_card(
                 .QUERY_RQ_MID_SUPPORT_FALLBACK_COMPONENT_WEIGHTS
             ),
             "effective_score": 0.01,
-            "membership_role_tie_break_rank": 6,
+            "membership_role_tie_break_rank": (
+                module.QUERY_RQ_MID_SUPPORT_FALLBACK_TIE_BREAK_RANK
+            ),
         }
     return _seal_query_rq_seed_card(
         module,
@@ -1333,7 +1344,7 @@ def _retrieval_fixture_with_query_rq_seed_cards(module) -> dict:
             _query_rq_chunk_seed_card(
                 module,
                 chunk_id="chunk-1",
-                score_source="query_rq_fuzzy_membership",
+                score_source="query_rq_primary_base",
             )
         ],
         "chunk-2": [
@@ -1890,6 +1901,40 @@ def test_versioned_quality_gate_good_fixtures_pass():
     assert _audit_agent_fixture(module, agent_fixture)["pass"] is True
 
 
+def test_context_package_quality_replays_bridge_graph_path_overlap():
+    module = _load_quality_gate()
+    fixture = _context_fixture()
+    fixture["hit_chunk_ids"] = []
+    fixture["restored_chunk_ids"] = ["chunk-1"]
+    fixture["bridge_chunk_ids"] = ["chunk-1"]
+    fixture["chunks"][0]["role"] = "bridge"
+    fixture["chunks"][0]["why_selected"][
+        "reason"
+    ] = "restored_from_selected_graph_path"
+    fixture["diagnostics"]["restore_counts"].update(
+        hit_chunks=0,
+        restored_chunks=1,
+        bridge_chunks=1,
+        graph_path_chunks=1,
+    )
+
+    audit = module.audit_context_package_quality(fixture)
+
+    assert audit["pass"] is True, audit
+
+
+def test_context_package_quality_accepts_snapshot_verification_superset():
+    module = _load_quality_gate()
+    fixture = _context_fixture()
+    fixture["diagnostics"]["snapshot_integrity"][
+        "verified_document_version_count"
+    ] = 2
+
+    audit = module.audit_context_package_quality(fixture)
+
+    assert audit["pass"] is True, audit
+
+
 def _context_package_checker():
     sys.path.insert(0, str(SCRIPTS_ROOT))
     try:
@@ -2057,17 +2102,17 @@ def test_gray_replay_uses_raw_query_not_external_facets_or_typed_controls():
     )
 
 
-def test_v11_quality_gate_protocol_identity_is_frozen():
+def test_v16_quality_gate_protocol_identity_is_frozen():
     from app.services import agent_graph
 
     module = _load_quality_gate()
     assert (
         module.QUALITY_GATE_PROTOCOL_VERSION
-        == "four_layer_acceptance_quality_gate_v11"
+        == "four_layer_acceptance_quality_gate_v16"
     )
     assert module.QUALITY_GATE_PROTOCOL_HASH == (
-        "299cf0db93c9852878cee195acde509d1"
-        "9b3694f0c52d1aa3df84d890bc0044d"
+        "ef21274a711f7c9c6811a8b8f1d813a4"
+        "3f8766e9a57e4f327c85538f382e2207"
     )
     assert module.chunk_facet_priority_protocol_hash() == (
         "d266e9eafef9016518b8d42b2924a598"
@@ -2877,6 +2922,7 @@ def _repair_overlay_path_label(module, directive, *, chunk_id="chunk-2"):
         "entry_parent_refs": [],
         "distance_so_far": 0.0,
         "reward_so_far": 0.0,
+        "cycle_reward_so_far": 0.0,
         "stop_reason": "repair_supported_evidence_carry_forward",
         "repair_evidence_retention_protocol_version": (
             module.REPAIR_EVIDENCE_RETENTION_PROTOCOL_VERSION

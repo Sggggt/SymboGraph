@@ -52,16 +52,13 @@ COPY scripts /app/scripts
 COPY infra/model-bridge /app/infra/model-bridge
 COPY infra/docker-compose.yml /app/infra/docker-compose.yml
 COPY infra/README.md /app/infra/README.md
-COPY infra/sample-import/.gitkeep /app/infra/sample-import/.gitkeep
 COPY start-app.ps1 /app/start-app.ps1
 COPY start-app.bat /app/start-app.bat
 COPY rebuild-images.ps1 /app/rebuild-images.ps1
 COPY rebuild-images.bat /app/rebuild-images.bat
 COPY package.json /app/package.json
 COPY package-lock.json /app/package-lock.json
-COPY AGENTS.md /app/AGENTS.md
 COPY docs/technical-spec.md /app/docs/technical-spec.md
-COPY docs/todo.md /app/docs/todo.md
 
 EXPOSE 8000
 

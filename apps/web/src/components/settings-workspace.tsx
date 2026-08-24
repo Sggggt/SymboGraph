@@ -103,12 +103,10 @@ type SettingsForm = {
   rq_kmeans_max_k: string;
   rq_residual_tau: string;
   edge_distance_protocol: "edge_distance_log_calibrated_strength_v2";
-  rq_membership_protocol: "rq_fuzzy_softmax_gamma_product_v1";
+  rq_membership_protocol: "rq_primary_chain_v1";
   edge_projection_protocol: "membership_q15_layer_type_calibrated_v3";
   edge_type_calibration_protocol: "type_local_winsorized_minmax_v1";
   rq_membership_temperature: string;
-  rq_membership_top_m: string;
-  rq_membership_probability_threshold: string;
   dense_knn_k_min: string;
   dense_knn_k_max: string;
   dense_reverse_b_min_base: string;
@@ -147,8 +145,6 @@ type GraphProtocolSettingsValues = Pick<
   | "edge_projection_protocol"
   | "edge_type_calibration_protocol"
   | "rq_membership_temperature"
-  | "rq_membership_top_m"
-  | "rq_membership_probability_threshold"
 >;
 
 type FieldProps = {
@@ -218,10 +214,10 @@ export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   中粗层双语派生: "开启后，下一次图谱重建会对 mid/coarse 概念节点和高层概念边额外生成中英双语派生 metadata；关闭时不会产生这部分模型调用成本。",
   "LLM 双语查询面": "开启后，QA 查询面提取会要求 LLM 为显式领域和过程 facet 生成中英双语 aliases；它只影响下一次检索路由，不写事实证据，也不触发图谱重建。",
   "边距离协议": "本地 allowlist 的关系强度到累计距离转换协议。它改变 active relation graph 语义，只能经 candidate、shadow rebuild、evaluation 和 promotion 生效。",
-  "RQ membership 协议": "本地 allowlist 的 RQ 模糊归属协议。LLM、prompt 和自由表达式都不能成为协议值；变更必须重建 RQ 与下游概念图。",
+  "RQ membership 协议": "本地 allowlist 的 RQ 主链归属协议。LLM、prompt 和自由表达式都不能成为协议值；变更必须重建 RQ 与下游概念图。",
   "边投影协议": "底层 chunk relation edge 向 mid/coarse 概念边投影的本地协议；support ids 与 gray predicates 都由确定性实现约束。",
   "边类型校准协议": "按 edge type 独立校准 raw strength 的本地协议；变更必须重新校准并重建 active relation graph。",
-  "RQ softmax 温度": "逐层完整 codebook softmax 的温度 τ_l；它改变 RQ fuzzy membership，必须通过 candidate 重建与 promotion 生效。",
+  "RQ softmax 温度": "逐层完整 codebook softmax 的温度 τ_l；它改变 primary membership 概率，必须通过 candidate 重建与 promotion 生效。",
   "RQ 每层候选上限": "每层保留的非主 code 稀疏候选上限；主 residual trajectory 始终保留，不受该值裁掉。",
   "RQ 概率裁剪阈值": "仅裁剪非主 code 的原始完整 softmax 概率阈值；membership 不重归一、不设人工下限。",
   粗概念起点数量: "摘要模式下从全部粗概念候选中选入图探索的起点数量；普通模式不使用这个参数。",
@@ -258,7 +254,7 @@ export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   候选诊断阈值: "mid concept 候选保留诊断的 membership/质量阈值，用于标记低置信候选而不是直接制造事实。",
   "RQ-KMeans 协议深度": "当前 Four-Layer active protocol 固定为 3：L3 对齐 mid concept、L2 对齐 coarse concept。该值不是可调构图参数。",
   "RQ-KMeans 最大 K": "每层 RQ-KMeans 聚类的最大分支数，影响 RQ prefix 地址空间粒度。",
-  "RQ 残差 Tau": "控制 RQ fuzzy membership 的残差距离温度；值越小，membership 越集中。",
+  "RQ 残差 Tau": "控制 RQ primary membership 的残差距离温度；值越小，membership 权重越集中。",
   "Dense KNN 最小 K": "每个 chunk 生成 dense relation 候选时的最小出边候选数，保障低证据节点仍有基本候选。",
   "Dense KNN 最大 K": "每个 chunk 生成 dense relation 候选时的最大出边候选数，限制高证据节点扩张。",
   基础互近邻下限: "普通 dense relation 的反向接纳下限，避免热门 chunk 吞掉全部入边机会。",
@@ -560,8 +556,6 @@ export function GraphProtocolSettingsSection({
         <SettingField label="边投影协议" value={values.edge_projection_protocol} onChange={() => undefined} disabled />
         <SettingField label="边类型校准协议" value={values.edge_type_calibration_protocol} onChange={() => undefined} disabled />
         <SettingField label="RQ softmax 温度" type="number" min={0.01} max={10} step={0.01} value={values.rq_membership_temperature} onChange={(value) => onChange("rq_membership_temperature", value)} />
-        <SettingField label="RQ 每层候选上限" type="number" min={1} max={6} value={values.rq_membership_top_m} onChange={(value) => onChange("rq_membership_top_m", value)} />
-        <SettingField label="RQ 概率裁剪阈值" type="number" min={0} max={1} step={0.01} value={values.rq_membership_probability_threshold} onChange={(value) => onChange("rq_membership_probability_threshold", value)} />
       </div>
     </section>
   );
@@ -1371,8 +1365,6 @@ export function buildRuntimeSettingsPayload(form: SettingsForm): ModelSettingsUp
     rq_kmeans_max_k: parseIntField(form.rq_kmeans_max_k),
     rq_residual_tau: parseFloatField(form.rq_residual_tau),
     rq_membership_temperature: parseFloatField(form.rq_membership_temperature),
-    rq_membership_top_m: parseIntField(form.rq_membership_top_m),
-    rq_membership_probability_threshold: parseFloatField(form.rq_membership_probability_threshold),
     dense_knn_k_min: parseIntField(form.dense_knn_k_min),
     dense_knn_k_max: parseIntField(form.dense_knn_k_max),
     dense_reverse_b_min_base: parseIntField(form.dense_reverse_b_min_base),
@@ -1418,8 +1410,6 @@ function rebuildCandidateSettings(
     rq_kmeans_max_k: parseIntField(form.rq_kmeans_max_k),
     rq_residual_tau: parseFloatField(form.rq_residual_tau),
     rq_membership_temperature: parseFloatField(form.rq_membership_temperature),
-    rq_membership_top_m: parseIntField(form.rq_membership_top_m),
-    rq_membership_probability_threshold: parseFloatField(form.rq_membership_probability_threshold),
     dense_knn_k_min: parseIntField(form.dense_knn_k_min),
     dense_knn_k_max: parseIntField(form.dense_knn_k_max),
     dense_reverse_b_min_base: parseIntField(form.dense_reverse_b_min_base),
@@ -1683,12 +1673,10 @@ export function SettingsWorkspace() {
       rq_kmeans_max_k: String(displayedSettings.rq_kmeans_max_k ?? 6),
       rq_residual_tau: String(displayedSettings.rq_residual_tau ?? 0.65),
       edge_distance_protocol: displayedSettings.edge_distance_protocol ?? "edge_distance_log_calibrated_strength_v2",
-      rq_membership_protocol: displayedSettings.rq_membership_protocol ?? "rq_fuzzy_softmax_gamma_product_v1",
+      rq_membership_protocol: displayedSettings.rq_membership_protocol ?? "rq_primary_chain_v1",
       edge_projection_protocol: displayedSettings.edge_projection_protocol ?? "membership_q15_layer_type_calibrated_v3",
       edge_type_calibration_protocol: displayedSettings.edge_type_calibration_protocol ?? "type_local_winsorized_minmax_v1",
       rq_membership_temperature: String(displayedSettings.rq_membership_temperature ?? 0.35),
-      rq_membership_top_m: String(displayedSettings.rq_membership_top_m ?? 2),
-      rq_membership_probability_threshold: String(displayedSettings.rq_membership_probability_threshold ?? 0.05),
       dense_knn_k_min: String(displayedSettings.dense_knn_k_min ?? 5),
       dense_knn_k_max: String(displayedSettings.dense_knn_k_max ?? 24),
       dense_reverse_b_min_base: String(displayedSettings.dense_reverse_b_min_base ?? 2),
@@ -2089,8 +2077,6 @@ export function SettingsWorkspace() {
                 edge_projection_protocol: form.edge_projection_protocol,
                 edge_type_calibration_protocol: form.edge_type_calibration_protocol,
                 rq_membership_temperature: form.rq_membership_temperature,
-                rq_membership_top_m: form.rq_membership_top_m,
-                rq_membership_probability_threshold: form.rq_membership_probability_threshold,
               }}
               onChange={(key, value) => updateForm(key, value)}
             />

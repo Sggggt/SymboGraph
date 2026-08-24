@@ -8,15 +8,13 @@ from pydantic import ValidationError
 
 PROTOCOL_SETTINGS = {
     "edge_distance_protocol": "edge_distance_log_calibrated_strength_v2",
-    "rq_membership_protocol": "rq_fuzzy_softmax_gamma_product_v1",
+    "rq_membership_protocol": "rq_primary_chain_v1",
     "edge_projection_protocol": "membership_q15_layer_type_calibrated_v3",
     "edge_type_calibration_protocol": "type_local_winsorized_minmax_v1",
 }
 
 RQ_MEMBERSHIP_SETTINGS = {
     "rq_membership_temperature": 0.35,
-    "rq_membership_top_m": 2,
-    "rq_membership_probability_threshold": 0.05,
 }
 
 
@@ -40,10 +38,6 @@ def test_settings_use_closed_local_protocol_literals_and_bounded_rq_parameters()
         Settings(_env_file=None, rq_membership_protocol="llm_prompt_decides_v9")
     with pytest.raises(ValidationError):
         Settings(_env_file=None, rq_membership_temperature=0.0)
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None, rq_membership_top_m=7)
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None, rq_membership_probability_threshold=1.01)
 
 
 def test_workspace_hot_reload_preserves_numeric_rq_and_source_io_types():
@@ -54,18 +48,12 @@ def test_workspace_hot_reload_preserves_numeric_rq_and_source_io_types():
         settings,
         {
             "RQ_MEMBERSHIP_TEMPERATURE": "0.41",
-            "RQ_MEMBERSHIP_TOP_M": "3",
-            "RQ_MEMBERSHIP_PROBABILITY_THRESHOLD": "0.08",
             "SOURCE_IO_CONCURRENCY": "7",
         },
     )
 
     assert type(settings.rq_membership_temperature) is float
     assert settings.rq_membership_temperature == 0.41
-    assert type(settings.rq_membership_top_m) is int
-    assert settings.rq_membership_top_m == 3
-    assert type(settings.rq_membership_probability_threshold) is float
-    assert settings.rq_membership_probability_threshold == 0.08
     assert type(settings.source_io_concurrency) is int
     assert settings.source_io_concurrency == 7
 
@@ -145,8 +133,6 @@ def test_api_and_shared_contract_expose_rebuild_protocol_identity():
     }
     with pytest.raises(ValidationError):
         ModelSettingsUpdate.model_validate({"edge_projection_protocol": "prompt: choose projection"})
-    with pytest.raises(ValidationError):
-        ModelSettingsUpdate.model_validate({"rq_membership_top_m": True})
 
 
 def test_runtime_payload_classifies_protocol_and_membership_settings_rebuild_required():
@@ -181,7 +167,7 @@ def test_graph_protocol_admission_is_deterministic_local_and_hashes_rq_parameter
         "free_expression": False,
     }
     assert first["rq_membership_parameters"]["membership_score_floor"] is None
-    assert first["rq_membership_parameters"]["renormalize_after_sparsification"] is False
+    assert first["rq_membership_parameters"]["renormalize_after_primary_selection"] is False
 
 
 def test_context_graph_protocol_constants_and_cache_identity_share_config_authority():
@@ -243,7 +229,7 @@ def test_rq_prefix_state_facts_do_not_depend_on_database_generated_ids():
         rq_level=1,
         rq_path_prefix=[1],
         parent_rq_prefix_id=None,
-        codebook_version="residual_quantized_kmeans_fuzzy_v2",
+        codebook_version="residual_quantized_kmeans_primary_v3",
     )
     first_child = SimpleNamespace(
         id="uuid-child-a",
@@ -251,7 +237,7 @@ def test_rq_prefix_state_facts_do_not_depend_on_database_generated_ids():
         rq_level=2,
         rq_path_prefix=[1, 2],
         parent_rq_prefix_id=first_root.id,
-        codebook_version="residual_quantized_kmeans_fuzzy_v2",
+        codebook_version="residual_quantized_kmeans_primary_v3",
     )
     second_root = SimpleNamespace(**{**first_root.__dict__, "id": "uuid-root-b"})
     second_child = SimpleNamespace(
@@ -278,8 +264,6 @@ def test_rq_prefix_state_facts_do_not_depend_on_database_generated_ids():
         ("edge_projection_protocol", "free_expression_v1"),
         ("edge_type_calibration_protocol", "llm_calibration_v1"),
         ("rq_membership_temperature", float("nan")),
-        ("rq_membership_top_m", 0),
-        ("rq_membership_probability_threshold", -0.01),
     ],
 )
 def test_graph_protocol_admission_fails_closed_on_mismatch(setting_key, value):
@@ -320,8 +304,6 @@ def test_active_settings_endpoint_treats_exact_rebuild_identity_as_side_effect_f
         {"edge_projection_protocol": None},
         {"edge_type_calibration_protocol": 42},
         {"rq_membership_temperature": 0.0},
-        {"rq_membership_top_m": True},
-        {"rq_membership_probability_threshold": 1.1},
     ],
 )
 def test_active_settings_endpoint_rejects_invalid_graph_protocol_patch_before_side_effects(
@@ -350,8 +332,6 @@ def test_active_settings_endpoint_rejects_invalid_graph_protocol_patch_before_si
             "edge_distance_log_calibrated_strength_v2",
         ),
         ("rq_membership_temperature", 0.35, 0.4),
-        ("rq_membership_top_m", 2, 3),
-        ("rq_membership_probability_threshold", 0.05, 0.1),
     ],
 )
 def test_active_settings_endpoint_requires_candidate_promotion_for_valid_changes(

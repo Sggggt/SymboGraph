@@ -388,7 +388,6 @@ export function makeRelationEdge(source: string, target: string, overrides: Part
     support_rq_prefix_ids: [],
     metadata: {
       candidate_channels: [],
-      top_alternative_prefix_ids: [],
       rq_path: [],
       support_chunk_ids_sample: [],
       support_chunk_edge_ids_sample: [],
@@ -528,7 +527,6 @@ export function makeProjectionEdge(
     support_rq_prefix_ids: ["rq:fixture"],
     metadata: {
       candidate_channels: [],
-      top_alternative_prefix_ids: [],
       rq_path: [],
       support_chunk_ids_sample: [],
       support_chunk_edge_ids_sample: [],

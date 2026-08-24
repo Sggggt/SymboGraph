@@ -1,6 +1,6 @@
 # 运维脚本
 
-`scripts/` 只保留当前 Four-Layer Context Graph RAG 主链需要的重建、诊断、对账、迁移和 smoke 入口。旧 Sample terminal、阶段性 gap 验收、一次性 provider 授权回执及开发过程归档脚本不属于产品运维面，已经删除。
+`scripts/` 只保留 Four-Layer Context Graph RAG 主链需要的重建、诊断、对账、迁移和 smoke 入口。
 
 ## 共同约束
 
@@ -8,7 +8,7 @@
 - 破坏性操作必须先输出完整、有界的目标清单和 identity hash。
 - PostgreSQL、Qdrant、Redis 和真实 provider 操作只允许在 Docker Compose 内执行。
 - 禁止记录 endpoint、API key、Authorization header、provider 原文、个人文件名或私有资料 hash。
-- 报告写入被 Git 忽略的 `output/`。
+- 临时诊断写入被 Git 忽略的 `output/`，核验后清空。
 - CLI 的 `--help` 必须在导入数据库、模型或向量客户端之前可用。
 
 ## 常用入口
@@ -46,9 +46,7 @@
 | `reconcile_source_snapshots.py` | 校验并修复 immutable source snapshot 引用。 |
 | `source_snapshot_gc.py` | 清点并按 retention gate 清理孤立 source snapshot。 |
 | `cleanup_stale_data.py` | 清点 stale vector / inactive chunk 派生数据。 |
-| `cleanup_orphan_mid_rq_memberships.py` | 清理迁移前遗留的 orphan Mid/RQ membership。 |
 | `cleanup_vector_collection.py` | 通过 durable intent 清理无 active 引用的 Qdrant collection。 |
-| `destroy_legacy_derived_data.py` | 清理明确标记的 legacy 派生对象。 |
 
 ### 诊断与验收
 

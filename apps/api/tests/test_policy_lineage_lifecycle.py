@@ -626,7 +626,7 @@ def test_changed_active_policy_state_does_not_change_gray_zone_decision(
     replayed once per KB context.  The two Policy identities being genuinely
     different, while the gray decision, matched rule, input hash, and
     zero model-call-count stay byte-for-byte identical, is the closure
-    evidence for the whitepaper boundary in AGENTS.md section 8.
+    evidence for the deterministic gray-zone authority boundary.
     """
 
     from app.core.config import get_settings

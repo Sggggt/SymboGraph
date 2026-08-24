@@ -8,7 +8,7 @@
 
 ## 项目简介
 
-SymboGraph 是一个本地通用智能知识库系统。系统采用 Four-Layer Context Graph RAG：固定 token chunk 提供稳定索引和引用地址，Chunk Structure Graph 保存原文结构和上下文恢复路径，Chunk Relation Graph 保存可复算的底层语义关系和 RQ chunk-pair evidence。RQ fuzzy membership 只负责路由和诊断；Mid Concept Graph 与 Coarse Concept Graph 分别由 RQ L3、L2 prefix packet 经过确定性 eligibility 规则压缩产生，并保持 `Mid≤chunks`、`Coarse≤Mid`。检索与问答只使用 context package，答案必须通过 citation verification。
+SymboGraph 是一个本地通用智能知识库系统。系统采用 Four-Layer Context Graph RAG：固定 token chunk 提供稳定索引和引用地址，Chunk Structure Graph 保存原文结构和上下文恢复路径，Chunk Relation Graph 保存可复算的底层语义关系和 RQ chunk-pair evidence。RQ 对每个 chunk 只持久化唯一 L1/L2/L3 主地址链；Mid Concept Graph 与 Coarse Concept Graph 分别由 RQ L3、L2 prefix packet 经过确定性 eligibility 规则压缩产生，并保持 `Mid≤chunks`、`Coarse≤Mid`。检索与问答只使用 context package，答案必须通过 citation verification。
 
 ## 目录
 
@@ -20,8 +20,8 @@ SymboGraph 是一个本地通用智能知识库系统。系统采用 Four-Layer 
 | `packages/shared` | 前后端共享类型和契约。 |
 | `infra` | Docker Compose 默认运行环境。 |
 | `scripts` | 重建、对账、诊断、检索评估、质量检查和 Docker smoke。 |
-| `docs` | 技术白皮书、工程清单和验收资料。 |
-| `output` | 诊断、benchmark、smoke、截图和验收报告输出目录，不提交。 |
+| `docs` | Four-Layer Context Graph RAG 技术白皮书。 |
+| `output` | 本地命令按需生成的临时诊断目录；始终忽略，可随时清空。 |
 
 ## 产品定位
 
@@ -56,7 +56,7 @@ source files
 -> contextual embedding and vector index
 -> optional automatic TPE operating point selection on chunk-version increments
 -> independent chunk relation graph
--> RQ prefix address tree and fuzzy membership
+-> RQ prefix address tree and primary-chain confidence
 -> RQ L3 mid concept graph
 -> RQ L2 coarse concept graph
 -> active context graph state
@@ -110,7 +110,7 @@ ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 ```
 
-设置页保存的是完整 desired 配置。`hot_reloadable` 字段会发布到 active 运行时；`rebuild_required` 与 `service_recreate_required` 字段分别等待显式重建/promotion 或服务重建，不会因页面保存而静默改写 active 图谱或容器拓扑。真实 endpoint、模型名、API key、资料 manifest 和授权回执只保存在被 Git 忽略的本地配置或 `output/` 中，仓库示例只能使用占位符或 `.invalid` 合成 fixture。
+设置页直接更新仓库根 `.env`。`hot_reloadable` 字段会发布到 active 运行时；`rebuild_required` 与 `service_recreate_required` 字段分别等待显式重建/promotion 或服务重建，不会因页面保存而静默改写 active 图谱或容器拓扑。真实 endpoint、模型名和 API key 只能保存在被 Git 忽略的根 `.env`，不得进入日志、报告或测试 fixture；仓库示例只能使用占位符或 `.invalid` 合成值。
 
 ## 快速启动
 
@@ -123,7 +123,7 @@ ENABLE_DATABASE_FALLBACK=false
 输出 tag，`rebuild-images.ps1` 会显式覆盖它：
 
 ```powershell
-# 只重建本地开发镜像
+# 只重建本地镜像
 .\rebuild-images.ps1
 
 # 已存在的 digest 只允许运行，不参与 build
@@ -225,17 +225,16 @@ python scripts/evaluate_layered_retrieval.py
 python scripts/evaluate_layered_retrieval.py --query "<query>" --execute
 python scripts/check_context_package_quality.py
 python scripts/evaluate_agent_trace.py
-python scripts/check_technical_spec_compliance.py --knowledge-base-name 贝叶斯
+python scripts/check_technical_spec_compliance.py --knowledge-base-name "<knowledge-base-name>"
 python scripts/reconcile_vector_records.py
 python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --execute
 ```
 
-`evaluate_layered_retrieval.py` 默认只重放 PostgreSQL 中已有 trace；新检索必须同时提供显式 query 和 `--execute`。写数据脚本默认提供 dry-run 或要求显式 `--execute`。生成的诊断、benchmark、smoke 输出和验收报告写入 `output/`。
+`evaluate_layered_retrieval.py` 默认只重放 PostgreSQL 中已有 trace；新检索必须同时提供显式 query 和 `--execute`。写数据脚本默认提供 dry-run 或要求显式 `--execute`。诊断结果写入被 Git 忽略的 `output/`，完成核验后可以清空。
 
 ## 文档
 
 - [docs/technical-spec.md](./docs/technical-spec.md)：Four-Layer Context Graph RAG 技术白皮书。
-- [docs/todo.md](./docs/todo.md)：工程落地清单。
 - [apps/api/README.md](./apps/api/README.md)：API 后端说明。
 - [apps/web/README.md](./apps/web/README.md)：Web 前端说明。
 - [apps/worker/README.md](./apps/worker/README.md)：Worker 说明。
@@ -247,7 +246,7 @@ python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --execute
 - `chunks` 是索引、引用、检索、问答和图谱关联的主单位。
 - 结构图只保存原文地图和上下文恢复路径，不进入 chunk relation edge 创建、保留或加权。
 - Chunk relation graph 只表达内容语义关系和允许的 RQ chunk-pair evidence。
-- RQ fuzzy membership 只提供路由与投影权重；Mid/Coarse concept eligibility 由确定性规则控制并产生语义压缩，上层边必须由底层 chunk relation edge support 投影。
+- RQ 只持久化每个 chunk 的唯一三层主链及其置信度；Mid/Coarse concept eligibility 由确定性规则控制并产生语义压缩，上层边必须由底层 chunk relation edge support 投影。
 - QA 只使用 context package，不直接使用裸 search results。
 - Citation 必须指向 raw chunk span。
 - Qdrant 和 Redis 均为 active 派生或运行态存储，必须能从 PostgreSQL 重建或刷新。

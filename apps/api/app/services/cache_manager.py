@@ -23,7 +23,7 @@ ORDINARY_QUERY_REPLAY_POINTER_WRITE_SESSION_KEY = (
     "ordinary_query_replay_pointer_writes_v1"
 )
 ACTIVE_RETRIEVAL_CACHE_KEY_PROTOCOL_VERSION = (
-    "layered_retrieval_full_identity_key_v3"
+    "layered_retrieval_full_identity_key_v5"
 )
 AGENT_REPLAY_POINTER_KEY_PROTOCOL_VERSION = (
     "agent_provider_free_upstream_pointer_key_v1"

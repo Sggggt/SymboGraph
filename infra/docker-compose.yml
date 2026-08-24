@@ -1,7 +1,7 @@
 services:
   model-bridge:
     profiles: ["model-bridge"]
-    image: ${API_IMAGE:-course-kg-api:dev}
+    image: ${API_IMAGE:-course-kg-api:local}
     pull_policy: never
     container_name: course-kg-model-bridge
     env_file:
@@ -39,7 +39,7 @@ services:
       start_period: 5s
 
   api:
-    image: ${API_IMAGE:-course-kg-api:dev}
+    image: ${API_IMAGE:-course-kg-api:local}
     build:
       context: ..
       dockerfile: apps/api/Dockerfile
@@ -57,8 +57,6 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATA_ROOT: /app/data
       RUNTIME_ENV_FILE: /workspace/.env
-      SAMPLE_IMPORT_ROOT: /app/import/sample
-      SAMPLE_IMPORT_MANIFEST: /app/import/sample/raw-manifest.json
       ENABLE_MODEL_FALLBACK: "false"
       ENABLE_DATABASE_FALLBACK: "false"
       INGESTION_EXECUTION_MODE: celery
@@ -70,12 +68,6 @@ services:
     command: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/apps/api/app"]
     volumes:
       - symbograph-data:/app/data
-      - type: bind
-        source: ${SAMPLE_IMPORT_PATH:-./sample-import}
-        target: /app/import/sample
-        read_only: true
-        bind:
-          create_host_path: false
       - type: bind
         source: ..
         target: /workspace
@@ -103,7 +95,7 @@ services:
       start_period: 60s
 
   worker:
-    image: ${API_IMAGE:-course-kg-api:dev}
+    image: ${API_IMAGE:-course-kg-api:local}
     build:
       context: ..
       dockerfile: apps/api/Dockerfile
@@ -120,8 +112,6 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATA_ROOT: /app/data
       RUNTIME_ENV_FILE: /workspace/.env
-      SAMPLE_IMPORT_ROOT: /app/import/sample
-      SAMPLE_IMPORT_MANIFEST: /app/import/sample/raw-manifest.json
       ENABLE_MODEL_FALLBACK: "false"
       ENABLE_DATABASE_FALLBACK: "false"
       INGESTION_EXECUTION_MODE: celery
@@ -132,12 +122,6 @@ services:
     command: ["watchfiles", "--filter", "python", "--target-type", "command", "python -m celery -A worker_app.celery_app worker --loglevel=info --queues=${INGESTION_TASK_QUEUE:-course-kg-main-ingestion} --concurrency=${WORKER_CONCURRENCY:-1} --prefetch-multiplier=1 --max-tasks-per-child=${WORKER_MAX_TASKS_PER_CHILD:-1}", "/app/apps/api/app", "/app/apps/worker/worker_app"]
     volumes:
       - symbograph-data:/app/data
-      - type: bind
-        source: ${SAMPLE_IMPORT_PATH:-./sample-import}
-        target: /app/import/sample
-        read_only: true
-        bind:
-          create_host_path: false
       - type: bind
         source: ..
         target: /workspace
@@ -165,7 +149,7 @@ services:
       start_period: 30s
 
   beat:
-    image: ${API_IMAGE:-course-kg-api:dev}
+    image: ${API_IMAGE:-course-kg-api:local}
     build:
       context: ..
       dockerfile: apps/api/Dockerfile

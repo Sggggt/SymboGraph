@@ -34,7 +34,7 @@
 
 SymboGraph 的判断是：瓶颈不一定是“切出完美 chunk”，而是“命中证据后能否恢复正确语义关联与原文上下文”。本项目以 ContextRAG 的上下文恢复思想为灵感，采用最简单、最稳定的固定长度 token chunk，把 chunk 视为地址和引用单位，而不是语义理解结果。系统不要求单个 chunk 自身完整表达知识，而是在 chunk 周围构建可复算关系网络、原文结构地图、概念路由层和 Agent 规划执行层。
 
-因此，SymboGraph 采用 Four-Layer Context Graph RAG：第 0 层保存 Chunk Structure Graph，第 1 层保存独立 Chunk Relation Graph 与 RQ membership/address protocol，第 2 层保存由确定性 eligibility 从 RQ L3 prefix packet 中选出的 Mid Concept Graph，第 3 层保存由确定性 eligibility 从 RQ L2 prefix packet 中选出的 Coarse Concept Graph。结构图承担完整结构信息存储和上下文恢复；chunk relation graph 只表达由内容语义证据支持的 chunk 间关系；RQ 提供残差语义地址、模糊归属、低置信诊断和路由先验，但 fuzzy membership 的笛卡尔组合不得直接决定概念节点数量；mid/coarse 节点必须形成可度量的语义压缩，边完全由底层 chunk relation edges 投影配权。LLM 负责已入选概念的命名与摘要、查询路由、typed action 规划、证据充分性判断和修复方向，不参与概念节点 eligibility；图检索 gray-zone 的分区与路径决策由 deterministic bounded observation 和版本化本地规则完成，LLM 不参与 gray-zone 判定；事实证据只能来自 context package 和 raw chunk citation span。
+因此，SymboGraph 采用 Four-Layer Context Graph RAG：第 0 层保存 Chunk Structure Graph，第 1 层保存独立 Chunk Relation Graph 与 RQ primary membership/address protocol，第 2 层保存由确定性 eligibility 从 RQ L3 prefix packet 中选出的 Mid Concept Graph，第 3 层保存由确定性 eligibility 从 RQ L2 prefix packet 中选出的 Coarse Concept Graph。结构图承担完整结构信息存储和上下文恢复；chunk relation graph 只表达由内容语义证据支持的 chunk 间关系；RQ 只提供 primary residual address、低置信诊断和路由先验；mid/coarse 节点必须形成可度量的语义压缩，边完全由底层 chunk relation edges 投影配权。LLM 负责已入选概念的命名与摘要、查询路由、typed action 规划、证据充分性判断和修复方向，不参与概念节点 eligibility；图检索 gray-zone 的分区与路径决策由 deterministic bounded observation 和版本化本地规则完成，LLM 不参与 gray-zone 判定；事实证据只能来自 context package 和 raw chunk citation span。
 
 总体目标可以写成约束优化问题：
 
@@ -74,9 +74,6 @@ $$
 | Agent 多轮 P&E | QA 是 single planner round + deterministic traversal + verification-triggered repair；还不是完整多轮 Planner/Evidence-Evaluator/Replan 闭环。 | `agent_graph.py`, `context_graph.py`, `answer_sessions`, `agent_*` tables | typed action validator、deterministic gray-zone rule、repair budget、citation verification 必须通过；repair budget 耗尽不得无支撑补齐。 | 引入多轮 evidence evaluator/replan 状态机，继续使用同一 typed action schema 和 deterministic executor；不得把 gray-zone 决策移交给 LLM。 |
 | Policy 优化深度 | policy 是 proxy reward 驱动的 lightweight arm prior，不是完整在线 bandit 或因果评估框架。 | `policy_states`, `reward_events`, runtime settings | policy 不得替代 LLM planner 或 deterministic gray-zone rule；只能提供 safe arms、预算先验和灰区阈值建议。 | 增加 posterior 更新、离线评估和安全探索控制，保持 planner 与本地灰区规则的决策边界。 |
 | 会话审计边界 | `qa_sessions` 用于前端对话记忆，`answer_sessions` 用于回答审计，两者仍并存。 | QA API、conversation state、answer audit、前端会话 | 每个 answer 必须能回到 context package、retrieval trace、citation verification 和 reward event。 | 继续收敛到 answer session、context package、citation verification、reward event 的统一审计链，同时保留 conversation transcript 的交互用途。 |
-| 小语料关系图稀疏性 | 以 `|E|/|V|` 配合大于 1 的阈值会让小库近完全图通过；未按 scope 收缩的 K/quota 会放大该问题。 | `auto_tpe.py`, relation builder, runtime settings, diagnostics | 使用无量纲归一化无向密度和 scope-aware 稀疏边预算双硬门；trial 采样域必须能产生满足硬门的候选，失败不得提升。 | 升级密度、搜索空间和 candidate adjacency 协议并 shadow rebuild；旧 trial 仅作历史诊断。 |
-| 高层语义压缩 | RQ 每层 top-m 的 fuzzy 笛卡尔组合若直接实例化 Mid/Coarse，会出现概念节点多于 chunk、投影边爆炸和 provider 成本失控。 | RQ membership, Mid/Coarse builder, projection, retrieval | eligibility 仅由本地确定性覆盖算法决定；`Mid <= chunks`、`Coarse <= Mid`，多 chunk 库还必须报告压缩率；LLM eligibility 调用数为 0。 | 保留完整 fuzzy routing，单独持久化 eligibility audit；只对入选概念调用定义 provider。 |
-| 产品 UI 审计泄漏 | Graph/Search/QA 主界面若默认展示 UUID、hash、protocol、raw JSON 或完整 trace，会把内部审计结构当作产品语义。 | graph/search/QA components, shared types, browser acceptance | 主界面只显示少量自然语言节点、证据、路径摘要、答案和引用；完整审计留在 PostgreSQL、受控诊断 API 与 `output/`，不得默认渲染。 | 增加 product-view projection 与负向 UI 回归，诊断入口保持显式且与普通使用路径分离。 |
 
 除上表外，若发现某模块无法满足白皮书强不变量，应先更新诊断脚本和执行计划并标记为阻断项；不得在技术白皮书中写成“可接受的缺口”。
 
@@ -110,7 +107,7 @@ source files
 -> chunk structure graph
 -> contextual dense embedding
 -> independent chunk relation graph
--> RQ-KMeans residual address and fuzzy membership
+-> RQ-KMeans residual address and primary membership
 -> RQ L3 mid concept graph
 -> mid edge projection calibration
 -> RQ L2 coarse concept graph
@@ -131,7 +128,7 @@ flowchart TB
     P --> S["Chunk Structure Graph"]
     C --> X["Contextual index text"]
     X --> V["Vector records / Qdrant"]
-    V --> RQ["RQ address and fuzzy membership"]
+    V --> RQ["RQ address and primary membership"]
     V --> R["Independent Chunk Relation Graph"]
     RQ --> M["RQ L3 Mid Concept Graph"]
     R --> M
@@ -182,7 +179,7 @@ G_0,G_1,G_2,G_3,\Pi
 \right)
 $$
 
-其中 \(G_0=(V_0,E_0)\) 是结构图，\(G_1=(V_C,E_C,\mathcal{R},\mathcal{M}_R)\) 是独立 chunk relation graph、RQ prefix address space 与 fuzzy membership，\(G_2=(V_M,E_M)\) 是由 RQ L3 prefix packet 定义的 mid concept graph，\(G_3=(V_K,E_K)\) 是由 RQ L2 prefix packet 定义的 coarse concept graph，\(\Pi\) 是跨层 membership、edge projection 与 trace 投影。
+其中 \(G_0=(V_0,E_0)\) 是结构图，\(G_1=(V_C,E_C,\mathcal{R},\mathcal{M}_R)\) 是独立 chunk relation graph、RQ prefix address space 与 primary membership，\(G_2=(V_M,E_M)\) 是由 RQ L3 prefix packet 定义的 mid concept graph，\(G_3=(V_K,E_K)\) 是由 RQ L2 prefix packet 定义的 coarse concept graph，\(\Pi\) 是跨层 membership、edge projection 与 trace 投影。
 
 跨层投影的目标性质是保守性：
 
@@ -234,7 +231,7 @@ $$
 G_1=(V_C,E_C,\mathcal{R},\mathcal{M}_R)
 $$
 
-其中 \(V_C\) 是 active chunks，\(E_C\) 是 chunk relation edges，\(\mathcal{R}\) 是 RQ prefix address tree，\(\mathcal{M}_R\) 是 chunk 到 RQ prefixes 的稀疏模糊归属矩阵。底层关系图只接受内容语义证据：
+其中 \(V_C\) 是 active chunks，\(E_C\) 是 chunk relation edges，\(\mathcal{R}\) 是 RQ prefix address tree，\(\mathcal{M}_R\) 是 chunk 到其唯一 L1/L2/L3 主地址链的软置信度矩阵。完整 codebook softmax 只用于确定性诊断，不物化非主链归属。底层关系图只接受内容语义证据：
 
 $$
 E_{\mathrm{cand}}
@@ -437,7 +434,7 @@ $$
 
 **架构影响：**
 - 影响对象：RQ membership diagnostics、mid concept packet、coarse concept packet、layered retrieval、bridge expansion、Agent repair 和 graph visualization。
-- 影响方式：底层关系边把固定 chunk 变成可遍历网络；RQ 提供地址和模糊归属；mid/coarse 节点和边只能从 RQ membership 与底层 chunk relation edge support 投影获得。
+- 影响方式：底层关系边把固定 chunk 变成可遍历网络；RQ 提供唯一主地址链及其软置信度；mid/coarse 节点和边只能从主链 membership 与底层 chunk relation edge support 投影获得。
 - 传播字段：`chunk_relation_graph_states`、`chunk_relation_edges.edge_type`、`weight`、`distance`、`raw_strength`、`features_json`、`normalization_stats_json`、`source_algorithm`、`protocol_version`、`edge_distance_protocol_hash`、`rq_path`、`rq_membership_score`。
 - 触发条件：embedding text version、vector records、chunk scope、dynamic KNN operating point、bridge quota protocol、RQ codebook、RQ membership protocol 或 edge keep policy 变化时，relation state hash 与下游 mid/coarse hash 需要重算。
 - 验收观察点：edge count by type、bridge edge count、degree distribution、raw strength distribution by edge type、normalized distance distribution、RQ membership diagnostics、graph expansion steps、path threshold hit distribution 和 traversal contribution。
@@ -452,7 +449,7 @@ V_M
 \{m_p:p\in\mathcal{P}_3,\ \operatorname{mass}(p)>0\}
 $$
 
-chunk 对 mid node 的归属来自 RQ fuzzy membership：
+chunk 对 mid node 的归属来自 RQ primary membership：
 
 $$
 \mu_{c,m_p}=\mu_{c,p}
@@ -525,7 +522,7 @@ V_K
 \{k_p:p\in\mathcal{P}_2,\ \operatorname{mass}(p)>0\}
 $$
 
-RQ prefix tree 是硬层级：L3 prefix 只有一个 L2 parent，L2 prefix 只有一个 L1 parent；模糊性存在于 membership 上，而不是把一个 prefix node 切成多个父节点。chunk 可以同时对多个 L3/L2/L1 prefixes 具有非零归属分数。coarse membership 由 chunk membership 和 child L3 membership 聚合：
+RQ prefix tree 是硬层级：L3 prefix 只有一个 L2 parent，L2 prefix 只有一个 L1 parent。每个 chunk 只物化一条 L1/L2/L3 主地址链，各层 membership score 表示该主选择的软置信度；其他 codeword 概率只进入完整 softmax 诊断。coarse membership 由主链 chunk membership 和 child L3 membership 聚合：
 
 $$
 \mu_{c,k_p}
@@ -1037,9 +1034,9 @@ metadata intent、batch recovery、Qdrant delete intent 和 cache dispatch。全
 
 同一 `chunk_version` 可以存在多个 parse attempt，但每个 document 在任一提交态至多有一个 active `DocumentVersion`；active chunk 必须属于该 active attempt，且其 `knowledge_base_id`、`document_id`、`chunk_version` 必须与引用的 Document / DocumentVersion 一致。上述约束既是 service promotion 事务的不变量，也是 PostgreSQL 的 fail-closed 门禁，不能只依赖进程内锁。
 
-用户可见的 upload path 是逻辑 source slot，不是版本事实地址。每次解析必须先把输入固定为 checksum-addressed immutable source snapshot，parser、DocumentVersion、chunk span、context package 与 citation 都绑定该 snapshot/checksum；后续同名上传不得改变旧 attempt 的 raw source。snapshot commit 必须经过 durable rename/目录持久化屏障并应用跨平台只读保护；权限位只是误写防护，不能替代 checksum 验证。引用生成必须验证 snapshot containment、存在性与内容完整性，不能把 mutable slot 或未经验证的数据库字符串当 citation source。checksum-addressed `source_slots/<digest>` 和 snapshot path 只承担存储身份，绝不是用户可见文件名或目录分组。upload admission 必须把通过校验的原始 filename 绑定到 logical source slot，并将其不带扩展名的 display title 持久化到 Document；后续重解析或全量重建没有新的 `display_filename` 时必须从 existing Document、历史 metadata intent 或 upload logical slot 依次恢复该标题，禁止用物理 hash path 覆盖。flat upload 的 product partition/tag 必须由同一 display title 派生，不能从 digest stem 或 hash shard 目录派生；raw operator import 仍按其真实相对目录计算 partition。文件列表、目录树、Search source/filter、Context Package document 和 Citation 必须投影同一个 display title；普通产品 UI 不得以 hash、UUID、`本地文件`、`本地资料` 等占位词掩盖缺失身份，身份恢复失败必须进入后端诊断与验收 RED。
+用户可见的 upload path 是逻辑 source slot，不是版本事实地址。每次解析必须先把输入固定为 checksum-addressed immutable source snapshot，parser、DocumentVersion、chunk span、context package 与 citation 都绑定该 snapshot/checksum；后续同名上传不得改变旧 attempt 的 raw source。snapshot commit 必须经过 durable rename/目录持久化屏障并应用跨平台只读保护；权限位只是误写防护，不能替代 checksum 验证。引用生成必须验证 snapshot containment、存在性与内容完整性，不能把 mutable slot 或未经验证的数据库字符串当 citation source。checksum-addressed `source_slots/<digest>` 和 snapshot path 只承担存储身份，绝不是用户可见文件名或目录分组。upload admission 必须把通过校验的原始 filename 绑定到 logical source slot，并将其不带扩展名的 display title 持久化到 Document；后续重解析或全量重建没有新的 `display_filename` 时必须从 existing Document、历史 metadata intent 或 upload logical slot 依次恢复该标题，禁止用物理 hash path 覆盖。文件名协议 `nfkc_security_shadow_display_colon_preservation_v3` 使用完整 NFKC security shadow 识别 Windows reserved stem，继续拒绝 ASCII 非法字符、控制字符、真实路径分隔符及版本化 separator-confusable denylist；用户可见 display normalization 只对安全 allowlist 中的 U+FF1A FULLWIDTH COLON 保留原字符，避免合法中文标点因 NFKC 变成 ASCII `:` 后被误拒。该保留字符不得进入物理路径，upload slot 与 snapshot 仍只使用 checksum-addressed 物理名称。flat upload 的 product partition/tag 必须由同一 display title 派生，不能从 digest stem 或 hash shard 目录派生；raw operator import 仍按其真实相对目录计算 partition。文件列表、目录树、Search source/filter、Context Package document 和 Citation 必须投影同一个 display title；普通产品 UI 不得以 hash、UUID、`本地文件`、`本地资料` 等占位词掩盖缺失身份，身份恢复失败必须进入后端诊断与验收 RED。
 
-上述目录持久化协议必须按实际 `DATA_ROOT` / storage root 的文件系统能力门禁，而不能只按容器操作系统推断。配置加载必须是零目录写的纯读取；`DATA_ROOT` mount point 由部署预置，完整门禁必须发生在 router、数据库 engine/connect、Redis、Qdrant 或模型网络副作用之前，成功后才用 durable mkdir 逐层创建默认 KB/storage/ingestion 子目录并逐级 fsync。生产启动恢复、worker task 和高层写入口必须先在同一 mount 上完成有界 `file fsync -> rename -> source/target parent fsync -> unlink -> parent fsync` 探针；POSIX 路径必须逐级 `openat + O_NOFOLLOW`，探针与 mkdir/rename/unlink 必须绑定同一 pinned directory descriptor。能力缓存键必须包含 process id、root、device/inode、完整 mount signature 和 protocol version，并使用有界 TTL；fork 子进程不得继承授权。worker 每个 mutation task 必须在访问 Redis/model bridge/DB 前重新 no-follow 打开根并核对 PID/device/inode/mount signature；fork、identity/mount 变化、首次使用或 TTL 到期时必须执行完整探针，不要求热任务每次重复创建探针文件。`/proc/self/mountinfo` 缺失、读取失败、未找到匹配项、设备不一致或超过有界行数/字节数一律 fail closed；Windows shared bind、FUSE、9p、virtiofs、NFS、SMB、overlay/tmpfs 等未证明 crash-durability 的 family/source 不得仅凭 syscall 成功放行。native Windows 普通服务进程当前没有已证明的 namespace barrier，不允许通过原始卷权限或环境变量伪装测试能力；测试 fake 只能由显式 fixture 注入，且 production 不得用 fake protocol 创建新 intent。默认 Compose 的 API/worker `/app/data` 使用共享 Docker managed volume，旧 `../data` bind 内容不自动迁移；宿主样本只允许从独立只读 `/app/import/sample` 显式导入，不得把该 bind 重新作为生产 `DATA_ROOT`。切换已有数据卷必须另行执行显式迁移和恢复验证，不能静默替换在线数据目录。
+上述目录持久化协议必须按实际 `DATA_ROOT` / storage root 的文件系统能力门禁，而不能只按容器操作系统推断。配置加载必须是零目录写的纯读取；`DATA_ROOT` mount point 由部署预置，完整门禁必须发生在 router、数据库 engine/connect、Redis、Qdrant 或模型网络副作用之前，成功后才用 durable mkdir 逐层创建默认 KB/storage/ingestion 子目录并逐级 fsync。生产启动恢复、worker task 和高层写入口必须先在同一 mount 上完成有界 `file fsync -> rename -> source/target parent fsync -> unlink -> parent fsync` 探针；POSIX 路径必须逐级 `openat + O_NOFOLLOW`，探针与 mkdir/rename/unlink 必须绑定同一 pinned directory descriptor。能力缓存键必须包含 process id、root、device/inode、完整 mount signature 和 protocol version，并使用有界 TTL；fork 子进程不得继承授权。worker 每个 mutation task 必须在访问 Redis/model bridge/DB 前重新 no-follow 打开根并核对 PID/device/inode/mount signature；fork、identity/mount 变化、首次使用或 TTL 到期时必须执行完整探针，不要求热任务每次重复创建探针文件。`/proc/self/mountinfo` 缺失、读取失败、未找到匹配项、设备不一致或超过有界行数/字节数一律 fail closed；Windows shared bind、FUSE、9p、virtiofs、NFS、SMB、overlay/tmpfs 等未证明 crash-durability 的 family/source 不得仅凭 syscall 成功放行。native Windows 普通服务进程当前没有已证明的 namespace barrier，不允许通过原始卷权限或环境变量伪装测试能力；测试 fake 只能由显式 fixture 注入，且 production 不得用 fake protocol 创建新 intent。默认 Compose 的 API/worker `/app/data` 使用共享 Docker managed volume；切换已有数据卷必须另行执行显式迁移和恢复验证，不能静默替换在线数据目录。
 
 只读 operator import 与可写 `DATA_ROOT` 必须使用不同的能力协议。`posix_readonly_import_openat_nofollow_fstat_v1` 只允许读取 manifest 完整 allowlist 中的文件，并要求生产 mount options 显式包含 `ro`；目录和每级相对路径必须由 pinned descriptor 逐级 `openat + O_NOFOLLOW` 打开，最终文件必须是单链接 regular file。读取前后必须重放 root/file device、inode、link count、size、mtime、ctime 和 regular-file identity，manifest checksum 必须与最终 descriptor 读取的 bytes 一致。只读 import 不要求在 source mount 上执行 rename/unlink durability probe，因为该 mount 不是写入事实源；但它也绝不能借此授权任何 `DATA_ROOT` mutation、snapshot commit 或 intent 写入。`rw` mount、symlink、路径逃逸、manifest/文件身份漂移、缺失 mount proof 或生产 fake adapter 一律在 upload/数据库/模型副作用前 fail closed。
 
@@ -1234,7 +1231,7 @@ S_1
 (V_C,E_C,\mathcal{R},\mathcal{M}_R,h_1,p_1)
 $$
 
-其中 \(E_C\) 是底层 chunk relation edges，\(\mathcal{R}\) 是 RQ prefix address tree，\(\mathcal{M}_R\) 是 chunk 到 RQ prefixes 的 fuzzy membership。\(h_1\) 是 state hash，\(p_1\) 是 protocol version。protocol 是 `chunk_relation_rq_membership_v3`。
+其中 \(E_C\) 是底层 chunk relation edges，\(\mathcal{R}\) 是 RQ prefix address tree，\(\mathcal{M}_R\) 是 chunk 到 RQ prefixes 的 primary membership。\(h_1\) 是 state hash，\(p_1\) 是 protocol version。protocol 是 `chunk_relation_rq_membership_v3`。
 
 目标 state hash：
 
@@ -1859,7 +1856,7 @@ $$
 
 ### 目标架构
 
-RQ membership layer 表示 RQ residual address 与 fuzzy membership protocol。它不是独立 active traversal layer，不承担原文结构职责，不通过社区检测决定底层边。原文层次、坐标、previous/next、表格、公式和图注闭包由 Chunk Structure Graph 负责；底层关系由 Chunk Relation Graph 负责；RQ 只定义语义地址、模糊归属、边界/低置信诊断、chunk seed prior 和高层节点投影基础。
+RQ membership layer 表示 RQ residual address 与 primary membership protocol。它不是独立 active traversal layer，不承担原文结构职责，不通过社区检测决定底层边。原文层次、坐标、previous/next、表格、公式和图注闭包由 Chunk Structure Graph 负责；底层关系由 Chunk Relation Graph 负责；RQ 只定义 primary 语义地址、边界/低置信诊断、chunk seed prior 和高层节点投影基础。
 
 RQ 层级的工程语义固定为：
 
@@ -1873,7 +1870,7 @@ active RQ address depth 固定为 3，不是可调参数。只要存在可用 ch
 
 为保证同层 `centroid_near` 的完整精确 pairwise 域静态有界，active `rq_kmeans_max_k` 固定允许区间为 `1..6`，默认 6；因此 L1/L2/L3 的协议上界分别为 6/36/216 个 prefix。配置、Runtime Settings request 与 UI 必须共同拒绝大于 6 的值，builder 还要独立 fail closed，不能依赖 UI 校验。该上限属于 rebuild-required RQ protocol identity；不得在同一 prefix-pair protocol hash 下扩成 64 或无界域。
 
-RQ prefix tree 是硬树：每个 L3 prefix 只有一个 L2 parent，每个 L2 prefix 只有一个 L1 parent。模糊性只存在于 membership score：一个 chunk 可以同时归属多个 L3/L2/L1 prefixes；一个 L3 prefix 不会被拆成多个 L2 parent，一个 L2 prefix 不会被拆成多个 L1 parent。
+RQ prefix tree 是硬树：每个 L3 prefix 只有一个 L2 parent，每个 L2 prefix 只有一个 L1 parent；每个 chunk 在每层只持久化一个主 prefix。membership score 是主链选择置信度，不授权创建第二条归属路径；一个 L3 prefix 不会被拆成多个 L2 parent，一个 L2 prefix 不会被拆成多个 L1 parent。
 
 目标架构受 [ContextRAG](https://arxiv.org/abs/2605.19735) 的 extraction-free graph construction 启发：底层拓扑不由 LLM 抽实体和关系，而由可复算 multilingual dense embedding、dynamic KNN、bridge quota 和 typed edge calibration 构建。RQ 提供语义地址、membership、seed prior 和 diagnostics，不创建 active bottom edge。[KG2RAG](https://aclanthology.org/2025.naacl-long.449/) 的 seed expansion / graph organization 思路用于检索阶段：先定位图入口，再沿关系图扩展和组织证据。
 
@@ -1882,7 +1879,7 @@ flowchart TB
     C["Active Chunks"] --> E["Contextual Embeddings"]
     E --> RQ["RQ-KMeans Paths"]
     RQ --> RP["RQ Prefix Nodes"]
-    E --> MEM["Fuzzy Membership"]
+    E --> MEM["Primary Membership"]
     RP --> MEM
     MEM --> L3["RQ L3 Mid Packets"]
     MEM --> L2["RQ L2 Coarse Packets"]
@@ -1933,11 +1930,11 @@ $$
 
 关联越强，\(s_e\) 越大，\(d_e\) 越小。不同 edge type 的 raw feature 不直接比较；只有归一化后的 distance 可进入累计路径距离、green/gray/hard stop 阈值和 cycle distance reward。跨类型导航仍保留 typed edge、support ids、路径证据和 deterministic gray-zone rule decision，不做全局拍脑袋加权。
 
-### RQ fuzzy memberships
+### RQ primary memberships
 
-RQ fuzzy membership 是 active 归属协议。可视化或诊断层可以报告辅助分组，但不能把分组结果作为 mid/coarse 节点事实源，也不能用分组边反向决定底层 chunk edge。
+RQ primary membership 是 active 归属协议。可视化或诊断层可以报告完整 softmax 与边界不确定性，但不能把未落库的非主候选作为 mid/coarse 节点事实源，也不能用诊断分组边反向决定底层 chunk edge。
 
-Fuzzy routing 与 concept eligibility 是两个独立协议。`rq_fuzzy_softmax_gamma_product_v1` 可以为同一 chunk 保留多个 L1/L2/L3 地址，用于 query routing、seed prior、边界诊断与投影权重；这些地址的笛卡尔组合不能自动实例化 Mid/Coarse 节点。概念 eligibility 必须在完整 membership 已落定后由 executor 单独计算，输入只允许 prefix、primary/fuzzy membership、support span、底层 edge、chunk scope 与确定性预算，`model_call_count=0`。未入选 prefix 仍保留完整 routing/diagnostic 事实，不得删除或重归一化 membership。
+`rq_primary_chain_v1` 对每个 chunk 只持久化 L1/L2/L3 primary chain。任何非主 code、single-deviation leaf 或 ancestor closure 都不得写入 `rq_prefix_memberships`、Query→RQ entry、概念 packet、节点权重或边投影。禁止各层候选笛卡尔积。完整 codebook softmax、候选概率、entropy 与 margin 只保留在 encoding diagnostics 中。概念 eligibility 由 executor 根据 primary membership、support span、底层 edge、chunk scope 与确定性预算单独计算，`model_call_count=0`。
 
 对第 \(l\) 层 codebook，chunk \(c\) 到 code \(k\) 的距离为：
 
@@ -1974,15 +1971,14 @@ $$
 p_{c,l,q_p^{(l)}}
 $$
 
-Active 协议固定为 `rq_fuzzy_softmax_gamma_product_v1`。每层必须先对完整 codebook 计算并审计归一化 softmax；稀疏化随后只保留按 `(-p, d, code_id)` 稳定排序的 `rq_membership_top_m` 个 code，并删除低于 `rq_membership_probability_threshold` 的非主 code。最近 code 构成的主 residual path 在每层始终保留，因此低置信 chunk 不会被丢弃。裁剪后不重新归一化，持久化分数仍使用裁剪前完整 softmax 的 (p_{c,l,k}) 代入上式，且不设置任何人工 membership floor。
+Active 协议固定为 `rq_primary_chain_v1`。每层必须先对完整 codebook 计算并审计归一化 softmax，最近 code 构成的主 residual path 在三层始终完整保留；不存在候选截断或概率裁剪设置。三层时每 chunk membership 必须恰为 3 条，全库必须恰为 `3×chunks`，非主 membership 与 Cartesian expansion 数必须为 0。持久化分数继续使用完整 softmax 中 primary code 的概率乘积，不重新归一化，也不设置人工 floor。
 
-`rq_membership_temperature` 对应所有层的 \(\tau_l\)，`rq_residual_tau` 对应 \(\tau_r\)。这两个温度、top-m、概率阈值和协议名均属于 `rebuild_required` Runtime Settings；只有 candidate 经 shadow rebuild、evaluation 和 promotion 后才能改变 active graph。RQ 编码按稳定 chunk id 分批，默认批上限为 256；构建诊断必须记录 codebook hash、protocol hash、逐 chunk encoding hash、canonical membership hash、完整 softmax 归一误差、各深度 membership 数量、批次数、`renormalized_after_sparsification=false`、`artificial_membership_floor=false` 和 `model_call_count=0`。同 codebook、向量、参数和 chunk scope 重建必须得到相同 membership hash。
+`rq_membership_temperature` 对应所有层的 \(\tau_l\)，`rq_residual_tau` 对应 \(\tau_r\)。这两个温度和协议名属于 `rebuild_required` Runtime Settings；只有 candidate 经 shadow rebuild、evaluation 和 promotion 后才能改变 active graph。RQ 编码按稳定 chunk id 分批，默认批上限为 256；构建诊断必须记录 codebook/protocol/encoding/membership hash、完整 softmax 归一误差、`primary=3×chunks`、`non_primary=0`、逐 chunk membership count hash、observed max/hard max=3、批次数、`cartesian_expansion_used=false`、`renormalized_after_primary_selection=false`、`artificial_membership_floor=false` 和 `model_call_count=0`。同 codebook、向量、参数和 chunk scope 重建必须得到相同 primary membership hash。
 
 membership role 由 \(\mu_{c,p}\)、rank、entropy、residual norm 和边界距离决定：
 
 ```text
 primary_member
-fuzzy_member
 boundary_member
 bridge_member
 low_confidence_member
@@ -1990,7 +1986,7 @@ outlier_member
 noise_candidate
 ```
 
-Active role 协议固定为 `rq_membership_role_entropy_boundary_v1`。第 (l) 层归一化 entropy 为 (H_{c,l}=-\sum_k p_{c,l,k}\log p_{c,l,k}/\log |K_l|)（单 codebook 时为 0）；prefix entropy 为截至该深度各层 (H_{c,l}) 的均值。每层同时记录前两名的概率 margin (Delta p_l=p_{(1)}-p_{(2)}) 与距离 margin (Delta d_l=d_{(2)}-d_{(1)})，prefix 的 boundary margin 取路径各层最小值；单 codebook 没有竞争边界，两个 margin 都使用固定非边界值 1。residual outlier threshold 取当前构建 scope 的 residual norm p95。
+Active role 协议固定为 `rq_membership_role_primary_entropy_boundary_v2`。第 (l) 层归一化 entropy 为 (H_{c,l}=-\sum_k p_{c,l,k}\log p_{c,l,k}/\log |K_l|)（单 codebook 时为 0）；prefix entropy 为截至该深度各层 (H_{c,l}) 的均值。每层同时记录前两名的概率 margin (Delta p_l=p_{(1)}-p_{(2)}) 与距离 margin (Delta d_l=d_{(2)}-d_{(1)})，prefix 的 boundary margin 取路径各层最小值；单 codebook 没有竞争边界，两个 margin 都使用固定非边界值 1。residual outlier threshold 取当前构建 scope 的 residual norm p95。
 
 角色按以下 deterministic precedence 判定，并把所有同时命中的 flags 一并留在 diagnostics：
 
@@ -2000,13 +1996,12 @@ outlier_member        residual_norm >= scope_p95 and gamma <= 0.25
 bridge_member         chunk has retained cross-document/cross-language bridge support
 low_confidence_member gamma <= 0.35 or membership_score <= 0.01
 boundary_member       entropy >= 0.65 or probability_margin <= 0.15 or distance_margin <= 0.05
-primary_member        primary L3 residual path
-fuzzy_member          remaining sparse prefix memberships
+primary_member        persisted primary prefix
 ```
 
 role protocol 输入、阈值、precedence、matched flags、role hash 与 `model_call_count=0` 必须写入每条 membership diagnostics；relation state 还必须保存 role/entropy/boundary/residual 的全量分布。角色只影响 membership diagnostics、上层 packet 权重、seed prior 与 tie-break，不创建底层关系边，也不参与或覆盖 gray-zone path decision。
 
-低置信 chunk 不被丢弃；它以低 membership、边界角色或 outlier/noise diagnostics 进入 packet 和 trace。模糊归属改变簇生成和高层投影权重，不额外增加图层。
+低置信 chunk 不被丢弃；它以低 membership、边界角色或 outlier/noise diagnostics 进入 packet 和 trace。Primary membership 权重影响高层投影，但不额外增加图层。
 
 ### RQ prefix diagnostics
 
@@ -2046,7 +2041,6 @@ diagnostic edge types：
 parent_child
 sibling
 centroid_near
-membership_overlap
 projected_chunk_support
 ```
 
@@ -2054,10 +2048,9 @@ projected_chunk_support
 
 active prefix-pair 诊断协议固定为 `rq_prefix_pair_diagnostics_v1`，其输入、方向和强度必须可复算：
 
-- `parent_child` 是从 hard parent 到 child 的有向事实，强度为 `child_membership_mass / parent_membership_mass`，support mass 为 child 的真实 fuzzy membership mass；
+- `parent_child` 是从 hard parent 到 child 的有向事实，强度为 `child_membership_mass / parent_membership_mass`，support mass 为 child 的真实 primary membership mass；
 - `sibling` 仅连接同一 hard parent（L1 使用同一隐式 root）的同层 prefix，强度为 `exp(-centroid_distance / level_tau)`；`level_tau` 是该层全部非零 reconstructed-centroid pair distance 排序后以全浮点精度计算的确定性中位数，偶数样本取中间两项均值，不允许复用带展示舍入的 quantile helper；没有非零距离时固定回退为 `1.0`；
 - `centroid_near` 在每层完整、静态有界的 prefix 域上精确计算距离，每个 prefix 保留最近 3 个邻居，取无向并集，强度与 sibling 使用同一距离式；
-- `membership_overlap` 只在同层 prefix 有共享 fuzzy member 时存在，support mass 为 `sum(min(mu_cp, mu_cq))`，强度为 weighted Jaccard `sum(min) / sum(max)`；
 - `projected_chunk_support` 只由已存在的底层 `ChunkRelationEdge` 投影。每个贡献质量为 `mu_source,p × mu_target,q`，support mass 是贡献质量之和，强度是该质量对底层 calibrated edge strength 的加权均值；底层 edge ids 必须完整保存。
 
 除 `parent_child` 外，端点都按稳定 `rq_prefix_key` 排序。canonical pair hash 绑定端点业务键、层级/path、类型、强度、完整 support chunk 业务键集、底层 edge contribution 事实 hash、source algorithm、protocol hash 与公式输入；chunk 业务键由 document source/checksum/type/title 与 chunk version/index、char/token span、section/page、text hash 构成。projected contribution 还必须绑定两端 chunk 业务键、对应 prefix 业务键、membership score 及其乘积。canonical hash 不绑定 chunk/prefix/edge 的数据库 UUID、创建时间或查询顺序。相同 graph state 的同事实重试必须复用既有行；事实不同则 fail closed。build/retry/promotion，以及任何显式执行的 reconcile（若提供），必须复用同一 verifier：从实际持久化 canonical facts 重算逐行与 aggregate hash，并检查端点 graph-state/KB、方向、同层/同 parent 约束和完整 support-id checksum，再保存由 graph state、KB、count、aggregate/protocol hash 组成的 durable integrity proof；没有独立 reconcile active path 时不得把 rebuild 之外的入口写成已实现。在线 search/QA admission 只做 pair row `COUNT` 与该 proof/state hash 的常数大小核对，不能在每次查询加载全量 pair JSON。底层 edge ids 在表中完整保存；support chunk/edge sample 都先按各自 UUID-free 业务键排序（数据库 id 仅作同业务键 tie-break/reference）再取前 24，concept packet 与 UI/API 同时返回完整 count/hash。诊断表、packet 与 UI 必须显式标记 `diagnostic_only=true`、`active_relation_edge=false`、`model_call_count=0`；不得把任何 pair 写入 active chunk relation graph，不得影响累计距离 gray-zone 分区或本地裁决。主库验收必须单列在线 admission p95 与 RSS。
@@ -2149,11 +2142,10 @@ diagnostic edge types：
 parent_child
 sibling
 centroid_near
-membership_overlap
 projected_chunk_support
 ```
 
-其中 `parent_child` 来自 prefix tree，`projected_chunk_support` 来自底层 chunk relation edge support 的投影统计。五类名称与 `rq_prefix_pair_diagnostics_v1` schema/allowlist 完全一致；它们只存入独立诊断表，不得以 `rq_*` 类型写入 active `ChunkRelationEdge`。诊断边不作为 mid/coarse active edge 的存在性条件。
+其中 `parent_child` 来自 prefix tree，`projected_chunk_support` 来自底层 chunk relation edge support 的投影统计。四类名称与 `rq_prefix_pair_diagnostics_v1` schema/allowlist 完全一致；它们只存入独立诊断表，不得以 `rq_*` 类型写入 active `ChunkRelationEdge`。诊断边不作为 mid/coarse active edge 的存在性条件。
 
 ### RQ chunk diagnostics
 
@@ -2196,7 +2188,7 @@ rq_residual_near
 - 影响方式：RQ layer 提供 L3/L2/L1 地址、chunk membership、边界/低置信/outlier 诊断和 chunk seed prior；active mid concept 与 RQ L3 prefix packet 对齐，active coarse concept 与 RQ L2 prefix packet 对齐；检索在 selected mid queue 中逐父节点使用 RQ membership 选择 chunk seeds，再进入独立 chunk relation graph 并由结构图恢复上下文。
 - 传播字段：`rq_prefixes`、`rq_prefix_memberships`、`rq_path`、`rq_level`、`rq_path_prefix`、`residual_norm`、`membership_score`、`membership_role`、`lcp_depth`、`residual_distance`、`rq_weight`、`support_chunk_edge_ids`。
 - 触发条件：relation graph hash、embedding vectors、RQ level/codebook、RQ membership protocol、bridge support 或 residual diagnostics 变化时，mid concept hash、coarse hash、retrieval trace 和 cache 必须刷新。
-- 验收观察点：RQ path availability、RQ L3-to-mid projection coverage、RQ L2-to-coarse projection coverage、fuzzy membership 数量、membership role 分布、LCP depth 分布、bridge path coverage、chunk seed quality 和 staged traversal diagnostics。
+- 验收观察点：RQ path availability、RQ L3-to-mid projection coverage、RQ L2-to-coarse projection coverage、primary membership 数量、membership role 分布、LCP depth 分布、bridge path coverage、chunk seed quality 和 staged traversal diagnostics。
 
 ## Mid Concept Graph
 
@@ -2228,7 +2220,7 @@ $$
 \{m_p:\ p\in\mathcal{P}_3,\ \operatorname{mass}(p)>0\}
 $$
 
-候选集合不等于 active 节点集合。active `concept_node_eligibility_primary_fuzzy_coverage_v1` 先验证正 membership、raw span 和 packet business identity，再用稳定 greedy coverage 选择节点：每轮依次最大化尚未覆盖的 primary-support chunk 数、尚未覆盖的 fuzzy-support chunk 数、membership mass、底层 support edge 数，最后按稳定 `rq_prefix_key` 破平。设 active chunk 数为 \(N_C\)，Mid 节点预算为：
+候选集合不等于 active 节点集合。active `concept_node_eligibility_primary_coverage_v3` 先验证 primary membership、raw span 和 packet business identity，再用稳定 greedy coverage 选择节点：每轮依次最大化尚未覆盖的 primary-support chunk 数、primary membership mass、primary 底层 support edge 数，最后按稳定 `rq_prefix_key` 破平。设 active chunk 数为 \(N_C\)，Mid 节点预算为：
 
 $$
 B_M(N_C)=
@@ -2239,8 +2231,13 @@ B_M(N_C)=
 \end{cases}
 $$
 
-只对前 \(B_M\) 个入选 packet 调用定义 provider；LLM 不得改变入选、排序、support 或预算。状态必须保存 candidate/eligible/ineligible counts、coverage、budget、完整 eligibility facts hash、稳定排序 sample 和 `model_call_count=0`。因此 `|V_M|<=|V_C|`，且当 \(N_C>1\) 且存在多个候选时必须形成严格压缩；不能用缺失概念节点删除底层 chunk 或 fuzzy route。
+只对前 \(B_M\) 个入选 packet 调用定义 provider；LLM 不得改变入选、排序、support 或预算。状态必须保存 candidate/eligible/ineligible counts、coverage、budget、完整 eligibility facts hash、稳定排序 sample 和 `model_call_count=0`。因此 `|V_M|<=|V_C|`，且当 \(N_C>1\) 且存在多个候选时必须形成严格压缩；不能用缺失概念节点删除底层 primary route。
 
+`primary_support_count>0` 是 Mid candidate 的硬资格门。Active 图只持久化唯一主链 leaf/ancestor prefix；任何没有 primary support 的候选必须记录 `no_primary_support`，并禁止创建 Mid、触发概念 provider、提供概念定义核心证据或单独创建高层边。Coarse candidate 必须至少拥有一个通过该门的 Mid 子节点。
+
+### Query-time membership score boundary
+
+Frontier 只允许使用 `distance_so_far - cycle_reward` 排序。RQ membership overlap 可以进入有界诊断和同层 tie-break 解释，但不得进入 effective score、path potential、reward、cache identity 或隐藏兼容读取路径。
 每个候选 \(m_p\) 必须保留：
 
 ```text
@@ -2691,7 +2688,7 @@ n_{ab}^{C}
 \mu_{i,k_a}\mu_{j,k_b}
 $$
 
-coarse projection 与 mid 使用同一 `membership_weighted_bottom_support_q15_log_mass_v1`：读取两侧 RQ L2 prefix 的全部正 fuzzy memberships，并扫描所属 relation state 的完整 bottom edge 集；每条无向 bottom edge 只采用最大 endpoint orientation product，保存完整 contribution card、bottom edge id/business fact hash 和两端 membership。coarse membership 不得退化为 included mid ids 或 LLM support 子集。
+coarse projection 与 mid 使用同一 `membership_weighted_bottom_support_q15_log_mass_v1`：读取两侧 RQ L2 prefix 的全部正 primary memberships，并扫描所属 relation state 的完整 bottom edge 集；每条无向 bottom edge 只采用最大 endpoint orientation product，保存完整 contribution card、bottom edge id/business fact hash 和两端 membership。coarse membership 不得退化为 included mid ids 或 LLM support 子集。
 
 由于 coarse projection 会改变距离分布，active coarse edge distance 必须按 `layer=coarse` 与 `edge_type` 做投影校准：
 
@@ -2772,7 +2769,7 @@ coarse diagnostics 必须保存 RQ L2 coverage、child L3 coverage、membership 
 
 ### 目标检索链路
 
-目标检索不是全局加权排序，也不是单个全局 frontier 从 coarse、mid、chunk 连续抢占预算，而是分层暂存的图导航。请求级 `retrieval_granularity` 当前只允许 `coarse` 与 `mid` 两种 active 模式，默认 `mid` 作为普通模式；`coarse` 作为摘要模式完全保持现有粗粒度链路；`mid` 是同构的中粒度入口模式，跳过 coarse gate，直接从 mid concept entry selection 形成 mid 起点队列，再复用相同的 mid frontier、chunk seed、chunk relation traversal、structure restoration 与 context package；`hybrid`/dual-start 暂不属于 active path。粗粒度模式先从 coarse candidates 取 coarse 起点，在 coarse graph 内完成探索并保留 coarse top-k；随后逐个 coarse 父节点下钻收集中概念候选，合并去重后再取摘要模式专用 mid 起点进入 mid graph，mid graph 探索后保留 mid top-k；最后逐个 mid 父节点下钻收集 chunk candidates，合并去重后取 chunk 起点进入 chunk relation graph，chunk graph 探索后取最终 hit chunks 进入 structure restoration 与 context package。RQ membership/address 不作为额外 active traversal layer，而是作为节点归属、chunk seed selector、模糊边界诊断和灰区路径判断上下文。
+目标检索不是全局加权排序，也不是单个全局 frontier 从 coarse、mid、chunk 连续抢占预算，而是分层暂存的图导航。请求级 `retrieval_granularity` 当前只允许 `coarse` 与 `mid` 两种 active 模式，默认 `mid` 作为普通模式；`coarse` 作为摘要模式完全保持现有粗粒度链路；`mid` 是同构的中粒度入口模式，跳过 coarse gate，直接从 mid concept entry selection 形成 mid 起点队列，再复用相同的 mid frontier、chunk seed、chunk relation traversal、structure restoration 与 context package；`hybrid`/dual-start 暂不属于 active path。粗粒度模式先从 coarse candidates 取 coarse 起点，在 coarse graph 内完成探索并保留 coarse top-k；随后逐个 coarse 父节点下钻收集中概念候选，合并去重后再取摘要模式专用 mid 起点进入 mid graph，mid graph 探索后保留 mid top-k；最后逐个 mid 父节点下钻收集 chunk candidates，合并去重后取 chunk 起点进入 chunk relation graph，chunk graph 探索后取最终 hit chunks 进入 structure restoration 与 context package。RQ membership/address 不作为额外 active traversal layer，而是作为主链节点归属、chunk seed selector、边界诊断和灰区路径判断上下文。
 
 目标链路：
 
@@ -2941,7 +2938,7 @@ posterior calibration 明确 `is_evidence=false`、`citation_authority=false`、
 
 同一 Agent request 的多轮 P&E/repair 可以按 `request_scoped_query_embedding_memo_v1` 复用 canonical query vector，但必须满足以下边界：memo 仅存在于当前协程调用栈，最多保存 4 个向量，key 同时绑定 knowledge base、`semantic_entry_query` packet hash 与 active PostgreSQL vector runtime identity；指针、模型、维度、collection/schema 或 semantic entry 任一变化都必须 miss。命中只省略重复 query embedding provider 调用，各轮 typed controls 仍须分别执行完整 deterministic traversal、写独立 trace 并接受同样的 gray/hard-interrupt gate。审计必须分别记录 memo hit 和 query embedding model-call count；不得缓存或持久化 credential、Authorization header、完整 provider response，也不得让 memo 进入 gray-zone observation、decision hash 或事实证据。
 
-full retrieval cache identity 必须同时绑定原始 query、`semantic_entry_query_protocol_version`、规范化 `semantic_entry_query`、完整 semantic-entry packet hash、query-facet posterior protocol 与四项 hot-reload calibration settings，协议为 `layered_retrieval_full_identity_key_v3`。dense entry 独立重放包使用 `entry_dense_db_vector_replay_v2`，同时绑定原始 query hash、semantic-entry protocol/text/packet hash、query-facet packet hash、实际 query vector 与 active PostgreSQL vector business facts；持久化和公开 replay 都必须重新派生同一 semantic entry 并拒绝任一漂移。首次 retrieval 与 repair 因复用同一 frozen facet packet，必须得到同一 semantic entry。Redis 旧 v1/v2 key 自然 miss，不得兼容读取或把旧 query vector 冒充 v3 输入。
+full retrieval cache identity 必须同时绑定原始 query、`semantic_entry_query_protocol_version`、规范化 `semantic_entry_query`、完整 semantic-entry packet hash、query-facet posterior protocol、四项 hot-reload calibration settings 与当前图/遍历协议，协议为 `layered_retrieval_full_identity_key_v5`。dense entry 独立重放包使用 `entry_dense_db_vector_replay_v2`，同时绑定原始 query hash、semantic-entry protocol/text/packet hash、query-facet packet hash、实际 query vector与 active PostgreSQL vector business facts；持久化和公开 replay 都必须重新派生同一 semantic entry 并拒绝任一漂移。首次 retrieval 与 repair 因复用同一 frozen facet packet，必须得到同一 semantic entry。Redis 旧 v1/v2/v3/v4 key 自然 miss，不得兼容读取或把旧 query vector 冒充 v5 输入。
 
 **架构影响：**
 - 影响对象：QA/Agent query understanding、layered retrieval、retrieval trace、context package diagnostics、cache key、前端轨迹展示和 repair retrieval。
@@ -3543,7 +3540,7 @@ execution-control card/hash 与该轮 retrieval trace；不能要求历史轮错
 executor event 与该 plan 的 retrieval trace；若随后发生 citation repair，最终响应
 trace 必须改由独立 reciprocal repair-chain gate 逐轮绑定到该 plan trace，不能把
 repair 子链 trace 伪装成新的 planner execution。
-预生产 Agent quality gate 使用 `four_layer_acceptance_quality_gate_v11`，把上述
+Agent quality gate 使用 `four_layer_acceptance_quality_gate_v16`，把上述
 required action、预算字段、observation-action linkage、逐 plan executor control
 card/hash、最终轮绑定以及 query-facet posterior 的 prior/likelihood/bounded
 observation/convergence/hash/zero-model-call replay 纳入冻结协议 identity。
@@ -3697,7 +3694,7 @@ prompt 不得进入该 packet。该文本按不可信资料内容处理，模型
 
 规划 replan 必须使用 `agent_replan_semantic_progress_v1`。每轮比较 result chunk、raw-span summary、covered facet、evidence role、独立 support path 和 citable span 的语义签名，不把新 trace UUID 当作进展；若下一轮 validator 得到与上一轮完全相同的 typed action target、budget 与 execution control hash，则在再次执行 retrieval 或 Evidence Evaluator provider 调用前记录 `no_progress` 并停止。若 control 改变但执行后语义签名与 evaluator directive 仍重复，也必须停止后续 replan。该判定只负责避免重复计划/模型成本，不参与 gray-zone path decision，模型调用数为 0。
 
-直接定义类问题（如“DF数据集成指的是什么”）的 evaluator contract 必须明确：当一个带合法 raw span 的候选 excerpt 直接命名目标术语并解释其含义，且用户没有要求比较或多来源时，可以判为 `sufficient`；不得仅为增加 chunk、路径或来源数量而重复扩展。最终答案仍必须经过 Context Package 与 citation verification。
+直接定义类问题（如“向量索引是什么”）的 evaluator contract 必须明确：当一个带合法 raw span 的候选 excerpt 直接命名目标术语并解释其含义，且用户没有要求比较或多来源时，可以判为 `sufficient`；不得仅为增加 chunk、路径或来源数量而重复扩展。最终答案仍必须经过 Context Package 与 citation verification。
 
 Agent run 的用户取消终态固定为 `cancelled`，并保留 `error=cancelled_by_user` 作为兼容原因；不得把主动取消伪装成 `failed`。同步请求、SSE 客户端断开和显式 cancel endpoint 都必须写同一 terminal state、completed timestamp 与唯一取消 trace，并释放 admission lease。
 
@@ -3987,9 +3984,9 @@ Runtime Settings 只有一个配置真值：仓库根 `.env`。任何通过 sche
 
 `Settings` 包含数据库、Qdrant、Redis、ingestion、模型、embedding、worker、chunk、context package、mid concept、RQ、Agent budget 和 fallback 参数。模型参数必须隔离为向量、图谱构建、对话三组，三组协议字段分别保存、校验和冻结，任一组的选择不得覆盖或隐式改写另外两组：`EMBEDDING_API_KEY`/`EMBEDDING_BASE_URL`/`EMBEDDING_RESOLVE_IP`/`EMBEDDING_MODEL`/`EMBEDDING_DIMENSIONS`/`EMBEDDING_API_PROTOCOL` 只用于文档与查询向量；`GRAPH_API_KEY`/`GRAPH_BASE_URL`/`GRAPH_RESOLVE_IP`/`GRAPH_MODEL`/`GRAPH_API_PROTOCOL` 只用于 mid/coarse concept 命名、概念摘要和中粗层双语派生；`CHAT_API_KEY`/`CHAT_BASE_URL`/`CHAT_RESOLVE_IP`/`CHAT_MODEL`/`CHAT_API_PROTOCOL`/`CHAT_JSON_MAX_TOKENS` 只用于 QA 回答、查询感知、Agent planner/evidence evaluator、citation verification 和 Profile 助手。`CHAT_API_PROTOCOL` 与 `GRAPH_API_PROTOCOL` 各自只能从本地强类型 allowlist `openai|anthropic` 选择；`openai` 固定追加 `/chat/completions` 并使用 Bearer Authorization，`anthropic` 固定追加 `/v1/messages`、使用官方 Anthropic SDK 的 Bearer Authorization 与固定 `anthropic-version`，把 system message 规范化为 Messages API 顶层 `system`，且必须显式提供有界 `max_tokens`。启用或禁用 model bridge 不得改变该协议或认证语义；bridge 启用时，chat 官方 SDK 必须使用 `Settings.chat_base_url` 中已经解析的 bridge 地址并在请求前同步 bridge runtime config，不得再从 Compose/进程原始 `CHAT_BASE_URL` 取值覆盖；graph 官方 SDK 同理只能使用独立的 `Settings.graph_base_url`，不得被进程原始 `GRAPH_BASE_URL` 或 chat route 覆盖。`EMBEDDING_API_PROTOCOL` 是独立的一等设置，但当前实现 allowlist 只包含 `openai`，固定追加 `/embeddings`；Anthropic Messages 不定义 embedding request/response，禁止把生成文本、hidden state、零向量或伪随机数冒充向量，也不得在 UI 中展示可执行的 `embedding=anthropic`。未来增加 Voyage 或自定义向量协议前，必须先冻结其 route、认证头、请求/响应、batch、dimension 与错误边界，并把协议纳入 candidate-local credential/transport、vector/Qdrant/outbox/active pointer/TPE/cache identity。三组配置不得互相 fallback，也不得共用密钥状态。协议转换不得改变 typed action、grounding、citation 或 provider response 不可持久化边界。gray-zone rule 不使用任何模型端点。
 
-向量连通性诊断使用 `embedding_provider_probe_v1`。脚本默认 dry-run，只冻结 embedding protocol/model/dimension、fallback/bridge 开关和 probe 输入的 UTF-8 长度/SHA-256；只有显式 `--execute` 才允许在 API 容器内同步 model bridge runtime config。`--arm provider` 通过生产 `EmbeddingProvider.embed_texts_with_meta` 发起一个单文本 `query|document` 请求；`--arm bridge` 使用同一冻结模型、维度和凭据对本地 Docker bridge 的 `/embeddings` 发起恰好一个请求，绕过 EmbeddingProvider retry/error mapping，但仍禁止绕过 bridge 直连真实上游。执行结果只能记录请求耗时、provider 类型、external-called、向量数量/维度、有限性、非零性、L2 norm，或 bridge HTTP status/content-type/response byte count/allowlisted error code/route，以及 `external_failure_classification_v1` 的有界 scalar 分类和异常类型链；不得记录输入正文、向量值、endpoint、resolve IP、API key、Authorization、provider body/headers 或原始异常消息。fallback=true 时 execute 必须在网络 I/O 前拒绝，防止 fake vector 被误报为连通。失败也必须先写 `output/` 报告再以非零退出。宿主机直连 provider 不属于该消融协议；bridge 未发布 loopback 端口时也不得临时扩大 Compose 暴露面。
+向量连通性诊断使用 `embedding_provider_probe_v1`。脚本默认 dry-run，只冻结 embedding protocol/model/dimension、fallback/bridge 开关和 probe 输入的 UTF-8 长度/SHA-256；只有显式 `--execute` 才允许在 API 容器内同步 model bridge runtime config。`--arm provider` 通过生产 `EmbeddingProvider.embed_texts_with_meta` 发起一个单文本 `query|document` 请求；`--arm bridge` 使用同一冻结模型、维度和凭据对本地 Docker bridge 的 `/embeddings` 发起恰好一个请求，绕过 EmbeddingProvider retry/error mapping，但仍禁止绕过 bridge 直连真实上游。执行结果只能记录请求耗时、provider 类型、external-called、向量数量/维度、有限性、非零性、L2 norm，或 bridge HTTP status/content-type/response byte count/allowlisted error code/route，以及 `external_failure_classification_v1` 的有界 scalar 分类和异常类型链；不得记录输入正文、向量值、endpoint、resolve IP、API key、Authorization、provider body/headers 或原始异常消息。fallback=true 时 execute 必须在网络 I/O 前拒绝，防止 fake vector 被误报为连通。失败必须输出脱敏诊断并以非零退出；bridge 未发布 loopback 端口时不得临时扩大 Compose 暴露面。
 
-模型出口授权中的精确 base URL、effective endpoint、模型名和资料 manifest 属于部署侧私有身份，不得硬编码或提交到仓库。仓库内 terminal fixture 只能使用 RFC 2606 保留的 `.invalid` 域名、合成模型名和合成 manifest card；真实值由被忽略的本地配置与 create-new authorization/release artifact 绑定。current authorization contract 使用 scope-aware v4 pins：每个 scope 独立冻结 authorization/source-release/runtime protocol、request/receipt/release cards、base URL、effective endpoint 与 runtime identity；current 与 historical scope 不得共享或回退 endpoint pin。current runtime identity 必须绑定 PostgreSQL `runtime_settings_versions` 的 changed-key/version 审计与根 `.env` identity；数据库不得保存完整参数 snapshot；新增 hot 字段但未发布 durable runtime version 时 provider release 必须 fail closed。system prompt 的稳定前缀先于动态 evidence/conversation 内容，provider cache 只有 usage 中的 `cache_read` tokens 可以计为命中。
+精确 base URL、effective endpoint、模型名和资料身份属于部署侧私有配置，不得硬编码或提交到仓库。测试只能使用 RFC 2606 保留的 `.invalid` 域名、合成模型名和公开合成数据。运行时 provider identity 必须绑定根 `.env`、已发布的 `runtime_settings_versions` 审计与请求 scope；数据库不得保存完整参数 snapshot，不同 scope 不得共享或回退 endpoint pin。system prompt 的稳定前缀先于动态 evidence/conversation 内容，provider cache 只有 usage 中的 `cache_read` tokens 可以计为命中。
 
 根 `.env` 通过受限 bind mount 提供给 API、worker 和 beat。文件身份审计必须以 canonical path、内容 SHA、size 和 version hash 为主，不得因为 Docker 容器重建后的 mount/inode 差异制造另一份配置副本。更新事务必须有文件锁、expected hash、完整新字节校验和 durable publication；失败时保留原文件并返回可行动错误，不得把临时文件或数据库 snapshot 提升为配置真值。
 
@@ -4047,8 +4044,6 @@ Planner 只有在 exact persisted target 或必要的有界 override 已由 obse
 edge_distance_protocol
 rq_membership_protocol
 rq_membership_temperature
-rq_membership_top_m
-rq_membership_probability_threshold
 edge_projection_protocol
 graph_operating_point_protocol
 graph_operating_point_optimizer = tpe
@@ -4105,12 +4100,12 @@ context_path_summary_budget
 
 ```text
 edge_distance_protocol = edge_distance_log_calibrated_strength_v2
-rq_membership_protocol = rq_fuzzy_softmax_gamma_product_v1
+rq_membership_protocol = rq_primary_chain_v1
 edge_projection_protocol = membership_q15_layer_type_calibrated_v3
 edge_type_calibration_protocol = type_local_winsorized_minmax_v1
 ```
 
-它们和 RQ membership 的 temperature/top-m/probability-threshold 都属于 `rebuild_required`；active settings PUT 不得把相同字段当热加载写入或广播。builder 必须在落库前验证 selected setting 与本地实现一致，并把 protocol/runtime identity hash 传播到 relation、RQ membership、mid/coarse projection、context graph、retrieval cache 与 freshness admission。
+上述协议字段、`rq_membership_temperature` 和 `rq_residual_tau` 都属于 `rebuild_required`；active settings PUT 不得把相同字段当热加载写入或广播。builder 必须在落库前验证 selected setting 与本地实现一致，并把 protocol/runtime identity hash 传播到 relation、RQ membership、mid/coarse projection、context graph、retrieval cache 与 freshness admission。RQ 主链协议不存在候选数量或概率裁剪设置。
 
 其中改变 chunking、embedding、dynamic dense KNN、bridge quota、edge type calibration、relation graph、RQ codebook、RQ membership protocol、edge projection、graph model endpoint 或 concept graph 的参数属于 `rebuild_required`；改变 chat model endpoint、staged traversal budget、layer top-k、result top-k default、label/cycle/path distance threshold、`gray_zone_rule_protocol`、gray-zone observation cadence 等不改变 active graph 的参数属于 `hot_reloadable`，需要刷新 traversal protocol hash 并失效检索与 QA cache。`gray_zone_rule_protocol` 只能从本地实现的 allowlist 中选择，不能保存 prompt、模型名或自由表达式。`concept_i18n_enabled` 是热加载功能开关：保存后立即控制检索是否使用已有成功翻译文本，并控制下一次构图是否执行双语派生；它不会自动改写已有 active graph。`query_facet_bilingual_enabled` 是热加载功能开关：保存后立即控制下一次 QA/search planning 的 LLM query facet packet 是否要求中英双语 aliases；它不写 concept graph，不触发 Qdrant 或 graph rebuild。预算类参数只作为 hard interrupt 或层间输出上限，不参与路径价值排序。
 
@@ -4124,9 +4119,9 @@ TPE settings 分两层处理。`enable_auto_tpe`、`tpe_trial_budget`、`tpe_sta
 
 通用 `rebuild_required` 更新使用 `runtime_settings_candidate_v2`，并以 `runtime_settings_shadow_builds` 保存每个知识库的冻结 before-state、candidate chunk scope、四层 shadow state、构建指标、evaluation evidence/hash 和 promotion/rollback audit。普通 settings Save 可以同时提交三类字段，全部合法字段先写同一个根 `.env`；其中 rebuild 子集写入后必须让旧 graph/index freshness gate 失败并返回 pending candidate，不能继续用隐藏旧参数服务。实际变化的 `service_recreate_required` 字段写入同一文件后返回 `requires_service_recreate`，只在显式 recreate 后改变容器形态。candidate/intent 表只保存有界执行计划和审计，不得成为另一份全局 Runtime Settings 真值。
 
-首次构图与普通重建使用同一 candidate/ingestion 事务协议。不存在 active graph 时，executor 以版本化空 before-state 建立首个 relation/RQ/Mid/Coarse/Context Graph；不得要求本地 terminal plan、provider authorization receipt、source-card archive 或固定 Sample 验收文件。模型 endpoint 与凭据只来自 active Runtime Settings，provider side effect 仍受 fallback=false、预算、事务和 compensation gate 约束。
+首次构图与普通重建使用同一 candidate/ingestion 事务协议。不存在 active graph 时，executor 以版本化空 before-state 建立首个 relation/RQ/Mid/Coarse/Context Graph。模型 endpoint 与凭据只来自 active Runtime Settings，provider side effect 仍受 fallback=false、预算、事务和 compensation gate 约束。
 
-first-import 或版本化构图恢复以 PostgreSQL batch/recovery/outbox intent 为唯一执行权。Celery/Redis 只提供投递与可见性，不是完成事实；重复投递必须复用 durable task identity，成功必须回放已提交的 chunk/vector/four-layer state，失败必须保留 before-image、write-set 和可重试分类。开发期 terminal-v4/v5、固定 Sample release/handoff、一次性 initial-activation、专用 provider 回执表与 retry beat 均不属于 active path，也不得保留为普通 worker 的隐式启动依赖。
+首次导入或版本化构图恢复以 PostgreSQL batch/recovery/outbox intent 为唯一执行权。Celery/Redis 只提供投递与可见性，不是完成事实；重复投递必须复用 durable task identity，成功必须回放已提交的 chunk/vector/four-layer state，失败必须保留 before-image、write-set 和可重试分类。
 
 candidate 流程固定为：
 
@@ -4173,7 +4168,7 @@ executor 必须先在知识库级 resource lock 内执行 active graph admission
 
 为避免同一已接纳业务输入在 scoped maintenance 中重复支付 Mid/Coarse 定义成本，概念定义允许使用 `concept_definition_semantic_reuse_v8`。它不是 provider response cache，也不得复制旧 membership、support、edge、node weight、grounding hash 或 graph pointer；只可从当前已通过 active admission/freshness 的 source Mid/Coarse state 投影已经持久化并受 state hash 保护的 schema-valid label/definition/summary 等语义字段，再对当前 packet 重新执行 provider output schema validator、grounded gate、deterministic grounding/membership/support/edge/weight 构建与完整 state hash。不得保存或恢复原始 provider response、Authorization header、API key 或未知 provider 字段。Mid packet 必须显式保存 UUID-free `rq_prefix_key`；读取缺少该字段的 admitted 旧 packet 时，只能从同一 source state 绑定的 `MidConcept.support_rq_l3_prefix_id -> RQPrefix.rq_prefix_key` 外键重放，并校验 level、relation generation、state 与已存在 internal/packet key，一致后才可用于 scope lookup。不得退回 generation-specific grounding hash 或猜测地址。
 
-复用键必须同时绑定 layer、definition-semantic business identity、去除纯地址 id 后仍逐字段覆盖完整 bounded semantic candidate universe（最多 6 个 candidate labels、6 个 representative excerpts、6 个 child Mid label/definition/summary excerpts）的 hash 与各类 count、当前 Profile business hash、**实际生效的完整 system prompt hash**（editable Profile system prompt 与服务端不可编辑 output contract 拼接后的 exact UTF-8 bytes）、prompt/schema/projection/schema-repair/reuse protocol、Graph provider protocol/model/credential-free target identity 与 timeout。reuse identity 不得绑定一次 provider packing 偶然选择的 selected/omitted 子集；同一完整候选集可能因不透明 lineage digest 或容量边界选择不同 sample，但完整语义候选相同才允许复用，任一候选文本/原文 span 变化仍必须 miss。Mid 定义 identity 必须绑定完整 UUID-free RQ membership 语义事实（prefix/chunk business key、score、role、RQ path 与 fuzzy encoding），但剔除每条 membership 内仅用于审计寻址的有界 `support_chunk_edges` 样本；还必须绑定该 prefix 全部 incident bottom-edge 的 UUID-free 事实，但剔除 relation generation 的 `graph_state_hash`。原始 membership/support-edge hashes、地址 id、grounding hash 与 full packet business hash 继续留在完整 packet、address `identity_card`、projection audit 和新 state hash，不能被定义 identity 替代。Coarse 键同样必须使用剔除 relation generation hash 的完整 UUID-free incident bottom-edge 事实，并保留原文 chunk business support、structure/source-span business facts、完整 bounded child semantic text、membership/edge count 与分布，但不得把模型无法解释且由新 generation 必须重算的 child grounding digest、membership digest、edge digest 或 full lineage hash 当作 definition semantic identity；这些完整 graph business hash 仍需单独保留在 audit、按当前协议重算并进入新 state hash。system prompt、Profile、output contract、provider model/protocol、模型可见语义事实、bounded semantic candidate universe 或任一复用协议只要变化一个字节都必须 cache miss；禁止只按 Profile id、concept id、packet id、地址 UUID 或旧 `prompt_protocol_version` 命中。source state 缺少完整审计、重复业务键、持久化 hash/validator 失败、输出字段无法无损投影或当前 active admission 失败时同样 miss/fail closed，不能打开 fallback。
+复用键必须同时绑定 layer、definition-semantic business identity、去除纯地址 id 后仍逐字段覆盖完整 bounded semantic candidate universe（最多 6 个 candidate labels、6 个 representative excerpts、6 个 child Mid label/definition/summary excerpts）的 hash 与各类 count、当前 Profile business hash、**实际生效的完整 system prompt hash**（editable Profile system prompt 与服务端不可编辑 output contract 拼接后的 exact UTF-8 bytes）、prompt/schema/projection/schema-repair/reuse protocol、Graph provider protocol/model/credential-free target identity 与 timeout。reuse identity 不得绑定一次 provider packing 偶然选择的 selected/omitted 子集；同一完整候选集可能因不透明 lineage digest 或容量边界选择不同 sample，但完整语义候选相同才允许复用，任一候选文本/原文 span 变化仍必须 miss。Mid 定义 identity 必须绑定完整 UUID-free RQ primary membership 语义事实（prefix/chunk business key、score、role、RQ path 与 primary encoding），但剔除每条 membership 内仅用于审计寻址的有界 `support_chunk_edges` 样本；还必须绑定该 prefix 全部 incident bottom-edge 的 UUID-free 事实，但剔除 relation generation 的 `graph_state_hash`。原始 membership/support-edge hashes、地址 id、grounding hash 与 full packet business hash 继续留在完整 packet、address `identity_card`、projection audit 和新 state hash，不能被定义 identity 替代。Coarse 键同样必须使用剔除 relation generation hash 的完整 UUID-free incident bottom-edge 事实，并保留原文 chunk business support、structure/source-span business facts、完整 bounded child semantic text、membership/edge count 与分布，但不得把模型无法解释且由新 generation 必须重算的 child grounding digest、membership digest、edge digest 或 full lineage hash 当作 definition semantic identity；这些完整 graph business hash 仍需单独保留在 audit、按当前协议重算并进入新 state hash。system prompt、Profile、output contract、provider model/protocol、模型可见语义事实、bounded semantic candidate universe 或任一复用协议只要变化一个字节都必须 cache miss；禁止只按 Profile id、concept id、packet id、地址 UUID 或旧 `prompt_protocol_version` 命中。source state 缺少完整审计、重复业务键、持久化 hash/validator 失败、输出字段无法无损投影或当前 active admission 失败时同样 miss/fail closed，不能打开 fallback。
 
 每个新 concept 的 `llm_audit_json.provider_output_audit` 必须记录 reuse protocol、semantic input hash、effective system prompt hash、source state/concept id、source output hash、`reuse_hit`、`provider_called`、provider request count 与 `provider_response_persisted=false`；Mid/Coarse state 与 scoped rebuild audit 汇总 hit/miss/provider request count。全命中时概念定义 provider request count 必须为 0；gray-zone model-call count始终独立为 0，概念定义复用不得取得 gray-zone 权限。
 
@@ -4499,7 +4494,7 @@ rq_prefix_memberships:
   residual_norm
   membership_entropy
   rank
-  top_alternative_prefix_ids
+  membership_origin = primary_chain
   diagnostics_json
 
 rq_prefix_diagnostics:
@@ -4768,7 +4763,7 @@ $$
 
 ### API
 
-目标 API 契约区分完整审计视图与产品视图。后端、受控诊断 API 和 `output/` 报告保持状态到审计 payload 的保真映射；普通 Graph/Search/QA 产品 API 只投影用户完成任务所需的少量自然语言字段：
+目标 API 契约区分完整审计视图与产品视图。后端和受控诊断 API 保持状态到审计 payload 的保真映射；普通 Graph/Search/QA 产品 API 只投影用户完成任务所需的少量自然语言字段：
 
 $$
 view
@@ -4830,7 +4825,7 @@ UI
 \{Graph,SearchTrace,ContextPackage,AnswerAudit\}
 $$
 
-图谱层包括 chunk-structure、chunk-relation、RQ membership/address、mid-concepts、coarse-concepts。产品主界面只显示少量节点名称、自然语言关系、层级数量、资料覆盖和可行动 freshness 提示；full counts、sampled counts、hash、grounding、edge distance distribution、projection support、projection calibration diagnostics 和 traversal contribution 保留在后端审计与 `output/`，不得默认渲染。QA 与图谱页的产品视觉和交互布局以线上 v6.2.2 为回归基线：保留其问答主画布、底部 composer、会话/引用 drawer，以及图谱的左侧结构索引、中央四层画布、右侧节点解读和全屏控制；新能力只允许在该布局内增加少量自然语言状态，不得把审计卡或 conversation raw state 挤回主画布。QA 例外恢复 v6.2.2 的分层思考轨迹交互：生成中默认展开实时步骤，历史回答显示可折叠步骤总览；该产品投影只允许节点自然语言名称、阶段、状态、耗时、证据/候选数量及经脱敏的输入输出短摘要。它不是完整 Retrieval Trace/Agent P&E 审计，不得显示 run/trace/context-package/chunk UUID、hash、protocol、raw scores JSON、document id 列表、provider response 或异常原文；gray-zone 步骤只能描述 deterministic executor 决策，不得伪装成 LLM 思考。
+图谱层包括 chunk-structure、chunk-relation、RQ membership/address、mid-concepts、coarse-concepts。产品主界面只显示少量节点名称、自然语言关系、层级数量、资料覆盖和可行动 freshness 提示；full counts、sampled counts、hash、grounding、edge distance distribution、projection support、projection calibration diagnostics 和 traversal contribution 只保留在后端审计，不得默认渲染。QA 页面保留问答主画布、底部 composer、会话/引用 drawer 和可折叠的分层进度；图谱页保留左侧结构索引、中央四层画布、右侧节点解读和全屏控制。分层进度投影只允许节点自然语言名称、阶段、状态、耗时、证据/候选数量及经脱敏的输入输出短摘要。它不是完整 Retrieval Trace/Agent P&E 审计，不得显示 run/trace/context-package/chunk UUID、hash、protocol、raw scores JSON、document id 列表、provider response 或异常原文；gray-zone 步骤只能描述 deterministic executor 决策，不得伪装成 LLM 思考。
 
 图谱 overview 默认只承载可交互的有界自然语言 node/edge sample：Mid/Coarse projection edge 与单边 support contribution 都必须设置固定上限，完整性事实在后端审计中用 full count/hash 与 `support_contributions_complete` 记录，但产品页面不显示这些内部字段。前端不得按 sample 长度推断 full graph/support 数量；需要逐路径或引用审计时由诊断脚本读取 Retrieval Trace/Context Package 的完整 PostgreSQL replay。
 
@@ -4843,7 +4838,7 @@ a concise coarse -> mid -> evidence path summary when useful
 context restoration and de-duplication result in user language
 ```
 
-frontier pops、stage queues、per-parent budget、candidate pool、top-k audit、edge distance、dominance pruning、cycle reward、matched rule、protocol/hash 与完整 trace 只写后端审计/`output/`，不得默认出现在搜索页。
+frontier pops、stage queues、per-parent budget、candidate pool、top-k audit、edge distance、dominance pruning、cycle reward、matched rule、protocol/hash 与完整 trace 只写后端审计，不得默认出现在搜索页。
 
 QA/Agent 产品面必须展示：
 
@@ -4870,26 +4865,7 @@ $$
 write(S')\Rightarrow execute=true
 $$
 
-主 `Sample` 最终验收的清库重建只能走 recovery-only exact same-ID reset，
-不得提供公共任意 fixed-ID create API。dry-run 必须把固定 KB ID、固定三文件
-checksum allowlist/manifest hash、实际 PostgreSQL `ON DELETE CASCADE` 全 owner
-path 与逐表精确计数、完整 Qdrant owned-point inventory、完整 verified
-filesystem inventory 共同纳入 plan hash；实际 PostgreSQL FK 图必须与
-SQLAlchemy canonical graph 完全一致，Alembic head 也必须等于协议固定 head，
-否则 fail closed。execute 必须在同一 KB resource lock 内重算并匹配 exact KB
-ID、manifest hash、plan hash，先生成正常 durable KB delete tombstone，再把其
-immutable PK 与 intent-committed payload hash 写入独立 reset intent 后才能继续。
-只有绑定的 exact delete tombstone 已 completed 且 PostgreSQL/Qdrant/filesystem
-删除后置条件均为空，才允许以同一 ID、名称 `Sample`、v0 和 builtin default
-Profile 单事务重建；恢复不得选择 latest 或其他 completed tombstone。delete 后、
-recreate commit 前后崩溃均从 durable reset phase 幂等恢复。
-
-completed storage-maintenance tombstone 是不可变审计事实。唯一性只约束
-`status <> 'completed'` 的 `(operation, scope_key)`，保证同一 scope 同时至多一个
-未完成操作，同时允许同 ID 重建后的资料库再次正常删除。若 downgrade 因重复
-completed 历史无法恢复旧全局 unique，必须 fail closed，禁止删除审计证据。
-
-脚本验收必须覆盖 rebuild、reconcile、diagnose、evaluate、quality check 和 docker smoke。输出写入 `output/`。
+脚本验收必须覆盖 rebuild、reconcile、diagnose、evaluate、quality check 和 docker smoke。写操作必须在同一知识库 resource lock 内重算 dry-run identity，并通过显式 `--execute` 与精确确认字段后执行。completed storage-maintenance tombstone 是不可变审计事实；恢复流程不得删除或重解释已完成审计。
 
 目标脚本必须补齐验收工件：
 
@@ -4938,11 +4914,11 @@ agent_trace_evaluate:
 
 
 **架构影响：**
-- 影响对象：后端编排、前端图谱/搜索/QA 页面、运维脚本、smoke check、preproduction check 和用户可见诊断。
+- 影响对象：后端编排、前端图谱/搜索/QA 页面、运维脚本、smoke check 和用户可见诊断。
 - 影响方式：API 把持久状态、edge projection、staged frontier trace 与 context package 转成前端视图；脚本把同一批状态转成可重复验收报告；前端展示决定问题是否能被定位。
 - 传播字段：API response schema、shared types、`retrieval_trace_id`、`context_package_id`、`frontier_json`、`path_labels_json`、`convergence_json`、graph stats payload、script JSON/report fields。
 - 触发条件：后端 schema、trace shape、edge projection payload、graph stats、context package payload、settings contract 或脚本参数变化时，前端类型、脚本和测试必须同步更新。
-- 验收观察点：typecheck/lint 通过、API contract fixture 对齐、脚本可从仓库根目录执行、报告写入 `output/`、前端能展示四层路径、frontier、edge projection 和证据包。
+- 验收观察点：typecheck/lint 通过、API contract fixture 对齐、脚本可从仓库根目录执行、前端能展示四层路径、frontier、edge projection 和证据包。
 
 ## 事务、并发与安全
 
@@ -5141,7 +5117,7 @@ reward event and policy state write
 runtime settings version publish
 ```
 
-所有生成性验收报告写入 `output/`。
+生成性诊断写入被 Git 忽略的临时目录，核验后可以清空，不得成为源码或文档依赖。
 
 
 
@@ -5149,8 +5125,8 @@ runtime settings version publish
 - 影响对象：工程交付门禁、CI、本地 Docker 栈、前端类型检查、脚本诊断、benchmark 和真实资料验收。
 - 影响方式：测试把架构不变量转成可执行断言；诊断把 graph quality、edge projection quality、traversal quality、citation quality 和 runtime behavior 转成可比较输出。
 - 传播字段：pytest result、Vitest result、docker smoke output、diagnostics JSON、benchmark logs、retrieval evaluation report、agent trace report、runtime probe report。
-- 触发条件：任何代码、schema、脚本、API、运行参数、edge protocol、traversal protocol 或文档验收边界变化时，对应测试与 `output/` 报告需要更新。
-- 验收观察点：关键路径测试通过、edge projection 不断链、staged frontier trace 可回放、cycle distance reward 有界、报告时间戳可追踪、失败项有可行动上下文、真实资料采样不进入仓库、`output/` 不提交。
+- 触发条件：任何代码、schema、脚本、API、运行参数、edge protocol、traversal protocol 或文档验收边界变化时，对应测试与诊断契约需要更新。
+- 验收观察点：关键路径测试通过、edge projection 不断链、staged frontier trace 可回放、cycle distance reward 有界、失败项有可行动上下文、真实资料采样和临时诊断不进入仓库。
 
 ## 核心原则
 
@@ -5209,5 +5185,5 @@ $$
 19. PostgreSQL 是事实源，Qdrant 与 Redis 是 active 派生或运行态；legacy BM25 artifacts 不属于 active path。
 20. 每次检索、回答、验证和 reward 都必须能由 trace、hash 与 id 链路审计。
 21. 图检索 gray-zone 分区保持 green/gray/red/hard-stop 累计距离阈值协议；每条 gray path 只能由版本化 deterministic local rule 基于 bounded observation 判定，LLM 不参与、不能覆盖，且 trace 必须证明同输入同决策和模型调用数为零。
-22. 高层图必须产生语义压缩：fuzzy RQ membership 只负责路由/诊断，deterministic eligibility 决定节点，`Mid <= chunks`、`Coarse <= Mid`，LLM eligibility 调用数为零。
-23. 完整审计保留在后端、受控诊断入口与 `output/`；Graph/Search/QA 产品主界面只展示少量自然语言关键信息，不默认展示 UUID、hash、protocol、raw JSON、代码日志或 trace。
+22. 高层图必须产生语义压缩：RQ primary membership 负责路由/诊断，deterministic eligibility 决定节点，`Mid <= chunks`、`Coarse <= Mid`，LLM eligibility 调用数为零。
+23. 完整审计保留在后端与受控诊断入口；Graph/Search/QA 产品主界面只展示少量自然语言关键信息，不默认展示 UUID、hash、protocol、raw JSON、代码日志或 trace。

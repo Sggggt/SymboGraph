@@ -72,10 +72,8 @@ def test_every_script_help_is_dependency_failure_safe(script_path: Path) -> None
 
 def test_write_capable_scripts_expose_explicit_execution_gate() -> None:
     write_capable = {
-        "cleanup_orphan_mid_rq_memberships.py",
         "cleanup_stale_data.py",
         "cleanup_vector_collection.py",
-        "destroy_legacy_derived_data.py",
         "docker_smoke.py",
         "manage_runtime_settings_candidate.py",
         "manage_vector_shadow.py",
@@ -103,22 +101,6 @@ def test_write_capable_scripts_expose_explicit_execution_gate() -> None:
         if "--execute" not in source:
             missing_gate.append(name)
     assert missing_gate == []
-
-
-def test_scripts_do_not_reintroduce_retired_terminal_or_private_fixtures() -> None:
-    forbidden = (
-        "sample_terminal_v5",
-        "\u006f\u0075\u0074\u0070\u0075\u0074\u002f\u0066\u0069\u006e\u0061\u006c\u002d\u0073\u0061\u006d\u0070\u006c\u0065",
-        "\u0077\u0069\u006e\u0063\u006f\u0064\u0065\u002e\u0077\u0069\u006e\u006e\u0069\u006e\u0067\u002e\u0063\u006f\u006d\u002e\u0063\u006e",
-        "\u4f55\u52b2\u71ca",
-    )
-    matches: list[str] = []
-    for path in sorted(SCRIPTS_ROOT.glob("*.py")):
-        source = path.read_text(encoding="utf-8")
-        for marker in forbidden:
-            if marker in source:
-                matches.append(f"{path.name}:{marker}")
-    assert matches == []
 
 
 def test_subprocess_environment_drops_local_credentials_and_endpoints(

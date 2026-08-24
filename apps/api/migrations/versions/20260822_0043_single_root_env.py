@@ -1,7 +1,7 @@
 """Make the repository-root .env the sole Runtime Settings authority.
 
 Revision ID: 20260822_0043
-Revises: 20260821_0042
+Revises: 20260820_0041
 
 The migration preserves only non-secret audit metadata.  Historical settings
 snapshots and secret-presence mirrors are intentionally not copied.
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 
 revision = "20260822_0043"
-down_revision = "20260821_0042"
+down_revision = "20260820_0041"
 branch_labels = None
 depends_on = None
 

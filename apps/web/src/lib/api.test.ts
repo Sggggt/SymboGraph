@@ -44,6 +44,46 @@ describe("api client", () => {
     );
   });
 
+  it("registers a multi-file selection sequentially for one knowledge base", async () => {
+    let activeRequests = 0;
+    let maxActiveRequests = 0;
+    const completionOrder: string[] = [];
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      activeRequests += 1;
+      maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+      const formData = init?.body as FormData;
+      const file = formData.get("upload") as File;
+      await Promise.resolve();
+      completionOrder.push(file.name);
+      activeRequests -= 1;
+      return jsonResponse({
+        document_id: `document-${file.name}`,
+        job_id: `job-${file.name}`,
+        status: "queued",
+        source_path: `/data/${file.name}`,
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { uploadFilesSequentially } = await import("./api");
+    const progress: number[] = [];
+
+    const responses = await uploadFilesSequentially(
+      [new File(["alpha"], "alpha.md"), new File(["beta"], "beta.md")],
+      "knowledge-base-1",
+      undefined,
+      (completed) => progress.push(completed),
+    );
+
+    expect(maxActiveRequests).toBe(1);
+    expect(completionOrder).toEqual(["alpha.md", "beta.md"]);
+    expect(progress).toEqual([1, 2]);
+    expect(responses.map((response) => response.source_path)).toEqual([
+      "/data/alpha.md",
+      "/data/beta.md",
+    ]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("cancels agent runs through the control endpoint", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ run_id: "run-1", status: "cancelled", error: "cancelled_by_user" }));
     vi.stubGlobal("fetch", fetchMock);

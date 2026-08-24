@@ -4,9 +4,8 @@ Revision ID: 20260820_0041
 Revises: None
 Create Date: 2026-08-20
 
-The repository retains only the current one-week migration baseline. Existing
-installations already stamped at ``20260820_0041`` remain compatible; a fresh
-database creates the complete current SQLAlchemy schema in this revision.
+This revision creates the complete current SQLAlchemy schema for a fresh
+database.
 """
 from __future__ import annotations
 

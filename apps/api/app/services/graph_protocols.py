@@ -28,8 +28,6 @@ ACTIVE_GRAPH_PROTOCOLS = {
 }
 RQ_MEMBERSHIP_PARAMETER_NAMES = (
     "rq_membership_temperature",
-    "rq_membership_top_m",
-    "rq_membership_probability_threshold",
 )
 
 
@@ -312,12 +310,6 @@ def validate_active_graph_protocol_settings(
         selected_protocols[setting_key] = expected
 
     temperature = getattr(settings, "rq_membership_temperature", None)
-    top_m = getattr(settings, "rq_membership_top_m", None)
-    probability_threshold = getattr(
-        settings,
-        "rq_membership_probability_threshold",
-        None,
-    )
     if (
         isinstance(temperature, bool)
         or not isinstance(temperature, (int, float))
@@ -327,27 +319,14 @@ def validate_active_graph_protocol_settings(
         raise GraphProtocolAdmissionError(
             "rq_membership_temperature must be finite and in (0, 10]"
         )
-    if type(top_m) is not int or not 1 <= top_m <= 6:
-        raise GraphProtocolAdmissionError("rq_membership_top_m must be in 1..6")
-    if (
-        isinstance(probability_threshold, bool)
-        or not isinstance(probability_threshold, (int, float))
-        or not math.isfinite(float(probability_threshold))
-        or not 0.0 <= float(probability_threshold) <= 1.0
-    ):
-        raise GraphProtocolAdmissionError(
-            "rq_membership_probability_threshold must be finite and in [0, 1]"
-        )
-
     identity = {
         "protocol_version": GRAPH_PROTOCOL_RUNTIME_IDENTITY_VERSION,
         "protocols": selected_protocols,
         "rq_membership_parameters": {
             "temperature": float(temperature),
-            "top_m": top_m,
-            "probability_threshold": float(probability_threshold),
             "primary_code_forced": True,
-            "renormalize_after_sparsification": False,
+            "non_primary_materialization": False,
+            "renormalize_after_primary_selection": False,
             "membership_score_floor": None,
         },
         "dynamic_language_inputs": {

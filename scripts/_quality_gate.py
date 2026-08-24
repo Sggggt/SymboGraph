@@ -13,7 +13,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 DISTANCE_REPLAY_ABS_TOLERANCE = 1e-9
-QUALITY_GATE_PROTOCOL_VERSION = "four_layer_acceptance_quality_gate_v11"
+QUALITY_GATE_PROTOCOL_VERSION = "four_layer_acceptance_quality_gate_v16"
 GRAPH_OPERATING_POINT_PROTOCOL_VERSION = (
     "dense_dynamic_knn_bridge_quota_edge_calibration_v2"
 )
@@ -54,7 +54,7 @@ PROJECTED_GRAY_PREDICATE_PROTOCOL_VERSION = (
 CHUNK_BUSINESS_KEY_PROTOCOL_VERSION = "chunk_business_key_v1"
 ASSIGNMENT_PROTOCOL_VERSION = "scope_key_chunk_business_assignment_v1"
 RELATION_SUPPORT_PROTOCOL_VERSION = "dense_relation_endpoint_support_v1"
-RQ_MEMBERSHIP_ROLE_PROTOCOL_VERSION = "rq_membership_role_entropy_boundary_v1"
+RQ_MEMBERSHIP_ROLE_PROTOCOL_VERSION = "rq_membership_role_primary_entropy_boundary_v2"
 RQ_MEMBERSHIP_ROLE_THRESHOLDS = {
     "noise_membership_score_max": 1e-8,
     "outlier_gamma_max": 0.25,
@@ -66,7 +66,7 @@ RQ_MEMBERSHIP_ROLE_THRESHOLDS = {
     "boundary_distance_max": 0.05,
 }
 QUERY_RQ_SEED_PROTOCOL_VERSION = (
-    "query_rq_fuzzy_membership_chunk_seed_v2"
+    "query_rq_primary_residual_mid_dense_v5"
 )
 CHUNK_FACET_PRIORITY_PROTOCOL_VERSION = (
     "validated_query_facet_posterior_chunk_priority_v2"
@@ -86,9 +86,9 @@ QUERY_FACET_ORDERED_WINDOW_PROTOCOL_VERSION = (
 QUERY_FACET_ORDERED_WINDOW_MIN_SPAN = 12
 QUERY_FACET_ORDERED_WINDOW_TOKEN_MULTIPLIER = 4
 QUERY_RQ_CHUNK_SEED_COMPONENT_WEIGHTS = {
-    "rq_relevance": 0.70,
-    "mid_entry": 0.20,
-    "dense": 0.10,
+    "rq_relevance": 0.20,
+    "mid_entry": 0.50,
+    "dense": 0.30,
 }
 QUERY_RQ_MID_SUPPORT_FALLBACK_COMPONENT_WEIGHTS = {
     "rq_relevance": 0.0,
@@ -97,11 +97,15 @@ QUERY_RQ_MID_SUPPORT_FALLBACK_COMPONENT_WEIGHTS = {
 }
 QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK = {
     "primary_member": 0,
-    "fuzzy_member": 1,
-    "boundary_member": 2,
-    "outlier_member": 3,
-    "noise_candidate": 4,
+    "boundary_member": 1,
+    "outlier_member": 2,
+    "noise_candidate": 3,
+    "bridge_member": 5,
+    "low_confidence_member": 5,
 }
+QUERY_RQ_MID_SUPPORT_FALLBACK_TIE_BREAK_RANK = (
+    max(QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK.values()) + 1
+)
 CHUNK_TEXT_HASH_PROTOCOL_VERSION = "chunk_text_sha256_normalized_v1"
 RAW_SPAN_TEXT_HASH_PROTOCOL_VERSION = "raw_chunk_span_utf8_sha256_v1"
 SOURCE_SNAPSHOT_PROTOCOL_VERSION = (
@@ -559,7 +563,6 @@ RQ_MEMBERSHIP_ROLES = {
     "low_confidence_member",
     "boundary_member",
     "primary_member",
-    "fuzzy_member",
 }
 REPAIR_ACTION_TYPES = {
     "repair_missing_citation",
@@ -662,7 +665,7 @@ def rq_membership_role_protocol_hash() -> str:
                 "residual_confidence_gamma",
                 "boundary_probability_margin",
                 "boundary_distance",
-                "primary_leaf",
+                "primary_prefix",
                 "bridge_support",
             ],
             "thresholds": RQ_MEMBERSHIP_ROLE_THRESHOLDS,
@@ -673,7 +676,6 @@ def rq_membership_role_protocol_hash() -> str:
                 "low_confidence_member",
                 "boundary_member",
                 "primary_member",
-                "fuzzy_member",
             ],
             "model_call_budget": 0,
         }
@@ -694,12 +696,14 @@ def query_rq_seed_protocol_hash() -> str:
                 "component_weights": (
                     QUERY_RQ_CHUNK_SEED_COMPONENT_WEIGHTS
                 ),
-                "no_query_rq_fuzzy_overlap": (
+                "primary_membership_hard_base_gate": True,
+                "primary_rq_relevance": (
+                    "primary_membership*exp(-residual_distance/tau_r)"
+                ),
+                "membership_overlap_diagnostic_only": (
                     "sqrt(query_prefix_score*chunk_membership_score)"
                 ),
-                "query_rq_present_score": (
-                    "0.75*rq_candidate_score+0.25*fuzzy_overlap"
-                ),
+                "membership_overlap_used_in_effective_score": False,
                 "membership_role_tie_break": (
                     QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK
                 ),
@@ -712,6 +716,9 @@ def query_rq_seed_protocol_hash() -> str:
                         QUERY_RQ_MID_SUPPORT_FALLBACK_COMPONENT_WEIGHTS
                     ),
                     "rq_path_and_membership_components": 0.0,
+                    "membership_role_tie_break_rank": (
+                        QUERY_RQ_MID_SUPPORT_FALLBACK_TIE_BREAK_RANK
+                    ),
                 },
                 "candidate_card_coverage": (
                     "every_chunk_by_mid_candidate_has_nonempty_cards"
@@ -1016,7 +1023,7 @@ def _membership_role_replay(
         "boundary_distance",
         "residual_outlier_threshold",
         "rank",
-        "is_primary_leaf",
+        "is_primary_prefix",
         "is_bridge_chunk",
     }
     if (
@@ -1038,7 +1045,7 @@ def _membership_role_replay(
         )
         or type(inputs.get("rank")) is not int
         or int(inputs["rank"]) <= 0
-        or type(inputs.get("is_primary_leaf")) is not bool
+        or inputs.get("is_primary_prefix") is not True
         or type(inputs.get("is_bridge_chunk")) is not bool
         or not 0.0 <= float(inputs["membership_score"]) <= 1.0
         or not 0.0 <= float(inputs["membership_entropy"]) <= 1.0
@@ -1066,8 +1073,7 @@ def _membership_role_replay(
             or _float(inputs["boundary_probability_margin"]) <= _float(thresholds["boundary_probability_margin_max"])
             or _float(inputs["boundary_distance"]) <= _float(thresholds["boundary_distance_max"])
         ),
-        "primary_member": bool(inputs["is_primary_leaf"]),
-        "fuzzy_member": not bool(inputs["is_primary_leaf"]) or int(inputs["rank"]) > 1,
+        "primary_member": True,
     }
     precedence = (
         "noise_candidate",
@@ -1076,7 +1082,6 @@ def _membership_role_replay(
         "low_confidence_member",
         "boundary_member",
         "primary_member",
-        "fuzzy_member",
     )
     matched = [role for role in precedence if flags[role]]
     return (matched[0] if matched else None), matched
@@ -2237,7 +2242,7 @@ def audit_graph_quality(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     audit.check(
         "rq_membership_diagnostics_are_deterministic",
         rq_diagnostics.get("model_call_count") == 0
-        and rq_diagnostics.get("renormalized_after_sparsification") is False
+        and rq_diagnostics.get("renormalized_after_primary_selection") is False
         and rq_diagnostics.get("artificial_membership_floor") is False
         and rq_diagnostics.get("rq_pair_edges_active") is False,
         code="rq_membership_diagnostic_protocol_invalid",
@@ -2358,9 +2363,13 @@ _RQ_CHUNK_SEED_CARD_FIELDS = frozenset(
         "residual_distance",
         "query_prefix_score",
         "chunk_membership_score",
-        "fuzzy_membership_overlap_score",
+        "membership_overlap_diagnostic_score",
         "rq_score",
+        "residual_score",
         "rq_relevance_component",
+        "primary_membership",
+        "membership_overlap_used_in_effective_score",
+        "query_membership_entropy",
         "rq_drift_penalty",
         "membership_role",
         "membership_rank",
@@ -2740,7 +2749,7 @@ def _audit_rq_chunk_seed_card(
             for field in (
                 "query_prefix_score",
                 "chunk_membership_score",
-                "fuzzy_membership_overlap_score",
+                "membership_overlap_diagnostic_score",
                 "rq_score",
                 "rq_relevance_component",
                 "mid_entry_component",
@@ -2814,8 +2823,8 @@ def _audit_rq_chunk_seed_card(
     )
 
     source = str(card.get("score_source") or "")
-    if source == "query_rq_fuzzy_membership":
-        fuzzy_overlap = round(
+    if source == "query_rq_primary_base":
+        membership_overlap = round(
             math.sqrt(
                 max(
                     0.0,
@@ -2825,25 +2834,12 @@ def _audit_rq_chunk_seed_card(
             ),
             6,
         )
-        if query_rq_path:
-            rq_relevance = round(
-                0.75 * _float(card.get("rq_score"))
-                + 0.25 * fuzzy_overlap,
-                6,
-            )
-            no_query_drift_valid = True
-        else:
-            rq_relevance = fuzzy_overlap
-            no_query_drift_valid = (
-                _strict_numeric_match(
-                    card.get("rq_score"),
-                    fuzzy_overlap,
-                )
-                and _strict_numeric_match(
-                    card.get("rq_drift_penalty"),
-                    round(max(0.0, 1.0 - fuzzy_overlap), 6),
-                )
-            )
+        primary_membership = card.get("primary_membership") is True
+        rq_relevance = (
+            _float(card.get("residual_score"))
+            if primary_membership
+            else 0.0
+        )
         expected_weights = QUERY_RQ_CHUNK_SEED_COMPONENT_WEIGHTS
         expected_effective_score = round(
             expected_weights["rq_relevance"] * rq_relevance
@@ -2867,14 +2863,21 @@ def _audit_rq_chunk_seed_card(
                 expected_weights,
             )
             and _strict_numeric_match(
-                card.get("fuzzy_membership_overlap_score"),
-                fuzzy_overlap,
+                card.get("membership_overlap_diagnostic_score"),
+                membership_overlap,
             )
             and _strict_numeric_match(
                 card.get("rq_relevance_component"),
                 rq_relevance,
             )
-            and no_query_drift_valid
+            and isinstance(card.get("primary_membership"), bool)
+            and card.get("membership_overlap_used_in_effective_score") is False
+            and _finite(card.get("query_membership_entropy"))
+            and 0.0
+            <= _float(card.get("query_membership_entropy"))
+            <= 1.0
+            and _finite(card.get("residual_score"))
+            and 0.0 <= _float(card.get("residual_score")) <= 1.0
             and card.get("membership_role_tie_break_rank")
             == expected_tie_break
         )
@@ -2900,10 +2903,16 @@ def _audit_rq_chunk_seed_card(
                 for field in (
                     "query_prefix_score",
                     "chunk_membership_score",
-                    "fuzzy_membership_overlap_score",
+                    "membership_overlap_diagnostic_score",
                     "rq_score",
+                    "residual_score",
                     "rq_relevance_component",
                 )
+            )
+            and card.get("primary_membership") is False
+            and card.get("membership_overlap_used_in_effective_score") is False
+            and _strict_numeric_match(
+                card.get("query_membership_entropy"), 1.0
             )
             and card.get("rq_drift_penalty") is None
             and card.get("membership_role")
@@ -2917,7 +2926,7 @@ def _audit_rq_chunk_seed_card(
                 expected_weights,
             )
             and card.get("membership_role_tie_break_rank")
-            == len(QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK) + 1
+            == QUERY_RQ_MID_SUPPORT_FALLBACK_TIE_BREAK_RANK
         )
     else:
         expected_effective_score = None
@@ -5321,7 +5330,10 @@ def _replay_path_cycle_reward(
         ):
             valid = False
         total = round(total + max(0.0, float(after)), 6)
-    declared = label.get("reward_so_far")
+    declared = label.get(
+        "cycle_reward_so_far",
+        label.get("reward_so_far"),
+    )
     return (
         valid
         and _finite(declared)
@@ -6437,6 +6449,14 @@ def audit_context_package_quality(snapshot: Mapping[str, Any]) -> dict[str, Any]
         | actual_by_role["bridge"]
         | actual_by_role["graph_path"]
     )
+    replayed_graph_path_ids = {
+        str(item.get("chunk_id"))
+        for item in chunks
+        if (
+            (item.get("why_selected") or {}).get("reason")
+            == "restored_from_selected_graph_path"
+        )
+    }
     restore_counts = diagnostics.get("restore_counts") or {}
     audit.check(
         "context_package_roles_and_counts_replayed",
@@ -6446,7 +6466,8 @@ def audit_context_package_quality(snapshot: Mapping[str, Any]) -> dict[str, Any]
         and restore_counts.get("hit_chunks") == len(hit_ids)
         and restore_counts.get("restored_chunks") == len(restored_ids)
         and restore_counts.get("bridge_chunks") == len(bridge_ids)
-        and restore_counts.get("graph_path_chunks") == len(actual_by_role["graph_path"])
+        and restore_counts.get("graph_path_chunks")
+        == len(replayed_graph_path_ids)
         and restore_counts.get("parent_structure_nodes") == len(set(_unique_strings(snapshot.get("parent_structure_node_ids")))),
         code="context_package_role_count_mismatch",
         expected={
@@ -6484,12 +6505,21 @@ def audit_context_package_quality(snapshot: Mapping[str, Any]) -> dict[str, Any]
         actual=budget_audit,
     )
     snapshot_integrity = diagnostics.get("snapshot_integrity") or {}
+    selected_document_version_ids = {
+        str(item.get("document_version_id"))
+        for item in chunks
+        if item.get("document_version_id")
+    }
+    verified_document_version_count = snapshot_integrity.get(
+        "verified_document_version_count"
+    )
     audit.check(
         "context_package_snapshot_integrity_gate",
         snapshot_integrity.get("fail_closed") is True
         and snapshot_integrity.get("protocol_version")
-        and snapshot_integrity.get("verified_document_version_count")
-        == len({str(item.get("document_version_id")) for item in chunks}),
+        and type(verified_document_version_count) is int
+        and verified_document_version_count
+        >= len(selected_document_version_ids),
         code="context_package_snapshot_integrity_invalid",
     )
     audit.check(

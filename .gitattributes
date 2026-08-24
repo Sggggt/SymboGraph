@@ -11,8 +11,8 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 
-# PowerShell scripts: auto (Git will convert on checkout according to platform)
-*.ps1 text=auto
+# PowerShell entrypoints use stable Windows line endings.
+*.ps1 text eol=crlf
 
 # Web source files: LF is standard
 *.js text eol=lf
@@ -22,9 +22,16 @@
 *.json text eol=lf
 *.css text eol=lf
 *.html text eol=lf
+*.svg text eol=lf
 *.md text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+*.lock text eol=lf
+*.ipynb text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+.dockerignore text eol=lf
+.env.example text eol=lf
 
 # Docker files
 Dockerfile text eol=lf
@@ -42,8 +49,11 @@ docker-compose.yaml text eol=lf
 *.jpeg binary
 *.gif binary
 *.ico binary
-*.svg binary
 *.pdf binary
+*.webp binary
+*.avif binary
+*.woff binary
+*.woff2 binary
 *.zip binary
 *.tar binary
 *.gz binary

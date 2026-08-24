@@ -884,37 +884,6 @@ def test_runtime_env_sync_treats_legacy_runtime_keys_as_deprecated(monkeypatch, 
     assert "HF_HUB_OFFLINE" not in cleaned
 
 
-def test_runtime_env_sync_allows_compose_only_keys_in_the_single_root_env(
-    monkeypatch,
-    tmp_path,
-):
-    from app.services import runtime_settings
-
-    env_path = tmp_path / ".env"
-    example_path = tmp_path / ".env.example"
-    env_path.write_text("DATABASE_URL=sqlite:///runtime.db\n", encoding="utf-8")
-    example_path.write_text(
-        "DATABASE_URL=\nSAMPLE_IMPORT_PATH=./sample-import\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
-    monkeypatch.setattr(runtime_settings, "ENV_EXAMPLE_PATH", example_path)
-
-    status = runtime_settings.env_sync_status()
-
-    assert status["synced"] is True
-    assert status["missing_keys"] == []
-    assert status["extra_keys"] == []
-
-    env_path.write_text(
-        "DATABASE_URL=sqlite:///runtime.db\nSAMPLE_IMPORT_PATH=./sample-import\n",
-        encoding="utf-8",
-    )
-    persisted_status = runtime_settings.env_sync_status()
-    assert persisted_status["synced"] is True
-    assert persisted_status["extra_keys"] == []
-
-
 def test_runtime_env_sync_does_not_require_deployment_only_postgres_keys(
     monkeypatch,
     tmp_path,
@@ -2218,7 +2187,6 @@ def test_operations_script_matrix_matches_context_graph_todo():
     scripts_root = repo_root / "scripts"
     required_scripts = {
         "check_runtime_settings_contract.py",
-        "destroy_legacy_derived_data.py",
         "rebuild_chunks.py",
         "rebuild_structure_graph.py",
         "rebuild_chunk_relation_graph.py",
@@ -2241,7 +2209,6 @@ def test_operations_script_matrix_matches_context_graph_todo():
 
     write_scripts = [
         "cleanup_stale_data.py",
-        "destroy_legacy_derived_data.py",
         "docker_smoke.py",
         "evaluate_layered_retrieval.py",
         "rebuild_chunks.py",
@@ -2258,11 +2225,6 @@ def test_operations_script_matrix_matches_context_graph_todo():
     for name in write_scripts:
         text = (scripts_root / name).read_text(encoding="utf-8")
         assert "--execute" in text
-
-    destructive_text = (scripts_root / "destroy_legacy_derived_data.py").read_text(encoding="utf-8")
-    assert "--confirm-destroy-legacy" in destructive_text
-    assert "--confirm-knowledge-base-id" in destructive_text
-    assert "--confirm-inventory-hash" in destructive_text
 
     stale_cleanup_text = (scripts_root / "cleanup_stale_data.py").read_text(
         encoding="utf-8"

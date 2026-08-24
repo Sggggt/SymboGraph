@@ -539,7 +539,6 @@ class RQPrefixMembership(Base):
     rq_path: Mapped[list[int]] = mapped_column(JSON, default=list)
     residual_norm: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
     rank: Mapped[int] = mapped_column(Integer, default=0, index=True)
-    top_alternative_prefix_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     support_chunk_edge_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)

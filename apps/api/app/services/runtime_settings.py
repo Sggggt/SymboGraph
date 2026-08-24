@@ -276,8 +276,6 @@ def model_settings_payload(
         "rq_kmeans_max_k": read_env_int("RQ_KMEANS_MAX_K", settings.rq_kmeans_max_k),
         "rq_residual_tau": read_env_float("RQ_RESIDUAL_TAU", settings.rq_residual_tau),
         "rq_membership_temperature": settings.rq_membership_temperature,
-        "rq_membership_top_m": settings.rq_membership_top_m,
-        "rq_membership_probability_threshold": settings.rq_membership_probability_threshold,
         "dense_knn_k_min": read_env_int("DENSE_KNN_K_MIN", settings.dense_knn_k_min),
         "dense_knn_k_max": read_env_int("DENSE_KNN_K_MAX", settings.dense_knn_k_max),
         "dense_reverse_b_min_base": read_env_int("DENSE_REVERSE_B_MIN_BASE", settings.dense_reverse_b_min_base),
@@ -3986,8 +3984,6 @@ def update_model_settings(payload: dict) -> dict:
         payload.pop(setting_key)
     rebuild_numeric_specs: dict[str, tuple[str, float, float]] = {
         "rq_membership_temperature": ("float", 0.0, 10.0),
-        "rq_membership_top_m": ("int", 1.0, 6.0),
-        "rq_membership_probability_threshold": ("float", 0.0, 1.0),
     }
     for setting_key, (value_type, lower, upper) in rebuild_numeric_specs.items():
         if setting_key not in payload:

@@ -100,9 +100,6 @@ async def test_rq_prefix_pair_diagnostics_persist_all_five_grounded_types(
             assert source.rq_level == target.rq_level
         if row.edge_type == "sibling":
             assert source.parent_rq_prefix_id == target.parent_rq_prefix_id
-        if row.edge_type == "membership_overlap":
-            assert row.support_membership_mass > 0.0
-            assert row.support_chunk_ids_sample_json
 
     projected_rows = [
         row for row in rows if row.edge_type == "projected_chunk_support"
@@ -300,7 +297,6 @@ async def test_rq_prefix_pair_diagnostic_formulas_match_the_exact_domain(
 
     expected_siblings: set[tuple[str, str]] = set()
     expected_centroid_near: set[tuple[str, str]] = set()
-    expected_membership_overlap: set[tuple[str, str]] = set()
     for level, level_prefixes in prefixes_by_level.items():
         pair_distances: dict[tuple[str, str], float] = {}
         positive_distances: list[float] = []
@@ -359,14 +355,6 @@ async def test_rq_prefix_pair_diagnostic_formulas_match_the_exact_domain(
                     min(left_members[chunk_id], right_members[chunk_id])
                     for chunk_id in shared_chunk_ids
                 )
-                union_chunk_ids = set(left_members).union(right_members)
-                union_mass = sum(
-                    max(
-                        left_members.get(chunk_id, 0.0),
-                        right_members.get(chunk_id, 0.0),
-                    )
-                    for chunk_id in union_chunk_ids
-                )
 
                 if str(source.parent_rq_prefix_id or "rq:root") == str(
                     target.parent_rq_prefix_id or "rq:root"
@@ -398,24 +386,9 @@ async def test_rq_prefix_pair_diagnostic_formulas_match_the_exact_domain(
                         "rq_level"
                     ] == level
 
-                if overlap_mass > 0.0:
-                    expected_membership_overlap.add(pair_key)
-                    overlap_row = rows_by_fact[(*pair_key, "membership_overlap")]
-                    assert overlap_row.support_membership_mass == pytest.approx(
-                        overlap_mass,
-                        rel=1e-12,
-                        abs=1e-14,
-                    )
-                    assert overlap_row.diagnostic_strength == pytest.approx(
-                        overlap_mass / union_mass,
-                        rel=1e-12,
-                        abs=1e-14,
-                    )
-
     for edge_type, expected_pairs in (
         ("sibling", expected_siblings),
         ("centroid_near", expected_centroid_near),
-        ("membership_overlap", expected_membership_overlap),
     ):
         assert {
             (source_key, target_key)
@@ -825,9 +798,7 @@ def test_rq_prefix_pair_static_domain_and_uuid_free_canonical_facts(monkeypatch)
         lambda: SimpleNamespace(
             rq_kmeans_levels=3,
             rq_kmeans_max_k=7,
-            rq_membership_top_m=2,
             rq_membership_temperature=0.35,
-            rq_membership_probability_threshold=0.05,
             rq_membership_protocol=context_graph.RQ_MEMBERSHIP_PROTOCOL_VERSION,
             rq_residual_tau=0.65,
         ),

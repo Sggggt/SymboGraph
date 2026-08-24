@@ -8,7 +8,7 @@
 
 ## Overview
 
-SymboGraph is a local, general-purpose intelligent knowledge base. It uses Four-Layer Context Graph RAG: fixed token chunks provide stable index and citation addresses, the Chunk Structure Graph preserves source structure and context-restoration paths, and the Chunk Relation Graph stores reproducible low-level semantic relations and RQ chunk-pair evidence. RQ fuzzy membership is routing and diagnostic metadata only. Deterministic eligibility rules compress RQ L3 and L2 prefix packets into Mid and Coarse concepts while enforcing `Mid≤chunks` and `Coarse≤Mid`. QA answers are generated from context packages and must pass citation verification.
+SymboGraph is a local, general-purpose intelligent knowledge base. It uses Four-Layer Context Graph RAG: fixed token chunks provide stable index and citation addresses, the Chunk Structure Graph preserves source structure and context-restoration paths, and the Chunk Relation Graph stores reproducible low-level semantic relations and RQ chunk-pair evidence. RQ persists exactly one L1/L2/L3 primary address chain per chunk. Deterministic eligibility rules compress RQ L3 and L2 prefix packets into Mid and Coarse concepts while enforcing `Mid≤chunks` and `Coarse≤Mid`. QA answers are generated from context packages and must pass citation verification.
 
 ## Repository Layout
 
@@ -20,8 +20,8 @@ SymboGraph is a local, general-purpose intelligent knowledge base. It uses Four-
 | `packages/shared` | Shared frontend/backend types and contracts. |
 | `infra` | Default Docker Compose runtime. |
 | `scripts` | Rebuild, reconciliation, diagnostics, retrieval evaluation, quality checks, and Docker smoke. |
-| `docs` | Technical white paper, engineering checklist, and acceptance material. |
-| `output` | Generated diagnostics, benchmarks, smoke output, screenshots, and acceptance reports. Not committed. |
+| `docs` | Four-Layer Context Graph RAG technical white paper. |
+| `output` | Ephemeral local diagnostics generated on demand; always ignored and safe to clear. |
 
 ## Product Positioning
 
@@ -49,7 +49,7 @@ source files
 -> contextual embedding and vector index
 -> optional automatic TPE operating point selection on chunk-version increments
 -> independent chunk relation graph
--> RQ prefix address tree and fuzzy membership
+-> RQ prefix address tree and primary-chain confidence
 -> RQ L3 mid concept graph
 -> RQ L2 coarse concept graph
 -> active context graph state
@@ -103,7 +103,7 @@ ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 ```
 
-The settings page persists the complete desired configuration. `hot_reloadable` fields are published to the active runtime; `rebuild_required` and `service_recreate_required` fields wait for explicit rebuild/promotion or service recreation. Saving the form never silently rewrites the active graph or container topology. Real endpoints, model names, API keys, source manifests, and authorization receipts belong only in Git-ignored local configuration or `output/`; checked-in examples use placeholders or synthetic `.invalid` fixtures.
+The settings page updates the repository-root `.env` directly. `hot_reloadable` fields are published to the active runtime; `rebuild_required` and `service_recreate_required` fields wait for explicit rebuild/promotion or service recreation. Saving the form never silently rewrites the active graph or container topology. Real endpoints, model names, and API keys belong only in the Git-ignored root `.env`; they must not enter logs, reports, or test fixtures. Checked-in examples use placeholders or synthetic `.invalid` values.
 
 ## Quick Start
 
@@ -117,7 +117,7 @@ reference and cannot be a Docker build output tag. `rebuild-images.ps1`
 explicitly overrides it for local builds:
 
 ```powershell
-# Rebuild local development images only
+# Rebuild local images only
 .\rebuild-images.ps1
 
 # Existing digests are runtime-only and require skipping the build
@@ -198,20 +198,19 @@ python scripts/evaluate_layered_retrieval.py
 python scripts/evaluate_layered_retrieval.py --query "<query>" --execute
 python scripts/check_context_package_quality.py
 python scripts/evaluate_agent_trace.py
-python scripts/check_technical_spec_compliance.py --knowledge-base-name Bayes
+python scripts/check_technical_spec_compliance.py --knowledge-base-name "<knowledge-base-name>"
 python scripts/reconcile_vector_records.py
 python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --execute
 ```
 
 `evaluate_layered_retrieval.py` replays persisted traces by default; creating a
 new retrieval requires an explicit query plus `--execute`. Write scripts
-default to dry-run or require explicit `--execute`. Generated reports go under
-`output/`.
+default to dry-run or require explicit `--execute`. Diagnostics go under the
+Git-ignored `output/` directory and may be cleared after review.
 
 ## Documents
 
 - [docs/technical-spec.md](./docs/technical-spec.md): Four-Layer Context Graph RAG technical white paper.
-- [docs/todo.md](./docs/todo.md): engineering implementation checklist.
 - [apps/api/README.md](./apps/api/README.md): API backend guide.
 - [apps/web/README.md](./apps/web/README.md): Web frontend guide.
 - [apps/worker/README.md](./apps/worker/README.md): Worker guide.
@@ -223,7 +222,7 @@ default to dry-run or require explicit `--execute`. Generated reports go under
 - `chunks` are the primary unit for indexing, citation, retrieval, QA, and graph links.
 - The structure graph preserves the source map and context-restoration paths only; it does not create, retain, or weight chunk relation edges.
 - The chunk relation graph stores content-semantic relations and allowed RQ chunk-pair evidence only.
-- RQ fuzzy membership supplies routing and projection weights only. Deterministic eligibility rules compress Mid/Coarse concepts, and upper-layer edges must be projected from bottom chunk relation edge support.
+- RQ persists one three-level primary chain and its confidence per chunk. Deterministic eligibility rules compress Mid/Coarse concepts, and upper-layer edges must be projected from bottom chunk relation edge support.
 - QA uses context packages, not raw search results.
 - Citations point to raw chunk spans.
 - Qdrant and Redis are active derived/runtime state and must be rebuildable or refreshable from PostgreSQL.

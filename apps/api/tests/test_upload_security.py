@@ -437,6 +437,47 @@ async def test_real_asgi_rejects_raw_path_and_unicode_confusable_filenames_with_
 
 
 @pytest.mark.asyncio
+async def test_real_asgi_preserves_safe_fullwidth_colon_in_upload_display_name(
+    db_session,
+    sample_knowledge_base,
+):
+    from app.models import Document
+    from app.services.storage import (
+        UPLOAD_FILENAME_VALIDATION_PROTOCOL_VERSION,
+        normalize_upload_filename,
+        normalize_upload_source_slot_key,
+    )
+
+    filename = "unit-test-product：inventory.md"
+    assert normalize_upload_filename(filename) == filename
+    assert normalize_upload_source_slot_key(filename) == (
+        "upload/unit-test-product:inventory.md"
+    )
+    assert UPLOAD_FILENAME_VALIDATION_PROTOCOL_VERSION == (
+        "nfkc_security_shadow_display_colon_preservation_v3"
+    )
+
+    body, boundary = _raw_multipart_body(
+        filename,
+        b"# synthetic fullwidth-colon upload\n",
+    )
+    async with await _asgi_client(db_session) as client:
+        response = await client.post(
+            "files/upload",
+            params={"knowledge_base_id": sample_knowledge_base.id},
+            content=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}"
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    document = db_session.get(Document, response.json()["document_id"])
+    assert document is not None
+    assert document.title == "unit-test-product：inventory"
+
+
+@pytest.mark.asyncio
 async def test_real_asgi_pre_admission_rejections_leave_no_durable_side_effects(
     monkeypatch,
     db_session,

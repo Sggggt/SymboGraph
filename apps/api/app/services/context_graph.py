@@ -415,7 +415,7 @@ STRUCTURE_MAPPING_BUSINESS_FACT_DIGEST_PROTOCOL_VERSION = (
 STRUCTURE_MAPPING_ADDRESS_SET_PROTOCOL_VERSION = (
     "structure_mapping_complete_address_stream_v1"
 )
-COARSE_MEMBERSHIP_PROTOCOL_VERSION = "coarse_membership_rq_l2_mid_fuzzy_v1"
+COARSE_MEMBERSHIP_PROTOCOL_VERSION = "coarse_membership_rq_l2_mid_primary_v2"
 COARSE_NODE_WEIGHT_PROTOCOL_VERSION = (
     "coarse_node_weight_rq_l2_mid_evidence_v1"
 )
@@ -523,7 +523,7 @@ TRAVERSAL_OBSERVATION_BUDGET_PROTOCOL_VERSION = "traversal_observation_budget_ha
 EDGE_REUSE_HARD_INTERRUPT_PROTOCOL_VERSION = "edge_reuse_hard_interrupt_v1"
 CANDIDATE_POOL_DEDUPE_PROTOCOL_VERSION = "candidate_pool_dedupe_hard_interrupt_v1"
 QUERY_RQ_SEED_PROTOCOL_VERSION = (
-    "query_rq_fuzzy_membership_chunk_seed_v2"
+    "query_rq_primary_residual_mid_dense_v5"
 )
 CHUNK_FACET_PRIORITY_PROTOCOL_VERSION = (
     "validated_query_facet_posterior_chunk_priority_v2"
@@ -549,17 +549,21 @@ QUERY_FACET_ORDERED_WINDOW_PROTOCOL_VERSION = (
 QUERY_FACET_ORDERED_WINDOW_MIN_SPAN = 12
 QUERY_FACET_ORDERED_WINDOW_TOKEN_MULTIPLIER = 4
 QUERY_RQ_CHUNK_SEED_COMPONENT_WEIGHTS = {
-    "rq_relevance": 0.70,
-    "mid_entry": 0.20,
-    "dense": 0.10,
+    "rq_relevance": 0.20,
+    "mid_entry": 0.50,
+    "dense": 0.30,
 }
 QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK = {
     "primary_member": 0,
-    "fuzzy_member": 1,
-    "boundary_member": 2,
-    "outlier_member": 3,
-    "noise_candidate": 4,
+    "boundary_member": 1,
+    "outlier_member": 2,
+    "noise_candidate": 3,
+    "bridge_member": 5,
+    "low_confidence_member": 5,
 }
+QUERY_RQ_MID_SUPPORT_FALLBACK_TIE_BREAK_RANK = (
+    max(QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK.values()) + 1
+)
 HARD_INTERRUPT_SAMPLE_LIMIT = 64
 CONCEPT_I18N_PROTOCOL_VERSION = "concept_i18n_bilingual_v1"
 QUERY_FACET_PROTOCOL_VERSION = "query_facet_packet_v2"
@@ -2939,12 +2943,14 @@ def query_rq_seed_protocol_hash() -> str:
                 "component_weights": (
                     QUERY_RQ_CHUNK_SEED_COMPONENT_WEIGHTS
                 ),
-                "no_query_rq_fuzzy_overlap": (
+                "primary_membership_hard_base_gate": True,
+                "primary_rq_relevance": (
+                    "primary_membership*exp(-residual_distance/tau_r)"
+                ),
+                "membership_overlap_diagnostic_only": (
                     "sqrt(query_prefix_score*chunk_membership_score)"
                 ),
-                "query_rq_present_score": (
-                    "0.75*rq_candidate_score+0.25*fuzzy_overlap"
-                ),
+                "membership_overlap_used_in_effective_score": False,
                 "membership_role_tie_break": (
                     QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK
                 ),
@@ -2959,6 +2965,9 @@ def query_rq_seed_protocol_hash() -> str:
                         "dense": 0.20,
                     },
                     "rq_path_and_membership_components": 0.0,
+                    "membership_role_tie_break_rank": (
+                        QUERY_RQ_MID_SUPPORT_FALLBACK_TIE_BREAK_RANK
+                    ),
                 },
                 "candidate_card_coverage": (
                     "every_chunk_by_mid_candidate_has_nonempty_cards"
@@ -10596,18 +10605,16 @@ RQ_LEVELS = 3
 RQ_MAX_K = 6
 RQ_TAU_R = 0.65
 RQ_TAU_L = 0.35
-RQ_MEMBERSHIP_TOP_M = 2
-RQ_MEMBERSHIP_PROBABILITY_THRESHOLD = 0.05
 RQ_MEMBERSHIP_PROTOCOL_VERSION = RQ_MEMBERSHIP_PROTOCOL_DEFAULT
-RQ_INDEX_PROTOCOL_VERSION = "residual_quantized_kmeans_fuzzy_v2"
+RQ_PRIMARY_MEMBERSHIPS_PER_CHUNK = RQ_LEVELS
+RQ_INDEX_PROTOCOL_VERSION = "residual_quantized_kmeans_primary_v3"
 RQ_ENCODING_BATCH_SIZE = 256
-RQ_MEMBERSHIP_ROLE_PROTOCOL_VERSION = "rq_membership_role_entropy_boundary_v1"
+RQ_MEMBERSHIP_ROLE_PROTOCOL_VERSION = "rq_membership_role_primary_entropy_boundary_v2"
 RQ_PREFIX_PAIR_DIAGNOSTIC_PROTOCOL_VERSION = "rq_prefix_pair_diagnostics_v1"
 RQ_PREFIX_PAIR_DIAGNOSTIC_EDGE_TYPES = (
     "parent_child",
     "sibling",
     "centroid_near",
-    "membership_overlap",
     "projected_chunk_support",
 )
 RQ_PREFIX_CENTROID_NEIGHBORS = 3
@@ -10639,11 +10646,6 @@ def rq_runtime_config() -> dict[str, float | int | str]:
         raise RuntimeError(
             f"Active Four-Layer RQ depth must be exactly {RQ_LEVELS}; configured={raw_levels!r}"
         )
-    raw_top_m = getattr(settings, "rq_membership_top_m", RQ_MEMBERSHIP_TOP_M)
-    if type(raw_top_m) is not int or not 1 <= raw_top_m <= RQ_MAX_K:
-        raise RuntimeError(
-            f"RQ fuzzy membership top-m must be an integer in [1, {RQ_MAX_K}]; configured={raw_top_m!r}"
-        )
     raw_max_k = getattr(settings, "rq_kmeans_max_k", RQ_MAX_K)
     if type(raw_max_k) is not int or not 1 <= raw_max_k <= RQ_MAX_K:
         raise RuntimeError(
@@ -10653,20 +10655,7 @@ def rq_runtime_config() -> dict[str, float | int | str]:
     raw_tau_l = getattr(settings, "rq_membership_temperature", RQ_TAU_L)
     tau_l = float(RQ_TAU_L if raw_tau_l is None else raw_tau_l)
     if not math.isfinite(tau_l) or not 0.0 < tau_l <= 10.0:
-        raise RuntimeError(f"RQ fuzzy membership temperature must be in (0, 10]; configured={raw_tau_l!r}")
-    raw_threshold = getattr(
-        settings,
-        "rq_membership_probability_threshold",
-        RQ_MEMBERSHIP_PROBABILITY_THRESHOLD,
-    )
-    probability_threshold = float(
-        RQ_MEMBERSHIP_PROBABILITY_THRESHOLD if raw_threshold is None else raw_threshold
-    )
-    if not math.isfinite(probability_threshold) or not 0.0 <= probability_threshold <= 1.0:
-        raise RuntimeError(
-            "RQ fuzzy membership probability threshold must be in [0, 1]; "
-            f"configured={raw_threshold!r}"
-        )
+        raise RuntimeError(f"RQ membership temperature must be in (0, 10]; configured={raw_tau_l!r}")
     membership_protocol = str(
         getattr(settings, "rq_membership_protocol", RQ_MEMBERSHIP_PROTOCOL_VERSION)
         or RQ_MEMBERSHIP_PROTOCOL_VERSION
@@ -10685,8 +10674,6 @@ def rq_runtime_config() -> dict[str, float | int | str]:
         "max_k": raw_max_k,
         "tau_r": tau_r,
         "tau_l": tau_l,
-        "top_m": raw_top_m,
-        "probability_threshold": probability_threshold,
         "membership_protocol": membership_protocol,
     }
 
@@ -10704,19 +10691,18 @@ def rq_membership_protocol_hash(config: dict[str, Any] | None = None) -> str:
             "soft_assignment": "full_codebook_softmax_negative_distance",
             "prefix_membership": "gamma_times_product_of_unpruned_level_probabilities",
             "residual_confidence": "exp_negative_final_residual_norm_over_tau_r",
-            "sparsification": "primary_always_retained_then_probability_threshold_and_top_m",
-            "renormalize_after_sparsification": False,
+            "materialization": "complete_primary_chain_only",
+            "cartesian_prefix_expansion": False,
+            "primary_chain_always_retained": True,
+            "non_primary_membership_materialization": False,
+            "max_memberships_per_chunk": RQ_PRIMARY_MEMBERSHIPS_PER_CHUNK,
+            "softmax_diagnostics_cover_full_codebook": True,
+            "renormalize_after_primary_selection": False,
             "artificial_membership_floor": False,
             "levels": int(resolved.get("levels") or RQ_LEVELS),
             "max_k": int(resolved.get("max_k") or RQ_MAX_K),
             "tau_l": float(resolved.get("tau_l") or RQ_TAU_L),
             "tau_r": float(resolved.get("tau_r") or RQ_TAU_R),
-            "top_m": int(resolved.get("top_m") or RQ_MEMBERSHIP_TOP_M),
-            "probability_threshold": float(
-                resolved.get("probability_threshold")
-                if resolved.get("probability_threshold") is not None
-                else RQ_MEMBERSHIP_PROBABILITY_THRESHOLD
-            ),
         }
     )
 
@@ -10733,7 +10719,7 @@ def rq_membership_role_protocol_hash() -> str:
                 "residual_confidence_gamma",
                 "boundary_probability_margin",
                 "boundary_distance",
-                "primary_leaf",
+                "primary_prefix",
                 "bridge_support",
             ],
             "thresholds": RQ_MEMBERSHIP_ROLE_THRESHOLDS,
@@ -10744,7 +10730,6 @@ def rq_membership_role_protocol_hash() -> str:
                 "low_confidence_member",
                 "boundary_member",
                 "primary_member",
-                "fuzzy_member",
             ],
             "model_call_budget": 0,
         }
@@ -10773,7 +10758,6 @@ def rq_prefix_pair_diagnostic_protocol_hash() -> str:
                 "median": "full_precision_sorted_middle_or_even_mean",
                 "empty_nonzero_distance_fallback": 1.0,
             },
-            "membership_overlap": "weighted_jaccard_sum_min_over_sum_max",
             "projected_chunk_support": (
                 "membership_product_weighted_mean_of_calibrated_bottom_edge_strength"
             ),
@@ -10805,7 +10789,7 @@ def classify_rq_membership_role(
     boundary_probability_margin: float,
     boundary_distance: float,
     residual_outlier_threshold: float,
-    is_primary_leaf: bool,
+    is_primary_prefix: bool,
     is_bridge_chunk: bool,
 ) -> dict[str, Any]:
     numeric_inputs = {
@@ -10827,6 +10811,8 @@ def classify_rq_membership_role(
         raise ValueError("RQ gamma and probability margin must be in [0, 1]")
     if type(rank) is not int or rank <= 0:
         raise ValueError("RQ membership rank must be a positive integer")
+    if is_primary_prefix is not True:
+        raise ValueError("Active RQ memberships must belong to the primary chain")
 
     thresholds = RQ_MEMBERSHIP_ROLE_THRESHOLDS
     flags = {
@@ -10846,8 +10832,7 @@ def classify_rq_membership_role(
             <= thresholds["boundary_probability_margin_max"]
             or boundary_distance <= thresholds["boundary_distance_max"]
         ),
-        "primary_member": bool(is_primary_leaf),
-        "fuzzy_member": not is_primary_leaf or rank > 1,
+        "primary_member": True,
     }
     role = next(
         role_name
@@ -10858,7 +10843,6 @@ def classify_rq_membership_role(
             "low_confidence_member",
             "boundary_member",
             "primary_member",
-            "fuzzy_member",
         )
         if flags[role_name]
     )
@@ -10872,7 +10856,7 @@ def classify_rq_membership_role(
         "inputs": {
             **{key: float(value) for key, value in numeric_inputs.items()},
             "rank": rank,
-            "is_primary_leaf": bool(is_primary_leaf),
+            "is_primary_prefix": True,
             "is_bridge_chunk": bool(is_bridge_chunk),
         },
         "model_call_count": 0,
@@ -11599,23 +11583,6 @@ def build_rq_prefix_pair_diagnostics(
                             "pairwise_scope_count": len(level_prefixes),
                         },
                     )
-                if float(overlap["overlap_mass"]) > 0.0:
-                    add_payload(
-                        source,
-                        target,
-                        edge_type="membership_overlap",
-                        diagnostic_strength=float(overlap["weighted_jaccard"]),
-                        support_membership_mass=float(overlap["overlap_mass"]),
-                        support_chunk_ids=overlap["shared_chunk_ids"],
-                        source_algorithm="rq_fuzzy_membership_weighted_jaccard_v1",
-                        formula_inputs={
-                            "rq_level": level,
-                            "overlap_mass": round(float(overlap["overlap_mass"]), 15),
-                            "union_mass": round(float(overlap["union_mass"]), 15),
-                            "shared_chunk_count": len(overlap["shared_chunk_ids"]),
-                        },
-                    )
-
     projected: dict[tuple[str, str], dict[str, Any]] = {}
     unique_edges = sorted(
         {str(edge.id): edge for edge in edges.values() if edge.id}.values(),
@@ -11727,7 +11694,7 @@ def build_rq_prefix_pair_diagnostics(
             support_membership_mass=membership_mass,
             support_chunk_ids=aggregate["chunk_ids"],
             support_chunk_edge_ids=aggregate["chunk_edge_ids"],
-            source_algorithm="chunk_relation_fuzzy_membership_projection_v1",
+            source_algorithm="chunk_relation_primary_membership_projection_v2",
             formula_inputs={
                 "membership_product_mass": round(membership_mass, 15),
                 "membership_weighted_strength_mass": round(
@@ -11891,8 +11858,6 @@ def build_rq_kmeans_clusters_and_edges(
         max_k=int(rq_config["max_k"]),
         tau_r=float(rq_config["tau_r"]),
         tau_l=float(rq_config["tau_l"]),
-        membership_top_m=int(rq_config["top_m"]),
-        membership_probability_threshold=float(rq_config["probability_threshold"]),
         membership_protocol=str(rq_config["membership_protocol"]),
     )
     if not rq_model.get("codebooks"):
@@ -11947,10 +11912,6 @@ def build_rq_kmeans_clusters_and_edges(
     for (level, _prefix), member_entries in prefix_groups.items():
         for chunk_id, membership in member_entries:
             encoded = assignments[chunk_id]
-            is_primary_leaf = bool(
-                membership["is_primary_prefix"]
-                and level == len(encoded["rq_path"])
-            )
             membership["role_evaluation"] = classify_rq_membership_role(
                 membership_score=float(membership["membership_score"]),
                 rank=int(membership["rank"]),
@@ -11962,11 +11923,11 @@ def build_rq_kmeans_clusters_and_edges(
                 ),
                 boundary_distance=float(membership["boundary_distance"]),
                 residual_outlier_threshold=residual_outlier_threshold,
-                is_primary_leaf=is_primary_leaf,
+                is_primary_prefix=bool(membership["is_primary_prefix"]),
                 is_bridge_chunk=chunk_id in bridge_chunk_ids,
             )
 
-    # The address tree is hard even though chunk memberships are fuzzy.  Flush
+    # The address tree and all persisted chunk memberships are primary. Flush
     # once per tree depth so children can reference durable parent ids; all
     # membership rows are inserted in one bounded batch below.
     for level in range(1, int(rq_config["levels"]) + 1):
@@ -12001,7 +11962,7 @@ def build_rq_kmeans_clusters_and_edges(
             )
             if level > 1 and parent_prefix is None:
                 raise RuntimeError(
-                    f"RQ fuzzy prefix {list(prefix)!r} is missing its hard parent"
+                    f"RQ primary prefix {list(prefix)!r} is missing its hard parent"
                 )
             score_by_chunk = {
                 chunk_id: float(membership["membership_score"])
@@ -12064,7 +12025,7 @@ def build_rq_kmeans_clusters_and_edges(
                     "residual_norm_max": max(residual_norms or [0.0]),
                 },
                 diagnostics_json={
-                    "source": "rq_fuzzy_softmax",
+                    "source": "rq_primary_chain",
                     "residual_mean_vector": residual_mean,
                     "membership_protocol_version": RQ_MEMBERSHIP_PROTOCOL_VERSION,
                     "membership_protocol_hash": rq_model["membership_protocol_hash"],
@@ -12089,16 +12050,6 @@ def build_rq_kmeans_clusters_and_edges(
         for key, cluster in level_clusters:
             rq_prefixes_by_key[key] = cluster
 
-    alternatives_by_chunk_depth: dict[tuple[str, int], list[tuple[float, str]]] = defaultdict(list)
-    for (level, prefix), member_entries in prefix_groups.items():
-        cluster = rq_prefixes_by_key[(level, prefix)]
-        for chunk_id, membership in member_entries:
-            alternatives_by_chunk_depth[(chunk_id, level)].append(
-                (float(membership["membership_score"]), cluster.id)
-            )
-    for alternatives in alternatives_by_chunk_depth.values():
-        alternatives.sort(key=lambda item: (-item[0], item[1]))
-
     rq_chunk_business_keys = chunk_business_references(db, chunks).key_by_id
     edge_support_by_chunk = {
         chunk_id: support_chunk_edge_ids_for_chunks(
@@ -12119,11 +12070,6 @@ def build_rq_kmeans_clusters_and_edges(
             encoded = assignments[chunk_id]
             role_evaluation = dict(membership["role_evaluation"])
             membership_role = str(role_evaluation["role"])
-            alternatives = [
-                prefix_id
-                for _score, prefix_id in alternatives_by_chunk_depth[(chunk_id, level)]
-                if prefix_id != cluster.id
-            ][: max(0, int(rq_config["top_m"]) ** level - 1)]
             membership_fact = {
                 "chunk_id": chunk_id,
                 "rq_prefix_key": cluster.rq_prefix_key,
@@ -12150,6 +12096,9 @@ def build_rq_kmeans_clusters_and_edges(
                 "residual_norm": round(float(encoded["residual_norm"]), 15),
                 "gamma": round(float(encoded["gamma"]), 15),
                 "membership_role_protocol_hash": role_evaluation["protocol_hash"],
+                "membership_origin": str(
+                    membership.get("membership_origin") or "primary_chain"
+                ),
             }
             membership_fact_hash = stable_hash(membership_fact)
             canonical_membership_facts.append(membership_fact)
@@ -12176,7 +12125,6 @@ def build_rq_kmeans_clusters_and_edges(
                     rq_path=list(prefix),
                     residual_norm=float(encoded["residual_norm"]),
                     rank=int(membership["rank"]),
-                    top_alternative_prefix_ids_json=alternatives,
                     support_chunk_edge_ids_json=edge_support_by_chunk[chunk_id],
                     diagnostics_json={
                         "residual_vector": encoded["residual_vector"],
@@ -12190,12 +12138,19 @@ def build_rq_kmeans_clusters_and_edges(
                             membership["assignment_probability_product"]
                         ),
                         "membership_formula": "gamma_times_product_of_unpruned_level_probabilities",
+                        "membership_origin": str(
+                            membership.get("membership_origin")
+                            or "primary_chain"
+                        ),
+                        "primary_membership_audit_hash": encoded[
+                            "primary_membership_audit"
+                        ]["audit_hash"],
                         "boundary_probability_margin": float(
                             membership["boundary_probability_margin"]
                         ),
                         "boundary_distance": float(membership["boundary_distance"]),
                         "membership_role_evaluation": role_evaluation,
-                        "renormalized_after_sparsification": False,
+                        "renormalized_after_primary_selection": False,
                         "artificial_membership_floor": False,
                         "membership_protocol_version": RQ_MEMBERSHIP_PROTOCOL_VERSION,
                         "membership_protocol_hash": rq_model["membership_protocol_hash"],
@@ -12305,6 +12260,69 @@ def build_rq_kmeans_clusters_and_edges(
         default=0.0,
     )
     rq_kmeans_diagnostics = dict((graph_state.diagnostics_json or {}).get("rq_kmeans") or {})
+    primary_audits = [
+        dict(encoded["primary_membership_audit"])
+        for encoded in assignments.values()
+    ]
+    membership_counts_by_chunk = {
+        str(chunk_id): len(encoded["prefix_memberships"])
+        for chunk_id, encoded in assignments.items()
+    }
+    primary_membership_counts_by_chunk = {
+        str(chunk_id): sum(
+            int(bool(membership["is_primary_prefix"]))
+            for membership in encoded["prefix_memberships"]
+        )
+        for chunk_id, encoded in assignments.items()
+    }
+    primary_membership_card = {
+        "protocol_version": RQ_MEMBERSHIP_PROTOCOL_VERSION,
+        "chunk_count": len(assignments),
+        "membership_count": len(membership_rows),
+        "primary_membership_count": sum(
+            primary_membership_counts_by_chunk.values()
+        ),
+        "non_primary_membership_count": 0,
+        "memberships_per_chunk": RQ_PRIMARY_MEMBERSHIPS_PER_CHUNK,
+        "observed_max_memberships_per_chunk": max(
+            membership_counts_by_chunk.values(), default=0
+        ),
+        "observed_min_memberships_per_chunk": min(
+            membership_counts_by_chunk.values(), default=0
+        ),
+        "all_primary_chains_complete": all(
+            count == int(rq_config["levels"])
+            for count in primary_membership_counts_by_chunk.values()
+        ),
+        "all_chunk_cardinalities_exact": all(
+            count == RQ_PRIMARY_MEMBERSHIPS_PER_CHUNK
+            for count in membership_counts_by_chunk.values()
+        ),
+        "softmax_prefix_combination_count": sum(
+            int(audit["softmax_prefix_combination_count"])
+            for audit in primary_audits
+        ),
+        "softmax_prefix_combinations_not_materialized": sum(
+            int(audit["softmax_prefix_combinations_not_materialized"])
+            for audit in primary_audits
+        ),
+        "cartesian_expansion_used": False,
+        "per_chunk_membership_count_hash": stable_hash(
+            membership_counts_by_chunk
+        ),
+        "per_chunk_primary_audit_hash": stable_hash(
+            {
+                chunk_id: assignments[chunk_id][
+                    "primary_membership_audit"
+                ]["audit_hash"]
+                for chunk_id in sorted(assignments)
+            }
+        ),
+        "model_call_count": 0,
+    }
+    primary_membership_card["audit_hash"] = stable_hash(
+        primary_membership_card
+    )
     graph_state.diagnostics_json = {
         **(graph_state.diagnostics_json or {}),
         "rq_kmeans": {
@@ -12323,15 +12341,11 @@ def build_rq_kmeans_clusters_and_edges(
             "codebook_hash": rq_model["codebook_hash"],
             "tau_l": float(rq_config["tau_l"]),
             "tau_r": float(rq_config["tau_r"]),
-            "top_m": int(rq_config["top_m"]),
-            "probability_threshold": float(rq_config["probability_threshold"]),
             "full_softmax_normalization_max_error": probability_normalization_max_error,
             "memberships_by_depth": {
                 str(depth): count for depth, count in sorted(depth_membership_counts.items())
             },
-            "multi_leaf_membership_chunk_count": sum(
-                1 for count in leaf_membership_counts.values() if count > 1
-            ),
+            "leaf_membership_chunk_count": len(leaf_membership_counts),
             "membership_score_distribution": {
                 "count": len(score_values),
                 "min": min(score_values) if score_values else None,
@@ -12353,7 +12367,8 @@ def build_rq_kmeans_clusters_and_edges(
             "path_availability": round(len(assignments) / max(len(chunks), 1), 6),
             "hard_parent_tree": True,
             "membership_write_batch_count": 1 if membership_rows else 0,
-            "renormalized_after_sparsification": False,
+            "primary_membership": primary_membership_card,
+            "renormalized_after_primary_selection": False,
             "artificial_membership_floor": False,
             "model_call_count": 0,
             "rq_pair_edges_active": False,
@@ -12393,16 +12408,7 @@ def annotate_relation_edges_with_rq_boundaries(
         selected = min(
             rows,
             key=lambda row: (
-                0
-                if bool(
-                    (
-                        ((row.diagnostics_json or {}).get("membership_role_evaluation") or {}).get(
-                            "inputs"
-                        )
-                        or {}
-                    ).get("is_primary_leaf")
-                )
-                else 1,
+                -len(row.rq_path or []),
                 int(row.rank or 0),
                 -float(row.membership_score or 0.0),
                 str(row.rq_prefix_id),
@@ -12489,8 +12495,6 @@ def train_rq_kmeans(
     max_k: int,
     tau_r: float | None = None,
     tau_l: float | None = None,
-    membership_top_m: int | None = None,
-    membership_probability_threshold: float | None = None,
     membership_protocol: str | None = None,
 ) -> dict[str, Any]:
     residuals = [list(vector) for vector in vectors]
@@ -12511,14 +12515,6 @@ def train_rq_kmeans(
         residuals = next_residuals
     resolved_tau_r = float(tau_r if tau_r is not None else rq_tau())
     resolved_tau_l = float(tau_l if tau_l is not None else RQ_TAU_L)
-    resolved_top_m = int(
-        membership_top_m if membership_top_m is not None else RQ_MEMBERSHIP_TOP_M
-    )
-    resolved_probability_threshold = float(
-        membership_probability_threshold
-        if membership_probability_threshold is not None
-        else RQ_MEMBERSHIP_PROBABILITY_THRESHOLD
-    )
     resolved_membership_protocol = str(
         membership_protocol or RQ_MEMBERSHIP_PROTOCOL_VERSION
     )
@@ -12532,8 +12528,6 @@ def train_rq_kmeans(
         "max_k": max_k,
         "tau_r": resolved_tau_r,
         "tau_l": resolved_tau_l,
-        "top_m": resolved_top_m,
-        "probability_threshold": resolved_probability_threshold,
         "membership_protocol": resolved_membership_protocol,
     }
     codebook_hash = stable_hash(
@@ -12554,8 +12548,9 @@ def train_rq_kmeans(
         "embedding_dimensions": len(vectors[0]) if vectors else 0,
         "tau_r": resolved_tau_r,
         "tau_l": resolved_tau_l,
-        "membership_top_m": resolved_top_m,
-        "membership_probability_threshold": resolved_probability_threshold,
+        "primary_memberships_per_chunk": (
+            RQ_PRIMARY_MEMBERSHIPS_PER_CHUNK
+        ),
         "membership_protocol": resolved_membership_protocol,
         "membership_protocol_hash": rq_membership_protocol_hash(protocol_config),
         "codebook_hash": codebook_hash,
@@ -12627,24 +12622,106 @@ def _canonical_rq_membership_fact(payload: dict[str, Any]) -> dict[str, Any]:
             15,
         ),
         "boundary_distance": round(float(payload.get("boundary_distance") or 0.0), 15),
+        "membership_origin": str(
+            payload.get("membership_origin") or "primary_chain"
+        ),
     }
 
+
+def primary_rq_prefix_memberships(
+    *,
+    primary_path: Sequence[int],
+    level_assignments: Sequence[Mapping[str, Any]],
+    gamma: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    normalized_primary_path = [int(value) for value in primary_path]
+    assignments = [dict(value) for value in level_assignments]
+    if len(normalized_primary_path) != len(assignments):
+        raise ValueError(
+            "RQ primary membership path must match assignment depth"
+        )
+
+    def path_probability(path: Sequence[int], depth: int) -> float:
+        product = 1.0
+        for assignment_index in range(depth):
+            probabilities = list(
+                assignments[assignment_index].get("probabilities") or []
+            )
+            code_index = int(path[assignment_index]) - 1
+            if not 0 <= code_index < len(probabilities):
+                raise ValueError(
+                    "RQ primary membership references an invalid code"
+                )
+            product *= float(probabilities[code_index])
+        return product
+
+    memberships: list[dict[str, Any]] = []
+    for depth in range(1, len(assignments) + 1):
+        prefix = normalized_primary_path[:depth]
+        probability_product = path_probability(prefix, depth)
+        memberships.append(
+            {
+                "prefix": prefix,
+                "depth": depth,
+                "rank": 1,
+                "is_primary_prefix": True,
+                "assignment_probability_product": probability_product,
+                "membership_score": float(gamma) * probability_product,
+                "membership_entropy": sum(
+                    float(assignment.get("entropy") or 0.0)
+                    for assignment in assignments[:depth]
+                )
+                / depth,
+                "boundary_probability_margin": min(
+                    float(
+                        assignment.get(
+                            "primary_probability_margin"
+                        )
+                        or 0.0
+                    )
+                    for assignment in assignments[:depth]
+                ),
+                "boundary_distance": min(
+                    float(
+                        assignment.get("primary_distance_margin")
+                        or 0.0
+                    )
+                    for assignment in assignments[:depth]
+                ),
+                "membership_origin": "primary_chain",
+            }
+        )
+
+    combination_count = 0
+    running_width = 1
+    for assignment in assignments:
+        running_width *= max(
+            1, len(assignment.get("candidate_codes") or [])
+        )
+        combination_count += running_width
+    audit = {
+        "protocol_version": RQ_MEMBERSHIP_PROTOCOL_VERSION,
+        "primary_chain_count": len(memberships),
+        "non_primary_membership_count": 0,
+        "materialized_membership_count": len(memberships),
+        "max_memberships_per_chunk": len(assignments),
+        "softmax_prefix_combination_count": combination_count,
+        "softmax_prefix_combinations_not_materialized": max(
+            0, combination_count - len(memberships)
+        ),
+        "cartesian_expansion_used": False,
+        "renormalized_after_primary_selection": False,
+        "artificial_membership_floor": False,
+        "model_call_count": 0,
+    }
+    audit["audit_hash"] = stable_hash(audit)
+    return memberships, audit
 
 def encode_rq_vector(vector: list[float], rq_model: dict[str, Any] | None) -> dict[str, Any]:
     codebooks = list((rq_model or {}).get("codebooks") or [])
     width = int((rq_model or {}).get("embedding_dimensions") or len(vector))
     tau_r = float((rq_model or {}).get("tau_r") or rq_tau())
     tau_l = float((rq_model or {}).get("tau_l") or RQ_TAU_L)
-    top_m = int((rq_model or {}).get("membership_top_m") or RQ_MEMBERSHIP_TOP_M)
-    probability_threshold_value = (rq_model or {}).get(
-        "membership_probability_threshold",
-        RQ_MEMBERSHIP_PROBABILITY_THRESHOLD,
-    )
-    probability_threshold = float(
-        RQ_MEMBERSHIP_PROBABILITY_THRESHOLD
-        if probability_threshold_value is None
-        else probability_threshold_value
-    )
     membership_protocol = str(
         (rq_model or {}).get("membership_protocol") or RQ_MEMBERSHIP_PROTOCOL_VERSION
     )
@@ -12653,10 +12730,6 @@ def encode_rq_vector(vector: list[float], rq_model: dict[str, Any] | None) -> di
             "RQ encoder received an unsupported membership protocol: "
             f"{membership_protocol!r}"
         )
-    if not 1 <= top_m <= RQ_MAX_K:
-        raise RuntimeError(f"RQ encoder top-m must be in [1, {RQ_MAX_K}]")
-    if not 0.0 <= probability_threshold <= 1.0:
-        raise RuntimeError("RQ encoder probability threshold must be in [0, 1]")
     residual = _fit_width(vector, width)
     reconstructed = [0.0 for _ in range(width)]
     path: list[int] = []
@@ -12673,22 +12746,6 @@ def encode_rq_vector(vector: list[float], rq_model: dict[str, Any] | None) -> di
         probabilities = rq_soft_assignment(distances, temperature=tau_l)
         ordered_indices = sorted(
             range(len(fitted_codebook)),
-            key=lambda candidate_index: (
-                -float(probabilities[candidate_index]),
-                float(distances[candidate_index]),
-                candidate_index,
-            ),
-        )
-        retained_indices = [
-            candidate_index
-            for candidate_index in ordered_indices
-            if candidate_index == index
-            or float(probabilities[candidate_index]) >= probability_threshold
-        ][:top_m]
-        if index not in retained_indices:
-            retained_indices = [index, *retained_indices[: max(0, top_m - 1)]]
-        retained_indices = sorted(
-            dict.fromkeys(retained_indices),
             key=lambda candidate_index: (
                 -float(probabilities[candidate_index]),
                 float(distances[candidate_index]),
@@ -12736,65 +12793,27 @@ def encode_rq_vector(vector: list[float], rq_model: dict[str, Any] | None) -> di
                         "rank": rank,
                         "is_primary": candidate_index == index,
                     }
-                    for rank, candidate_index in enumerate(retained_indices, start=1)
+                    for rank, candidate_index in enumerate(ordered_indices, start=1)
                 ],
-                "retained_probability_mass": float(
-                    sum(probabilities[candidate_index] for candidate_index in retained_indices)
-                ),
+                "full_probability_mass": float(sum(probabilities)),
             }
         )
         reconstructed = _vector_add(reconstructed, center)
         residual = _vector_sub(residual, center)
     residual_norm = _vector_norm(residual)
     gamma = rq_membership_score(residual_norm, tau_r=tau_r)
-    prefix_memberships: list[dict[str, Any]] = []
-    partial_prefixes: list[tuple[list[int], float]] = [([], 1.0)]
-    for level_assignment in level_assignments:
-        depth = int(level_assignment["level"])
-        next_prefixes: list[tuple[list[int], float]] = []
-        for prefix, probability_product in partial_prefixes:
-            for candidate in level_assignment["candidate_codes"]:
-                next_prefixes.append(
-                    (
-                        [*prefix, int(candidate["code"])],
-                        probability_product * float(candidate["probability"]),
-                    )
-                )
-        ranked_prefixes = sorted(next_prefixes, key=lambda item: (-item[1], item[0]))
-        entropy = sum(
-            float(assignment["entropy"])
-            for assignment in level_assignments[:depth]
-        ) / max(depth, 1)
-        boundary_probability_margin = min(
-            float(assignment["primary_probability_margin"])
-            for assignment in level_assignments[:depth]
+    prefix_memberships, primary_membership_audit = (
+        primary_rq_prefix_memberships(
+            primary_path=path,
+            level_assignments=level_assignments,
+            gamma=gamma,
         )
-        boundary_distance = min(
-            float(assignment["primary_distance_margin"])
-            for assignment in level_assignments[:depth]
-        )
-        for rank, (prefix, probability_product) in enumerate(ranked_prefixes, start=1):
-            prefix_memberships.append(
-                {
-                    "prefix": prefix,
-                    "depth": depth,
-                    "rank": rank,
-                    "is_primary_prefix": prefix == path[:depth],
-                    "assignment_probability_product": probability_product,
-                    "membership_score": gamma * probability_product,
-                    "membership_entropy": entropy,
-                    "boundary_probability_margin": boundary_probability_margin,
-                    "boundary_distance": boundary_distance,
-                }
-            )
-        partial_prefixes = ranked_prefixes
+    )
     membership_config = {
         "levels": len(level_assignments),
         "max_k": max((len(codebook) for codebook in codebooks), default=0),
         "tau_r": tau_r,
         "tau_l": tau_l,
-        "top_m": top_m,
-        "probability_threshold": probability_threshold,
         "membership_protocol": membership_protocol,
     }
     membership_protocol_hash = str(
@@ -12822,6 +12841,7 @@ def encode_rq_vector(vector: list[float], rq_model: dict[str, Any] | None) -> di
                 for assignment in level_assignments
             ],
             "prefix_memberships": canonical_memberships,
+            "primary_membership_audit": primary_membership_audit,
         }
     )
     return {
@@ -12837,8 +12857,7 @@ def encode_rq_vector(vector: list[float], rq_model: dict[str, Any] | None) -> di
         "membership_protocol": membership_protocol,
         "membership_protocol_hash": membership_protocol_hash,
         "membership_encoding_hash": encoding_hash,
-        "membership_top_m": top_m,
-        "membership_probability_threshold": probability_threshold,
+        "primary_membership_audit": primary_membership_audit,
     }
 
 
@@ -12909,12 +12928,6 @@ def rq_model_from_relation_state(relation_state: ChunkRelationGraphState | None)
         "max_k": int(model.get("max_k") or 0),
         "tau_r": float(model.get("tau_r") or 0.0),
         "tau_l": float(model.get("tau_l") or 0.0),
-        "top_m": int(model.get("membership_top_m") or 0),
-        "probability_threshold": float(
-            model.get("membership_probability_threshold")
-            if model.get("membership_probability_threshold") is not None
-            else -1.0
-        ),
         "membership_protocol": model.get("membership_protocol"),
     }
     expected_protocol_hash = rq_membership_protocol_hash(protocol_config)
@@ -12958,14 +12971,56 @@ def encode_query_rq(relation_state: ChunkRelationGraphState | None, query_vector
     }
 
 
-def query_rq_prefix_membership_score(query_rq: dict[str, Any], prefix: list[int]) -> float:
+def query_rq_prefix_membership_fact(
+    query_rq: dict[str, Any],
+    prefix: list[int],
+) -> dict[str, Any]:
     normalized_prefix = [int(value) for value in prefix]
     matches = [
-        float(membership.get("membership_score") or 0.0)
+        dict(membership)
         for membership in (query_rq.get("prefix_memberships") or [])
         if [int(value) for value in (membership.get("prefix") or [])] == normalized_prefix
     ]
-    return max(matches or [0.0])
+    if not matches:
+        return {
+            "prefix": normalized_prefix,
+            "membership_score": 0.0,
+            "membership_entropy": 1.0,
+            "rank": 0,
+            "is_primary_prefix": False,
+        }
+    selected = min(
+        matches,
+        key=lambda membership: (
+            -float(membership.get("membership_score") or 0.0),
+            float(membership.get("membership_entropy") or 0.0),
+            int(membership.get("rank") or 0),
+        ),
+    )
+    return {
+        "prefix": normalized_prefix,
+        "membership_score": max(
+            0.0,
+            min(1.0, float(selected.get("membership_score") or 0.0)),
+        ),
+        "membership_entropy": max(
+            0.0,
+            min(1.0, float(selected.get("membership_entropy") or 0.0)),
+        ),
+        "rank": int(selected.get("rank") or 0),
+        "is_primary_prefix": bool(selected.get("is_primary_prefix")),
+    }
+
+
+def query_rq_prefix_membership_score(
+    query_rq: dict[str, Any],
+    prefix: list[int],
+) -> float:
+    return float(
+        query_rq_prefix_membership_fact(query_rq, prefix)[
+            "membership_score"
+        ]
+    )
 
 
 def rq_candidate_score(query_rq: dict[str, Any], membership: RQPrefixMembership) -> dict[str, Any]:
@@ -12980,12 +13035,12 @@ def rq_candidate_score(query_rq: dict[str, Any], membership: RQPrefixMembership)
     residual_score = math.exp(-distance / tau)
     membership_score = max(0.0, min(1.0, float(membership.membership_score or 0.0)))
     query_membership_score = query_rq_prefix_membership_score(query_rq, candidate_path)
-    fuzzy_overlap_score = math.sqrt(max(0.0, query_membership_score * membership_score))
-    rq_score = max(0.0, min(1.0, 0.65 * fuzzy_overlap_score + 0.35 * residual_score))
+    membership_overlap_score = math.sqrt(max(0.0, query_membership_score * membership_score))
+    rq_score = max(0.0, min(1.0, 0.65 * membership_overlap_score + 0.35 * residual_score))
     lcp_ratio = lcp / levels
     rq_drift_penalty = max(
         0.0,
-        (1.0 - fuzzy_overlap_score) + 0.15 * min(distance, 10.0),
+        (1.0 - membership_overlap_score) + 0.15 * min(distance, 10.0),
     )
     return {
         "query_rq_path": query_path,
@@ -12997,7 +13052,8 @@ def rq_candidate_score(query_rq: dict[str, Any], membership: RQPrefixMembership)
         "candidate_residual_norm": round(float(membership.residual_norm or 0.0), 6),
         "query_prefix_membership_score": query_membership_score,
         "candidate_prefix_membership_score": membership_score,
-        "fuzzy_membership_overlap_score": fuzzy_overlap_score,
+        "membership_overlap_diagnostic_score": membership_overlap_score,
+        "residual_score": round(residual_score, 6),
         "rq_score": round(rq_score, 6),
         "rq_drift_penalty": round(rq_drift_penalty, 6),
         "membership_reason": membership.membership_reason,
@@ -13218,7 +13274,7 @@ STOP_TERMS = {
 
 
 CONCEPT_NODE_ELIGIBILITY_PROTOCOL_VERSION = (
-    "concept_node_eligibility_primary_fuzzy_coverage_v1"
+    "concept_node_eligibility_primary_coverage_v3"
 )
 CONCEPT_NODE_ELIGIBILITY_SAMPLE_LIMIT = 16
 
@@ -13241,6 +13297,26 @@ def _select_concept_eligibility_cards(
     layer: str,
     source_count: int,
 ) -> tuple[list[str], dict[str, Any]]:
+    normalized_cards: list[dict[str, Any]] = []
+    for raw_card in cards:
+        card = dict(raw_card)
+        primary_ids = sorted(
+            {str(value) for value in (card.get("primary_support_ids") or [])}
+        )
+        reasons = sorted(
+            {str(value) for value in (card.get("ineligible_reasons") or [])}
+        )
+        if not primary_ids:
+            reasons = sorted({*reasons, "no_primary_support"})
+        card["primary_support_ids"] = primary_ids
+        card["ineligible_reasons"] = reasons
+        card["admissible"] = bool(card.get("admissible")) and not reasons
+        business_fact = dict(card.get("business_fact") or {})
+        business_fact["ineligible_reasons"] = reasons
+        business_fact["primary_backed"] = bool(primary_ids)
+        card["business_fact"] = business_fact
+        normalized_cards.append(card)
+    cards = normalized_cards
     budget = min(
         concept_node_eligibility_budget(layer, source_count),
         sum(1 for card in cards if bool(card.get("admissible"))),
@@ -13255,13 +13331,7 @@ def _select_concept_eligibility_cards(
         for card in remaining.values()
         for item in (card.get("primary_support_ids") or [])
     }
-    all_fuzzy = {
-        str(item)
-        for card in remaining.values()
-        for item in (card.get("fuzzy_support_ids") or [])
-    }
     covered_primary: set[str] = set()
-    covered_fuzzy: set[str] = set()
     selected_ids: list[str] = []
     selected_samples: list[dict[str, Any]] = []
     while remaining and len(selected_ids) < budget:
@@ -13270,14 +13340,10 @@ def _select_concept_eligibility_cards(
             primary_ids = {
                 str(value) for value in (card.get("primary_support_ids") or [])
             }
-            fuzzy_ids = {
-                str(value) for value in (card.get("fuzzy_support_ids") or [])
-            }
             return (
                 -len(primary_ids - covered_primary),
-                -len(fuzzy_ids - covered_fuzzy),
-                -float(card.get("membership_mass") or 0.0),
-                -int(card.get("support_edge_count") or 0),
+                -float(card.get("primary_membership_mass") or 0.0),
+                -int(card.get("primary_support_edge_count") or 0),
                 str(card.get("prefix_key") or ""),
                 str(card.get("prefix_id") or ""),
             )
@@ -13285,9 +13351,6 @@ def _select_concept_eligibility_cards(
         prefix_id, card = min(remaining.items(), key=rank)
         primary_ids = {
             str(value) for value in (card.get("primary_support_ids") or [])
-        }
-        fuzzy_ids = {
-            str(value) for value in (card.get("fuzzy_support_ids") or [])
         }
         selected_ids.append(prefix_id)
         selected_samples.append(
@@ -13297,20 +13360,24 @@ def _select_concept_eligibility_cards(
                 "new_primary_support_count": len(
                     primary_ids - covered_primary
                 ),
-                "new_fuzzy_support_count": len(fuzzy_ids - covered_fuzzy),
                 "primary_support_count": len(primary_ids),
-                "fuzzy_support_count": len(fuzzy_ids),
                 "membership_mass": round(
                     float(card.get("membership_mass") or 0.0),
+                    12,
+                ),
+                "primary_membership_mass": round(
+                    float(card.get("primary_membership_mass") or 0.0),
                     12,
                 ),
                 "support_edge_count": int(
                     card.get("support_edge_count") or 0
                 ),
+                "primary_support_edge_count": int(
+                    card.get("primary_support_edge_count") or 0
+                ),
             }
         )
         covered_primary.update(primary_ids)
-        covered_fuzzy.update(fuzzy_ids)
         remaining.pop(prefix_id)
 
     canonical_facts = sorted(
@@ -13348,11 +13415,6 @@ def _select_concept_eligibility_cards(
         "primary_coverage_rate": (
             len(covered_primary) / len(all_primary) if all_primary else 1.0
         ),
-        "fuzzy_coverage_count": len(covered_fuzzy),
-        "fuzzy_scope_count": len(all_fuzzy),
-        "fuzzy_coverage_rate": (
-            len(covered_fuzzy) / len(all_fuzzy) if all_fuzzy else 1.0
-        ),
         "compression_rate": (
             1.0 - (len(selected_ids) / source_count)
             if source_count > 0
@@ -13367,6 +13429,7 @@ def _select_concept_eligibility_cards(
             len(selected_samples) <= CONCEPT_NODE_ELIGIBILITY_SAMPLE_LIMIT
         ),
         "llm_eligibility_authority": False,
+        "primary_only_selection_authority": True,
         "model_call_count": 0,
     }
     audit["audit_hash"] = stable_hash(audit)
@@ -13457,7 +13520,6 @@ def select_mid_concept_eligible_prefixes(
             memberships_by_prefix.get(str(prefix.id), []),
             key=lambda row: (str(row.chunk_id), int(row.rank or 0), str(row.id)),
         )
-        fuzzy_ids = sorted({str(row.chunk_id) for row in rows})
         primary_ids = sorted(
             {
                 str(row.chunk_id)
@@ -13468,20 +13530,38 @@ def select_mid_concept_eligible_prefixes(
                 )
             }
         )
+        primary_rows = [
+            row
+            for row in rows
+            if _rq_membership_is_primary(
+                row,
+                prefix_level=int(prefix.rq_level or 0),
+            )
+        ]
         declared_support_ids = sorted(
             {str(value) for value in (prefix.support_chunk_ids_json or [])}
         )
         ineligible_reasons: list[str] = []
-        if not fuzzy_ids:
-            ineligible_reasons.append("no_positive_fuzzy_membership")
-        if set(declared_support_ids) != set(fuzzy_ids):
+        if not primary_ids:
+            ineligible_reasons.append("no_positive_primary_membership")
+        if not primary_ids:
+            ineligible_reasons.append("no_primary_support")
+        if set(declared_support_ids) != set(primary_ids):
             ineligible_reasons.append("support_membership_scope_mismatch")
         if not set(declared_support_ids).issubset(span_chunk_ids):
             ineligible_reasons.append("support_span_incomplete")
         membership_mass = sum(float(row.membership_score or 0.0) for row in rows)
+        primary_membership_mass = sum(
+            float(row.membership_score or 0.0) for row in primary_rows
+        )
         support_edge_ids = {
             str(edge_id)
             for row in rows
+            for edge_id in (row.support_chunk_edge_ids_json or [])
+        }
+        primary_support_edge_ids = {
+            str(edge_id)
+            for row in primary_rows
             for edge_id in (row.support_chunk_edge_ids_json or [])
         }
         business_fact = {
@@ -13492,7 +13572,7 @@ def select_mid_concept_eligible_prefixes(
                 business_key_by_chunk_id.get(chunk_id, chunk_id)
                 for chunk_id in primary_ids
             ),
-            "fuzzy_support": [
+            "primary_memberships": [
                 {
                     "chunk_business_key": business_key_by_chunk_id.get(
                         str(row.chunk_id),
@@ -13502,15 +13582,18 @@ def select_mid_concept_eligible_prefixes(
                         float(row.membership_score or 0.0),
                         15,
                     ),
-                    "primary": _rq_membership_is_primary(
-                        row,
-                        prefix_level=int(prefix.rq_level or 0),
-                    ),
                 }
                 for row in rows
             ],
             "membership_mass": round(membership_mass, 15),
+            "primary_membership_mass": round(
+                primary_membership_mass,
+                15,
+            ),
             "support_edge_count": len(support_edge_ids),
+            "primary_support_edge_count": len(
+                primary_support_edge_ids
+            ),
             "span_complete": not (
                 set(declared_support_ids) - span_chunk_ids
             ),
@@ -13521,9 +13604,12 @@ def select_mid_concept_eligible_prefixes(
                 "prefix_id": str(prefix.id),
                 "prefix_key": str(prefix.rq_prefix_key or ""),
                 "primary_support_ids": primary_ids,
-                "fuzzy_support_ids": fuzzy_ids,
                 "membership_mass": membership_mass,
+                "primary_membership_mass": primary_membership_mass,
                 "support_edge_count": len(support_edge_ids),
+                "primary_support_edge_count": len(
+                    primary_support_edge_ids
+                ),
                 "admissible": not ineligible_reasons,
                 "ineligible_reasons": ineligible_reasons,
                 "business_fact": business_fact,
@@ -13590,9 +13676,13 @@ def select_coarse_concept_eligible_prefixes(
                 "prefix_id": str(prefix.id),
                 "prefix_key": str(prefix.rq_prefix_key or ""),
                 "primary_support_ids": child_ids,
-                "fuzzy_support_ids": child_ids,
                 "membership_mass": membership_mass,
+                "primary_membership_mass": float(len(child_ids)),
                 "support_edge_count": sum(
+                    len(concept.support_chunk_edge_ids_json or [])
+                    for concept in children
+                ),
+                "primary_support_edge_count": sum(
                     len(concept.support_chunk_edge_ids_json or [])
                     for concept in children
                 ),
@@ -14122,7 +14212,7 @@ def _mid_node_weight_card(
     total_role_mass = sum(role_mass.values()) or membership_mass
     core_mass = sum(
         role_mass.get(role, 0.0)
-        for role in ("primary_member", "fuzzy_member")
+        for role in ("primary_member",)
     )
     boundary_mass = sum(
         role_mass.get(role, 0.0)
@@ -18836,7 +18926,6 @@ def concept_packet_for_cluster(
         "core_chunk_ids": list(
             dict.fromkeys(
                 membership_role_chunk_ids.get("primary_member", [])
-                + membership_role_chunk_ids.get("fuzzy_member", [])
             )
         ),
         "outlier_chunk_ids": list(
@@ -19010,7 +19099,7 @@ def build_mid_concept_edges(db: Session, state: MidConceptState, concepts: list[
     for prefix_id in prefix_ids:
         if not membership_scores_by_prefix.get(prefix_id):
             raise RuntimeError(
-                f"Mid projection prefix {prefix_id} has no positive fuzzy memberships"
+                f"Mid projection prefix {prefix_id} has no positive primary memberships"
             )
     projection_chunk_ids = {
         str(chunk_id)
@@ -19201,7 +19290,7 @@ def _coarse_membership_card(
     l2_prefix: RQPrefix,
     l2_membership_rows: Sequence[RQPrefixMembership],
 ) -> dict[str, Any]:
-    """Replay one Mid -> Coarse membership from RQ L2 fuzzy facts."""
+    """Replay one Mid -> Coarse membership from RQ L2 primary facts."""
 
     support_chunk_ids = list(
         dict.fromkeys(str(value) for value in (concept.support_chunk_ids_json or []))
@@ -19237,7 +19326,7 @@ def _coarse_membership_card(
     )
     if final_score <= 0.0:
         raise RuntimeError(
-            "Coarse membership requires positive RQ L2 fuzzy support"
+            "Coarse membership requires positive RQ L2 primary support"
         )
 
     matched_roles = sorted(
@@ -19618,7 +19707,7 @@ def _persist_coarse_concept_provider_result(
             "provider_output_audit": provider_output_audit,
             "confidence": confidence_diagnostics,
             "executor_authority": {
-                "membership": "deterministic_rq_l2_fuzzy_replay",
+                "membership": "deterministic_rq_l2_primary_replay",
                 "roles": "deterministic_local_role_rule",
                 "support": "complete_rq_l2_positive_membership_scope",
                 "node_weight": COARSE_NODE_WEIGHT_PROTOCOL_VERSION,
@@ -20384,7 +20473,7 @@ async def build_coarse_concept_graph(
     for prefix_id in prefix_ids:
         if not membership_scores_by_prefix.get(prefix_id):
             raise RuntimeError(
-                f"Coarse projection prefix {prefix_id} has no positive fuzzy memberships"
+                f"Coarse projection prefix {prefix_id} has no positive primary memberships"
             )
     projection_chunk_ids = {
         str(chunk_id)
@@ -27014,10 +27103,10 @@ def select_rq_membership_entries(db: Session, knowledge_base_id: str, query_vect
                 )
             )
             residual_score = math.exp(-distance / max(float(query_rq.get("tau_r") or rq_tau()), 1e-6))
-            fuzzy_membership_score = query_rq_prefix_membership_score(query_rq, prefix)
+            primary_membership_score = query_rq_prefix_membership_score(query_rq, prefix)
             rq_score = max(
                 0.0,
-                min(1.0, 0.70 * fuzzy_membership_score + 0.30 * residual_score),
+                min(1.0, 0.70 * primary_membership_score + 0.30 * residual_score),
             )
             scores[cluster.id] = max(scores[cluster.id], rq_score)
     # Query -> RQ relevance remains a query-side fact. Selected Mid concepts
@@ -28231,7 +28320,7 @@ def project_gray_rq_membership_observation(
         "residual_distance",
         "query_prefix_membership_score",
         "candidate_prefix_membership_score",
-        "fuzzy_membership_overlap_score",
+        "membership_overlap_diagnostic_score",
         "membership_reason",
         "membership_role",
         "membership_rank",
@@ -29846,7 +29935,17 @@ def _cycle_reward_for_next_state(
     previous_path = list(state.get("path") or [])
     if neighbor_id not in previous_path:
         return 0.0, None
-    cap_remaining = max(0.0, float(envelope.get("max_cycle_reward_per_path") or 0.0) - float(state.get("reward_so_far") or 0.0))
+    cap_remaining = max(
+        0.0,
+        float(envelope.get("max_cycle_reward_per_path") or 0.0)
+        - float(
+            state.get(
+                "cycle_reward_so_far",
+                state.get("reward_so_far") or 0.0,
+            )
+            or 0.0
+        ),
+    )
     if cap_remaining <= 0:
         return 0.0, {
             "protocol_version": CYCLE_REWARD_REPLAY_PROTOCOL_VERSION,
@@ -31676,7 +31775,6 @@ def execute_priority_queue_traversal(
     if rq_membership_entries:
         for row in db.scalars(select(RQPrefixMembership).where(RQPrefixMembership.rq_prefix_id.in_(list(rq_membership_entries.keys())))).all():
             rq_rows_by_prefix[row.rq_prefix_id].append(row)
-
     def add_chunk_candidate(
         chunk_id: str,
         score: float,
@@ -31815,25 +31913,39 @@ def execute_priority_queue_traversal(
         membership_score = bounded_query_rq_score(
             row.membership_score
         )
-        fuzzy_overlap = round(
+        query_membership_fact = (
+            query_rq_prefix_membership_fact(
+                query_rq,
+                [int(value) for value in (row.rq_path or [])],
+            )
+            if query_rq is not None and row.rq_path
+            else {
+                "membership_score": 0.0,
+                "membership_entropy": 1.0,
+            }
+        )
+        query_prefix_score = bounded_query_rq_score(
+            query_membership_fact.get("membership_score")
+        )
+        membership_overlap = round(
             math.sqrt(
                 max(
                     0.0,
-                    bounded_query_rq_score(prefix_strength)
-                    * membership_score,
+                    query_prefix_score * membership_score,
                 )
             ),
             6,
         )
+        primary_membership = _rq_membership_is_primary(
+            row,
+            prefix_level=len(row.rq_path or []),
+        )
         if query_rq is not None and row.rq_path:
             rq_diagnostics = rq_candidate_score(query_rq, row)
-            exact_rq_score = bounded_query_rq_score(
-                rq_diagnostics["rq_score"]
-            )
-            rq_relevance = round(
-                0.75 * exact_rq_score
-                + 0.25 * fuzzy_overlap,
-                6,
+            rq_relevance = bounded_query_rq_score(
+                rq_diagnostics.get("residual_score")
+                if primary_membership
+                else 0.0
             )
         else:
             rq_diagnostics = {
@@ -31843,21 +31955,20 @@ def execute_priority_queue_traversal(
                 ],
                 "lcp_depth": 0,
                 "residual_distance": None,
-                "query_prefix_membership_score": (
-                    bounded_query_rq_score(prefix_strength)
-                ),
+                "query_prefix_membership_score": query_prefix_score,
                 "candidate_prefix_membership_score": (
                     membership_score
                 ),
-                "fuzzy_membership_overlap_score": fuzzy_overlap,
-                "rq_score": fuzzy_overlap,
+                "membership_overlap_diagnostic_score": membership_overlap,
+                "rq_score": 0.0,
+                "residual_score": 0.0,
                 "rq_drift_penalty": round(
-                    max(0.0, 1.0 - fuzzy_overlap),
+                    max(0.0, 1.0 - membership_overlap),
                     6,
                 ),
                 "hard_path_lcp_used_as_score": False,
             }
-            rq_relevance = fuzzy_overlap
+            rq_relevance = 0.0
         dense_score = bounded_query_rq_score(
             dense_entries.get(row.chunk_id, 0.0)
         )
@@ -31906,15 +32017,26 @@ def execute_priority_queue_traversal(
             "residual_distance": (
                 rq_diagnostics.get("residual_distance")
             ),
-            "query_prefix_score": bounded_query_rq_score(
-                prefix_strength
-            ),
+            "query_prefix_score": query_prefix_score,
             "chunk_membership_score": membership_score,
-            "fuzzy_membership_overlap_score": fuzzy_overlap,
+            "membership_overlap_diagnostic_score": membership_overlap,
             "rq_score": bounded_query_rq_score(
                 rq_diagnostics.get("rq_score")
             ),
+            "residual_score": bounded_query_rq_score(
+                rq_diagnostics.get("residual_score")
+            ),
             "rq_relevance_component": rq_relevance,
+            "primary_membership": primary_membership,
+            "membership_overlap_used_in_effective_score": False,
+            "query_membership_entropy": round(
+                float(
+                    query_membership_fact.get(
+                        "membership_entropy", 1.0
+                    )
+                ),
+                6,
+            ),
             "rq_drift_penalty": rq_diagnostics.get(
                 "rq_drift_penalty"
             ),
@@ -31939,7 +32061,7 @@ def execute_priority_queue_traversal(
                 QUERY_RQ_CHUNK_SEED_COMPONENT_WEIGHTS
             ),
             "effective_score": effective_score,
-            "score_source": "query_rq_fuzzy_membership",
+            "score_source": "query_rq_primary_base",
             "membership_role_tie_break_rank": int(
                 QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK.get(
                     membership_role,
@@ -31991,9 +32113,13 @@ def execute_priority_queue_traversal(
             "residual_distance": None,
             "query_prefix_score": 0.0,
             "chunk_membership_score": 0.0,
-            "fuzzy_membership_overlap_score": 0.0,
+            "membership_overlap_diagnostic_score": 0.0,
             "rq_score": 0.0,
+            "residual_score": 0.0,
             "rq_relevance_component": 0.0,
+            "primary_membership": False,
+            "membership_overlap_used_in_effective_score": False,
+            "query_membership_entropy": 1.0,
             "rq_drift_penalty": None,
             "membership_role": "mid_support_fallback",
             "membership_rank": 0,
@@ -32008,7 +32134,7 @@ def execute_priority_queue_traversal(
                 "mid_support_without_rq_membership"
             ),
             "membership_role_tie_break_rank": (
-                len(QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK) + 1
+                QUERY_RQ_MID_SUPPORT_FALLBACK_TIE_BREAK_RANK
             ),
             "is_evidence": False,
             "node_weight_used_as_query_relevance": False,
@@ -32085,7 +32211,7 @@ def execute_priority_queue_traversal(
                     "source": "mid_support_without_rq_membership",
                     "rq_seed_card": fallback_seed_card,
                     "membership_role_tie_break_rank": (
-                        len(QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK) + 1
+                        QUERY_RQ_MID_SUPPORT_FALLBACK_TIE_BREAK_RANK
                     ),
                 }
             )
@@ -32103,7 +32229,7 @@ def execute_priority_queue_traversal(
                 int(
                     item.get(
                         "membership_role_tie_break_rank",
-                        len(QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK) + 1,
+                        QUERY_RQ_MID_SUPPORT_FALLBACK_TIE_BREAK_RANK,
                     )
                 ),
                 str(item["id"]),
@@ -32188,10 +32314,7 @@ def execute_priority_queue_traversal(
                         int(
                             card.get(
                                 "membership_role_tie_break_rank",
-                                len(
-                                    QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK
-                                )
-                                + 1,
+                                QUERY_RQ_MID_SUPPORT_FALLBACK_TIE_BREAK_RANK,
                             )
                         )
                         for card in (
@@ -32199,8 +32322,7 @@ def execute_priority_queue_traversal(
                         )
                     ]
                     or [
-                        len(QUERY_RQ_MEMBERSHIP_ROLE_TIE_BREAK)
-                        + 1
+                        QUERY_RQ_MID_SUPPORT_FALLBACK_TIE_BREAK_RANK
                     ]
                 ),
                 str(item["id"]),
@@ -32562,6 +32684,7 @@ def execute_priority_queue_traversal(
             "path_edge_types": [],
             "distance_so_far": distance,
             "reward_so_far": 0.0,
+            "cycle_reward_so_far": 0.0,
             "covered_facets": sorted(covered),
             "evidence_roles": sorted(seed_roles[chunk_id]),
             "depth": 0,
@@ -32575,7 +32698,12 @@ def execute_priority_queue_traversal(
             "entry_support_refs": {},
         }
         state["state_signature"] = _state_signature_payload(state)
-        key = (len(required_facets - covered), distance, 0, -len(state["evidence_roles"]))
+        key = (
+            len(required_facets - covered),
+            round(distance, 6),
+            0,
+            -len(state["evidence_roles"]),
+        )
         heapq.heappush(frontier, (key, serial, state))
         frontier_enqueues.append(
             {
@@ -32710,6 +32838,9 @@ def execute_priority_queue_traversal(
             "path_edge_type_multiset": (state.get("state_signature") or {}).get("path_edge_type_multiset") or {},
             "distance_so_far": state["distance_so_far"],
             "reward_so_far": state["reward_so_far"],
+            "cycle_reward_so_far": float(
+                state.get("cycle_reward_so_far") or 0.0
+            ),
             "expanded_edge_ids": expanded_edge_ids,
         }
         path_labels.append(path_label)
@@ -32982,7 +33113,15 @@ def execute_priority_queue_traversal(
                 edge_strength=_edge_calibrated_strength(edge),
                 envelope=envelope,
             )
-            reward_so_far = round(max(0.0, float(state["reward_so_far"]) + max(0.0, reward_increment)), 6)
+            cycle_reward_so_far = round(
+                max(
+                    0.0,
+                    float(state.get("cycle_reward_so_far") or 0.0)
+                    + max(0.0, reward_increment),
+                ),
+                6,
+            )
+            reward_so_far = cycle_reward_so_far
             path_edge_types = list(state.get("path_edge_types") or []) + [edge_type]
             next_state = {
                 "layer": "chunk",
@@ -32996,6 +33135,7 @@ def execute_priority_queue_traversal(
                 "path_edge_types": path_edge_types,
                 "distance_so_far": next_distance,
                 "reward_so_far": reward_so_far,
+                "cycle_reward_so_far": cycle_reward_so_far,
                 "cycle_distance_rewards": list(state.get("cycle_distance_rewards") or []) + ([cycle_diagnostics] if cycle_diagnostics else []),
                 "distance_zone": zone,
                 "covered_facets": sorted(covered),
@@ -33160,6 +33300,9 @@ def execute_priority_queue_traversal(
                 "covered_facets": state["covered_facets"],
                 "distance_so_far": state["distance_so_far"],
                 "reward_so_far": state["reward_so_far"],
+                "cycle_reward_so_far": float(
+                    state.get("cycle_reward_so_far") or 0.0
+                ),
                 "evidence_roles": state["evidence_roles"],
                 "parent_layer": state.get("parent_layer"),
                 "parent_node_id": state.get("parent_node_id"),
@@ -33239,6 +33382,7 @@ def execute_priority_queue_traversal(
             "support_refs": {"support_chunk_ids": [chunk_id]},
             "distance_so_far": 0.0,
             "reward_so_far": 0.0,
+            "cycle_reward_so_far": 0.0,
         }
         carry_forward_summary = aggregate_node_path_contributions(
             [carry_forward_state]
@@ -33313,6 +33457,7 @@ def execute_priority_queue_traversal(
                 "entry_parent_refs": [],
                 "distance_so_far": 0.0,
                 "reward_so_far": 0.0,
+                "cycle_reward_so_far": 0.0,
                 "stop_reason": "repair_supported_evidence_carry_forward",
                 "repair_evidence_retention_protocol_version": (
                     REPAIR_EVIDENCE_RETENTION_PROTOCOL_VERSION
@@ -33403,6 +33548,17 @@ def execute_priority_queue_traversal(
         raise RuntimeError(
             "chunk traversal observation budget audit does not match local gray-zone evaluation count"
         )
+    for label in path_labels:
+        cycle_total = float(
+            label.get("cycle_reward_so_far") or 0.0
+        )
+        if abs(
+            float(label.get("reward_so_far") or 0.0)
+            - round(cycle_total, 6)
+        ) > 1e-6:
+            raise RuntimeError(
+                "traversal reward total does not replay cycle rewards"
+            )
     convergence = {
         "reason": stop_reason,
         "convergence_replay_protocol_version": (
@@ -33672,6 +33828,7 @@ def execute_priority_queue_traversal(
             "explicit_query_relevance_precedence": True,
             "selected_mid_route_fallback_only_when_missing": True,
             "mid_support_baseline_may_mask_rq_seed": False,
+            "membership_overlap_used_in_effective_score": False,
             "node_weight_used_as_query_relevance": False,
             "hard_path_lcp_used_as_score": False,
             "is_evidence": False,
@@ -34666,7 +34823,19 @@ def write_retrieval_trace(
         popped_state = popped[0] if popped else {}
         layer_path_labels = walk.get("path_labels") or []
         expanded_edge_ids = list(dict.fromkeys(edge_id for label in layer_path_labels for edge_id in (label.get("expanded_edge_ids") or [])))
-        cycle_distance_reward = max([float(label.get("reward_so_far") or 0.0) for label in layer_path_labels] + [0.0])
+        cycle_distance_reward = max(
+            [
+                float(
+                    label.get(
+                        "cycle_reward_so_far",
+                        label.get("reward_so_far") or 0.0,
+                    )
+                    or 0.0
+                )
+                for label in layer_path_labels
+            ]
+            + [0.0]
+        )
         convergence = walk.get("convergence") or {}
         parent_layer = None
         parent_node_id = None
@@ -36605,7 +36774,6 @@ def graph_layer_payload(db: Session, knowledge_base_id: str, layer: str, *, limi
                     "membership_role": row.membership_role,
                     "membership_entropy": row.membership_entropy,
                     "membership_rank": row.rank,
-                    "top_alternative_prefix_ids": row.top_alternative_prefix_ids_json or [],
                     "rq_path": row.rq_path or [],
                     "residual_norm": row.residual_norm,
                 },

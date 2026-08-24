@@ -196,7 +196,7 @@ def test_docker_smoke_coverage_flags_fail_closed() -> None:
 
 def _rq_seed_trace_fixture() -> dict:
     audit = {
-        "protocol_version": "query_rq_fuzzy_membership_chunk_seed_v2",
+        "protocol_version": "query_rq_primary_residual_mid_dense_v5",
         "protocol_hash": "a" * 64,
         "model_call_count": 0,
         "gray_zone_decision_authority": False,
@@ -253,6 +253,67 @@ def test_docker_smoke_rejects_retired_candidate_rq_only_trace() -> None:
 
     with pytest.raises(RuntimeError, match="typed RQ seed audit"):
         docker_smoke.validate_retrieval_rq_seed_diagnostics(trace)
+
+
+def test_docker_smoke_accepts_explicit_evidence_insufficiency_without_citations() -> None:
+    docker_smoke = _load_docker_smoke()
+
+    audit = docker_smoke.validate_qa_acceptance_payload(
+        {
+            "answer": "The available evidence is insufficient.",
+            "citations": [],
+            "model_audit": {
+                "grounding_outcome": "insufficient_evidence",
+                "insufficient_evidence": True,
+                "citation_verification_pass_rate": 0.0,
+            },
+        }
+    )
+
+    assert audit["insufficient_evidence"] is True
+    assert audit["context_package_required"] is True
+    assert audit["returned_citation_count"] == 0
+
+
+def test_docker_smoke_accepts_pre_package_evidence_gate_block() -> None:
+    docker_smoke = _load_docker_smoke()
+
+    audit = docker_smoke.validate_qa_acceptance_payload(
+        {
+            "answer": "The available corpus is insufficient; narrow the question.",
+            "citations": [],
+            "context_package_id": None,
+            "model_audit": {
+                "context_package_evidence_gate_passed": False,
+                "answer_model_called": False,
+                "evidence_evaluator": {
+                    "verdict": "insufficient_corpus"
+                },
+            },
+        }
+    )
+
+    assert audit["insufficient_evidence"] is True
+    assert audit["evidence_gate_blocked"] is True
+    assert audit["context_package_required"] is False
+    assert audit["returned_citation_count"] == 0
+
+
+def test_docker_smoke_requires_citations_for_grounded_answer() -> None:
+    docker_smoke = _load_docker_smoke()
+
+    with pytest.raises(RuntimeError, match="Grounded QA returned no citations"):
+        docker_smoke.validate_qa_acceptance_payload(
+            {
+                "answer": "A factual answer.",
+                "citations": [],
+                "model_audit": {
+                    "grounding_outcome": "grounded_answer",
+                    "insufficient_evidence": False,
+                    "citation_verification_pass_rate": 0.0,
+                },
+            }
+        )
 
 
 class _FakeResponse:

@@ -1401,10 +1401,6 @@ def _candidate_rq_prefix_inputs(
         max_k=int(rq_config["max_k"]),
         tau_r=float(rq_config["tau_r"]),
         tau_l=float(rq_config["tau_l"]),
-        membership_top_m=int(rq_config["top_m"]),
-        membership_probability_threshold=float(
-            rq_config["probability_threshold"]
-        ),
         membership_protocol=str(rq_config["membership_protocol"]),
     )
     assignments, batch_count = encode_rq_vectors_batch(normalized, rq_model)

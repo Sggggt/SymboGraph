@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 
-def _two_way_rq_model(*, threshold: float = 0.0) -> dict:
+def _two_way_rq_model(*, tau_l: float = 0.35) -> dict:
     from app.services.context_graph import (
         RQ_INDEX_PROTOCOL_VERSION,
         RQ_MEMBERSHIP_PROTOCOL_VERSION,
@@ -23,9 +23,7 @@ def _two_way_rq_model(*, threshold: float = 0.0) -> dict:
         "levels": 3,
         "max_k": 2,
         "tau_r": 0.65,
-        "tau_l": 0.35,
-        "top_m": 2,
-        "probability_threshold": threshold,
+        "tau_l": tau_l,
         "membership_protocol": RQ_MEMBERSHIP_PROTOCOL_VERSION,
     }
     return {
@@ -35,9 +33,7 @@ def _two_way_rq_model(*, threshold: float = 0.0) -> dict:
         "codebook_sizes": [2, 2, 2],
         "embedding_dimensions": 2,
         "tau_r": 0.65,
-        "tau_l": 0.35,
-        "membership_top_m": 2,
-        "membership_probability_threshold": threshold,
+        "tau_l": tau_l,
         "membership_protocol": RQ_MEMBERSHIP_PROTOCOL_VERSION,
         "membership_protocol_hash": rq_membership_protocol_hash(config),
         "codebook_hash": stable_hash(
@@ -51,8 +47,11 @@ def _two_way_rq_model(*, threshold: float = 0.0) -> dict:
     }
 
 
-def test_rq_encoder_materializes_sparse_fuzzy_prefixes_from_full_softmax():
-    from app.services.context_graph import encode_rq_vector
+def test_rq_encoder_materializes_primary_chain_from_full_softmax():
+    from app.services.context_graph import (
+        RQ_PRIMARY_MEMBERSHIPS_PER_CHUNK,
+        encode_rq_vector,
+    )
 
     encoded = encode_rq_vector([0.0, 0.0], _two_way_rq_model())
 
@@ -65,12 +64,28 @@ def test_rq_encoder_materializes_sparse_fuzzy_prefixes_from_full_softmax():
     counts_by_depth = Counter(
         membership["depth"] for membership in encoded["prefix_memberships"]
     )
-    assert counts_by_depth == {1: 2, 2: 4, 3: 8}
+    assert sum(counts_by_depth.values()) == (
+        RQ_PRIMARY_MEMBERSHIPS_PER_CHUNK
+    ) == 3
+    assert counts_by_depth == {1: 1, 2: 1, 3: 1}
     assert sum(
         1
         for membership in encoded["prefix_memberships"]
         if membership["depth"] == 3 and membership["is_primary_prefix"]
     ) == 1
+    assert sum(
+        int(membership["is_primary_prefix"])
+        for membership in encoded["prefix_memberships"]
+    ) == 3
+    assert sum(
+        int(not membership["is_primary_prefix"])
+        for membership in encoded["prefix_memberships"]
+    ) == 0
+    primary_audit = encoded["primary_membership_audit"]
+    assert primary_audit["non_primary_membership_count"] == 0
+    assert primary_audit["softmax_prefix_combination_count"] == 14
+    assert primary_audit["softmax_prefix_combinations_not_materialized"] == 11
+    assert primary_audit["cartesian_expansion_used"] is False
 
     for membership in encoded["prefix_memberships"]:
         probability_product = 1.0
@@ -88,15 +103,15 @@ def test_rq_encoder_materializes_sparse_fuzzy_prefixes_from_full_softmax():
         )
 
 
-def test_rq_sparsification_keeps_primary_without_renormalizing_or_flooring():
+def test_rq_primary_selection_does_not_renormalize_or_floor():
     from app.services.context_graph import encode_rq_vector, rq_membership_score
 
-    encoded = encode_rq_vector([0.0, 0.0], _two_way_rq_model(threshold=0.99))
+    encoded = encode_rq_vector([0.0, 0.0], _two_way_rq_model())
 
     assert [
         len(assignment["candidate_codes"])
         for assignment in encoded["level_assignments"]
-    ] == [1, 1, 1]
+    ] == [2, 2, 2]
     assert len(encoded["prefix_memberships"]) == 3
     assert encoded["level_assignments"][0]["candidate_codes"][0]["probability"] == pytest.approx(0.5)
     assert encoded["prefix_memberships"][0]["membership_score"] == pytest.approx(
@@ -109,18 +124,57 @@ def test_rq_sparsification_keeps_primary_without_renormalizing_or_flooring():
     )
 
 
+def test_primary_rq_never_materializes_non_primary_codes():
+    from app.services.context_graph import primary_rq_prefix_memberships
+
+    assignments = [
+        {
+            "entropy": 0.9,
+            "primary_probability_margin": 0.1,
+            "primary_distance_margin": 0.01,
+            "probabilities": [0.6, 0.4],
+            "candidate_codes": [
+                {
+                    "code": 1,
+                    "probability": 0.6,
+                    "rank": 1,
+                    "is_primary": True,
+                },
+                {
+                    "code": 2,
+                    "probability": 0.4,
+                    "rank": 2,
+                    "is_primary": False,
+                },
+            ],
+        }
+        for _level in range(3)
+    ]
+
+    memberships, audit = primary_rq_prefix_memberships(
+        primary_path=[1, 1, 1],
+        level_assignments=assignments,
+        gamma=1.0,
+    )
+
+    assert len(memberships) == 3
+    assert all(row["is_primary_prefix"] for row in memberships)
+    assert audit["non_primary_membership_count"] == 0
+    assert audit["materialized_membership_count"] == 3
+
+
 def test_rq_encoding_hash_is_deterministic_and_parameter_sensitive():
     from app.services.context_graph import encode_rq_vector, encode_rq_vectors_batch
 
-    first = encode_rq_vector([0.0, 0.0], _two_way_rq_model(threshold=0.0))
-    second = encode_rq_vector([0.0, 0.0], _two_way_rq_model(threshold=0.0))
-    pruned = encode_rq_vector([0.0, 0.0], _two_way_rq_model(threshold=0.99))
+    first = encode_rq_vector([0.0, 0.0], _two_way_rq_model(tau_l=0.35))
+    second = encode_rq_vector([0.0, 0.0], _two_way_rq_model(tau_l=0.35))
+    changed = encode_rq_vector([0.0, 0.0], _two_way_rq_model(tau_l=0.5))
 
     assert first["membership_encoding_hash"] == second["membership_encoding_hash"]
-    assert first["membership_encoding_hash"] != pruned["membership_encoding_hash"]
+    assert first["membership_encoding_hash"] != changed["membership_encoding_hash"]
     batched, batch_count = encode_rq_vectors_batch(
         [("chunk-b", [0.1, 0.0]), ("chunk-a", [0.0, 0.0])],
-        _two_way_rq_model(threshold=0.0),
+        _two_way_rq_model(),
         batch_size=1,
     )
     assert list(batched) == ["chunk-a", "chunk-b"]
@@ -128,11 +182,11 @@ def test_rq_encoding_hash_is_deterministic_and_parameter_sensitive():
     with pytest.raises(ValueError, match="duplicate chunk ids"):
         encode_rq_vectors_batch(
             [("chunk-a", [0.0, 0.0]), ("chunk-a", [0.1, 0.0])],
-            _two_way_rq_model(threshold=0.0),
+            _two_way_rq_model(),
         )
 
 
-def test_rq_candidate_score_uses_exact_fuzzy_prefix_not_hard_lcp_as_score():
+def test_rq_candidate_score_uses_exact_primary_prefix_not_hard_lcp():
     from app.services.context_graph import encode_rq_vector, rq_candidate_score
 
     encoded = encode_rq_vector([0.0, 0.0], _two_way_rq_model())
@@ -165,7 +219,7 @@ def test_rq_candidate_score_uses_exact_fuzzy_prefix_not_hard_lcp_as_score():
         membership_score=exact_prefix["membership_score"],
         residual_norm=encoded["residual_norm"],
         membership_reason="rq_leaf",
-        membership_role="fuzzy_member",
+        membership_role="primary_member",
         membership_entropy=exact_prefix["membership_entropy"],
         rank=1,
         diagnostics_json={"residual_vector": candidate_residual},
@@ -183,8 +237,7 @@ def test_rq_candidate_score_uses_exact_fuzzy_prefix_not_hard_lcp_as_score():
 @pytest.mark.parametrize(
     ("overrides", "expected_role"),
     [
-        ({"is_primary_leaf": True}, "primary_member"),
-        ({}, "fuzzy_member"),
+        ({}, "primary_member"),
         ({"membership_entropy": 0.9}, "boundary_member"),
         ({"boundary_distance": 0.01}, "boundary_member"),
         ({"is_bridge_chunk": True}, "bridge_member"),
@@ -212,7 +265,7 @@ def test_rq_membership_role_protocol_covers_every_role(overrides, expected_role)
         "boundary_probability_margin": 0.5,
         "boundary_distance": 0.5,
         "residual_outlier_threshold": 2.0,
-        "is_primary_leaf": False,
+        "is_primary_prefix": True,
         "is_bridge_chunk": False,
     }
     evaluation = classify_rq_membership_role(**{**inputs, **overrides})
@@ -235,7 +288,7 @@ def test_rq_membership_role_precedence_retains_all_simultaneous_matches():
         boundary_probability_margin=0.01,
         boundary_distance=0.01,
         residual_outlier_threshold=2.0,
-        is_primary_leaf=True,
+        is_primary_prefix=True,
         is_bridge_chunk=True,
     )
 
@@ -247,14 +300,13 @@ def test_rq_membership_role_precedence_retains_all_simultaneous_matches():
         "low_confidence_member",
         "boundary_member",
         "primary_member",
-        "fuzzy_member",
     ]
     assert evaluation["inputs"]["rank"] == 2
     assert evaluation["model_call_count"] == 0
 
 
 @pytest.mark.asyncio
-async def test_rq_build_persists_multi_memberships_and_mass(
+async def test_rq_build_persists_complete_primary_memberships_and_mass(
     db_session,
     populated_context_graph,
 ):
@@ -278,12 +330,19 @@ async def test_rq_build_persists_multi_memberships_and_mass(
     )
     assert relation_state is not None
     diagnostics = (relation_state.diagnostics_json or {})["rq_membership"]
-    assert diagnostics["membership_protocol_version"] == "rq_fuzzy_softmax_gamma_product_v1"
+    assert diagnostics["membership_protocol_version"] == "rq_primary_chain_v1"
     assert diagnostics["artificial_membership_floor"] is False
-    assert diagnostics["renormalized_after_sparsification"] is False
+    assert diagnostics["renormalized_after_primary_selection"] is False
     assert diagnostics["membership_write_batch_count"] == 1
     assert diagnostics["full_softmax_normalization_max_error"] < 1e-12
     assert diagnostics["membership_hash"]
+    primary = diagnostics["primary_membership"]
+    assert primary["cartesian_expansion_used"] is False
+    assert primary["all_primary_chains_complete"] is True
+    assert primary["all_chunk_cardinalities_exact"] is True
+    assert primary["memberships_per_chunk"] == 3
+    assert primary["observed_max_memberships_per_chunk"] == 3
+    assert primary["non_primary_membership_count"] == 0
 
     membership_counts = list(
         db_session.execute(
@@ -294,7 +353,10 @@ async def test_rq_build_persists_multi_memberships_and_mass(
         ).all()
     )
     assert membership_counts
-    assert any(count > 3 for _chunk_id, count in membership_counts)
+    assert all(count == 3 for _chunk_id, count in membership_counts)
+    assert sum(count for _chunk_id, count in membership_counts) == (
+        3 * len(membership_counts)
+    )
     rows = list(
         db_session.scalars(
             select(RQPrefixMembership)
@@ -304,8 +366,9 @@ async def test_rq_build_persists_multi_memberships_and_mass(
     )
     assert all((row.diagnostics_json or {}).get("artificial_membership_floor") is False for row in rows)
     assert all(0.0 <= row.membership_score <= 1.0 for row in rows)
-    assert any(
-        row.membership_role != "primary_member" and len(row.rq_path or []) == 3
+    assert all(
+        (row.diagnostics_json or {}).get("membership_origin")
+        == "primary_chain"
         for row in rows
     )
     assert diagnostics["membership_role_protocol_hash"]

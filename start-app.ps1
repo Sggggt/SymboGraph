@@ -2,9 +2,10 @@ param(
   [int]$BackendPort = 8000,
   [int]$FrontendPort = 3000,
   [string]$OpenPath = "/graph",
+  # Frozen because Docker prefixes the persistent symbograph-data volume with this identity.
   [string]$ComposeProjectName = "knowledgegraph-dev-20260820",
-  [string]$ApiImage = "course-kg-api:dev",
-  [string]$WebImage = "course-kg-web:dev",
+  [string]$ApiImage = "course-kg-api:local",
+  [string]$WebImage = "course-kg-web:local",
   [switch]$SkipBuild,
   [switch]$NoBrowser
 )
@@ -168,7 +169,6 @@ $graphResolveIp = Get-DotEnvValue -Key "GRAPH_RESOLVE_IP" -DefaultValue ""
 $embeddingApiProtocol = Get-DotEnvValue -Key "EMBEDDING_API_PROTOCOL" -DefaultValue "openai"
 $embeddingBaseUrl = Get-DotEnvValue -Key "EMBEDDING_BASE_URL" -DefaultValue ""
 $embeddingResolveIp = Get-DotEnvValue -Key "EMBEDDING_RESOLVE_IP" -DefaultValue ""
-$configuredSampleImportPath = Get-DotEnvValue -Key "SAMPLE_IMPORT_PATH" -DefaultValue ""
 $modelFallbackEnabled = Get-DotEnvBool -Key "ENABLE_MODEL_FALLBACK" -DefaultValue $false
 $databaseFallbackEnabled = Get-DotEnvBool -Key "ENABLE_DATABASE_FALLBACK" -DefaultValue $false
 $modelBridgeAdminToken = Get-DotEnvValue -Key "MODEL_BRIDGE_ADMIN_TOKEN" -DefaultValue ""
@@ -206,7 +206,7 @@ if ($embeddingApiProtocol -cne "openai") {
   throw "Unsupported EMBEDDING_API_PROTOCOL='$embeddingApiProtocol'. Use openai. Standard Anthropic Messages has no embedding contract."
 }
 if ($modelFallbackEnabled -or $databaseFallbackEnabled) {
-  throw "The Docker development stack requires ENABLE_MODEL_FALLBACK=false and ENABLE_DATABASE_FALLBACK=false."
+  throw "The source-mounted local stack requires ENABLE_MODEL_FALLBACK=false and ENABLE_DATABASE_FALLBACK=false."
 }
 $modelBridgeAdminTokenHasControlCharacter = $false
 if ($null -ne $modelBridgeAdminToken) {
@@ -236,28 +236,11 @@ if ($modelBridgeEnabled -and @(
   throw "MODEL_BRIDGE_ENABLED=true requires a non-default MODEL_BRIDGE_ADMIN_TOKEN."
 }
 
-$repositorySampleImportPath = Join-Path $Root "infra\sample-import"
-if ([string]::IsNullOrWhiteSpace($configuredSampleImportPath)) {
-  $sampleImportPath = $repositorySampleImportPath
-} elseif ([IO.Path]::IsPathRooted($configuredSampleImportPath)) {
-  $sampleImportPath = $configuredSampleImportPath
-} else {
-  $sampleImportPath = Join-Path $Root $configuredSampleImportPath
-}
-if (-not (Test-Path -LiteralPath $sampleImportPath -PathType Container)) {
-  if (-not (Test-Path -LiteralPath $repositorySampleImportPath -PathType Container)) {
-    throw "Neither the configured SAMPLE_IMPORT_PATH nor the repository sample-import directory exists."
-  }
-  Write-Host "Configured SAMPLE_IMPORT_PATH is absent; using the repository sample-import directory." -ForegroundColor Yellow
-  $sampleImportPath = $repositorySampleImportPath
-}
-
 $BackendUrl = "http://127.0.0.1:$BackendPort/api/ready"
 $FrontendUrl = "http://127.0.0.1:$FrontendPort$OpenPath"
 $env:COMPOSE_PROJECT_NAME = $ComposeProjectName
 $env:API_IMAGE = $ApiImage
 $env:WEB_IMAGE = $WebImage
-$env:SAMPLE_IMPORT_PATH = $sampleImportPath
 $env:API_HOST_PORT = [string]$BackendPort
 $env:WEB_HOST_PORT = [string]$FrontendPort
 $env:CHAT_BASE_URL = $chatBaseUrl
@@ -431,7 +414,7 @@ function Sync-ModelBridge {
   }
 }
 
-Write-Host "SymboGraph source-mounted Docker development launcher" -ForegroundColor Cyan
+Write-Host "SymboGraph source-mounted local Docker launcher" -ForegroundColor Cyan
 Write-Host "Root: $Root"
 Write-Host "Compose project: $ComposeProjectName"
 Write-Host "API image: $ApiImage"
@@ -455,7 +438,7 @@ if (-not $SkipBuild) {
   if (-not (Test-Path -LiteralPath $RebuildImagesScript -PathType Leaf)) {
     throw "Image rebuild script not found: $RebuildImagesScript"
   }
-  Write-Host "Building the latest source-mounted development images..." -ForegroundColor Cyan
+  Write-Host "Building the latest source-mounted local images..." -ForegroundColor Cyan
   & $RebuildImagesScript `
     -ApiBuildTag $ApiImage `
     -WebBuildTag $WebImage `

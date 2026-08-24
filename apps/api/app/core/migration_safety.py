@@ -15,17 +15,37 @@ from sqlalchemy.engine import Connection, Engine
 
 
 BASELINE_REVISION = "20260820_0041"
-RETIRED_DEVELOPMENT_ARTIFACTS_REVISION = "20260821_0042"
 DESTRUCTIVE_MIGRATION_ENV = "ALLOW_DESTRUCTIVE_MIGRATIONS"
-RETIRED_DEVELOPMENT_TABLES = (
-    "runtime_settings_initial_graph_handoff_receipts",
-    "runtime_settings_initial_graph_source_closure_amendments",
-    "first_import_graph_retry_execution_intents",
-    "runtime_settings_initial_graph_activation_intents",
-)
-DESTRUCTIVE_UPGRADE_REVISIONS = {
-    RETIRED_DEVELOPMENT_ARTIFACTS_REVISION: RETIRED_DEVELOPMENT_TABLES,
+DESTRUCTIVE_UPGRADE_REVISIONS: dict[str, tuple[str, ...]] = {
+    "20260824_0044": (
+        "rq_prefix_memberships.top_alternative_prefix_ids_json",
+    ),
 }
+
+
+def _materialized_destructive_targets(
+    bind: Connection,
+    configured_targets: Iterable[str],
+) -> list[str]:
+    inspector = inspect(bind)
+    existing_tables = set(inspector.get_table_names())
+    existing_columns: dict[str, set[str]] = {}
+    targets: list[str] = []
+    for target in configured_targets:
+        if "." not in target:
+            if target in existing_tables:
+                targets.append(target)
+            continue
+        table_name, column_name = target.split(".", 1)
+        if table_name not in existing_tables:
+            continue
+        columns = existing_columns.setdefault(
+            table_name,
+            {column["name"] for column in inspector.get_columns(table_name)},
+        )
+        if column_name in columns:
+            targets.append(target)
+    return targets
 
 
 def _normalized_tokens(value: str | None) -> set[str]:
@@ -58,8 +78,11 @@ def revision_report(
     force_authorized: bool = False,
 ) -> dict[str, Any]:
     configured_targets = DESTRUCTIVE_UPGRADE_REVISIONS.get(revision, ())
-    existing = set(inspect(bind).get_table_names()) if configured_targets else set()
-    targets = [name for name in configured_targets if name in existing]
+    targets = (
+        _materialized_destructive_targets(bind, configured_targets)
+        if configured_targets
+        else []
+    )
     authorization_source = destructive_authorization_source(
         revision,
         x_arguments=x_arguments,

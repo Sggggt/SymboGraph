@@ -35,7 +35,7 @@ function makeTrace(): AgentTraceEventPayload[] {
 describe("QA layered trace product surface", () => {
   afterEach(() => cleanup());
 
-  it("keeps the v6.2.2 layered interaction while redacting internal identities and raw JSON", () => {
+  it("keeps the layered interaction while redacting internal identities and raw JSON", () => {
     render(<AgentTraceStream trace={makeTrace()} defaultExpanded compact />);
 
     const stream = screen.getByTestId("agent-trace-stream");

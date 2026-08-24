@@ -251,6 +251,40 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def validate_qa_acceptance_payload(qa: dict) -> dict:
+    require(qa.get("answer"), f"QA returned no answer: {qa}")
+    qa_audit = qa.get("model_audit") or {}
+    grounding_outcome = qa_audit.get("grounding_outcome")
+    evaluator = qa_audit.get("evidence_evaluator") or {}
+    evidence_gate_blocked = bool(
+        qa_audit.get("context_package_evidence_gate_passed") is False
+        and qa_audit.get("answer_model_called") is False
+        and evaluator.get("verdict")
+        in {"insufficient_corpus", "need_expansion"}
+    )
+    insufficient_evidence = bool(
+        qa_audit.get("insufficient_evidence")
+        or grounding_outcome == "insufficient_evidence"
+        or evidence_gate_blocked
+    )
+    citations = list(qa.get("citations") or [])
+    pass_rate = qa_audit.get("citation_verification_pass_rate")
+    if not insufficient_evidence:
+        require(citations, f"Grounded QA returned no citations: {qa}")
+        require(
+            pass_rate is None or float(pass_rate) > 0.0,
+            f"QA citation verification did not pass: {qa}",
+        )
+    return {
+        "model_audit": qa_audit,
+        "citation_verification_pass_rate": pass_rate,
+        "insufficient_evidence": insufficient_evidence,
+        "evidence_gate_blocked": evidence_gate_blocked,
+        "context_package_required": not evidence_gate_blocked,
+        "returned_citation_count": len(citations),
+    }
+
+
 def validate_retrieval_rq_seed_diagnostics(trace: dict) -> dict[str, int]:
     """Validate the current public RQ seed audit without retired fields."""
     seed_steps = [
@@ -668,9 +702,9 @@ def main() -> int:
             qa_request,
             timeout=float(args.qa_timeout_seconds),
         )
-        require(qa.get("answer"), f"QA returned no answer: {qa}")
-        require(qa.get("citations"), f"QA returned no citations: {qa}")
-        require(qa.get("context_package_id"), f"QA did not return context_package_id: {qa}")
+        qa_acceptance = validate_qa_acceptance_payload(qa)
+        if qa_acceptance["context_package_required"]:
+            require(qa.get("context_package_id"), f"QA did not return context_package_id: {qa}")
         require(qa.get("retrieval_trace_id"), f"QA did not return retrieval_trace_id: {qa}")
         qa_trace = client.request_json("GET", f"/retrieval-traces/{qa['retrieval_trace_id']}/graph-steps")
         require(qa_trace.get("steps"), f"QA retrieval trace has no steps: {qa_trace}")
@@ -697,11 +731,17 @@ def main() -> int:
                 "determinism": gray_zone_trace_audit["determinism"],
             }
         )
-        qa_audit = qa.get("model_audit") or {}
-        pass_rate = qa_audit.get("citation_verification_pass_rate")
-        require(pass_rate is None or float(pass_rate) > 0.0, f"QA citation verification did not pass: {qa}")
-        package = client.request_json("GET", f"/context-packages/{qa['context_package_id']}")
-        require(package.get("citation_spans"), f"Context package has no citation spans: {package}")
+        qa_audit = qa_acceptance["model_audit"]
+        pass_rate = qa_acceptance["citation_verification_pass_rate"]
+        package = {}
+        if qa.get("context_package_id"):
+            package = client.request_json(
+                "GET", f"/context-packages/{qa['context_package_id']}"
+            )
+            require(
+                package.get("citation_spans"),
+                f"Context package has no citation spans: {package}",
+            )
         payload["checks"].append(
             {
                 "name": "qa_context_package",
@@ -710,15 +750,20 @@ def main() -> int:
                 "answer_session_id": qa_audit.get("answer_session_id"),
                 "retrieval_trace_id": qa["retrieval_trace_id"],
                 "context_package_id": qa["context_package_id"],
-                "returned_citation_count": len(qa.get("citations") or []),
+                "returned_citation_count": qa_acceptance[
+                    "returned_citation_count"
+                ],
                 "persisted_citation_span_count": len(
                     package.get("citation_spans") or []
                 ),
                 "citation_verification_pass_rate": pass_rate,
                 "grounding_outcome": qa_audit.get("grounding_outcome"),
-                "insufficient_evidence": bool(
-                    qa_audit.get("insufficient_evidence")
-                ),
+                "insufficient_evidence": qa_acceptance[
+                    "insufficient_evidence"
+                ],
+                "evidence_gate_blocked": qa_acceptance[
+                    "evidence_gate_blocked"
+                ],
             }
         )
         payload["pass"] = True

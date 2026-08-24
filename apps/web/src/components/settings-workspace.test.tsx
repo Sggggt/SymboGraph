@@ -183,12 +183,10 @@ describe("settings parameter help", () => {
       rq_kmeans_max_k: "6",
       rq_residual_tau: "0.65",
       edge_distance_protocol: "edge_distance_log_calibrated_strength_v2",
-      rq_membership_protocol: "rq_fuzzy_softmax_gamma_product_v1",
+      rq_membership_protocol: "rq_primary_chain_v1",
       edge_projection_protocol: "membership_q15_layer_type_calibrated_v3",
       edge_type_calibration_protocol: "type_local_winsorized_minmax_v1",
       rq_membership_temperature: "0.4",
-      rq_membership_top_m: "1",
-      rq_membership_probability_threshold: "0.08",
       dense_knn_k_min: "3",
       dense_knn_k_max: "12",
       dense_reverse_b_min_base: "1",
@@ -213,7 +211,6 @@ describe("settings parameter help", () => {
       embedding_base_url: "https://embedding.example.test/v1",
       embedding_model: "embedding-v2",
       fixed_chunk_size_tokens: 640,
-      rq_membership_top_m: 1,
       worker_concurrency: 4,
       model_bridge_enabled: true,
     });
@@ -264,18 +261,16 @@ describe("settings parameter help", () => {
     expect(SETTINGS_PARAMETER_HELP["RQ-KMeans 协议深度"]).toContain("固定为 3");
   });
 
-  it("shows graph protocols and fuzzy-membership controls as rebuild-only identities", () => {
+  it("shows graph protocols and primary-membership controls as rebuild-only identities", () => {
     const onChange = vi.fn();
     render(
       <GraphProtocolSettingsSection
         values={{
           edge_distance_protocol: "edge_distance_log_calibrated_strength_v2",
-          rq_membership_protocol: "rq_fuzzy_softmax_gamma_product_v1",
+          rq_membership_protocol: "rq_primary_chain_v1",
           edge_projection_protocol: "membership_q15_layer_type_calibrated_v3",
           edge_type_calibration_protocol: "type_local_winsorized_minmax_v1",
           rq_membership_temperature: "0.35",
-          rq_membership_top_m: "2",
-          rq_membership_probability_threshold: "0.05",
         }}
         onChange={onChange}
       />,
@@ -290,17 +285,9 @@ describe("settings parameter help", () => {
     ]) {
       expect((screen.getByRole("textbox", { name: new RegExp(label) }) as HTMLInputElement).disabled).toBe(true);
     }
-    for (const label of [
-      "RQ softmax 温度",
-      "RQ 每层候选上限",
-      "RQ 概率裁剪阈值",
-    ]) {
+    for (const label of ["RQ softmax 温度"]) {
       expect((screen.getByRole("spinbutton", { name: new RegExp(label) }) as HTMLInputElement).disabled).toBe(false);
     }
-    fireEvent.change(screen.getByRole("spinbutton", { name: /RQ 每层候选上限/ }), {
-      target: { value: "1" },
-    });
-    expect(onChange).toHaveBeenCalledWith("rq_membership_top_m", "1");
     const temperature = screen.getByRole("spinbutton", {
       name: /RQ softmax 温度/,
     }) as HTMLInputElement;
@@ -308,7 +295,6 @@ describe("settings parameter help", () => {
     expect(temperature.step).toBe("0.01");
     expect(temperature.checkValidity()).toBe(true);
     expect(SETTINGS_PARAMETER_HELP["RQ membership 协议"]).toContain("LLM");
-    expect(SETTINGS_PARAMETER_HELP["RQ 概率裁剪阈值"]).toContain("不重归一");
   });
 
   it("keeps active runtime and graph parameters documented without legacy BM25 wording", () => {

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+from pathlib import Path
 from typing import Any
 
 from _context_graph_maintenance import REPO_ROOT, write_report
@@ -21,7 +23,18 @@ def ts_interface_keys(interface_name: str) -> set[str]:
 
 
 def env_example_keys() -> set[str]:
-    path = REPO_ROOT / ".env.example"
+    runtime_env_file = str(os.getenv("RUNTIME_ENV_FILE") or "").strip()
+    runtime_workspace_example = (
+        Path(runtime_env_file).resolve().parent / ".env.example"
+        if runtime_env_file
+        else None
+    )
+    path = (
+        runtime_workspace_example
+        if runtime_workspace_example is not None
+        and runtime_workspace_example.exists()
+        else REPO_ROOT / ".env.example"
+    )
     if not path.exists():
         return set()
     keys: set[str] = set()
@@ -104,8 +117,6 @@ def main() -> None:
         "edge_projection_protocol",
         "edge_type_calibration_protocol",
         "rq_membership_temperature",
-        "rq_membership_top_m",
-        "rq_membership_probability_threshold",
         "enable_auto_tpe",
         "tpe_trial_budget",
         "tpe_startup_random_trials",
@@ -156,8 +167,6 @@ def main() -> None:
         "EDGE_PROJECTION_PROTOCOL",
         "EDGE_TYPE_CALIBRATION_PROTOCOL",
         "RQ_MEMBERSHIP_TEMPERATURE",
-        "RQ_MEMBERSHIP_TOP_M",
-        "RQ_MEMBERSHIP_PROBABILITY_THRESHOLD",
         "ENABLE_AUTO_TPE",
         "TPE_TRIAL_BUDGET",
         "TPE_STARTUP_RANDOM_TRIALS",
@@ -181,8 +190,6 @@ def main() -> None:
         "edge_projection_protocol",
         "edge_type_calibration_protocol",
         "rq_membership_temperature",
-        "rq_membership_top_m",
-        "rq_membership_probability_threshold",
     }
     for key in sorted(rebuild_graph_settings):
         if key not in rebuild_lifecycle:

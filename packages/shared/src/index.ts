@@ -673,6 +673,8 @@ export interface RepairExecutionAudit {
   gray_zone_protocol_and_thresholds_frozen: true;
   candidate_context_package_id?: string | null;
   candidate_retrieval_trace_id?: string | null;
+  candidate_semantic_progress_hash?: string | null;
+  candidate_reverted_to_last_valid_package?: true | null;
   supported_claim_regression_rejected: string[];
   regression_fail_closed?: true | null;
 }
@@ -1723,12 +1725,10 @@ export interface ModelSettingsResponse {
   rq_kmeans_max_k?: number;
   rq_residual_tau?: number;
   edge_distance_protocol?: "edge_distance_log_calibrated_strength_v2";
-  rq_membership_protocol?: "rq_fuzzy_softmax_gamma_product_v1";
+  rq_membership_protocol?: "rq_primary_chain_v1";
   edge_projection_protocol?: "membership_q15_layer_type_calibrated_v3";
   edge_type_calibration_protocol?: "type_local_winsorized_minmax_v1";
   rq_membership_temperature?: number;
-  rq_membership_top_m?: number;
-  rq_membership_probability_threshold?: number;
   dense_knn_k_min?: number;
   dense_knn_k_max?: number;
   dense_reverse_b_min_base?: number;
@@ -1952,12 +1952,10 @@ export interface ModelSettingsUpdate {
   rq_kmeans_max_k?: number | null;
   rq_residual_tau?: number | null;
   edge_distance_protocol?: "edge_distance_log_calibrated_strength_v2";
-  rq_membership_protocol?: "rq_fuzzy_softmax_gamma_product_v1";
+  rq_membership_protocol?: "rq_primary_chain_v1";
   edge_projection_protocol?: "membership_q15_layer_type_calibrated_v3";
   edge_type_calibration_protocol?: "type_local_winsorized_minmax_v1";
   rq_membership_temperature?: number;
-  rq_membership_top_m?: number;
-  rq_membership_probability_threshold?: number;
   dense_knn_k_min?: number | null;
   dense_knn_k_max?: number | null;
   dense_reverse_b_min_base?: number | null;
@@ -2442,7 +2440,6 @@ export interface GraphEdgeMetadata {
   membership_role?: string | null;
   membership_entropy?: number | null;
   membership_rank?: number | null;
-  top_alternative_prefix_ids: string[];
   rq_path: number[];
   residual_norm?: number | null;
   diagnostic_strength?: number | null;
@@ -3016,6 +3013,7 @@ export interface RetrievalTraversalState {
   path_edge_types: string[];
   distance_so_far?: number | null;
   reward_so_far?: number | null;
+  cycle_reward_so_far?: number;
   distance_zone?: string | null;
   covered_facets: string[];
   evidence_roles: string[];
@@ -3084,8 +3082,8 @@ export interface RetrievalRQRouteContribution {
 }
 
 export interface RetrievalRQStageSeedCard {
-  protocol_version: "query_rq_fuzzy_membership_chunk_seed_v2";
-  protocol_hash: "144d218ea37a70f2aa85730624c5cec0807e20542078adc1574f832cbff017d8";
+  protocol_version: "query_rq_primary_residual_mid_dense_v5";
+  protocol_hash: "0bd925993ad11bdc46cf852cfa17e2e62b014ff6f4cc2f5f3c73a5aecf6190bc";
   rq_prefix_id: string;
   rq_path: number[];
   rq_level: number;
@@ -3110,8 +3108,8 @@ export interface RetrievalRQStageSeedCard {
 }
 
 export interface RetrievalRQChunkSeedCard {
-  protocol_version: "query_rq_fuzzy_membership_chunk_seed_v2";
-  protocol_hash: "144d218ea37a70f2aa85730624c5cec0807e20542078adc1574f832cbff017d8";
+  protocol_version: "query_rq_primary_residual_mid_dense_v5";
+  protocol_hash: "0bd925993ad11bdc46cf852cfa17e2e62b014ff6f4cc2f5f3c73a5aecf6190bc";
   parent_mid_concept_id: string;
   chunk_id: string;
   rq_l3_prefix_id: string | null;
@@ -3121,11 +3119,15 @@ export interface RetrievalRQChunkSeedCard {
   residual_distance: number | null;
   query_prefix_score: number;
   chunk_membership_score: number;
-  fuzzy_membership_overlap_score: number;
+  membership_overlap_diagnostic_score: number;
   rq_score: number;
+  residual_score: number;
   rq_relevance_component: number;
+  primary_membership: boolean;
+  membership_overlap_used_in_effective_score: false;
+  query_membership_entropy: number;
   rq_drift_penalty: number | null;
-  membership_role: "primary_member" | "fuzzy_member" | "boundary_member" | "outlier_member" | "noise_candidate" | "bridge_member" | "low_confidence_member" | "mid_support_fallback";
+  membership_role: "primary_member" | "boundary_member" | "outlier_member" | "noise_candidate" | "bridge_member" | "low_confidence_member" | "mid_support_fallback";
   membership_rank: number;
   membership_entropy: number | null;
   bridge_or_boundary_role: boolean;
@@ -3134,7 +3136,7 @@ export interface RetrievalRQChunkSeedCard {
   dense_component: number;
   component_weights: Record<string, number>;
   effective_score: number;
-  score_source: "query_rq_fuzzy_membership" | "mid_support_without_rq_membership";
+  score_source: "query_rq_primary_base" | "mid_support_without_rq_membership";
   membership_role_tie_break_rank: number;
   is_evidence: false;
   node_weight_used_as_query_relevance: false;
@@ -3258,6 +3260,7 @@ export interface RetrievalPathLabel {
   evidence_roles: string[];
   distance_so_far?: number | null;
   reward_so_far?: number | null;
+  cycle_reward_so_far?: number;
   root_node_id?: string | null;
   parent_layer?: string | null;
   parent_node_id?: string | null;
@@ -3381,7 +3384,7 @@ export interface GrayRQMembershipRoleInputs {
   boundary_distance: number;
   residual_outlier_threshold: number;
   rank: number;
-  is_primary_leaf: boolean;
+  is_primary_prefix: true;
   is_bridge_chunk: boolean;
 }
 
@@ -3406,8 +3409,9 @@ export interface GrayRQScore {
   candidate_residual_norm: number;
   query_prefix_membership_score: number;
   candidate_prefix_membership_score: number;
-  fuzzy_membership_overlap_score: number;
+  membership_overlap_diagnostic_score: number;
   rq_score: number;
+  residual_score: number;
   rq_drift_penalty: number;
   membership_reason: string;
   membership_role: string;
@@ -3428,7 +3432,7 @@ export interface GrayProjectedRQDiagnostics {
   residual_distance?: number | null;
   query_prefix_membership_score?: number | null;
   candidate_prefix_membership_score?: number | null;
-  fuzzy_membership_overlap_score?: number | null;
+  membership_overlap_diagnostic_score?: number | null;
   membership_reason?: string | null;
   membership_role?: string | null;
   membership_rank?: number | null;
@@ -3540,13 +3544,14 @@ export interface RetrievalGrayZoneDeterminismAudit {
 }
 
 export interface RetrievalQueryRQSeedAudit {
-  protocol_version: "query_rq_fuzzy_membership_chunk_seed_v2";
-  protocol_hash: "144d218ea37a70f2aa85730624c5cec0807e20542078adc1574f832cbff017d8";
+  protocol_version: "query_rq_primary_residual_mid_dense_v5";
+  protocol_hash: "0bd925993ad11bdc46cf852cfa17e2e62b014ff6f4cc2f5f3c73a5aecf6190bc";
   requested_query_rq_scores: Record<string, number>;
   effective_rq_scores: Record<string, number>;
   explicit_query_relevance_precedence: true;
   selected_mid_route_fallback_only_when_missing: true;
   mid_support_baseline_may_mask_rq_seed: false;
+  membership_overlap_used_in_effective_score: false;
   node_weight_used_as_query_relevance: false;
   hard_path_lcp_used_as_score: false;
   is_evidence: false;

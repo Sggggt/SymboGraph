@@ -327,7 +327,6 @@ def main() -> None:
                         "residual_norm": membership.residual_norm,
                         "rank": membership.rank,
                         "rq_path": membership.rq_path or [],
-                        "top_alternative_prefix_ids": membership.top_alternative_prefix_ids_json or [],
                         "role_evaluation": (
                             (membership.diagnostics_json or {}).get(
                                 "membership_role_evaluation"

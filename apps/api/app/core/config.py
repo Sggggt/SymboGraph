@@ -17,7 +17,7 @@ KNOWLEDGE_BASE_STORAGE_IDENTITY_PROTOCOL = "knowledge_base_uuid_root_v1"
 ACTIVE_RQ_KMEANS_LEVELS = 3
 EDGE_DISTANCE_PROTOCOL_DEFAULT = "edge_distance_log_calibrated_strength_v2"
 EDGE_DISTANCE_PROTOCOL_ALLOWLIST = frozenset({EDGE_DISTANCE_PROTOCOL_DEFAULT})
-RQ_MEMBERSHIP_PROTOCOL_DEFAULT = "rq_fuzzy_softmax_gamma_product_v1"
+RQ_MEMBERSHIP_PROTOCOL_DEFAULT = "rq_primary_chain_v1"
 RQ_MEMBERSHIP_PROTOCOL_ALLOWLIST = frozenset({RQ_MEMBERSHIP_PROTOCOL_DEFAULT})
 EDGE_PROJECTION_PROTOCOL_DEFAULT = "membership_q15_layer_type_calibrated_v3"
 EDGE_PROJECTION_PROTOCOL_ALLOWLIST = frozenset({EDGE_PROJECTION_PROTOCOL_DEFAULT})
@@ -122,8 +122,6 @@ REBUILD_REQUIRED_SETTINGS = {
     "rq_kmeans_max_k",
     "rq_residual_tau",
     "rq_membership_temperature",
-    "rq_membership_top_m",
-    "rq_membership_probability_threshold",
     "dense_knn_k_min",
     "dense_knn_k_max",
     "dense_reverse_b_min_base",
@@ -153,15 +151,7 @@ SERVICE_RECREATE_REQUIRED_SETTINGS = {
     "model_bridge_admin_token",
 }
 
-PROCESS_ONLY_ENV_KEYS = frozenset(
-    {
-        "MODEL_BRIDGE_ADMIN_TOKEN",
-        # Used by Docker Compose to resolve the host bind source before the
-        # container starts. The API/worker never read it as a hot runtime
-        # setting, so it must not be copied into the shared managed env file.
-        "SAMPLE_IMPORT_PATH",
-    }
-)
+PROCESS_ONLY_ENV_KEYS = frozenset({"MODEL_BRIDGE_ADMIN_TOKEN"})
 
 RUNTIME_ENV_SETTINGS = (
     HOT_RELOAD_SETTINGS
@@ -235,12 +225,6 @@ class Settings(BaseSettings):
 
     knowledge_base_name: str = "Sample KnowledgeBase"
     data_root: Path = Field(default=WORKSPACE_ROOT / "data")
-    sample_import_root: Path = Field(
-        default=WORKSPACE_ROOT / "infra" / "sample-import"
-    )
-    sample_import_manifest: Path = Field(
-        default=WORKSPACE_ROOT / "infra" / "sample-import" / "raw-manifest.json"
-    )
     storage_root: Path | None = None
     ingestion_root: Path | None = None
     upload_max_bytes: int = Field(default=100 * 1024 * 1024, ge=1, le=10 * 1024 * 1024 * 1024)
@@ -306,7 +290,7 @@ class Settings(BaseSettings):
         "edge_distance_log_calibrated_strength_v2"
     ] = EDGE_DISTANCE_PROTOCOL_DEFAULT
     rq_membership_protocol: Literal[
-        "rq_fuzzy_softmax_gamma_product_v1"
+        "rq_primary_chain_v1"
     ] = RQ_MEMBERSHIP_PROTOCOL_DEFAULT
     edge_projection_protocol: Literal[
         "membership_q15_layer_type_calibrated_v3"
@@ -317,12 +301,6 @@ class Settings(BaseSettings):
     rq_kmeans_max_k: int = Field(default=6, ge=1, le=6)
     rq_residual_tau: float = Field(default=0.65, gt=0.0, le=10.0)
     rq_membership_temperature: float = Field(default=0.35, gt=0.0, le=10.0)
-    rq_membership_top_m: int = Field(default=2, ge=1, le=6)
-    rq_membership_probability_threshold: float = Field(
-        default=0.05,
-        ge=0.0,
-        le=1.0,
-    )
     dense_knn_k_min: int = Field(default=5, ge=1, le=200)
     dense_knn_k_max: int = Field(default=16, ge=1, le=500)
     dense_reverse_b_min_base: int = Field(default=2, ge=1, le=200)
@@ -752,13 +730,11 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "traversal_observation_budget",
         "query_facet_posterior_observation_budget",
         "query_facet_posterior_round_budget",
-        "rq_membership_top_m",
     }
     float_fields: set[str] = {
         "mid_concept_candidate_keep_threshold",
         "rq_residual_tau",
         "rq_membership_temperature",
-        "rq_membership_probability_threshold",
         "dense_min_cosine",
         "dense_strong_cosine",
         "cross_doc_min_cosine",
