@@ -621,6 +621,38 @@ class ModelBridgeHandler(BaseHTTPRequestHandler):
         except RuntimeError:
             self._send_json(400, {"error": "invalid_json_body"})
             return
+        stream_requested = request_payload.get("stream") is True
+        if stream_requested and route not in {"chat", "chat_anthropic"}:
+            self._send_json(400, {"error": "streaming_not_supported_for_route"})
+            return
+        if stream_requested:
+            try:
+                self._forward_stream_with_urllib(
+                    target_url,
+                    body,
+                    route=route,
+                    timeout=config.timeout,
+                    resolve_ip=resolve_ip,
+                )
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+            except Exception as exc:
+                print(
+                    f"model_bridge_upstream_stream_failure route={route} "
+                    f"error_type={type(exc).__name__}",
+                    flush=True,
+                )
+                if not self.wfile.closed:
+                    self._send_json(
+                        502,
+                        {
+                            "error": {
+                                "code": "upstream_stream_transport_error",
+                                "route": route,
+                            }
+                        },
+                    )
+            return
         try:
             status_code, response_body = self._forward_with_urllib(
                 target_url,
@@ -796,6 +828,101 @@ class ModelBridgeHandler(BaseHTTPRequestHandler):
             if hasattr(_thread_local, "dns_overrides"):
                 delattr(_thread_local, "dns_overrides")
 
+    def _forward_stream_with_urllib(
+        self,
+        target_url: str,
+        body: bytes,
+        *,
+        route: str,
+        timeout: int,
+        resolve_ip: str | None,
+    ) -> None:
+        parsed = urlparse(target_url)
+        if not parsed.hostname:
+            raise ValueError(f"Invalid target URL: {target_url}")
+        credential_headers = validated_client_auth_headers(
+            self.headers,
+            route=route,
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "Accept-Encoding": "identity",
+            "Host": parsed.netloc,
+        }
+        headers.update(credential_headers)
+        resolved_ip = BridgeState.resolve_target_ip(
+            route,
+            parsed.hostname,
+            resolve_ip,
+        )
+        opener = build_verified_https_opener(verified_tls_context())
+        request = urllib.request.Request(
+            target_url,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        _thread_local.dns_overrides = {parsed.hostname: resolved_ip}
+        response_started = False
+        try:
+            try:
+                response = opener.open(request, timeout=timeout)
+            except urllib.error.HTTPError as exc:
+                status = int(exc.code)
+                exc.close()
+                self._send_json(
+                    502 if 300 <= status < 400 else status,
+                    {
+                        "error": {
+                            "code": (
+                                "upstream_redirect_rejected"
+                                if 300 <= status < 400
+                                else "upstream_http_error"
+                            ),
+                            "status": status,
+                        }
+                    },
+                )
+                return
+            with response:
+                status = int(response.status)
+                content_type = str(response.headers.get("Content-Type", ""))
+                content_encoding = str(response.headers.get("Content-Encoding", ""))
+                if not _is_event_stream_content_type(content_type):
+                    raise RuntimeError("Upstream streaming response was not event-stream")
+                if content_encoding.strip().casefold() not in {"", "identity"}:
+                    raise RuntimeError("Upstream streaming content encoding was unsupported")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache, no-transform")
+                self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                response_started = True
+                self.close_connection = True
+                total = 0
+                while True:
+                    line = response.readline(256 * 1024 + 1)
+                    if not line:
+                        break
+                    total += len(line)
+                    if len(line) > 256 * 1024 or total > MAX_MODEL_RESPONSE_BODY_BYTES:
+                        raise RuntimeError("Upstream stream exceeded the hard byte bound")
+                    self.wfile.write(line)
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception:
+            if response_started:
+                self.close_connection = True
+                return
+            raise
+        finally:
+            if hasattr(_thread_local, "dns_overrides"):
+                delattr(_thread_local, "dns_overrides")
+
     def log_message(self, format: str, *args: object) -> None:
         # Do not emit request targets, headers, bodies, provider responses, or
         # credential-bearing exception text through BaseHTTPRequestHandler.
@@ -852,6 +979,10 @@ def _is_provider_json_content_type(value: str) -> bool:
         media_type == "application/json"
         or (media_type.startswith("application/") and media_type.endswith("+json"))
     )
+
+
+def _is_event_stream_content_type(value: str) -> bool:
+    return str(value or "").split(";", 1)[0].strip().casefold() == "text/event-stream"
 
 
 def _strict_json_object(raw: bytes, *, error_message: str) -> dict:

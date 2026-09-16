@@ -299,11 +299,12 @@ def test_upload_file_response_requires_typed_lock_diagnostics_and_job_id():
         ("photo.jpeg", b"\xff\xd8\xff\xe0JFIF\x00\xff\xd9", "jpeg"),
         ("bitmap.bmp", _minimal_bmp(), "bmp"),
         ("legacy.ppt", _legacy_ppt_header(), "ole_presentation"),
-        ("word.docx", _ooxml_bytes(presentation=False), "ooxml_word"),
-        (
+        pytest.param("word.docx", _ooxml_bytes(presentation=False), "ooxml_word", id='word-docx'),
+        pytest.param(
             "slides.pptx",
             _ooxml_bytes(presentation=True),
             "ooxml_presentation",
+            id='slides-pptx',
         ),
     ],
 )

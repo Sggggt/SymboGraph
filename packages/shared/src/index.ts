@@ -1,3 +1,4 @@
+export type * from "./intent-retrieval";
 export type Visibility = "private";
 
 export type SourceType =
@@ -34,6 +35,9 @@ export type JobState =
 export type KnowledgeBaseFileStatus = "pending" | "parsing" | "parsed" | "failed" | "skipped" | "active";
 
 export type AgentRoute =
+  | "intent_execution_retrieval_v1"
+  | "system_capability"
+  | "verified_context_reuse"
   | "layered_context_graph"
   | "direct_answer"
   | "multi_hop_research"
@@ -42,7 +46,22 @@ export type AgentRoute =
   | "cross_document_synthesis"
   | "clarify";
 
+export type DirectAnswerMode = "system_capability" | "verified_context_reuse";
+
 export type RetrievalGranularity = "mid" | "coarse";
+
+export type RetrievalTerminalOutcome =
+  | "completed"
+  | "partial_answer"
+  | "insufficient_evidence"
+  | "scope_ambiguous"
+  | "representation_incomplete"
+  | "context_budget_exhausted"
+  | "strategy_invalid"
+  | "entry_unavailable"
+  | "index_unavailable"
+  | "technical_failure"
+  | "cancelled";
 
 export type AgentRunState =
   | "queued"
@@ -127,7 +146,6 @@ export interface SearchRequest {
   session_id?: string | null;
   filters?: SearchFilters;
   top_k?: number;
-  retrieval_granularity?: RetrievalGranularity;
 }
 
 export interface ConversationUserConstraints {
@@ -136,7 +154,7 @@ export interface ConversationUserConstraints {
 }
 
 export interface ConversationTaskState {
-  status: "active" | "waiting_user" | "completed" | "cancelled";
+  status: "active" | "waiting_user" | "completed" | "cancelled" | "failed";
   objective?: string | null;
   current_step?: string | null;
 }
@@ -147,13 +165,14 @@ export interface ConversationStateUpdate {
 }
 
 export interface ConversationHistoryReference {
-  protocol_version: "answer_context_citation_reference_v1";
+  protocol_version: "answer_context_citation_reference_v1" | "answer_context_source_reference_v2";
   turn_index: number;
   run_id: string;
   answer_session_id: string;
   context_package_id: string;
   retrieval_trace_id: string;
   citation_verification_ids: string[];
+  source_binding_ids?: string[];
 }
 
 export interface ConversationStatePayload {
@@ -225,7 +244,7 @@ export interface StorageMaintenanceRecoveryHealth {
 }
 
 export interface CitationSourceSpan {
-  contract_version: "raw_chunk_source_span_v1";
+  contract_version: "raw_chunk_source_span_v1" | "raw_chunk_source_span_v3";
   document_version_id: string;
   chunk_id: string;
   source_path: string;
@@ -317,7 +336,7 @@ export interface CitationVerificationAudit {
   diagnostics: CitationVerificationDiagnostics;
 }
 
-export interface Citation {
+export interface LegacyVerifiedCitation {
   contract_version: "citation_public_v1";
   chunk_id: string;
   citation_index: number;
@@ -347,6 +366,70 @@ export interface Citation {
   answer_session_id: string;
   citation_verification_id: string;
 }
+
+export interface BoundCitationSourceSpan extends Omit<CitationSourceSpan, "contract_version" | "verification_id"> {
+  contract_version: "raw_chunk_source_span_v2";
+  context_package_id: string;
+  retrieval_trace_id: string;
+  verification_id: null;
+  source_binding_id: string;
+}
+
+interface AnswerSourceBindingAuditFields {
+  status: "source_bound";
+  source_binding_id: string;
+  unit_id: string;
+  unit_index: number;
+  answer_hash: string;
+  binding_hash: string;
+  provenance_status: "valid";
+  structure_context_status: "valid";
+  transactional_replay: true;
+  semantic_entailment_claimed: false;
+}
+
+export type AnswerSourceBindingAudit = AnswerSourceBindingAuditFields & (
+  | {
+      contract_version: "answer_source_binding_public_v1";
+      protocol_version: "answer_source_binding_v1";
+      reflection_audit_hash: string;
+      retrieval_gate_audit_hash?: null;
+      retrieval_gate_observation_id?: null;
+    }
+  | {
+      contract_version: "answer_source_binding_public_v2";
+      protocol_version: "answer_source_binding_v2";
+      reflection_audit_hash?: null;
+      retrieval_gate_audit_hash: string;
+      retrieval_gate_observation_id: string;
+    }
+  | {
+      contract_version: "answer_source_binding_public_v3";
+      protocol_version: "answer_source_binding_v2";
+      reflection_audit_hash?: null;
+      retrieval_gate_audit_hash?: null;
+      retrieval_gate_observation_id?: null;
+      source_integrity_admission_hash: string;
+      source_integrity_admission_observation_id: string;
+    }
+);
+
+export interface SourceBoundCitation extends Omit<LegacyVerifiedCitation, "contract_version" | "source_span" | "verification" | "citation_verification_id" | "claim_id" | "claim_index" | "claim_text"> {
+  contract_version: "citation_public_v2";
+  source_span: BoundCitationSourceSpan;
+  verification: null;
+  citation_verification_id: null;
+  claim_id: null;
+  claim_index: null;
+  claim_text: null;
+  source_binding_id: string;
+  source_binding: AnswerSourceBindingAudit;
+  unit_id: string;
+  unit_index: number;
+  unit_text: string;
+}
+
+export type Citation = LegacyVerifiedCitation | SourceBoundCitation;
 
 export interface SearchCitation {
   contract_version: "search_citation_public_v1";
@@ -386,7 +469,7 @@ export interface SearchResult {
 }
 
 export interface RetrievalCacheAudit {
-  protocol_version: "layered_retrieval_postgresql_strict_replay_v1";
+  protocol_version: "layered_retrieval_postgresql_strict_replay_v1" | "intent_execution_retrieval_cache_v1";
   status: "hit" | "miss" | "poison" | "unavailable";
   cache_hit: boolean;
   cache_miss: boolean;
@@ -404,7 +487,7 @@ export interface RetrievalCacheAudit {
   provider_perception_model_call_count?: 0 | null;
   query_embedding_model_call_count?: 0 | null;
   traversal_execution_count?: 0 | null;
-  retrieval_fact_insert_count?: 0 | null;
+  retrieval_fact_insert_count?: 0 | 1 | null;
   gray_zone_input_modified: false;
   gray_zone_model_call_count: 0;
   context_package_reused?: boolean | null;
@@ -425,7 +508,7 @@ export interface OrdinaryQueryReplayPointerAudit {
 }
 
 export interface OrdinaryQueryPerceptionAudit {
-  protocol_version: "bounded_query_perception_and_facet_proposal_v1";
+  protocol_version: "bounded_query_perception_and_facet_proposal_v2";
   provider_protocol_hash: string;
   model_call_budget: 2;
   model_call_count: number;
@@ -475,9 +558,9 @@ export interface ModelAuditFields {
   retrieval_trace_id?: string | null;
   context_package_id?: string | null;
   conversation_state_scope_hash?: string | null;
-  semantic_entry_query_protocol_version?: "validated_query_facet_semantic_entry_v1" | null;
+  semantic_entry_query_protocol_version?: "validated_query_facet_semantic_entry_v1" | "validated_query_facet_semantic_entry_v2" | "validated_query_facet_semantic_entry_v3" | null;
   semantic_entry_query_hash?: string | null;
-  semantic_entry_query_selection_source?: "validated_required_facet" | "raw_query" | null;
+  semantic_entry_query_selection_source?: "validated_required_facet" | "validated_required_domain_composite" | "raw_query" | null;
   semantic_entry_query_is_evidence?: false | null;
   semantic_entry_query_citation_authority?: false | null;
   semantic_entry_query_gray_zone_decision_authority?: false | null;
@@ -511,6 +594,7 @@ export interface ModelAuditFields {
   repair_global_top_k_modified?: false | null;
   repair_gray_zone_model_call_count?: 0 | null;
   retrieval_cache?: RetrievalCacheAudit | null;
+  intent_retrieval_cache?: RetrievalCacheAudit | null;
   query_perception_audit?: OrdinaryQueryPerceptionAudit | null;
   query_embedding_execution?: QueryEmbeddingExecutionAudit | null;
 }
@@ -533,6 +617,7 @@ export interface ExpectedEvidenceAudit {
   target_layer?: string | null;
   fallback_allowed?: boolean | null;
   required_verification_stage?: string | null;
+  required_review_stage?: string | null;
   protocol_version?: string | null;
   executor_mechanism?: string | null;
   failure_card_hashes: string[];
@@ -788,6 +873,15 @@ export interface ProviderCallAudit {
 
 export interface AnswerModelAudit extends ModelAuditFields {
   contract_version: "answer_model_audit_public_v1";
+  protocol_version?: string | null;
+  accepted_plan_hash?: string | null;
+  planning_model_call_count?: number | null;
+  generation_model_call_count?: number | null;
+  post_generation_model_call_count?: number | null;
+  source_admission_model_call_count?: number | null;
+  capability_card_hash?: string | null;
+  generation?: Record<string, unknown> | null;
+  source_binding_count?: number | null;
   model?: string | null;
   external_called?: boolean | null;
   fallback_reason?: string | null;
@@ -798,6 +892,7 @@ export interface AnswerModelAudit extends ModelAuditFields {
   typed_action_control_hash?: string | null;
   evidence_evaluator?: EvidenceEvaluatorVerdictAudit | null;
   context_package_evidence_gate_passed?: boolean | null;
+  preliminary_evidence_uncertain?: boolean | null;
   answer_model_called?: boolean | null;
   answer_claim_limit?: number | null;
   output_token_budget?: number | null;
@@ -820,17 +915,30 @@ export interface AnswerModelAudit extends ModelAuditFields {
   insufficient_evidence: boolean;
   grounding_outcome?: string | null;
   returned_citation_count?: number | null;
+  answer_reflection?: AnswerReflectionSummary | null;
+  retrieval_control?: RetrievalAnswerSummary | null;
+  qa_performance?: QAPerformanceSummary | null;
+  source_binding_pass_rate?: number | null;
+  direct_answer_mode?: DirectAnswerMode | null;
+  direct_answer_protocol_version?: string | null;
+  policy_update_eligible?: boolean | null;
+  tool_call_count?: number | null;
 }
 
 export interface SearchResponse {
-  contract_version: "search_public_v1";
+  contract_version: "search_public_v2";
   query: string;
   results: SearchResult[];
   degraded_mode: boolean;
   model_audit: ModelAudit;
   retrieval_trace_id?: string | null;
   context_package_id?: string | null;
-  retrieval_granularity?: RetrievalGranularity;
+  run_id?: string | null;
+  entry_layer?: import("./intent-retrieval").RetrievalEntryLayer | null;
+  intent?: import("./intent-retrieval").RetrievalIntent | null;
+  execution_strategy?: import("./intent-retrieval").RetrievalExecutionStrategy | null;
+  terminal_outcome?: RetrievalTerminalOutcome | null;
+  accepted_plan_hash?: string | null;
   conversation_state?: ConversationStatePayload | null;
 }
 
@@ -847,24 +955,28 @@ export interface QARequest {
   top_k?: number;
   history?: ChatMessage[];
   conversation_state_update?: ConversationStateUpdate | null;
-  retrieval_granularity?: RetrievalGranularity;
 }
 
 export interface QAResponse {
-  contract_version: "qa_public_v1";
+  contract_version: "qa_public_v2";
   run_id?: string | null;
   session_id?: string | null;
   answer: string;
   citations: Citation[];
   used_chunks: ContextItem[];
   route?: AgentRoute | string | null;
+  direct_answer_mode?: DirectAnswerMode | null;
   trace?: AgentTraceEventPayload[];
   degraded_mode: boolean;
   model_audit: AnswerModelAudit;
   answer_model_audit?: AnswerModelAudit | null;
   context_package_id?: string | null;
   retrieval_trace_id?: string | null;
-  retrieval_granularity?: RetrievalGranularity;
+  answer_session_id?: string | null;
+  entry_layer?: import("./intent-retrieval").RetrievalEntryLayer | null;
+  intent?: import("./intent-retrieval").RetrievalIntent | null;
+  execution_strategy?: import("./intent-retrieval").RetrievalExecutionStrategy | null;
+  terminal_outcome?: RetrievalTerminalOutcome | null;
   conversation_state?: ConversationStatePayload | null;
 }
 
@@ -883,6 +995,13 @@ export interface AgentQueryIntentConversationAudit {
 
 export interface AgentQueryIntentAudit {
   intent: string;
+  direct_answer_kind:
+    | "identity"
+    | "model_identity"
+    | "capabilities"
+    | "evidence"
+    | "usage"
+    | "none";
   entities: string[];
   sub_queries: string[];
   needs_graph: boolean;
@@ -902,6 +1021,7 @@ export interface AgentActionValidationResult {
   bridge_protection_checked?: boolean | null;
   required_restore_modes: string[];
   required_verification_stage?: string | null;
+  required_review_stage?: string | null;
   inserted_required_action?: boolean | null;
 }
 
@@ -966,6 +1086,7 @@ export interface AgentStopConditionRequestAudit {
   all_required_facets_covered?: boolean | null;
   independent_support_paths_at_least?: number | null;
   citation_verification_passes?: boolean | null;
+  answer_review_passes?: boolean | null;
   frontier_empty?: boolean | null;
   all_claims_supported?: boolean | null;
   no_semantic_progress?: boolean | null;
@@ -977,6 +1098,7 @@ export interface AgentStopConditionResultAudit {
   all_required_facets_covered?: boolean | null;
   independent_support_paths_at_least?: boolean | null;
   citation_verification_passes?: boolean | null;
+  answer_review_passes?: boolean | null;
   frontier_empty?: boolean | null;
   all_claims_supported?: boolean | null;
   no_semantic_progress?: boolean | null;
@@ -1016,7 +1138,194 @@ export interface AgentReplanProgressAudit {
   audit_hash: string;
 }
 
+export type ReflectionIssueType = "missing_evidence" | "ambiguous_question" | "context_conflict" | "answer_incomplete" | "answer_off_topic" | "source_binding" | "format";
+export type ReflectionAction = "accept" | "revise_answer" | "restore_context" | "replan_retrieval" | "clarify_user" | "insufficient_evidence";
+
+export interface AnswerSelfAssessment {
+  question_relevance: number;
+  context_relevance: number;
+  coverage: number;
+  needs_reflection: boolean;
+  issue_types: ReflectionIssueType[];
+  summary: string;
+}
+
+export interface ReflectionDecision {
+  protocol_version: "agent_answer_reflection_v1";
+  action: ReflectionAction;
+  issue_types: ReflectionIssueType[];
+  target_unit_indexes: number[];
+  source_handles: string[];
+  missing_facets: string[];
+  correction_instructions: string;
+  clarification_question: string | null;
+}
+
+export interface ReflectionGate {
+  protocol_version: "agent_answer_reflection_v1";
+  decision: "skip_reflection" | "reflect" | "source_integrity_failed";
+  reasons: string[];
+  path_metrics: {
+    protocol_version: "answer_path_support_score_v1" | "answer_path_support_score_v2";
+    path_score: number | null;
+    coverage: number;
+    weakest_path_score: number | null;
+    source_count: number;
+    scored_source_count: number;
+    sources: Array<{ source_handle: string; score: number | null; effective_distance: number | null }>;
+  };
+  self_assessment: AnswerSelfAssessment;
+  thresholds: { path_support: number; question_relevance: number; context_relevance: number };
+  source_binding_valid: boolean;
+  draft_hash: string;
+  evidence_manifest_hash: string;
+  decision_hash: string;
+}
+
+export interface AnswerReflectionSummary {
+  protocol_version: "agent_answer_reflection_v1";
+  outcome: "accepted_without_reflection" | "accepted_after_reflection" | "clarify_user" | "insufficient_evidence";
+  reflection_rounds_used: number;
+  generation_model_call_count: number;
+  reflection_model_call_count: number;
+  citation_judge_model_call_count: 0;
+  source_binding_count: number;
+  source_binding_pass_rate: number;
+  self_assessment: AnswerSelfAssessment;
+  path_score: number | null;
+  path_coverage: number;
+  reflection_audit_hash: string;
+  self_assessment_is_reward_label: false;
+}
+
+export interface EvidenceInterval {
+  knowledge_base_id: string;
+  document_version_id: string;
+  start: number;
+  end: number;
+}
+
+export interface EvidenceScopeFact {
+  id: string;
+  knowledge_base_id: string;
+  kind: "document" | "section" | "text" | "table" | "formula" | "code" | "figure" | "caption";
+  resolution: "verified" | "unresolved" | "unsupported";
+  extent_complete: boolean;
+  intervals: EvidenceInterval[];
+  witness_ids: string[];
+}
+
+export interface SourceScopeSelector {
+  kind: EvidenceScopeFact["kind"];
+  reference: string;
+  match: "title" | "label" | "kind";
+}
+
+export interface SourceScopeRequest {
+  op: "scope" | "union" | "intersection";
+  selector: SourceScopeSelector | null;
+  children: SourceScopeRequest[];
+}
+
+export interface SourceScopeObligation {
+  op: "coverage" | "all" | "any";
+  scope: SourceScopeRequest | null;
+  mode: "overlap" | "complete";
+  children: SourceScopeObligation[];
+}
+
+export interface EvidenceScopeCoverage {
+  protocol_version: "evidence_scope_algebra_v1";
+  state: "satisfied" | "unsatisfied" | "unknown";
+  mode: "overlap" | "complete";
+  input_hash: string;
+  usable_intervals: EvidenceInterval[];
+  missing_intervals: EvidenceInterval[];
+  scope_extent_known: boolean;
+  reason: string;
+  semantic_sufficiency_claimed: false;
+}
+
+export interface SourceScopeBinding {
+  request_hash: string;
+  fact: EvidenceScopeFact;
+  node_ids: string[];
+  source_identity_hash: string;
+  reason: "resolved" | "no_verified_match" | "ambiguous" | "representation_incomplete" | "unsupported_representation";
+}
+
+export interface FacetScopeInput {
+  facet_id: string;
+  bindings: SourceScopeBinding[];
+}
+
+export interface FacetScopeStatus {
+  facet_id: string;
+  state: EvidenceScopeCoverage["state"];
+  input_hash: string;
+  coverage: EvidenceScopeCoverage[];
+  reason_codes: string[];
+}
+
+export interface RetrievalAnswerSummary {
+  protocol_version: "retrieval_answer_v1";
+  gate_outcome: string;
+  repairs_used: number;
+  generation_call_count: number;
+  post_generation_review_count: 0;
+  source_binding_count: number;
+  source_binding_pass_rate: number;
+  feature_utility: { lower: number; upper: number } | null;
+  audit_hash: string;
+}
+
+export interface QAStageTiming {
+  sequence: number;
+  parent_sequence: number | null;
+  stage: string;
+  start_ms: number;
+  duration_ms: number;
+  exclusive_ms: number;
+  status: "ok" | "error" | "cancelled" | "running";
+  error_type: string | null;
+  fields: {
+    role?: "chat" | "graph" | "embedding" | null;
+    attempt?: number | null;
+    round_index?: number | null;
+    input_characters?: number | null;
+    output_token_budget?: number | null;
+    input_tokens?: number | null;
+    output_tokens?: number | null;
+    item_count?: number | null;
+    http_status?: number | null;
+    cache_hit?: boolean | null;
+  };
+}
+
+export interface QAPerformanceSummary {
+  protocol_version: "qa_stage_timing_v1";
+  elapsed_ms: number;
+  stages: Record<string, {
+    count: number; success_count: number; error_count: number; cancelled_count: number;
+    total_ms: number; active_wall_ms: number; exclusive_ms: number;
+    p50_ms: number | null; p95_ms: number | null; p99_ms: number | null;
+  }>;
+  spans: QAStageTiming[];
+  unfinished_span_count: number;
+  quantile_method: "nearest_rank";
+  clock: "monotonic";
+  first_response_ms: number | null;
+  first_token_ms: number | null;
+  provider_compute_ms: number | null;
+  provider_detail_availability: "roundtrip_only";
+}
+
 export type AgentTraceNode =
+  | "intent_planning"
+  | "intent_execution_retrieval"
+  | "source_integrity_admission"
+  | "verified_context_reuse"
+  | "retrieval_control"
   | "query_understanding"
   | "query_facet_extraction"
   | "agent_planner"
@@ -1033,9 +1342,19 @@ export type AgentTraceNode =
   | "layered_retrieval"
   | "context_package"
   | "grounded_answer"
+  | "answer_generation"
+  | "reflection_gate"
+  | "answer_reflection"
+  | "reflection_backtrack"
+  | "reflection_action_validation"
+  | "answer_source_binding"
   | "citation_verification"
   | "repair_executed"
   | "reward_event"
+  | "direct_answer_route_gate"
+  | "direct_answer_reuse_evaluator"
+  | "direct_answer_fallback"
+  | "direct_answer"
   | "cancelled"
   | "agent_admission"
   | "error";
@@ -1047,7 +1366,17 @@ export interface AgentTraceScoresFields {
 export type AgentTraceScores = AgentTraceScoresFields &
   (
     | {
+        audit_kind: "retrieval_control";
+        stage: string;
+        outcome?: string | null;
+        repairs_used?: number | null;
+        source_count?: number | null;
+        missing_facet_count?: number | null;
+        model_call_count?: number | null;
+      }
+    | {
         audit_kind: "query_understanding";
+        protocol_version?: string | null;
         top_k?: number | null;
         query_intent?: AgentQueryIntentAudit | null;
         retrieval_granularity?: RetrievalGranularity | null;
@@ -1145,9 +1474,59 @@ export type AgentTraceScores = AgentTraceScoresFields &
         agent_operating_envelope_hash?: string | null;
       }
     | {
+        audit_kind: "direct_answer";
+        protocol_version?: string | null;
+        response_mode?: DirectAnswerMode | null;
+        reason_code?: string | null;
+        reason?: string | null;
+        error_type?: string | null;
+        verdict?: string | null;
+        decision_hash?: string | null;
+        capability_card_hash?: string | null;
+        input_hash?: string | null;
+        output_hash?: string | null;
+        model_call_count?: number | null;
+        tool_call_count?: number | null;
+        tool_call_count_before_fallback?: number | null;
+        policy_update_eligible?: boolean | null;
+        answer_session_id?: string | null;
+        answer_hash?: string | null;
+        citation_count?: number | null;
+        citation_pass_rate?: number | null;
+        claim_pass_rate?: number | null;
+        returned_citation_count?: number | null;
+      }
+    | {
+        audit_kind: "answer_reflection";
+        stage: string;
+        gate?: ReflectionGate | null;
+        decision?: ReflectionDecision | null;
+        action?: string | null;
+        error_code?: string | null;
+        executed_action_count?: number | null;
+        unit_count?: number | null;
+        source_binding_count?: number | null;
+        reflection_rounds_used?: number | null;
+        reflection_audit_hash?: string | null;
+        summary?: AnswerReflectionSummary | null;
+      }
+    | {
         audit_kind: "status";
         cancel_requested?: boolean | null;
         admission_failure?: boolean | null;
+      }
+    | {
+        audit_kind: "intent_execution";
+        protocol_version?: string | null;
+        accepted_plan_hash?: string | null;
+        capability_hash?: string | null;
+        strategy_hash?: string | null;
+        source_integrity_admission_hash?: string | null;
+        entry_layer?: import("./intent-retrieval").RetrievalEntryLayer | null;
+        model_call_count?: number | null;
+        score_fields_used?: string[];
+        fallback_before_retrieval?: boolean | null;
+        retrieval_audit?: Record<string, unknown> | null;
       }
   );
 
@@ -1184,7 +1563,9 @@ export interface TaskStatusResponse {
   current_node?: string | null;
   retry_count?: number;
   route?: AgentRoute | string | null;
-  retrieval_granularity?: RetrievalGranularity;
+  direct_answer_mode?: DirectAnswerMode | null;
+  entry_layer?: import("./intent-retrieval").RetrievalEntryLayer | null;
+  terminal_outcome?: RetrievalTerminalOutcome | null;
   answer?: string | null;
   error?: string | null;
   created_at?: string | null;
@@ -1207,12 +1588,21 @@ export type AgentPEActionType =
   | "restore_context_package"
   | "build_context_package"
   | "verify_citations"
+  | "review_answer"
   | "repair_missing_citation"
   | "repair_concept_gap"
   | "repair_bridge_gap"
-  | "repair_structure_context";
+  | "repair_structure_context"
+  | "accept"
+  | "revise_answer"
+  | "restore_context"
+  | "replan_retrieval"
+  | "clarify_user"
+  | "insufficient_evidence";
 
 export type AgentPEObservationType =
+  | "retrieval_state_transition" | "retrieval_gate" | "retrieval_scope_targets" | "retrieval_sufficiency" | "retrieval_scope_resolution"
+  | "retrieval_packing_repair" | "retrieval_generation_packing" | "retrieval_repair_request" | "retrieval_lexical_patch"
   | "plan_validation_failed"
   | "executor_contract_blocked"
   | "entry_selection"
@@ -1227,7 +1617,118 @@ export type AgentPEObservationType =
   | "context_package_built"
   | "citation_verification"
   | "typed_repair_round"
-  | "claim_level_final_grounded_gate";
+  | "claim_level_final_grounded_gate"
+  | "answer_reflection"
+  | "answer_reflection_final";
+
+export const retrievalRunObservationProtocols = {
+  retrieval_state_transition: ["retrieval_fsm_transition_v1"],
+  retrieval_gate: ["retrieval_gate_observation_v1"],
+  retrieval_sufficiency: ["retrieval_sufficiency_call_v1", "retrieval_sufficiency_call_v2"],
+  retrieval_scope_resolution: ["source_location_call_v1"],
+  retrieval_scope_targets: ["source_scope_target_plan_v1"],
+  retrieval_packing_repair: ["retrieval_packing_repair_v1", "scope_interval_repacking_v1"],
+  retrieval_generation_packing: ["feature_preserving_generation_packing_v1", "scope_preserving_generation_packing_v1"],
+  retrieval_repair_request: ["retrieval_repair_request_v1"],
+  retrieval_lexical_patch: ["retrieval_patch_observation_v1"],
+} as const;
+
+export interface RequirementSufficiency {
+  facet_id: string;
+  status: "covered" | "missing" | "uncertain";
+  reason: "supported" | "missing_attribute" | "incomplete_set" | "wrong_source" |
+    "conflicting_scope" | "ambiguous_evidence" | "no_usable_evidence";
+  source_handles: string[];
+  gap: string;
+}
+
+export interface EvidenceSufficiency {
+  protocol_version: "retrieval_evidence_sufficiency_v1";
+  requirements: RequirementSufficiency[];
+  question_complete: boolean;
+  unrepresented_question_span: string;
+  affected_facet_ids: string[];
+}
+
+export interface SourceAddressedAssessment {
+  protocol_version: "source_addressed_assessment_v1";
+  task_hash: string;
+  strategy_hash: string;
+  feature_input_hash: string;
+  feature_hash: string;
+  thresholds: { coverage: number; path_quality: number; calibration_id: string };
+  context_package_id: string;
+  retrieval_trace_id: string;
+  evidence_manifest_hash: string;
+  provenance_session_hash: string;
+  facets: {
+    facet_id: string;
+    coverage: { lower: number; upper: number };
+    path_quality: { lower: number; upper: number };
+    complete_coverage: EvidenceScopeCoverage[];
+    selected_request_hashes: string[];
+    usable_intervals: EvidenceInterval[];
+    path_source_ids: string[];
+    sources: { source_handle: string; text_char_spans: [number, number][] }[];
+  }[];
+  relevance_uncertain: true;
+  generation_authorized: false;
+  model_call_count: 0;
+}
+
+export interface ScopeGenerationPackingPlan {
+  protocol_version: "scope_preserving_generation_packing_v1";
+  task_hash: string;
+  feature_input_hash: string;
+  source_context_package_id: string;
+  scope_input_hash: string;
+  source_items_hash: string;
+  selected_chunk_ids: string[];
+  selection_token_budget: number;
+  reserved_token_budget: number;
+  original_source_count: number;
+  selected_source_count: number;
+  original_text_characters: number;
+  selected_text_characters: number;
+  all_intersecting_sources_kept: true;
+  source_text_modified: false;
+  model_call_count: 0;
+}
+
+export type LexicalRepairChoice =
+  | { operation: "none_supported" | "need_scope_clarification" }
+  | { operation: "replace_surface"; candidate_ids: string[]; remove_term_ids?: string[] }
+  | { operation: "add_attested_alias" | "qualify" | "locator_probe"; candidate_ids: string[] };
+
+export interface LexicalPatchSelection<Facet extends string = string> {
+  protocol_version: "lexical_patch_selection_v2";
+  choices: Record<Facet, LexicalRepairChoice>;
+}
+
+export interface SemanticScopeSelection {
+  protocol_version: "semantic_source_location_v1";
+  observation_id: string;
+  run_id: string;
+  ledger_hash: string;
+  task_hash: string;
+  source_index_hash: string;
+  items: { selector_hash: string; node_id: string }[];
+  semantic_identity_proven: false;
+}
+
+export type SourceLocationChoice =
+  | { status: "selected"; candidate_id: string }
+  | { status: "unresolved" | "ambiguous" };
+
+export type SourceScopeDeclaration =
+  | { kind: "section"; reference: string; match: "role"; role: "summary" | "detail" }
+  | { kind: "document" | "section" | "text" | "table" | "formula" | "code" | "figure" | "caption";
+      reference: string; match: "title" | "label" | "kind"; role?: never };
+
+export interface SourceLocationOutput<Selector extends string = string> {
+  protocol_version: "source_location_choices_v1";
+  choices: Record<Selector, SourceLocationChoice>;
+}
 
 export interface AgentPEJsonPayload {
   encoding: "canonical_json_v1";
@@ -1316,6 +1817,7 @@ export interface AgentPEPlanAuditRow {
   validation: AgentPEJsonPayload;
   planner_model_metadata: AgentPEJsonPayload;
   status:
+    | "executed"
     | "validated"
     | "invalid"
     | "validator_replan_requested"
@@ -1336,8 +1838,8 @@ export interface AgentPEActionAuditRow {
   order_index: number;
   id: string;
   run_id: string;
-  plan_id: string;
-  plan_index: number;
+  plan_id: string | null;
+  plan_index: number | null;
   parent_action_id?: string | null;
   action_index: number;
   action_type: AgentPEActionType;
@@ -1347,7 +1849,7 @@ export interface AgentPEActionAuditRow {
   expected_evidence: AgentPEJsonPayload;
   stop_condition: AgentPEJsonPayload;
   validator: AgentPEActionValidatorAudit;
-  status: "accepted" | "completed" | "rejected" | "deferred" | "no_progress";
+  status: "accepted" | "executing" | "completed" | "failed" | "cancelled" | "rejected" | "deferred" | "no_progress";
   input_hash?: string | null;
   output_hash?: string | null;
   control_hash?: string | null;
@@ -1364,12 +1866,13 @@ export interface AgentPEObservationAuditRow {
   order_index: number;
   id: string;
   run_id: string;
-  plan_id: string;
-  plan_index: number;
+  plan_id: string | null;
+  plan_index: number | null;
   action_id?: string | null;
   action_index?: number | null;
   parent_action_id?: string | null;
   observation_type: AgentPEObservationType;
+  run_control_protocol?: "retrieval_fsm_v1" | null;
   protocol_version?: string | null;
   input_hash?: string | null;
   output_hash?: string | null;
@@ -1424,10 +1927,12 @@ export interface SessionMessage {
   content: string;
   run_id?: string | null;
   route?: string | null;
+  direct_answer_mode?: DirectAnswerMode | null;
   retrieval_trace_id?: string | null;
   citations: Citation[];
   citation_replay_status?: "not_present" | "valid" | "unavailable";
   citation_replay_reason?: "persisted_citation_contract_mismatch" | null;
+  trace?: AgentTraceEventPayload[];
   source?: "client_history" | null;
 }
 
@@ -1678,6 +2183,11 @@ export interface RuntimeSettingsLifecycle {
 }
 
 export interface ModelSettingsResponse {
+  retrieval_total_timeout_seconds?: number | null;
+  retrieval_planning_timeout_seconds?: number | null;
+  retrieval_generation_timeout_seconds?: number | null;
+  retrieval_planning_max_tokens?: number | null;
+  retrieval_generation_max_tokens?: number | null;
   provider?: "multi_protocol" | string;
   chat_api_protocol?: "openai" | "anthropic";
   graph_api_protocol?: "openai" | "anthropic";
@@ -1701,6 +2211,9 @@ export interface ModelSettingsResponse {
   model_request_timeout_seconds?: number;
   chat_json_max_tokens?: number;
   agent_request_concurrency?: number;
+  graph_compute_memory_mb?: number | null;
+  graph_compute_threads?: number | null;
+  graph_progress_interval_seconds?: number | null;
   source_io_concurrency?: number;
   agent_request_queue_limit?: number;
   agent_request_queue_timeout_seconds?: number;
@@ -1708,10 +2221,9 @@ export interface ModelSettingsResponse {
   upload_max_bytes?: number;
   concept_i18n_enabled?: boolean;
   query_facet_bilingual_enabled?: boolean;
-  query_facet_posterior_enabled?: boolean;
-  query_facet_posterior_observation_budget?: number;
-  query_facet_posterior_round_budget?: number;
-  query_facet_posterior_convergence_epsilon?: number;
+  ingestion_memory_soft_limit_ratio?: number;
+  ingestion_memory_hard_limit_ratio?: number;
+  ingestion_memory_critical_limit_ratio?: number;
   fixed_chunk_size_tokens?: number;
   fixed_chunk_overlap_tokens?: number;
   context_package_token_budget?: number;
@@ -1758,8 +2270,20 @@ export interface ModelSettingsResponse {
   operating_point_hard_gate_min_structure_recovery_rate?: number;
   operating_point_hard_gate_max_candidate_latency_p95_ms?: number;
   retrieval_result_top_k_default?: number;
+  retrieval_v1_dense_candidate_budget?: number;
+  retrieval_v1_rq_candidate_budget?: number;
+  retrieval_v1_bm25_candidate_budget?: number;
+  retrieval_v1_root_entry_budget?: number;
+  retrieval_v1_per_parent_entry_budget?: number;
+  retrieval_v1_layer_entry_budget?: number;
+  retrieval_v1_max_depth?: number;
+  retrieval_v1_restore_per_hit?: number;
+  lexical_index_max_documents?: number;
+  lexical_index_max_postings?: number;
+  lexical_index_max_characters?: number;
+  bm25_k1?: number;
+  bm25_b?: number;
   agent_coarse_initial_budget?: number;
-  agent_coarse_total_budget?: number;
   agent_coarse_top_k?: number;
   agent_mid_per_coarse_budget?: number;
   agent_coarse_drilldown_mid_initial_budget?: number;
@@ -1772,8 +2296,6 @@ export interface ModelSettingsResponse {
   agent_max_depth_per_layer?: number;
   agent_max_labels_per_node?: number;
   agent_max_edge_reuse?: number;
-  agent_max_cycle_reward_per_path?: number;
-  agent_cycle_reward_distance_threshold?: number;
   agent_path_distance_green_threshold?: number;
   agent_path_distance_gray_threshold?: number;
   agent_path_distance_hard_threshold?: number;
@@ -1781,12 +2303,9 @@ export interface ModelSettingsResponse {
   gray_zone_observation_cadence?: number;
   traversal_observation_budget?: number;
   agent_structure_restore_per_chunk_budget?: number;
-  agent_structure_restore_budget?: number;
   context_path_summary_budget?: number;
-  agent_planning_round_budget?: number;
-  agent_max_typed_actions_per_round?: number;
-  agent_repair_round_budget?: number;
-  agent_verification_budget?: number;
+  agent_answer_unit_limit?: number;
+  agent_history_summary_max_chars?: number;
   enable_model_fallback?: boolean;
   enable_database_fallback?: boolean;
   has_chat_api_key?: boolean;
@@ -1907,6 +2426,11 @@ export interface ModelBridgeStatus {
 }
 
 export interface ModelSettingsUpdate {
+  retrieval_total_timeout_seconds?: number | null;
+  retrieval_planning_timeout_seconds?: number | null;
+  retrieval_generation_timeout_seconds?: number | null;
+  retrieval_planning_max_tokens?: number | null;
+  retrieval_generation_max_tokens?: number | null;
   chat_api_key?: string | null;
   clear_chat_api_key?: boolean;
   chat_api_protocol?: "openai" | "anthropic" | null;
@@ -1930,6 +2454,9 @@ export interface ModelSettingsUpdate {
   model_request_timeout_seconds?: number | null;
   chat_json_max_tokens?: number | null;
   agent_request_concurrency?: number | null;
+  graph_compute_memory_mb?: number | null;
+  graph_compute_threads?: number | null;
+  graph_progress_interval_seconds?: number | null;
   source_io_concurrency?: number | null;
   agent_request_queue_limit?: number | null;
   agent_request_queue_timeout_seconds?: number | null;
@@ -1937,10 +2464,9 @@ export interface ModelSettingsUpdate {
   upload_max_bytes?: number | null;
   concept_i18n_enabled?: boolean | null;
   query_facet_bilingual_enabled?: boolean | null;
-  query_facet_posterior_enabled?: boolean | null;
-  query_facet_posterior_observation_budget?: number | null;
-  query_facet_posterior_round_budget?: number | null;
-  query_facet_posterior_convergence_epsilon?: number | null;
+  ingestion_memory_soft_limit_ratio?: number | null;
+  ingestion_memory_hard_limit_ratio?: number | null;
+  ingestion_memory_critical_limit_ratio?: number | null;
   fixed_chunk_size_tokens?: number | null;
   fixed_chunk_overlap_tokens?: number | null;
   context_package_token_budget?: number | null;
@@ -1985,8 +2511,20 @@ export interface ModelSettingsUpdate {
   operating_point_hard_gate_min_structure_recovery_rate?: number | null;
   operating_point_hard_gate_max_candidate_latency_p95_ms?: number | null;
   retrieval_result_top_k_default?: number | null;
+  retrieval_v1_dense_candidate_budget?: number | null;
+  retrieval_v1_rq_candidate_budget?: number | null;
+  retrieval_v1_bm25_candidate_budget?: number | null;
+  retrieval_v1_root_entry_budget?: number | null;
+  retrieval_v1_per_parent_entry_budget?: number | null;
+  retrieval_v1_layer_entry_budget?: number | null;
+  retrieval_v1_max_depth?: number | null;
+  retrieval_v1_restore_per_hit?: number | null;
+  lexical_index_max_documents?: number | null;
+  lexical_index_max_postings?: number | null;
+  lexical_index_max_characters?: number | null;
+  bm25_k1?: number | null;
+  bm25_b?: number | null;
   agent_coarse_initial_budget?: number | null;
-  agent_coarse_total_budget?: number | null;
   agent_coarse_top_k?: number | null;
   agent_mid_per_coarse_budget?: number | null;
   agent_coarse_drilldown_mid_initial_budget?: number | null;
@@ -1999,8 +2537,6 @@ export interface ModelSettingsUpdate {
   agent_max_depth_per_layer?: number | null;
   agent_max_labels_per_node?: number | null;
   agent_max_edge_reuse?: number | null;
-  agent_max_cycle_reward_per_path?: number | null;
-  agent_cycle_reward_distance_threshold?: number | null;
   agent_path_distance_green_threshold?: number;
   agent_path_distance_gray_threshold?: number;
   agent_path_distance_hard_threshold?: number;
@@ -2008,12 +2544,9 @@ export interface ModelSettingsUpdate {
   gray_zone_observation_cadence?: number;
   traversal_observation_budget?: number;
   agent_structure_restore_per_chunk_budget?: number | null;
-  agent_structure_restore_budget?: number | null;
   context_path_summary_budget?: number | null;
-  agent_planning_round_budget?: number | null;
-  agent_max_typed_actions_per_round?: number | null;
-  agent_repair_round_budget?: number | null;
-  agent_verification_budget?: number | null;
+  agent_answer_unit_limit?: number | null;
+  agent_history_summary_max_chars?: number | null;
   embedding_api_key?: string | null;
   clear_embedding_api_key?: boolean;
 }
@@ -2088,10 +2621,16 @@ export interface EnvSyncStatus {
   synced: boolean;
   settings_file_present?: boolean;
   settings_file_schema_synced?: boolean;
+  env_file_present?: boolean;
+  env_file_schema_synced?: boolean;
   missing_keys: string[];
   extra_keys: string[];
+  overlap_keys?: string[];
   deprecated_keys: string[];
   bom_keys: string[];
+  runtime_settings_missing_keys?: string[];
+  runtime_settings_extra_keys?: string[];
+  runtime_settings_error_type?: string | null;
 }
 
 export interface InfrastructureStatus {
@@ -2764,6 +3303,47 @@ export interface BatchError {
   message?: string | null;
 }
 
+export interface BuildLatencySummary {
+  count: number;
+  sample_count: number;
+  success_count: number;
+  failure_count: number;
+  p50_ms: number | null;
+  p95_ms: number | null;
+  p99_ms: number | null;
+  total_ms: number;
+  active_wall_seconds: number;
+  success_requests_per_second: number;
+  sampled: boolean;
+}
+
+export interface BuildPerformanceSummary {
+  protocol_version: "build_performance_v1" | "build_performance_v2";
+  cold: boolean;
+  elapsed_seconds: number;
+  stages: Record<string, BuildLatencySummary>;
+  peak_rss_bytes: number;
+  peak_container_memory_bytes: number;
+  cpu_seconds: number;
+  average_cpu_cores: number;
+  available_cpu_count: number;
+  average_cpu_percent: number;
+  resource_sample_count: number;
+  deadline_seconds: number | null;
+  deadline_exceeded: boolean;
+  provider_cache_hits: number;
+  provider_cache_observations: number;
+  provider_cache_unknown_responses?: number;
+  embedding_vector_count: number;
+  in_progress_ms: Record<string, number[]>;
+  numeric_workspace?: Record<string, unknown>;
+  process_io_read_bytes?: number | null;
+  process_io_write_bytes?: number | null;
+  temporary_space_peak_bytes?: number;
+  database_wait_sample_count?: number;
+  database_wait_observations?: Record<string, number>;
+}
+
 export interface IngestionBatchSummary {
   batch_id: string;
   knowledge_base_id?: string;
@@ -2780,7 +3360,7 @@ export interface IngestionBatchSummary {
   coverage_by_language?: Record<string, number>;
   errors?: BatchError[];
   graph_stats?: Record<string, unknown>;
-  stats?: Record<string, unknown>;
+  stats?: Record<string, unknown> & { performance?: BuildPerformanceSummary };
   phase?: string | null;
   current_phase?: string | null;
   cancel_requested?: boolean;
@@ -3740,11 +4320,21 @@ export interface ContextStructureOCRLayoutItemAudit {
   bbox: CitationBoundingBox;
 }
 
+export interface PDFTableGeometryAudit {
+  protocol_version: "pdf_ruled_table_geometry_v1";
+  detector_version: string;
+  row_band_count: number;
+  column_count: number;
+  region: CitationBoundingBox;
+  source_block_indices: number[];
+}
+
 export interface ContextStructureNativeMetadataAudit {
   native_structure?: boolean | null;
   parent_ref?: string | null;
   parser_source?: string | null;
   native_geometry?: boolean | null;
+  table_geometry?: PDFTableGeometryAudit | null;
   layout_protocol_version?: string | null;
   flow_block_protocol_version?: string | null;
   block_start_protocol_version?: string | null;
@@ -3778,6 +4368,7 @@ export interface ContextStructureNativeMetadataAudit {
 }
 
 export interface ContextStructureLayoutAudit {
+  has_formula?: boolean | null;
   coordinate_system?: string | null;
   structure_id?: string | null;
   layout_id?: string | null;
@@ -3803,6 +4394,7 @@ export interface ContextStructureLayoutAudit {
   page_size?: [number, number] | number[] | null;
   native_layout_block_count?: number | null;
   pdf_image_count?: number | null;
+  ocr_image_errors?: string[];
   ocr_applied?: boolean | null;
   ocr_page_count?: number | null;
   ocr_reason?: string | null;
@@ -3876,7 +4468,7 @@ export interface ContextPackageChunk {
   structure_closure: ContextStructureClosure;
   why_selected: ContextSelectionReason;
   dedupe_key: string;
-  role: "hit" | "bridge" | "graph_path" | "restored_context";
+  role: "hit" | "bridge" | "graph_path" | "restored_context" | "source_scope" | "source_scope_context" | "preserved_source";
   context_package_id: string;
 }
 
@@ -3895,7 +4487,7 @@ export interface ContextMetadata {
   structure_closure: ContextStructureClosure;
   why_selected: ContextSelectionReason;
   dedupe_key: string;
-  role: "hit" | "bridge" | "graph_path" | "restored_context";
+  role: "hit" | "bridge" | "graph_path" | "restored_context" | "source_scope" | "source_scope_context" | "preserved_source";
   content_clipped: boolean;
   content_token_count: number;
   original_token_count: number;
@@ -3934,6 +4526,22 @@ export type ContextGraphExpansionPath =
   | { kind: "parent_structure_nodes"; node_ids: string[] };
 
 export interface ContextPackageDiagnostics {
+  source_retention?: {
+    protocol_version: "reflection_bound_source_retention_v1";
+    base_context_package_id: string;
+    base_retrieval_trace_id: string;
+    source_context_package_id: string;
+    retrieval_executed: false;
+    gray_zone_model_call_count: 0;
+    retained_chunk_ids: string[];
+    preserved_chunk_ids: string[];
+  } | null;
+  source_expansion?: {
+    protocol_version: "reflection_source_structure_expansion_v1";
+    expanded_chunk_ids: string[];
+    graph_hits_added: 0;
+    gray_zone_model_call_count: 0;
+  } | null;
   context_restoration_protocol: string;
   repair_protocol_version?: string | null;
   repair_action_type?: string | null;
@@ -3947,8 +4555,8 @@ export interface ContextPackageDiagnostics {
   profile_hash?: string | null;
   path_summary: { node_visit_count: number; distinct_parent_count: number; distinct_path_count: number; distinct_edge_type_count: number; covered_facets: string[]; support_chunk_union: string[]; reached_by_paths: RetrievalPathContribution[]; cycle_convergence_score: number };
   dedupe_keys: string[];
-  restore_counts: { hit_chunks: number; restored_chunks: number; bridge_chunks: number; graph_path_chunks: number; parent_structure_nodes: number; per_hit_chunk_budget: number };
-  token_budget_audit: { token_budget: number; token_count: number; within_budget: boolean; clipped_chunk_ids: string[]; skipped_chunk_ids: string[]; packing_protocol: string };
+  restore_counts: { hit_chunks: number; restored_chunks: number; bridge_chunks: number; graph_path_chunks: number; parent_structure_nodes: number; per_hit_chunk_budget: number; required_scope_chunks?: number; source_scope_context_chunks?: number };
+  token_budget_audit: { token_budget: number; token_count: number; within_budget: boolean; clipped_chunk_ids: string[]; skipped_chunk_ids: string[]; packing_protocol: string; candidate_chunk_ids?: string[]; selection_token_budget?: number | null };
   snapshot_integrity: { protocol_version: string; verified_document_version_count: number; fail_closed: true };
 }
 
@@ -3966,6 +4574,10 @@ export interface QueryFacetSchemaRejection {
 }
 
 export interface QueryFacetDiagnostics {
+  lexical_strategy_protocol_version?: "retrieval_lexical_strategy_v1" | null;
+  lexical_strategy_hash?: string | null;
+  fixed_task_hash?: string | null;
+  lexical_only_aliases?: boolean;
   source: string;
   schema_validation: "canonical_facet_groups_only";
   query_facet_protocol_hash: string;
@@ -4096,8 +4708,10 @@ export interface RetrievalAgentOperatingEnvelope {
   context_path_summary_budget: number;
   planning_round_budget: number;
   max_typed_actions_per_round: number;
-  repair_round_budget: number;
-  verification_budget: number;
+  repair_round_budget?: number | null;
+  verification_budget?: number | null;
+  answer_unit_limit?: number | null;
+  reflection_round_budget?: number | null;
   allowed_relation_types: Array<
     "dense_semantic" | "dense_cross_document_bridge" | "dense_cross_language_bridge"
   >;
@@ -4209,12 +4823,13 @@ export interface ContextPackageResponse {
 }
 
 export interface RetrievalTraceStepsResponse {
-  contract_version: "layered_retrieval_trace_public_v1";
+  contract_version: "layered_retrieval_trace_public_v1" | "intent_execution_retrieval_trace_public_v1";
   trace_id: string;
   context_package_id?: string | null;
   query?: string;
   retrieval_mode?: string;
   retrieval_granularity?: RetrievalGranularity;
+  entry_layer?: "coarse" | "mid" | "chunk";
   conversation_state_scope_hash: string;
   concept_path: Array<{ layer: "coarse" | "mid" | "rq_membership" | "chunk"; ids: string[] }>;
   query_facets: QueryFacetPacket;
@@ -4230,6 +4845,7 @@ export interface RetrievalTraceStepsResponse {
   rq_diagnostics: { query_rq_path: number[]; query_residual_norm?: number | null; index_protocol?: string | null };
   gray_zone_protocol: string;
   gray_zone_model_call_count: 0;
+  retrieval_cache?: RetrievalCacheAudit | null;
   gray_zone_determinism: RetrievalGrayZoneDeterminismAudit;
   gray_zone_path_decisions?: RetrievalGrayZoneDecision[];
   path_distance_threshold_hits?: RetrievalGrayZoneDecision[];

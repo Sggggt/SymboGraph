@@ -230,10 +230,17 @@ def _strict_json_copy(value: Any, *, path: str = "$") -> Any:
             raise QdrantOutboxError(f"Qdrant outbox value at {path} must be finite JSON")
         return 0.0 if value == 0.0 else value
     if isinstance(value, list):
-        return [
-            _strict_json_copy(item, path=f"{path}[{index}]")
-            for index, item in enumerate(value)
-        ]
+        copied_items=[]
+        for index,item in enumerate(value):
+            if item is None or isinstance(item,(str,bool)) or type(item) is int:
+                copied_items.append(item)
+            elif type(item) is float:
+                if not math.isfinite(item):
+                    raise QdrantOutboxError(f"Qdrant outbox value at {path}[{index}] must be finite JSON")
+                copied_items.append(0.0 if item==0.0 else item)
+            else:
+                copied_items.append(_strict_json_copy(item,path=f"{path}[{index}]"))
+        return copied_items
     if isinstance(value, dict):
         copied: dict[str, Any] = {}
         for key, item in value.items():
@@ -2554,15 +2561,11 @@ def _decode_v2_reconcile_payload(
         raise QdrantOutboxError(f"Intent {row.id} target payload exceeds its bounded scope")
     if not isinstance(before_points, list):
         raise QdrantOutboxError(f"Intent {row.id} before-image payload is invalid")
-    if payload.get("target_payload_hash") != _outbox_payload_hash(
-        QDRANT_OUTBOX_PROTOCOL_VERSION,
-        target_points,
-    ):
+    target_bytes=_outbox_v2_canonical_bytes(target_points)
+    if payload.get("target_payload_hash") != hashlib.sha256(target_bytes).hexdigest():
         raise QdrantOutboxError(f"Intent {row.id} target payload hash is invalid")
-    if payload.get("before_image_hash") != _outbox_payload_hash(
-        QDRANT_OUTBOX_PROTOCOL_VERSION,
-        before_points,
-    ):
+    before_bytes=_outbox_v2_canonical_bytes(before_points)
+    if payload.get("before_image_hash") != hashlib.sha256(before_bytes).hexdigest():
         raise QdrantOutboxError(f"Intent {row.id} before-image hash is invalid")
 
     expected_contract = _outbox_protocol_contract(QDRANT_OUTBOX_PROTOCOL_VERSION)
@@ -2590,15 +2593,11 @@ def _decode_v2_reconcile_payload(
         allow_historical_vector_hash=True,
     )
     decoded_before = _canonicalize_before_points(before_points, intent_id=row.id)
-    if _outbox_v2_canonical_bytes(decoded_targets) != _outbox_v2_canonical_bytes(
-        target_points
-    ):
+    if _outbox_v2_canonical_bytes(decoded_targets) != target_bytes:
         raise QdrantOutboxError(
             f"Intent {row.id} target points were not persisted in canonical binary32 form"
         )
-    if _outbox_v2_canonical_bytes(decoded_before) != _outbox_v2_canonical_bytes(
-        before_points
-    ):
+    if _outbox_v2_canonical_bytes(decoded_before) != before_bytes:
         raise QdrantOutboxError(
             f"Intent {row.id} before-image points were not persisted in canonical binary32 form"
         )

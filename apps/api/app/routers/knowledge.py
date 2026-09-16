@@ -23,6 +23,7 @@ from app.schemas import (
     RebuildGraphResponse,
     RefreshResponse,
     RetrievalTraceStepsResponse,
+    IntentExecutionRetrievalTraceStepsResponse,
     AutoTpeStatusResponse,
 )
 from app.services.context_graph import (
@@ -296,7 +297,13 @@ def context_package(package_id: str, db: Session = Depends(get_db)) -> dict:
     return payload
 
 
-@router.get("/retrieval-traces/{trace_id}/graph-steps", response_model=RetrievalTraceStepsResponse)
+@router.get(
+    "/retrieval-traces/{trace_id}/graph-steps",
+    response_model=(
+        RetrievalTraceStepsResponse
+        | IntentExecutionRetrievalTraceStepsResponse
+    ),
+)
 def retrieval_trace_steps(trace_id: str, db: Session = Depends(get_db)) -> dict:
     try:
         payload = get_retrieval_trace_steps(db, trace_id)

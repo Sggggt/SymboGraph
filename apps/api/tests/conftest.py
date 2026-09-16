@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ def explicit_test_storage_durability_adapter():
 def no_fallback_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     data_root = tmp_path / "data"
     root_env = tmp_path / ".env"
+    root_settings = tmp_path / "settings.json"
     # DATA_ROOT is deployment-provisioned; production code must never create
     # it before proving the filesystem capability contract.
     data_root.mkdir(parents=True, exist_ok=False)
@@ -60,13 +62,29 @@ def no_fallback_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
                 "GRAPH_API_PROTOCOL=openai",
                 "ENABLE_MODEL_FALLBACK=false",
                 "ENABLE_DATABASE_FALLBACK=false",
-                "ENABLE_AUTO_TPE=false",
             ]
         )
         + "\n",
         encoding="utf-8",
     )
+    settings_example = Path(__file__).resolve().parents[3] / "settings.example.json"
+    if not settings_example.exists():
+        settings_example = Path("/workspace/settings.example.json")
+    root_settings.write_bytes(settings_example.read_bytes())
+    settings_payload = json.loads(settings_example.read_text(encoding="utf-8"))[
+        "settings"
+    ]
+    for key, value in settings_payload.items():
+        process_value = (
+            "true"
+            if value is True
+            else "false"
+            if value is False
+            else str(value)
+        )
+        monkeypatch.setenv(key.upper(), process_value)
     monkeypatch.setenv("RUNTIME_ENV_FILE", str(root_env))
+    monkeypatch.setenv("RUNTIME_SETTINGS_FILE", str(root_settings))
     from app.core import config as config_module
 
     def read_test_env() -> dict[str, str]:
@@ -76,6 +94,7 @@ def no_fallback_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     from app.services import runtime_settings
 
     monkeypatch.setattr(runtime_settings, "ENV_PATH", root_env)
+    monkeypatch.setattr(runtime_settings, "SETTINGS_PATH", root_settings)
     from app.core.config import get_settings
 
     get_settings.cache_clear()
@@ -89,6 +108,9 @@ def db_session(no_fallback_env: Path):
     import app.db as db
     import app.models  # noqa: F401
 
+    original_settings,original_engine = db.settings,db.engine
+    original_session_factory = db.SessionLocal
+    original_session_options = dict(original_session_factory.kw)
     get_settings.cache_clear()
     db.settings = get_settings()
     db.engine.dispose()
@@ -104,6 +126,9 @@ def db_session(no_fallback_env: Path):
     finally:
         session.close()
         db.engine.dispose()
+        db.settings,db.engine = original_settings,original_engine
+        db.SessionLocal = original_session_factory
+        original_session_factory.configure(**original_session_options)
         get_settings.cache_clear()
 
 
@@ -305,10 +330,85 @@ def fake_model_stack(monkeypatch: pytest.MonkeyPatch):
             return {"ok": active_ids.issubset(vector_ids), "missing": sorted(active_ids - vector_ids), "stale": sorted(vector_ids - active_ids)}
 
     class FakeChatProvider:
+        api_protocol = "openai"
+        model = "unit-test-chat"
+
         def __init__(self, *args, **kwargs) -> None:
             pass
 
+        def provider_call_audit(self):
+            return None
+
         async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
+            if "INTENT EXECUTION RETRIEVAL V1" in system_prompt:
+                import json
+                packet = json.loads(user_prompt)
+                capabilities = packet["capabilities"]
+                layers = capabilities.get("available_layers") or []
+                question = str(packet.get("question") or "")
+                if not layers:
+                    return {
+                        "intent": {"primary": "system_capability"},
+                        "execution_strategy": {
+                            "route": "system_capability",
+                            "entry_layer": None,
+                            "generate_lexical": False,
+                            "hybrid": False,
+                            "reason_code": "system_request",
+                        },
+                    }
+                layer = "chunk" if "chunk" in layers else layers[-1]
+                return {
+                    "intent": {"primary": "fact_lookup"},
+                    "requirements": [{"id": "f1", "text": question[:256]}],
+                    "entities": ["Bayesian"],
+                    "execution_strategy": {
+                        "route": "retrieve",
+                        "entry_layer": layer,
+                        "semantic_query": question,
+                        "generate_lexical": False,
+                        "hybrid": False,
+                        "layer_weights": {
+                            name: {"dense": 1, "rq": 0, "bm25": 0}
+                            for name in ({"coarse": ("coarse", "mid", "chunk"), "mid": ("mid", "chunk"), "chunk": ("chunk",)}[layer])
+                        },
+                        "reason_code": "semantic_paraphrase",
+                    },
+                }
+            if 'SOURCE LOCATION CHOICES V1' in system_prompt:
+                import json
+                packet=json.loads(user_prompt)
+                return {'choices':{item['id']:{'status':'unresolved'} for item in packet['location_requests']}}
+            if 'PRE-GENERATION EVIDENCE SUFFICIENCY V1' in system_prompt:
+                import json
+                packet = json.loads(user_prompt)
+                scoped = {item['requirement_id']:item['sources'] for item in (packet.get('source_scopes') or {}).get('requirements',[])}
+                return {'question_complete':True,'requirements':[
+                    {'facet_id':item['id'],'status':'covered','reason':'supported',
+                     'source_handles':[(scoped.get(item['id']) or packet['evidence'])[0]['source_handle']]}
+                    for item in packet['requirements']]}
+            if 'RETRIEVAL TASK PLANNING V2' in system_prompt:
+                return {'source_references':[], 'perception':{'intent':'definition','direct_answer_kind':'none','entities':['Bayesian']},
+                    'requirements':[{'facet':'Bayesian network','lexical_role':'domain','aliases':['Bayesian networks']},
+                        {'facet':'factorization','lexical_role':'procedure','aliases':['conditional probability factorization']}],
+                    'answer_shape':'definition'}
+            if 'SINGLE GROUNDED ANSWER V2' in system_prompt:
+                import json
+                packet = json.loads(user_prompt)
+                source = packet['evidence'][0]
+                return {'answer_units':[{'kind':'factual','text':source['text'],'source_handles':[source['source_handle']]}]}
+            if "IMMUTABLE ANSWER REFLECTION SYSTEM ENVELOPE" in system_prompt:
+                import json
+                packet = json.loads(user_prompt)
+                if packet.get("answer_draft") is None:
+                    source = packet["evidence"][0]
+                    return {"protocol_version": "structured_answer_self_assessment_v1",
+                        "answer_units": [{"kind": "factual", "text": source["text"], "source_handles": [source["source_handle"]]}],
+                        "self_assessment": {"question_relevance": 0.95, "context_relevance": 0.95, "coverage": 0.9,
+                            "needs_reflection": False, "issue_types": [], "summary": "Synthetic source supports this test answer."}}
+                return {"protocol_version": "agent_answer_reflection_v1", "action": "accept", "issue_types": [],
+                    "target_unit_indexes": [], "source_handles": [], "missing_facets": [],
+                    "correction_instructions": "", "clarification_question": None}
             if "query facet extractor" in system_prompt:
                 return {
                     "facet_groups": [
@@ -354,7 +454,109 @@ def fake_model_stack(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(context_graph, "VectorStore", FakeVectorStore)
     monkeypatch.setattr(context_graph, "ChatProvider", FakeChatProvider)
     monkeypatch.setattr(agent_graph, "ChatProvider", FakeChatProvider)
+    from app.services import retrieval_agent
+    monkeypatch.setattr(retrieval_agent, 'EmbeddingProvider', FakeEmbeddingProvider)
+    from app.services import layered_execution_v1
+    monkeypatch.setattr(layered_execution_v1, "EmbeddingProvider", FakeEmbeddingProvider)
     return {"EmbeddingProvider": FakeEmbeddingProvider, "VectorStore": FakeVectorStore, "ChatProvider": FakeChatProvider}
+
+
+@pytest.fixture
+def historical_answer_executor(monkeypatch, request):
+    """Explicit test-only execution to preserve old audit replay coverage.
+
+    New-request tests use the production controller. This fixture never adds
+    an application setting or a production route back to the retired loop.
+    """
+    from app.services import agent_graph
+    from app.core.config import get_settings
+    from app.schemas import AgentRequest
+    monkeypatch.setenv('APP_ENV','test')
+    get_settings.cache_clear()
+
+    def historical_request(*args, **kwargs):
+        granularity = kwargs.pop("retrieval_granularity", "mid")
+        value = AgentRequest(*args, **kwargs)
+        object.__setattr__(value, "retrieval_granularity", granularity)
+        return value
+
+    if hasattr(request.module, "AgentRequest"):
+        monkeypatch.setattr(request.module, "AgentRequest", historical_request)
+
+    async def execute_historical(db, request, session, run):
+        # The retired replay contract keeps its frozen v1 mode field without
+        # reintroducing that field into the public request schema.
+        if "retrieval_granularity" not in request.__dict__:
+            object.__setattr__(request, "retrieval_granularity", "mid")
+        result = await agent_graph._retired_answer_reflection_executor(
+            db,
+            request,
+            session,
+            run,
+        )
+        result.pop("retrieval_granularity", None)
+        result.setdefault("entry_layer", "mid")
+        result.setdefault(
+            "terminal_outcome",
+            "scope_ambiguous"
+            if db.get(type(run), run.id).status == "needs_clarification"
+            else "completed",
+        )
+        return result
+    monkeypatch.setattr(agent_graph, "execute_agent_run", execute_historical)
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def historical_retrieval_agent_executor(monkeypatch, request):
+    """Run the retired retrieval-agent controller only for replay tests."""
+
+    from app.core.config import get_settings
+    from app.schemas import AgentRequest
+    from app.services import agent_graph, retrieval_agent
+
+    monkeypatch.setenv("APP_ENV", "test")
+    get_settings.cache_clear()
+
+    def historical_request(*args, **kwargs):
+        granularity = kwargs.pop("retrieval_granularity", "mid")
+        value = AgentRequest(*args, **kwargs)
+        object.__setattr__(value, "retrieval_granularity", granularity)
+        return value
+
+    if hasattr(request.module, "AgentRequest"):
+        monkeypatch.setattr(request.module, "AgentRequest", historical_request)
+
+    execute_retrieval_agent = retrieval_agent.execute_retrieval_agent
+
+    async def execute_historical(db, request, session, run):
+        if "retrieval_granularity" not in request.__dict__:
+            object.__setattr__(request, "retrieval_granularity", "mid")
+        result = await execute_retrieval_agent(
+            db,
+            request,
+            session,
+            run,
+        )
+        result.pop("retrieval_granularity", None)
+        result.setdefault("entry_layer", "mid")
+        result.setdefault(
+            "terminal_outcome",
+            "scope_ambiguous"
+            if db.get(type(run), run.id).status == "needs_clarification"
+            else "completed",
+        )
+        return result
+
+    monkeypatch.setattr(
+        retrieval_agent,
+        "execute_retrieval_agent",
+        execute_historical,
+    )
+    monkeypatch.setattr(agent_graph, "execute_agent_run", execute_historical)
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture
@@ -367,7 +569,7 @@ def local_agent_admission():
 
 
 @pytest_asyncio.fixture
-async def populated_context_graph(db_session, sample_knowledge_base, fake_model_stack, local_agent_admission, tmp_path):
+async def populated_context_graph(db_session, sample_knowledge_base, fake_model_stack, local_agent_admission, tmp_path, request):
     from app.core.config import get_settings
     from app.models import Document, DocumentVersion
     from app.services.context_graph import rebuild_context_graph, write_chunks_and_structure, write_contextual_indexes
@@ -444,6 +646,10 @@ async def populated_context_graph(db_session, sample_knowledge_base, fake_model_
             section="Bayesian networks > Factorization",
         ),
     ]
+    section_metadata = getattr(request, "param", None)
+    if section_metadata:
+        for section in sections:
+            section.metadata.update(section_metadata)
     chunks = write_chunks_and_structure(
         db_session,
         knowledge_base=sample_knowledge_base,

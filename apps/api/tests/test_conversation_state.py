@@ -105,6 +105,25 @@ def _persist_answer_reference(
     return run, trace, package, answer, verification
 
 
+def test_delete_session_detaches_durable_run_and_answer_audits(
+    db_session,
+    sample_knowledge_base,
+):
+    from app.models import AgentRun, AnswerSession, QASession
+    from app.routers.sessions import delete_session
+
+    session = _create_session(db_session, sample_knowledge_base.id)
+    run, _trace, _package, answer, _verification = _persist_answer_reference(
+        db_session,
+        session=session,
+    )
+
+    assert delete_session(session.id, db_session) == {"deleted": True}
+    assert db_session.get(QASession, session.id) is None
+    assert db_session.get(AgentRun, run.id).session_id is None
+    assert db_session.get(AnswerSession, answer.id).qa_session_id is None
+
+
 def test_conversation_request_schema_rejects_role_shape_turn_and_token_drift():
     from app.schemas import AgentRequest
 
@@ -201,6 +220,108 @@ def test_persisted_task_status_does_not_coerce_false_to_active():
 
     with pytest.raises(ConversationStateIntegrityError, match="status must be text"):
         canonical_task_state({"status": False})
+
+
+def test_agent_run_creation_persists_the_user_message_before_execution(
+    db_session,
+    sample_knowledge_base,
+):
+    from app.schemas import AgentRequest
+    from app.services.agent_graph import create_agent_run_context
+    from app.services.conversation_state import load_conversation_state
+
+    session, run = create_agent_run_context(
+        db_session,
+        AgentRequest(
+            knowledge_base_id=sample_knowledge_base.id,
+            question="persist this unit-test question",
+        ),
+    )
+
+    _row, snapshot = load_conversation_state(
+        db_session,
+        knowledge_base_id=sample_knowledge_base.id,
+        session_id=session.id,
+    )
+    assert session.last_question == "persist this unit-test question"
+    assert session.transcript == [
+        {
+            "role": "user",
+            "content": "persist this unit-test question",
+            "run_id": run.id,
+        }
+    ]
+    assert snapshot.prompt_history == []
+    assert snapshot.prompt_history_audit["pending_user_message_count"] == 1
+
+
+def test_latest_run_terminal_state_is_persisted_and_resets_on_next_turn(
+    db_session,
+    sample_knowledge_base,
+):
+    from datetime import datetime, timedelta
+
+    from app.models import AgentRun
+    from app.services.conversation_state import (
+        load_conversation_state,
+        mark_session_task_terminal_for_run,
+        prepare_session_for_turn,
+    )
+
+    session = _create_session(db_session, sample_knowledge_base.id)
+    created_at = datetime.utcnow()
+    older = AgentRun(
+        knowledge_base_id=sample_knowledge_base.id,
+        session_id=session.id,
+        question="older unit-test turn",
+        status="running",
+        created_at=created_at,
+    )
+    latest = AgentRun(
+        knowledge_base_id=sample_knowledge_base.id,
+        session_id=session.id,
+        question="latest unit-test turn",
+        status="running",
+        created_at=created_at + timedelta(seconds=1),
+    )
+    db_session.add_all([older, latest])
+    db_session.commit()
+
+    assert mark_session_task_terminal_for_run(
+        db_session,
+        session_id=session.id,
+        run_id=older.id,
+        status="cancelled",
+    ) is False
+    assert mark_session_task_terminal_for_run(
+        db_session,
+        session_id=session.id,
+        run_id=latest.id,
+        status="failed",
+    ) is True
+    db_session.commit()
+    _row, terminal = load_conversation_state(
+        db_session,
+        knowledge_base_id=sample_knowledge_base.id,
+        session_id=session.id,
+    )
+    assert terminal.task_state["status"] == "failed"
+    assert terminal.task_state["current_step"] == "failed"
+    assert [item["role"] for item in session.transcript] == ["user", "assistant"]
+    assert session.transcript[0]["run_id"] == latest.id
+    assert session.transcript[1]["run_id"] == latest.id
+    assert session.last_question == latest.question
+    assert session.last_answer == "本轮问答未能完成，请重新提问。"
+
+    resumed = prepare_session_for_turn(
+        db_session,
+        session=session,
+        history=[],
+        question="next unit-test turn",
+        state_update=None,
+    )
+    assert resumed.task_state["status"] == "active"
+    assert resumed.task_state["current_step"] == "answering"
 
 
 def test_persisted_transcript_type_tamper_cannot_replay_unchanged_hash(
@@ -580,11 +701,13 @@ def test_answer_context_citation_references_are_durable_and_tamper_checked(
     sample_knowledge_base,
 ):
     from app.models import KnowledgeBase
+    from app.routers.sessions import get_session_messages, list_sessions
     from app.schemas import ConversationStatePayload, SessionSummary
     from app.services.conversation_state import (
         ConversationStateIntegrityError,
         append_completed_turn,
         load_conversation_state,
+        prepare_session_for_turn,
         session_summary_payload,
     )
 
@@ -641,6 +764,30 @@ def test_answer_context_citation_references_are_durable_and_tamper_checked(
             session_id=session.id,
         )
 
+    # A stale source disables evidence reuse, but history remains readable and
+    # the user can continue with a fresh retrieval plan.
+    readable = session_summary_payload(
+        db_session,
+        session,
+        validate_references=False,
+    )
+    assert readable["last_question"] == run.question
+    listed = list_sessions(sample_knowledge_base.id, db_session)
+    assert [item["id"] for item in listed] == [session.id]
+    messages = get_session_messages(session.id, db_session)
+    assert [item["role"] for item in messages["messages"]] == [
+        "user",
+        "assistant",
+    ]
+    continued = prepare_session_for_turn(
+        db_session,
+        session=session,
+        history=[],
+        question="Continue with fresh evidence",
+        state_update=None,
+    )
+    assert continued.prompt_history[-1]["content"] == answer.answer
+
 
 def test_public_transcript_projects_latest_plan_trace_without_rewriting_history(
     db_session,
@@ -675,18 +822,183 @@ def test_public_transcript_projects_latest_plan_trace_without_rewriting_history(
     )
     db_session.add(plan)
     db_session.commit()
+    from app.services.agent_graph import trace as persist_trace
+
+    persisted_event = persist_trace(
+        db_session,
+        run.id,
+        "unit_session_trace",
+        input_summary="bounded input",
+        output_summary="bounded output",
+    )
 
     assert "retrieval_trace_id" not in session.transcript[-1]
     projected = session_transcript_public_payload(db_session, session)
     assert projected[-1]["retrieval_trace_id"] == trace.id
     assert projected[-1]["citations"] == []
     assert projected[-1]["citation_replay_status"] == "unavailable"
+    assert projected[-1]["trace"] == [persisted_event]
     assert (
         projected[-1]["citation_replay_reason"]
         == "persisted_citation_contract_mismatch"
     )
     assert "retrieval_trace_id" not in session.transcript[-1]
     assert session.transcript[-1]["citations"] == [{"chunk_id": "legacy-only"}]
+
+
+def test_session_list_excludes_incompatible_session_without_hiding_valid_history(
+    db_session,
+    sample_knowledge_base,
+    caplog,
+):
+    from fastapi import HTTPException
+
+    from app.models import AgentRun, AgentTraceEvent
+    from app.routers.sessions import (
+        INCOMPATIBLE_SESSION_DETAIL,
+        get_session,
+        get_session_messages,
+        list_sessions,
+    )
+    from app.services.conversation_state import append_completed_turn
+
+    def completed_session(question: str):
+        session = _create_session(db_session, sample_knowledge_base.id)
+        run = AgentRun(
+            knowledge_base_id=sample_knowledge_base.id,
+            session_id=session.id,
+            question=question,
+            status="completed",
+            route="system_capability",
+        )
+        db_session.add(run)
+        db_session.flush()
+        append_completed_turn(
+            db_session,
+            session_id=session.id,
+            question=question,
+            answer="Synthetic compatible answer.",
+            run_id=run.id,
+            citations=[],
+            route="system_capability",
+            direct_answer_mode="system_capability",
+        )
+        return session, run
+
+    compatible, _compatible_run = completed_session("Compatible synthetic turn")
+    incompatible, incompatible_run = completed_session("Legacy synthetic turn")
+    db_session.add(
+        AgentTraceEvent(
+            run_id=incompatible_run.id,
+            sequence_index=0,
+            node="unit-test-legacy-node",
+            status="completed",
+            scores={},
+        )
+    )
+    db_session.commit()
+
+    caplog.set_level("WARNING", logger="app.routers.sessions")
+    listed = list_sessions(sample_knowledge_base.id, db_session)
+
+    assert [item["id"] for item in listed] == [compatible.id]
+    assert "Excluded incompatible sessions" in caplog.text
+    with pytest.raises(HTTPException) as summary_error:
+        get_session(incompatible.id, db_session)
+    assert summary_error.value.status_code == 409
+    assert summary_error.value.detail == INCOMPATIBLE_SESSION_DETAIL
+    with pytest.raises(HTTPException) as messages_error:
+        get_session_messages(incompatible.id, db_session)
+    assert messages_error.value.status_code == 409
+    assert messages_error.value.detail == INCOMPATIBLE_SESSION_DETAIL
+
+
+def test_completed_turn_validates_the_canonical_multi_source_reference(
+    monkeypatch,
+    db_session,
+    sample_knowledge_base,
+):
+    from app.models import AgentRun, AnswerSession, ContextPackage, RetrievalTrace
+    from app.services import conversation_state
+
+    session = _create_session(db_session, sample_knowledge_base.id)
+    _row, before_turn = conversation_state.load_conversation_state(
+        db_session,
+        knowledge_base_id=sample_knowledge_base.id,
+        session_id=session.id,
+    )
+    run = AgentRun(
+        knowledge_base_id=sample_knowledge_base.id,
+        session_id=session.id,
+        question="Explain the multi-source result",
+        status="running",
+        route="intent_execution_retrieval_v1",
+    )
+    db_session.add(run)
+    db_session.flush()
+    trace = RetrievalTrace(
+        knowledge_base_id=sample_knowledge_base.id,
+        query=run.question,
+        retrieval_mode="intent_execution_retrieval_v1",
+        conversation_state_scope_hash=before_turn.scope_hash,
+    )
+    db_session.add(trace)
+    db_session.flush()
+    package = ContextPackage(
+        knowledge_base_id=sample_knowledge_base.id,
+        retrieval_trace_id=trace.id,
+        query=run.question,
+        diagnostics_json={"conversation_state_scope_hash": before_turn.scope_hash},
+    )
+    db_session.add(package)
+    db_session.flush()
+    descending_ids = [
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "00000000-0000-0000-0000-000000000001",
+    ]
+    answer = AnswerSession(
+        knowledge_base_id=sample_knowledge_base.id,
+        retrieval_trace_id=trace.id,
+        context_package_id=package.id,
+        qa_session_id=session.id,
+        question=run.question,
+        answer="A grounded multi-source answer.",
+        citation_ids_json=descending_ids,
+        prompt_protocol_version="single_grounded_answer_v3",
+        model_json={"conversation_state_scope_hash": before_turn.scope_hash},
+        diagnostics_json={
+            "conversation_state_scope_hash": before_turn.scope_hash,
+            "source_integrity_admission": {
+                "protocol_version": "source_integrity_admission_v1"
+            },
+        },
+    )
+    db_session.add(answer)
+    db_session.flush()
+    captured_references = []
+
+    def capture_new_reference(_db, _session, references, _transcript, **_kwargs):
+        captured_references.extend(references)
+
+    monkeypatch.setattr(
+        conversation_state,
+        "_validate_reference_provenance",
+        capture_new_reference,
+    )
+    completed = conversation_state.append_completed_turn(
+        db_session,
+        session_id=session.id,
+        question=run.question,
+        answer=answer.answer,
+        run_id=run.id,
+        citations=[],
+        answer_session_id=answer.id,
+        retrieval_trace_id=trace.id,
+    )
+
+    expected_ids = sorted(descending_ids)
+    assert captured_references[0]["source_binding_ids"] == expected_ids
+    assert completed.history_references[-1]["source_binding_ids"] == expected_ids
 
 
 def test_persisted_history_turn_index_type_tamper_cannot_replay_unchanged_hash(
@@ -740,10 +1052,10 @@ async def test_ordinary_search_uses_session_scope_and_constraints(
     db_session,
     sample_knowledge_base,
 ):
-    from app.schemas import ConversationStateUpdate, SearchRequest
+    from app.schemas import AgentRequest, ConversationStateUpdate
+    from app.services import agent_graph
     from app.services.conversation_state import prepare_session_for_turn
 
-    search_router = import_module("app.routers.search")
     session = _create_session(db_session, sample_knowledge_base.id)
     document_id = str(uuid4())
     prepare_session_for_turn(
@@ -760,49 +1072,18 @@ async def test_ordinary_search_uses_session_scope_and_constraints(
         ),
     )
     db_session.commit()
-    captured = {}
-
-    async def fake_search(
-        db,
-        knowledge_base_id,
-        query,
-        filters,
-        top_k,
-        **kwargs,
-    ):
-        captured.update(
-            {
-                "knowledge_base_id": knowledge_base_id,
-                "query": query,
-                "filters": filters,
-                **kwargs,
-            }
-        )
-        return [], {
-            "retrieval_trace_id": None,
-            "context_package_id": None,
-            "conversation_state_scope_hash": kwargs[
-                "conversation_state_scope_hash"
-            ],
-        }
-
-    monkeypatch.setattr(search_router, "search_chunks_with_audit", fake_search)
-    response = await search_router.search(
-        SearchRequest(
-            query="Find the constrained facts",
-            knowledge_base_id=sample_knowledge_base.id,
-            session_id=session.id,
-        ),
-        db_session,
+    request = AgentRequest(
+        question="Find the constrained facts",
+        knowledge_base_id=sample_knowledge_base.id,
+        session_id=session.id,
     )
-    assert captured["filters"].document_ids == [document_id]
-    assert captured["conversation_state_scope_hash"] == response[
-        "conversation_state"
-    ]["scope_hash"]
-    assert captured["conversation_state_audit"][
+    _session, run = agent_graph.create_agent_run_context(db_session, request)
+    assert request.filters.document_ids == [document_id]
+    assert run.metadata_json["conversation_state_scope_hash"]
+    assert run.metadata_json["conversation_state"][
         "conversation_text_is_evidence"
     ] is False
-    assert captured["conversation_state_audit"][
+    assert run.metadata_json["conversation_state"][
         "gray_zone_model_call_count"
     ] == 0
 

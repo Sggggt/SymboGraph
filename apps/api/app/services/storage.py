@@ -15,7 +15,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from threading import RLock
+from threading import Event as ThreadEvent, RLock
 from time import monotonic
 from typing import Any, BinaryIO, Iterator
 from uuid import uuid4
@@ -495,6 +495,7 @@ _SOURCE_IO_SEMAPHORES: WeakKeyDictionary[
     tuple[int, asyncio.Semaphore],
 ] = WeakKeyDictionary()
 _SOURCE_IO_SEMAPHORES_LOCK = RLock()
+_SOURCE_IO_CANCEL_SCOPES: ContextVar[tuple[ThreadEvent, ...]] = ContextVar("source_io_cancel_scopes", default=())
 
 
 def _reset_storage_durability_state_after_fork() -> None:
@@ -505,6 +506,7 @@ def _reset_storage_durability_state_after_fork() -> None:
     _CAPABILITY_CACHE_PROCESS_ID = os.getpid()
     _SOURCE_IO_SEMAPHORES = WeakKeyDictionary()
     _SOURCE_IO_SEMAPHORES_LOCK = RLock()
+    _SOURCE_IO_CANCEL_SCOPES.set(())
     _TEST_DURABILITY_ADAPTER.set(None)
     _FROZEN_READONLY_IMPORT_ROOT.set(None)
 
@@ -524,9 +526,16 @@ def _use_explicit_test_namespace_durability_adapter() -> Iterator[None]:
         _TEST_DURABILITY_ADAPTER.reset(token)
 
 
+def raise_if_source_io_cancelled() -> None:
+    if any(signal.is_set() for signal in _SOURCE_IO_CANCEL_SCOPES.get()):
+        raise asyncio.CancelledError("source_io_cancelled")
+
+
 async def run_bounded_source_io(function, /, *args, **kwargs):
     """Run blocking source/storage I/O behind a hot-reloadable semaphore."""
 
+    from app.services.qa_performance import qa_stage
+    raise_if_source_io_cancelled()
     limit = int(get_settings().source_io_concurrency)
     loop = asyncio.get_running_loop()
     with _SOURCE_IO_SEMAPHORES_LOCK:
@@ -535,8 +544,36 @@ async def run_bounded_source_io(function, /, *args, **kwargs):
             cached = (limit, asyncio.Semaphore(limit))
             _SOURCE_IO_SEMAPHORES[loop] = cached
         semaphore = cached[1]
-    async with semaphore:
-        return await asyncio.to_thread(function, *args, **kwargs)
+    with qa_stage("source_io_queue"):
+        await semaphore.acquire()
+    try:
+        signal = ThreadEvent()
+        token = _SOURCE_IO_CANCEL_SCOPES.set((*_SOURCE_IO_CANCEL_SCOPES.get(), signal))
+        try:
+            with qa_stage("source_io"):
+                # Create the task inside the timing scope so its copied
+                # ContextVars bind thread spans to this parent.
+                work = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+                try:
+                    return await asyncio.shield(work)
+                except asyncio.CancelledError as cancellation:
+                    signal.set()
+                    # Count the full drain: a cancelled Future does not stop
+                    # its OS thread or release Session/slot ownership.
+                    while not work.done():
+                        try:
+                            await asyncio.shield(work)
+                        except asyncio.CancelledError:
+                            signal.set()
+                        except Exception:
+                            break
+                    if not work.cancelled() and work.exception() is not None:
+                        raise cancellation from work.exception()
+                    raise
+        finally:
+            _SOURCE_IO_CANCEL_SCOPES.reset(token)
+    finally:
+        semaphore.release()
 
 
 @contextmanager

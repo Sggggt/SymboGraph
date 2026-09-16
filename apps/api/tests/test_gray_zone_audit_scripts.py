@@ -765,7 +765,8 @@ def test_agent_evaluation_fetches_and_audits_each_returned_retrieval_trace(
             "answer": "Grounded answer.",
             "citations": [{"chunk_id": "chunk-1"}],
             "trace": [{"node": node} for node in module.REQUIRED_TRACE_NODES],
-            "model_audit": {"citation_verification_pass_rate": 1.0},
+            "model_audit": {"source_binding_pass_rate": 1.0,
+                            "answer_reflection": {"citation_judge_model_call_count": 0}},
             "degraded_mode": False,
         }
 
@@ -967,7 +968,7 @@ def test_docker_smoke_fetches_search_and_qa_traces_and_reports_ordinary_coverage
             if path == "/knowledge_bases":
                 return [{"id": "kb-1", "active_chunk_count": 1}]
             if path == "/knowledge_bases/kb-1/context-graph/stats":
-                return {"counts": {"active_chunks": 1, "chunk_relation_edges": 1}}
+                return {"counts": {"active_chunks": 1, "chunk_relation_edges": 1}, "freshness": {"is_admissible": True}}
             if path.startswith("/knowledge_bases/kb-1/graph/"):
                 graph_type = path.rsplit("/", 1)[-1]
                 response = {"graph_type": graph_type, "counts": {}, "nodes": [], "edges": []}

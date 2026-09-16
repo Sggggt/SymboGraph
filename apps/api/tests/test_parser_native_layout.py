@@ -46,6 +46,7 @@ def test_two_column_pdf_preserves_parser_native_blocks(tmp_path: Path):
     assert min(box["x0"] for box in native_boxes) < 0.2
     assert max(box["x0"] for box in native_boxes) > 0.5
     assert all(item.char_end > item.char_start for item in section.layout_items)
+    assert not any(item.object_type == "table" for item in section.structure_objects)
 
 
 def test_scanned_image_uses_ocr_native_regions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

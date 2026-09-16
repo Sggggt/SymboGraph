@@ -451,7 +451,10 @@ class AgentAdmissionLease:
             done, _ = await asyncio.wait({work, lost}, return_when=asyncio.FIRST_COMPLETED)
             if lost in done and self._lost_event.is_set():
                 if not work.done():
-                    work.cancel()
+                    # The child persists its own terminal state before this
+                    # wrapper raises. Carry the closed admission cause across
+                    # cancellation so it cannot be recorded as a user cancel.
+                    work.cancel(self._lost_error.code if self._lost_error else "agent_admission_lease_lost")
                     with suppress(asyncio.CancelledError):
                         await work
                 self.raise_if_lost()

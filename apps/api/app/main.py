@@ -17,9 +17,9 @@ from app.services.storage import (
 # construct an engine, connect PostgreSQL, import a provider, or create a
 # fallback file.
 fail_closed_native_windows_production_before_settings()
-from app.services.runtime_settings import initialize_runtime_env_from_root_file
+from app.services.runtime_settings import initialize_runtime_configuration_from_root_files
 
-_EARLY_RUNTIME_ENV_INITIALIZATION = initialize_runtime_env_from_root_file()
+_EARLY_RUNTIME_CONFIGURATION_INITIALIZATION = initialize_runtime_configuration_from_root_files()
 _EARLY_SETTINGS = get_settings()
 _EARLY_STORAGE_DURABILITY_CAPABILITY = ensure_storage_durability_ready(
     settings=_EARLY_SETTINGS,
@@ -29,9 +29,12 @@ _EARLY_STORAGE_DURABILITY_CAPABILITY = ensure_storage_durability_ready(
 from app.api import router
 from app.db import ensure_schema
 from app.services.ingestion import finalize_interrupted_batches
+from app.services.context_graph import invalidate_context_graph_cache_after_commit
+from app.services.lexical_storage import reconcile_pending_lexical_index_jobs
 from app.services.runtime_settings import refresh_runtime_settings_if_needed, sync_model_bridge_runtime_config
 from app.services.strategy_profiles import (
     reconcile_builtin_default_profile_startup,
+    reconcile_retired_answer_prompts_startup,
     reconcile_profile_lifecycle_events_startup,
 )
 from app.services.storage_maintenance import (
@@ -62,6 +65,7 @@ async def lifespan(app: FastAPI):
             )
         sync_model_bridge_runtime_config(settings=settings)
         reconcile_builtin_default_profile_startup()
+        reconcile_retired_answer_prompts_startup()
         profile_lifecycle_reconcile = reconcile_profile_lifecycle_events_startup()
         if profile_lifecycle_reconcile.get("failed"):
             raise RuntimeError(
@@ -75,6 +79,9 @@ async def lifespan(app: FastAPI):
             await reconcile_pending_storage_maintenance_startup()
         )
         finalize_interrupted_batches()
+        app.state.lexical_index_recovery = await reconcile_pending_lexical_index_jobs(
+            invalidate=invalidate_context_graph_cache_after_commit,
+        )
         app.state.startup_ready = True
         yield
     finally:

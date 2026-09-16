@@ -18,6 +18,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.services.build_performance import instrument_build, measured
+from app.services.source_parse_pipeline import SourcePreparationPipeline, prepared_source, preparation_started, serialized_parse
 from app.core.utils import source_type_from_path
 from app.models import (
     Chunk,
@@ -39,6 +41,8 @@ from app.models import (
     IngestionJob,
     KnowledgeBaseVectorRuntimeState,
     KnowledgeBase,
+    LexicalIndexJob,
+    LexicalIndexState,
     MidConceptState,
     ParseJob,
     SourceFile,
@@ -88,6 +92,10 @@ from app.services.language_metadata import (
     language_identity_summary,
     normalize_explicit_language_tag,
     pending_language_record_fields,
+)
+from app.services.lexical_storage import (
+    mark_active_lexical_index_stale,
+    rebuild_lexical_index_for_knowledge_base,
 )
 from app.services import runtime_settings as runtime_settings_service
 from app.services.runtime_settings import (
@@ -326,6 +334,7 @@ SOURCE_FILE_DELETE_DATABASE_COMMIT_FIELDS = (
     "chunk_version_state_hash",
     "context_graph_state_id",
     "freshness_rows_marked_stale",
+    "lexical_index_state_id_marked_stale",
     "cache_invalidation_required",
     "cache_invalidation_dispatched_at",
     "qdrant_cleanup_performed",
@@ -874,6 +883,12 @@ def current_worker_id() -> str:
 
 
 def exception_message(exc: Exception) -> str:
+    from sqlalchemy.exc import StatementError
+    if isinstance(exc, StatementError):
+        cause = getattr(exc, "orig", None)
+        if cause is not None and "NUL" in str(cause):
+            return "database_text_invalid_control: NUL byte rejected"
+        return f"database_write_failed:{type(cause).__name__ if cause else type(exc).__name__}"
     message = str(exc).strip()
     return message or f"{exc.__class__.__name__}: {exc!r}"
 
@@ -3701,6 +3716,22 @@ def request_batch_cancel_control(db: Session, batch_id: str, knowledge_base_id: 
     for job in batch.jobs:
         if job.status not in TERMINAL_STATES:
             job.status = "cancel_requested"
+    for lexical_job in db.scalars(
+        select(LexicalIndexJob).where(
+            LexicalIndexJob.ingestion_batch_id == batch.id,
+            LexicalIndexJob.status.in_(
+                ["prepared", "building", "ready_to_publish"]
+            ),
+        )
+    ):
+        lexical_job.status = "cancel_requested"
+        lexical_job.error_code = "cancel_requested"
+        lexical_job.diagnostics_json = {
+            **dict(lexical_job.diagnostics_json or {}),
+            "phase": "cancel_requested",
+            "cancel_requested_at": now.isoformat(),
+            "ingestion_batch_id": batch.id,
+        }
     db.commit()
     emit_ingestion_log(
         batch.id,
@@ -3773,6 +3804,7 @@ async def ingest_file(
                 file_stage_id=file_stage_id,
             )
         except asyncio.CancelledError as exc:
+            db.rollback()
             _restore_document_metadata_after_failure(
                 db,
                 knowledge_base_id=knowledge_base.id,
@@ -3782,6 +3814,7 @@ async def ingest_file(
             )
             raise
         except Exception as exc:
+            db.rollback()
             _restore_document_metadata_after_failure(
                 db,
                 knowledge_base_id=knowledge_base.id,
@@ -3792,6 +3825,26 @@ async def ingest_file(
             raise
 
 
+async def _prepare_source_parse(path, source_root, *, expected_checksum=None):
+    from app.services.build_performance import measure
+    settings = get_settings()
+    path = validate_knowledge_base_source_path(path,knowledge_base_source_root=source_root)
+    config = (int(settings.upload_max_bytes),bool(settings.enable_model_fallback))
+    try:
+        frozen_snapshot = await run_bounded_source_io(snapshot_source_file,path,
+            knowledge_base_source_root=source_root,expected_checksum=expected_checksum,max_bytes=settings.upload_max_bytes)
+    except UploadChecksumMismatchError as exc:
+        raise SourceSnapshotError("Source bytes changed before immutable preparation") from exc
+    parsed_source_type, sections, parse_error = "", [], None
+    try:
+        with measure("file_parse"):
+            parsed_source_type, sections = await run_bounded_source_io(serialized_parse,parse_document,frozen_snapshot)
+    except Exception as exc:
+        parse_error = exc
+    return frozen_snapshot,parsed_source_type,sections,parse_error,config
+
+
+@measured("file_complete",start_resolver=preparation_started)
 async def _ingest_file_locked(
     db: Session,
     source_path: Path,
@@ -3826,28 +3879,14 @@ async def _ingest_file_locked(
     storage_root = settings.knowledge_base_paths_for_source_root(
         knowledge_base.source_root
     )["storage_root"]
-    try:
-        frozen_snapshot = await run_bounded_source_io(
-            snapshot_source_file,
-            path,
-            knowledge_base_source_root=knowledge_base.source_root,
-            expected_checksum=expected_checksum,
-            max_bytes=settings.upload_max_bytes,
-        )
-    except UploadChecksumMismatchError as exc:
-        raise SourceSnapshotError(
-            "Source bytes changed before the immutable attempt snapshot was committed "
-            f"for {path}"
-        ) from exc
+    frozen_snapshot,parsed_source_type,sections,parse_error,parse_config = await prepared_source(path,
+        lambda:_prepare_source_parse(path,knowledge_base.source_root,expected_checksum=expected_checksum))
+    if parse_config != (int(settings.upload_max_bytes),bool(settings.enable_model_fallback)):
+        raise SourceSnapshotError("Parser configuration changed after source preparation")
+    if expected_checksum is not None and frozen_snapshot.checksum != expected_checksum:
+        raise SourceSnapshotError("Prepared source does not match the pending metadata checksum")
     storage_path = frozen_snapshot.canonical_path
     checksum = frozen_snapshot.checksum
-    parsed_source_type = ""
-    sections = []
-    parse_error: Exception | None = None
-    try:
-        parsed_source_type, sections = parse_document(frozen_snapshot)
-    except Exception as exc:
-        parse_error = exc
     ingestion_root = settings.knowledge_base_paths_for_source_root(
         knowledge_base.source_root
     )["ingestion_root"]
@@ -5413,19 +5452,23 @@ def finalize_interrupted_batches() -> None:
                 recovery_compensation: dict[str, Any] = {}
                 if batch_recovery is not None:
                     try:
-                        recovery_compensation = (
-                            _restore_graph_before_scope(
+                        if batch_recovery.status == "completed":
+                            recovery_compensation = {
+                                "status": "not_required",
+                                "reason": "graph_commit_boundary_completed_before_interruption",
+                            }
+                        elif batch_recovery.parse_committed:
+                            recovery_compensation = _restore_graph_before_scope(
                                 db,
                                 recovery=batch_recovery,
                                 reason=f"{recovery_reason}; graph transaction interrupted",
                             )
-                            if batch_recovery.parse_committed
-                            else compensate_ingestion_batch_parse_writes(
+                        else:
+                            recovery_compensation = compensate_ingestion_batch_parse_writes(
                                 db,
                                 recovery=batch_recovery,
                                 reason=f"{recovery_reason}; parse transaction interrupted",
                             )
-                        )
                     except Exception as exc:
                         db.rollback()
                         batch = db.get(IngestionBatch, batch.id)
@@ -5675,24 +5718,49 @@ async def _run_context_graph_rebuild_batch_locked(batch_id: str, *, execution_mo
         recovery.graph_write_set_hash = _canonical_payload_hash(graph_write_set)
         recovery.status = "completed"
         recovery.completed_at = datetime.utcnow()
-        batch.status = "completed"
         batch.processed_files = 1
         batch.success_count = 1
         batch.failure_count = 0
+        batch.stats = {
+            **(batch.stats or {}),
+            "phase": "lexical_index",
+            "graph_stats": graph_stats,
+            "parse_committed": False,
+            "graph_rebuild_committed": True,
+            "context_graph_state_id": context_state.id,
+            "graph_write_set_hash": recovery.graph_write_set_hash,
+            "lexical_index": {"status": "pending"},
+        }
+        mark_batch_worker_heartbeat(db, batch, phase="lexical_index")
+        db.commit()
+        emit_ingestion_log(batch.id, "context_graph_completed", "Four-layer context graph is active", **graph_stats)
+        emit_ingestion_log(batch.id, "lexical_index_started", "Verifying versioned raw-source BM25 index")
+        lexical_stats = await rebuild_lexical_index_for_knowledge_base(
+            knowledge_base.id,
+            ingestion_batch_id=batch.id,
+            operation="graph_rebuild_lexical_index_build",
+        )
+        batch = db.get(IngestionBatch, batch_id, populate_existing=True)
+        recovery = db.get(IngestionBatchRecovery, recovery.id, populate_existing=True)
+        if batch is None or recovery is None or recovery.status != "completed":
+            raise RuntimeError("Graph rebuild lexical completion lost its durable graph boundary")
+        batch.status = "completed"
         batch.completed_at = datetime.utcnow()
         batch.worker_id = None
         batch.heartbeat_at = None
         batch.stats = {
             **(batch.stats or {}),
             "phase": "completed",
-            "graph_stats": graph_stats,
-            "parse_committed": False,
-            "graph_rebuild_committed": True,
-            "context_graph_state_id": context_state.id,
-            "graph_write_set_hash": recovery.graph_write_set_hash,
+            "lexical_index": lexical_stats,
         }
         db.commit()
-        emit_ingestion_log(batch.id, "context_graph_completed", "Four-layer context graph is active", **graph_stats)
+        emit_ingestion_log(
+            batch.id,
+            "lexical_index_completed",
+            "Versioned raw-source BM25 index is active",
+            document_count=lexical_stats["document_count"],
+            posting_count=lexical_stats["posting_count"],
+        )
         emit_ingestion_log(batch.id, "batch_completed", "Context graph rebuild completed", **graph_stats)
         return summarize_batch(batch)
     except IngestionCancelled:
@@ -5711,7 +5779,7 @@ async def _run_context_graph_rebuild_batch_locked(batch_id: str, *, execution_mo
                         recovery=recovery,
                         reason="cooperative cancellation during maintenance graph rebuild",
                     )
-                    if recovery is not None
+                    if recovery is not None and recovery.status != "completed"
                     else {}
                 )
             except Exception as compensation_exc:
@@ -5741,7 +5809,11 @@ async def _run_context_graph_rebuild_batch_locked(batch_id: str, *, execution_mo
             mark_batch_cancelled(
                 db,
                 batch,
-                cancellation_status="graph_cancelled_parse_scope_preserved",
+                cancellation_status=(
+                    "lexical_cancelled_graph_scope_preserved"
+                    if recovery is not None and recovery.status == "completed"
+                    else "graph_cancelled_parse_scope_preserved"
+                ),
             )
             db.commit()
             emit_ingestion_log(
@@ -6476,6 +6548,7 @@ async def reconcile_versioned_graph_completion(
         outer.close()
 
 
+@instrument_build
 async def run_uploaded_files_ingestion(
     batch_id: str,
     file_paths: list[str],
@@ -6602,88 +6675,98 @@ async def _run_uploaded_files_ingestion_locked(
         coverage: Counter[str] = Counter()
         language_coverage: Counter[str] = Counter()
         errors: list[dict[str, str]] = []
-        for index, path in enumerate(paths, start=1):
-            ensure_not_cancelled(db, batch_id)
-            batch = db.get(IngestionBatch, batch_id)
-            if batch is None:
-                break
-            recovery = db.get(IngestionBatchRecovery, recovery.id)
-            if recovery is None:
-                raise RuntimeError("Ingestion batch recovery row disappeared during parsing")
-            file_stage = _prepare_file_stage(
-                db,
-                recovery=recovery,
-                source_path=path,
-                sequence_index=index,
-            )
-            batch = db.get(IngestionBatch, batch_id)
-            if batch is None:
-                raise RuntimeError(f"Batch {batch_id} disappeared before file parsing")
-            mark_batch_worker_heartbeat(db, batch, phase="parsing")
-            db.commit()
-            emit_ingestion_log(batch.id, "file_started", f"[{index}/{len(paths)}] Parsing {path.name}", source_path=str(path))
-            try:
-                result = await ingest_file(
-                    db,
-                    path,
-                    trigger_source=batch.trigger_source,
-                    batch_id=batch.id,
-                    knowledge_base_id=knowledge_base.id,
-                    rebuild_graph=False,
-                    force=force,
-                    target_version=target_version,
-                    file_stage_id=file_stage.id,
-                )
-                coverage[result["source_type"]] += 1
-                language_coverage[str(result.get("language") or "unknown")] += 1
-                batch.success_count += 1
-                emit_ingestion_log(batch.id, "file_completed", f"{path.name} parsed successfully", source_path=str(path), stats=result.get("stats", {}))
-            except IngestionCancelled as exc:
-                db.rollback()
-                _mark_file_stage_failed(
-                    db,
-                    stage_id=file_stage.id,
-                    exc=exc,
-                    cancelled=True,
-                )
-                raise
-            except Exception as exc:
-                db.rollback()
-                message = exception_message(exc)
-                _mark_file_stage_failed(
-                    db,
-                    stage_id=file_stage.id,
-                    exc=exc,
-                    cancelled=False,
-                )
-                errors.append({"source_path": str(path), "message": message})
+        source_root = knowledge_base.source_root
+        async with SourcePreparationPipeline(paths,lambda path:_prepare_source_parse(path,source_root)) as source_pipeline:
+            for index, path in enumerate(paths, start=1):
+                ensure_not_cancelled(db, batch_id)
                 batch = db.get(IngestionBatch, batch_id)
-                if batch is not None:
-                    batch.failure_count += 1
-                    batch.last_error = message
-                    batch.stats = {**(batch.stats or {}), "errors": errors}
-                emit_ingestion_log(batch_id, "file_failed", f"{path.name} parse failed: {message}", source_path=str(path), error=message)
+                if batch is None:
+                    break
+                recovery = db.get(IngestionBatchRecovery, recovery.id)
+                if recovery is None:
+                    raise RuntimeError("Ingestion batch recovery row disappeared during parsing")
+                file_stage = _prepare_file_stage(
+                    db,
+                    recovery=recovery,
+                    source_path=path,
+                    sequence_index=index,
+                )
+                batch = db.get(IngestionBatch, batch_id)
+                if batch is None:
+                    raise RuntimeError(f"Batch {batch_id} disappeared before file parsing")
+                mark_batch_worker_heartbeat(db, batch, phase="parsing")
                 db.commit()
-            finally:
-                batch = db.get(IngestionBatch, batch_id)
-                if batch is not None:
-                    batch.processed_files += 1
-                    batch.stats = {
-                        **(batch.stats or {}),
-                        "coverage_by_source_type": dict(coverage),
-                        "coverage_by_language": dict(language_coverage),
-                        "errors": errors,
-                    }
-                    db.commit()
-                    emit_ingestion_log(
-                        batch.id,
-                        "batch_progress",
-                        f"Progress {batch.processed_files}/{batch.total_files}",
-                        processed_files=batch.processed_files,
-                        total_files=batch.total_files,
-                        success_count=batch.success_count,
-                        failure_count=batch.failure_count,
+                emit_ingestion_log(batch.id, "file_started", f"[{index}/{len(paths)}] Parsing {path.name}", source_path=str(path))
+                try:
+                    result = await ingest_file(
+                        db,
+                        path,
+                        trigger_source=batch.trigger_source,
+                        batch_id=batch.id,
+                        knowledge_base_id=knowledge_base.id,
+                        rebuild_graph=False,
+                        force=force,
+                        target_version=target_version,
+                        file_stage_id=file_stage.id,
                     )
+                    coverage[result["source_type"]] += 1
+                    language_coverage[str(result.get("language") or "unknown")] += 1
+                    batch.success_count += 1
+                    emit_ingestion_log(batch.id, "file_completed", f"{path.name} parsed successfully", source_path=str(path), stats=result.get("stats", {}))
+                except IngestionCancelled as exc:
+                    db.rollback()
+                    _mark_file_stage_failed(
+                        db,
+                        stage_id=file_stage.id,
+                        exc=exc,
+                        cancelled=True,
+                    )
+                    raise
+                except Exception as exc:
+                    db.rollback()
+                    message = exception_message(exc)
+                    _mark_file_stage_failed(
+                        db,
+                        stage_id=file_stage.id,
+                        exc=exc,
+                        cancelled=False,
+                    )
+                    errors.append({"source_path": str(path), "message": message})
+                    batch = db.get(IngestionBatch, batch_id)
+                    if batch is not None:
+                        batch.failure_count += 1
+                        batch.last_error = message
+                        batch.stats = {**(batch.stats or {}), "errors": errors}
+                    emit_ingestion_log(batch_id, "file_failed", f"{path.name} parse failed: {message}", source_path=str(path), error=message)
+                    db.commit()
+                finally:
+                    await source_pipeline.discard(path)
+                    batch = db.get(IngestionBatch, batch_id)
+                    if batch is not None:
+                        batch.processed_files += 1
+                        batch.stats = {
+                            **(batch.stats or {}),
+                            "coverage_by_source_type": dict(coverage),
+                            "coverage_by_language": dict(language_coverage),
+                            "errors": errors,
+                        }
+                        db.commit()
+                        emit_ingestion_log(
+                            batch.id,
+                            "batch_progress",
+                            f"Progress {batch.processed_files}/{batch.total_files}",
+                            processed_files=batch.processed_files,
+                            total_files=batch.total_files,
+                            success_count=batch.success_count,
+                            failure_count=batch.failure_count,
+                        )
+                        # Completed file before-images are durable, not a RAM
+                        # cache for the remaining documents in this batch.
+                        db.expunge_all()
+                        result = None
+                        file_stage = None
+                        from app.services.resource_guard import release_unused_memory
+                        release_unused_memory()
         batch = db.get(IngestionBatch, batch_id)
         if batch is None:
             raise RuntimeError(f"Batch {batch_id} disappeared")
@@ -6705,8 +6788,8 @@ async def _run_uploaded_files_ingestion_locked(
                 select(IngestionFileStage).where(
                     IngestionFileStage.batch_recovery_id == recovery.id,
                     IngestionFileStage.status == "indexed_committed",
-                )
-            ).all():
+                ).execution_options(yield_per=1)
+            ):
                 _validated_file_stage(
                     db,
                     file_stage,
@@ -6715,6 +6798,7 @@ async def _run_uploaded_files_ingestion_locked(
                 )
                 file_stage.status = "retained_after_parse_commit"
                 file_stage.phase = "context_graph"
+                db.flush()
             batch.status = "extracting_graph"
             batch.stats = {
                 **(batch.stats or {}),
@@ -6725,6 +6809,20 @@ async def _run_uploaded_files_ingestion_locked(
             mark_batch_worker_heartbeat(db, batch, phase="context_graph")
             db.commit()
             emit_ingestion_log(batch.id, "context_graph_started", "Building four-layer context graph")
+            # The durable parse boundary permits dropping all parse-stage ORM
+            # before-images. Re-read control identities before the graph stage.
+            kb_identity, recovery_identity = knowledge_base.id, recovery.id
+            db.expunge_all()
+            file_stage = recovery = knowledge_base = batch = None
+            from app.services.resource_guard import release_unused_memory
+            memory_release = release_unused_memory()
+            batch = db.get(IngestionBatch, batch_id)
+            knowledge_base = db.get(KnowledgeBase, kb_identity)
+            recovery = db.get(IngestionBatchRecovery, recovery_identity)
+            if batch is None or knowledge_base is None or recovery is None:
+                raise RuntimeError("Durable parse identities disappeared at graph boundary")
+            batch.stats = {**dict(batch.stats or {}), "parse_memory_release":memory_release}
+            db.commit()
             context_state = await rebuild_context_graph(db, knowledge_base.id, batch_id=batch.id, chunk_version_incremented=target_version > current_version)
             knowledge_base.current_chunk_version = max(knowledge_base.current_chunk_version or 0, target_version)
             graph_stats = dict(context_state.stats_json or {})
@@ -6739,11 +6837,36 @@ async def _run_uploaded_files_ingestion_locked(
             batch.stats = {
                 **(batch.stats or {}),
                 "graph_stats": graph_stats,
-                "phase": "completed",
+                "phase": "lexical_index",
                 "parse_committed": True,
                 "graph_write_set_hash": recovery.graph_write_set_hash,
+                "lexical_index": {"status": "pending"},
             }
+            mark_batch_worker_heartbeat(db, batch, phase="lexical_index")
+            db.commit()
             emit_ingestion_log(batch.id, "context_graph_completed", "Four-layer context graph is active", **graph_stats)
+            emit_ingestion_log(batch.id, "lexical_index_started", "Building versioned raw-source BM25 index")
+            lexical_stats = await rebuild_lexical_index_for_knowledge_base(
+                knowledge_base.id,
+                ingestion_batch_id=batch.id,
+                operation="ingestion_lexical_index_build",
+            )
+            batch = db.get(IngestionBatch, batch_id, populate_existing=True)
+            recovery = db.get(IngestionBatchRecovery, recovery.id, populate_existing=True)
+            if batch is None or recovery is None or recovery.status != "completed":
+                raise RuntimeError("Ingestion lexical completion lost its durable graph boundary")
+            batch.stats = {
+                **(batch.stats or {}),
+                "phase": "completed",
+                "lexical_index": lexical_stats,
+            }
+            emit_ingestion_log(
+                batch.id,
+                "lexical_index_completed",
+                "Versioned raw-source BM25 index is active",
+                document_count=lexical_stats["document_count"],
+                posting_count=lexical_stats["posting_count"],
+            )
         else:
             graph_stats = {}
             recovery = db.get(IngestionBatchRecovery, recovery.id, with_for_update=True)
@@ -6777,13 +6900,20 @@ async def _run_uploaded_files_ingestion_locked(
                 )
             )
             try:
-                if recovery is not None and recovery.parse_committed:
+                if (
+                    recovery is not None
+                    and recovery.parse_committed
+                    and recovery.status != "completed"
+                ):
                     compensation = _restore_graph_before_scope(
                         db,
                         recovery=recovery,
                         reason="cooperative cancellation during context graph build",
                     )
                     cancellation_status = "graph_cancelled_parse_scope_preserved"
+                elif recovery is not None and recovery.status == "completed":
+                    compensation = {}
+                    cancellation_status = "lexical_cancelled_graph_scope_preserved"
                 elif recovery is not None:
                     compensation = compensate_ingestion_batch_parse_writes(
                         db,
@@ -6906,7 +7036,51 @@ async def run_ingestion_job(job_id: str, source_path: Path, trigger_source: str 
     with SessionLocal() as db:
         job = db.get(IngestionJob, job_id)
         knowledge_base_id = job.knowledge_base_id if job else None
-        return await ingest_file(db, source_path, trigger_source=trigger_source, existing_job_id=job_id, knowledge_base_id=knowledge_base_id)
+        result = await ingest_file(
+            db,
+            source_path,
+            trigger_source=trigger_source,
+            existing_job_id=job_id,
+            knowledge_base_id=knowledge_base_id,
+        )
+    if knowledge_base_id is None:
+        raise RuntimeError("Ingestion job lost its knowledge-base identity")
+    try:
+        lexical_stats = await rebuild_lexical_index_for_knowledge_base(
+            knowledge_base_id,
+            operation="single_ingestion_lexical_index_build",
+        )
+    except BaseException as exc:
+        with SessionLocal() as db:
+            job = db.get(IngestionJob, job_id)
+            if job is not None:
+                job.status = "cancelled" if isinstance(exc, IngestionCancelled) else "failed"
+                job.error_message = exception_message(exc)
+                job.stats = {
+                    **dict(job.stats or {}),
+                    "phase": "lexical_index_failed",
+                    "parse_and_graph_committed": True,
+                    "lexical_index_error_type": exc.__class__.__name__,
+                }
+                db.commit()
+        raise
+    with SessionLocal() as db:
+        job = db.get(IngestionJob, job_id)
+        if job is None:
+            raise RuntimeError("Ingestion job disappeared before lexical completion")
+        job.stats = {
+            **dict(job.stats or {}),
+            "phase": "completed",
+            "lexical_index": lexical_stats,
+        }
+        db.commit()
+    return {
+        **result,
+        "stats": {
+            **dict(result.get("stats") or {}),
+            "lexical_index": lexical_stats,
+        },
+    }
 
 
 def list_knowledge_base_files(db: Session, knowledge_base_id: str) -> list[dict]:
@@ -7302,6 +7476,7 @@ def _empty_source_file_delete_database_commit() -> dict[str, Any]:
         "chunk_version_state_hash": None,
         "context_graph_state_id": None,
         "freshness_rows_marked_stale": 0,
+        "lexical_index_state_id_marked_stale": None,
         "cache_invalidation_required": True,
         "cache_invalidation_dispatched_at": None,
         "qdrant_cleanup_performed": False,
@@ -7539,6 +7714,13 @@ def _validate_source_file_delete_payload(
         if context_state_id is None and database_commit["freshness_rows_marked_stale"] != 0:
             raise SourceFileDeleteIntegrityError(
                 f"Source deletion intent {row.id} has freshness rows without a graph state"
+            )
+        lexical_state_id = database_commit.get("lexical_index_state_id_marked_stale")
+        if lexical_state_id is not None and (
+            not isinstance(lexical_state_id, str) or not lexical_state_id
+        ):
+            raise SourceFileDeleteIntegrityError(
+                f"Source deletion intent {row.id} has an invalid lexical stale witness"
             )
         if database_commit["deleted_source_file_count"] != len(source_files_before):
             raise SourceFileDeleteIntegrityError(
@@ -8007,6 +8189,7 @@ def _finalize_source_file_delete_database(
         "context_graph_state_id": None,
         "freshness_rows_marked_stale": 0,
     }
+    lexical_freshness = {"stale_state_id": None, "reason": SOURCE_FILE_DELETE_OPERATION}
     if changed_chunk_ids:
         freshness = mark_context_graph_active_scope_stale(
             db,
@@ -8014,6 +8197,11 @@ def _finalize_source_file_delete_database(
             changed_chunk_ids=changed_chunk_ids,
             active_chunk_scope_hash=active_scope_hash_after,
             mutation=SOURCE_FILE_DELETE_OPERATION,
+        )
+        lexical_freshness = mark_active_lexical_index_stale(
+            db,
+            knowledge_base.id,
+            reason=SOURCE_FILE_DELETE_OPERATION,
         )
     database_commit = {
         "committed_at": _source_file_delete_now(),
@@ -8031,6 +8219,7 @@ def _finalize_source_file_delete_database(
         ),
         "context_graph_state_id": freshness["context_graph_state_id"],
         "freshness_rows_marked_stale": freshness["freshness_rows_marked_stale"],
+        "lexical_index_state_id_marked_stale": lexical_freshness["stale_state_id"],
         "cache_invalidation_required": True,
         "cache_invalidation_dispatched_at": None,
         # The durable Qdrant cleanup lifecycle owns point removal. This deletion closes the
@@ -8184,6 +8373,23 @@ def _verify_source_file_delete_database_commit(
         ):
             raise SourceFileDeleteIntegrityError(
                 "Context graph freshness witness changed before cache invalidation completed"
+            )
+    lexical_state_id = payload["database_commit"].get(
+        "lexical_index_state_id_marked_stale"
+    )
+    if lexical_state_id is not None:
+        lexical_state = db.get(
+            LexicalIndexState,
+            lexical_state_id,
+            populate_existing=True,
+        )
+        if (
+            lexical_state is None
+            or lexical_state.knowledge_base_id != knowledge_base.id
+            or lexical_state.state != "stale"
+        ):
+            raise SourceFileDeleteIntegrityError(
+                "Lexical index stale witness changed before cache invalidation completed"
             )
     storage_root = get_settings().knowledge_base_paths_for_source_root(
         knowledge_base.source_root

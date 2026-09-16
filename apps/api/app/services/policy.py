@@ -603,6 +603,13 @@ def validate_persisted_policy_state(
     RewardEvent link is therefore checked separately for learned states.
     """
 
+    if (row.reward_summary_json or {}).get("origin") == "answer_reflection_reward_update_v1":
+        from app.services.reflection_reward import validate_reflection_policy_state
+        from app.services.agent_reflection import ReflectionContractError
+        try:
+            return validate_reflection_policy_state(db, row, knowledge_base_id=knowledge_base_id)
+        except ReflectionContractError as exc:
+            raise PolicyStateValidationError(str(exc)) from None
     row_id = str(row.id or "")
     if not row_id:
         raise PolicyStateValidationError(

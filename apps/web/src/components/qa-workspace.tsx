@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useId, useMemo, useRef, useState } from "react";
-import type { AgentResponse, AgentTraceEventPayload, AnswerModelAudit, Citation, ConversationStatePayload, ModelSettingsResponse, ModelSettingsUpdate, RetrievalGranularity, SessionMessage, SessionSummary } from "@course-kg/shared";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import type { AgentResponse, AgentTraceEventPayload, AnswerModelAudit, Citation, ConversationStatePayload, DirectAnswerMode, ModelSettingsResponse, ModelSettingsUpdate, SessionMessage, SessionMessagesResponse, SessionSummary, TaskStatusResponse } from "@course-kg/shared";
 import { motion } from "framer-motion";
 import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -37,7 +37,7 @@ import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
-import { cancelAgentRun, deleteSession, fetchDashboard, fetchModelSettings, fetchSessionMessages, fetchSessions, fetchTaskStatus, streamAnswer, updateModelSettings } from "@/lib/api";
+import { cancelAgentRun, deleteSession, fetchModelSettings, fetchSessionMessages, fetchSessions, fetchTaskStatus, streamAnswer, updateModelSettings } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 
@@ -46,6 +46,7 @@ export type ChatTurn = {
   content: string;
   run_id?: string | null;
   route?: string | null;
+  direct_answer_mode?: DirectAnswerMode | null;
   citations?: Citation[];
   trace?: AgentTraceEventPayload[];
   retrieval_trace_id?: string | null;
@@ -57,50 +58,29 @@ export type ChatTurn = {
 type ActiveStreamState = {
   runId?: string | null;
   sessionId?: string | null;
-  retrievalGranularity?: RetrievalGranularity;
   question: string;
   startedAt: string;
 };
 
 type AgentSettingsForm = {
-  query_facet_bilingual_enabled: boolean;
-  query_facet_posterior_enabled: boolean;
-  query_facet_posterior_observation_budget: string;
-  query_facet_posterior_round_budget: string;
-  query_facet_posterior_convergence_epsilon: string;
   context_package_token_budget: string;
   retrieval_result_top_k_default: string;
-  agent_coarse_initial_budget: string;
-  agent_coarse_top_k: string;
-  agent_mid_per_coarse_budget: string;
-  agent_coarse_drilldown_mid_initial_budget: string;
-  agent_mid_initial_budget: string;
-  agent_mid_top_k: string;
-  agent_chunk_per_mid_budget: string;
-  agent_chunk_initial_budget: string;
-  agent_chunk_top_k: string;
-  candidate_pool_dedupe_budget: string;
-  agent_max_depth_per_layer: string;
-  agent_max_labels_per_node: string;
-  agent_max_edge_reuse: string;
-  agent_max_cycle_reward_per_path: string;
-  agent_cycle_reward_distance_threshold: string;
+  retrieval_v1_dense_candidate_budget: string;
+  retrieval_v1_rq_candidate_budget: string;
+  retrieval_v1_bm25_candidate_budget: string;
+  retrieval_v1_root_entry_budget: string;
+  retrieval_v1_per_parent_entry_budget: string;
+  retrieval_v1_layer_entry_budget: string;
+  retrieval_v1_max_depth: string;
+  retrieval_v1_restore_per_hit: string;
   agent_path_distance_green_threshold: string;
   agent_path_distance_gray_threshold: string;
   agent_path_distance_hard_threshold: string;
-  traversal_observation_budget: string;
-  agent_structure_restore_per_chunk_budget: string;
-  context_path_summary_budget: string;
-  agent_planning_round_budget: string;
-  agent_max_typed_actions_per_round: string;
-  agent_repair_round_budget: string;
-  agent_verification_budget: string;
+  agent_answer_unit_limit: string;
+  agent_history_summary_max_chars: string;
 };
 
-type AgentNumberSettingKey = Exclude<
-  keyof AgentSettingsForm,
-  "query_facet_bilingual_enabled" | "query_facet_posterior_enabled"
->;
+type AgentNumberSettingKey = keyof AgentSettingsForm;
 
 type AgentNumberField = {
   key: AgentNumberSettingKey;
@@ -111,6 +91,12 @@ type AgentNumberField = {
 };
 
 const userCancelledMessage = "已取消当前对话";
+const missingSessionMessage = "该会话已不存在，历史列表已刷新。";
+
+function responseStatus(value: unknown): number | null {
+  const status = (value as { status?: unknown } | null)?.status;
+  return typeof status === "number" ? status : null;
+}
 
 export function legacyQaPayloadStorageKeys(scope: string): string[] {
   return [
@@ -141,95 +127,42 @@ const agentSettingsInputClass = "h-11 rounded-xl border-white/10 bg-white/[0.045
 const agentParameterNameClass = "text-xs font-medium uppercase tracking-[0.16em] text-cyan-100/52";
 
 export const AGENT_PARAMETER_HELP: Record<string, string> = {
-  模型双语查询词面: "开启后，查询词面提取会要求模型为显式概念补充中英文别名；只影响下一次检索路由，不写入事实证据，也不触发图谱重建。",
-  "Query facet posterior 观察预算": "单次检索最多读取多少条确定性候选观察来校准 facet 权重；这是 hot_reloadable hard cap，只影响下一次 search、QA 或 repair retrieval，不调用模型、不触发图谱重建。",
-  "Query facet posterior 轮次预算": "当前协议最多使用 dense entry 与 merged chunk 两个固定 checkpoint；达到预算立即停止，不扩大 top-k 或模型预算。",
-  "Query facet posterior 收敛阈值": "相邻两轮 posterior 的 L1 变化不超过该值时提前停止。posterior 只在相同未覆盖 facet 数量内做 tie-break，不是事实概率。",
-  证据包令牌预算: "上下文证据包可容纳的令牌上限。证据包是回答生成的唯一证据输入，预算不足时会优先保留更强支撑。",
-  结果保留数量默认值: "搜索、问答和智能体请求未显式指定结果数量时使用的默认返回上限；它不是裸召回规模。",
-  粗概念起点数量: "摘要模式下从全部粗概念候选中选入图探索的起点数量；普通模式不使用这个参数。",
-  粗概念保留数量: "摘要模式下粗概念图探索后保留并继续下钻的粗概念数量。",
-  每个粗概念中概念预算: "对每个已保留粗概念分别下钻的中概念候选数量上限，保证逐父节点探索。",
-  普通模式中概念起点数量: "普通模式下，从全体中概念候选池中选入中概念图探索的起点数量。",
-  摘要模式中概念起点数量: "摘要模式下，从粗概念逐父节点下钻合并后的中概念候选池中选入中概念图探索的起点数量。",
-  中概念保留数量: "中概念图探索后保留并继续下钻到片段层的中概念数量。",
-  每个中概念片段预算: "对每个已保留中概念分别下钻到片段候选的数量上限，用来控制底层候选扩展范围。",
-  片段起点数量: "从全部片段候选中选入片段图探索的起点数量。",
-  片段最终保留数量: "片段图探索后最终保留进入证据包候选的片段数量。",
-  候选去重池预算: "跨路径、跨 RQ 成员关系和跨概念合并候选时保留的候选池规模，防止单次检索过载。",
-  每层最大深度: "图遍历在每个层级允许继续扩展的最大深度，用来避免路径无限扩张。",
-  每节点标签上限: "同一节点可保留的路径标签数量上限，用于限制 dominance pruning 中的重复路径状态。",
-  边复用上限: "同一条边在单条路径中允许复用的次数上限，防止环路反复放大。",
-  闭环奖励上限: "单条路径最多可获得的闭环收敛奖励。奖励只辅助短而强的收敛路径，不能替代证据。",
-  闭环奖励距离阈值: "只有总距离足够短的闭环路径才会得到收敛奖励，长而弱的环不会提升路径价值。",
+  证据包令牌预算: "一次回答能够接收的原文证据上限。来源范围、结构恢复与命中片段都在同一硬预算内装包。",
+  结果保留数量默认值: "请求未指定 top_k 时采用的分层合并命中预算；结构恢复另受独立预算控制。",
+  "Dense 候选预算": "每层 Dense 通道独立提名的最大候选数。",
+  "RQ 候选预算": "每层基于完整 RQ 前缀重构相关性的独立候选数。",
+  "BM25 候选预算": "启用词面时，从当前 active 原文 BM25 快照独立提名的候选数。",
+  根入口预算: "LLM 选择 coarse、mid 或 chunk 后，该根层融合保留的入口数。",
+  逐父节点预算: "从每个父节点分别下钻时允许保留的子候选数。",
+  单层总预算: "逐父节点合并和图遍历后，每一层最多保留的节点数。",
+  最大遍历深度: "每层按非负累计距离扩展时允许的最大边深度。",
+  每命中恢复预算: "每个最终命中可恢复的前后文、结构对象或桥接片段上限。",
   路径绿色阈值: "路径距离小于该值时视为高置信路径，通常可继续确定性扩展。",
   路径灰区阈值: "路径距离落入灰区时，由 executor 基于有界观测和版本化本地规则确定性裁决继续、下钻、走桥或停止；LLM 与证据评估器不参与、覆盖或补判。",
   路径硬中断阈值: "路径距离超过该值时执行器直接剪枝，不允许模型绕过硬阈值继续扩展。",
-  扩展观察总预算: "单次图遍历允许持久化的完整 gray-zone 有界观测总量。达到预算后仍逐路径执行同一本地确定性规则，但只保留最小审计包并记录 hard interrupt；该参数 hot_reloadable，模型调用预算始终为 0。",
-  每个片段结构恢复数量: "对每个最终命中片段最多追加多少前后文或桥接上下文；不改变片段检索命中数量。",
-  路径摘要预算: "证据包中可保留的图路径摘要数量上限，用于解释证据从粗层到中层再到片段的来源。",
-  规划轮次预算: "智能体可进行规划和评估的最大轮数，用来控制单次任务内的推理成本。",
-  每轮动作上限: "每个规划轮最多允许的类型化动作数量。所有动作仍必须通过验证器和确定性执行器。",
-  修复轮次预算: "引用缺失、桥接不足或结构上下文不足时允许的修复轮次；耗尽后只能返回已验证部分或证据不足说明。",
-  引用验证预算: "回答后可执行的引用验证次数上限，用于把声明绑定回原始片段范围。",
+  回答单元上限: "一次生成可返回的完整段落或列表项上限。来源准入后只生成一次。",
+  前文摘要字数上限: "仅用于理解对话指代的历史摘要上限；历史文字不成为事实证据。",
 };
 
-const commonRetrievalFields: AgentNumberField[] = [
+const retrievalBudgetFields: AgentNumberField[] = [
   { key: "context_package_token_budget", label: "证据包令牌预算", min: 256, max: 20000 },
   { key: "retrieval_result_top_k_default", label: "结果保留数量默认值", min: 1, max: 50 },
-  { key: "agent_mid_top_k", label: "中概念保留数量", min: 1, max: 500 },
-  { key: "agent_chunk_per_mid_budget", label: "每个中概念片段预算", min: 1, max: 200 },
-  { key: "agent_chunk_initial_budget", label: "片段起点数量", min: 1, max: 1000 },
-  { key: "agent_chunk_top_k", label: "片段最终保留数量", min: 1, max: 1000 },
-  { key: "agent_structure_restore_per_chunk_budget", label: "每个片段结构恢复数量", min: 1, max: 200 },
-  { key: "candidate_pool_dedupe_budget", label: "候选去重池预算", min: 1, max: 5000 },
-];
-
-const queryFacetPosteriorFields: AgentNumberField[] = [
-  { key: "query_facet_posterior_observation_budget", label: "Query facet posterior 观察预算", min: 1, max: 1024 },
-  { key: "query_facet_posterior_round_budget", label: "Query facet posterior 轮次预算", min: 1, max: 2 },
-  { key: "query_facet_posterior_convergence_epsilon", label: "Query facet posterior 收敛阈值", min: 0, max: 1, step: 0.001 },
-];
-
-const midModeRetrievalFields: AgentNumberField[] = [
-  { key: "agent_mid_initial_budget", label: "普通模式中概念起点数量", min: 1, max: 500 },
-];
-
-const coarseModeRetrievalFields: AgentNumberField[] = [
-  { key: "agent_coarse_initial_budget", label: "粗概念起点数量", min: 1, max: 200 },
-  { key: "agent_coarse_top_k", label: "粗概念保留数量", min: 1, max: 200 },
-  { key: "agent_mid_per_coarse_budget", label: "每个粗概念中概念预算", min: 1, max: 100 },
-  { key: "agent_coarse_drilldown_mid_initial_budget", label: "摘要模式中概念起点数量", min: 1, max: 500 },
+  { key: "retrieval_v1_dense_candidate_budget", label: "Dense 候选预算", min: 1, max: 4096 },
+  { key: "retrieval_v1_rq_candidate_budget", label: "RQ 候选预算", min: 1, max: 4096 },
+  { key: "retrieval_v1_bm25_candidate_budget", label: "BM25 候选预算", min: 1, max: 4096 },
+  { key: "retrieval_v1_root_entry_budget", label: "根入口预算", min: 1, max: 256 },
+  { key: "retrieval_v1_per_parent_entry_budget", label: "逐父节点预算", min: 1, max: 256 },
+  { key: "retrieval_v1_layer_entry_budget", label: "单层总预算", min: 1, max: 1024 },
+  { key: "retrieval_v1_max_depth", label: "最大遍历深度", min: 0, max: 64 },
+  { key: "retrieval_v1_restore_per_hit", label: "每命中恢复预算", min: 0, max: 64 },
 ];
 
 const agentControlFields: AgentNumberField[] = [
-  { key: "agent_max_depth_per_layer", label: "每层最大深度", min: 1, max: 12 },
-  { key: "agent_max_labels_per_node", label: "每节点标签上限", min: 1, max: 20 },
-  { key: "agent_max_edge_reuse", label: "边复用上限", min: 1, max: 20 },
-  { key: "agent_max_cycle_reward_per_path", label: "闭环奖励上限", min: 0, max: 2, step: 0.01 },
-  { key: "agent_cycle_reward_distance_threshold", label: "闭环奖励距离阈值", min: 0, max: 20, step: 0.01 },
   { key: "agent_path_distance_green_threshold", label: "路径绿色阈值", min: 0, max: 20, step: 0.01 },
   { key: "agent_path_distance_gray_threshold", label: "路径灰区阈值", min: 0, max: 20, step: 0.01 },
   { key: "agent_path_distance_hard_threshold", label: "路径硬中断阈值", min: 0, max: 40, step: 0.01 },
-  { key: "traversal_observation_budget", label: "扩展观察总预算", min: 1, max: 20000 },
-  { key: "context_path_summary_budget", label: "路径摘要预算", min: 1, max: 500 },
-  { key: "agent_planning_round_budget", label: "规划轮次预算", min: 1, max: 10 },
-  { key: "agent_max_typed_actions_per_round", label: "每轮动作上限", min: 1, max: 50 },
-  { key: "agent_repair_round_budget", label: "修复轮次预算", min: 0, max: 10 },
-  { key: "agent_verification_budget", label: "引用验证预算", min: 1, max: 100 },
-];
-
-const retrievalGranularityOptions: Array<{ value: RetrievalGranularity; label: string; description: string }> = [
-  {
-    value: "mid",
-    label: "普通模式",
-    description: "从中层概念直接进入检索，适合具体知识点和术语问题",
-  },
-  {
-    value: "coarse",
-    label: "摘要模式",
-    description: "先从粗层摘要概念进入检索，适合总览和主题性问题",
-  },
+  { key: "agent_answer_unit_limit", label: "回答单元上限", min: 1, max: 32 },
+  { key: "agent_history_summary_max_chars", label: "前文摘要字数上限", min: 512, max: 12000 },
 ];
 
 function isAbortError(error: unknown): boolean {
@@ -252,91 +185,43 @@ function stringSetting(value: number | undefined, fallback: number): string {
 
 function agentSettingsFormFromSettings(settings?: ModelSettingsResponse | null): AgentSettingsForm {
   return {
-    query_facet_bilingual_enabled: settings?.query_facet_bilingual_enabled ?? false,
-    query_facet_posterior_enabled: settings?.query_facet_posterior_enabled ?? true,
-    query_facet_posterior_observation_budget: stringSetting(settings?.query_facet_posterior_observation_budget, 64),
-    query_facet_posterior_round_budget: stringSetting(settings?.query_facet_posterior_round_budget, 2),
-    query_facet_posterior_convergence_epsilon: stringSetting(settings?.query_facet_posterior_convergence_epsilon, 0.02),
     context_package_token_budget: stringSetting(settings?.context_package_token_budget, 12000),
     retrieval_result_top_k_default: stringSetting(settings?.retrieval_result_top_k_default, 12),
-    agent_coarse_initial_budget: stringSetting(settings?.agent_coarse_initial_budget ?? settings?.agent_coarse_total_budget, 5),
-    agent_coarse_top_k: stringSetting(settings?.agent_coarse_top_k ?? settings?.agent_coarse_initial_budget ?? settings?.agent_coarse_total_budget, 5),
-    agent_mid_per_coarse_budget: stringSetting(settings?.agent_mid_per_coarse_budget, 6),
-    agent_coarse_drilldown_mid_initial_budget: stringSetting(
-      settings?.agent_coarse_drilldown_mid_initial_budget ?? settings?.agent_mid_top_k,
-      8
-    ),
-    agent_mid_initial_budget: stringSetting(settings?.agent_mid_initial_budget ?? settings?.agent_mid_top_k, 8),
-    agent_mid_top_k: stringSetting(settings?.agent_mid_top_k, 8),
-    agent_chunk_per_mid_budget: stringSetting(settings?.agent_chunk_per_mid_budget, 12),
-    agent_chunk_initial_budget: stringSetting(settings?.agent_chunk_initial_budget ?? settings?.agent_chunk_top_k, 16),
-    agent_chunk_top_k: stringSetting(settings?.agent_chunk_top_k, 16),
-    candidate_pool_dedupe_budget: stringSetting(settings?.candidate_pool_dedupe_budget, 80),
-    agent_max_depth_per_layer: stringSetting(settings?.agent_max_depth_per_layer, 3),
-    agent_max_labels_per_node: stringSetting(settings?.agent_max_labels_per_node, 3),
-    agent_max_edge_reuse: stringSetting(settings?.agent_max_edge_reuse, 2),
-    agent_max_cycle_reward_per_path: stringSetting(settings?.agent_max_cycle_reward_per_path, 0.18),
-    agent_cycle_reward_distance_threshold: stringSetting(settings?.agent_cycle_reward_distance_threshold, 1.2),
+    retrieval_v1_dense_candidate_budget: stringSetting(settings?.retrieval_v1_dense_candidate_budget, 64),
+    retrieval_v1_rq_candidate_budget: stringSetting(settings?.retrieval_v1_rq_candidate_budget, 64),
+    retrieval_v1_bm25_candidate_budget: stringSetting(settings?.retrieval_v1_bm25_candidate_budget, 64),
+    retrieval_v1_root_entry_budget: stringSetting(settings?.retrieval_v1_root_entry_budget, 12),
+    retrieval_v1_per_parent_entry_budget: stringSetting(settings?.retrieval_v1_per_parent_entry_budget, 8),
+    retrieval_v1_layer_entry_budget: stringSetting(settings?.retrieval_v1_layer_entry_budget, 64),
+    retrieval_v1_max_depth: stringSetting(settings?.retrieval_v1_max_depth, 3),
+    retrieval_v1_restore_per_hit: stringSetting(settings?.retrieval_v1_restore_per_hit, 8),
     agent_path_distance_green_threshold: stringSetting(settings?.agent_path_distance_green_threshold, 0.45),
     agent_path_distance_gray_threshold: stringSetting(settings?.agent_path_distance_gray_threshold, 1.35),
     agent_path_distance_hard_threshold: stringSetting(settings?.agent_path_distance_hard_threshold, 2.4),
-    traversal_observation_budget: stringSetting(settings?.traversal_observation_budget, 64),
-    agent_structure_restore_per_chunk_budget: stringSetting(settings?.agent_structure_restore_per_chunk_budget ?? settings?.agent_structure_restore_budget, 16),
-    context_path_summary_budget: stringSetting(settings?.context_path_summary_budget, 32),
-    agent_planning_round_budget: stringSetting(settings?.agent_planning_round_budget, 2),
-    agent_max_typed_actions_per_round: stringSetting(settings?.agent_max_typed_actions_per_round, 8),
-    agent_repair_round_budget: stringSetting(settings?.agent_repair_round_budget, 2),
-    agent_verification_budget: stringSetting(settings?.agent_verification_budget, 8),
+    agent_answer_unit_limit: stringSetting(settings?.agent_answer_unit_limit, 12),
+    agent_history_summary_max_chars: stringSetting(settings?.agent_history_summary_max_chars, 4000),
   };
 }
 
-function buildAgentSettingsPayload(form: AgentSettingsForm, retrievalGranularity: RetrievalGranularity): ModelSettingsUpdate {
-  const payload: ModelSettingsUpdate = {
-    query_facet_bilingual_enabled: form.query_facet_bilingual_enabled,
-    query_facet_posterior_enabled: form.query_facet_posterior_enabled,
-    query_facet_posterior_observation_budget: parseIntField(form.query_facet_posterior_observation_budget),
-    query_facet_posterior_round_budget: parseIntField(form.query_facet_posterior_round_budget),
-    query_facet_posterior_convergence_epsilon: parseFloatField(form.query_facet_posterior_convergence_epsilon),
+function buildAgentSettingsPayload(form: AgentSettingsForm): ModelSettingsUpdate {
+  return {
     context_package_token_budget: parseIntField(form.context_package_token_budget),
     retrieval_result_top_k_default: parseIntField(form.retrieval_result_top_k_default),
-    agent_mid_top_k: parseIntField(form.agent_mid_top_k),
-    agent_chunk_per_mid_budget: parseIntField(form.agent_chunk_per_mid_budget),
-    agent_chunk_initial_budget: parseIntField(form.agent_chunk_initial_budget),
-    agent_chunk_top_k: parseIntField(form.agent_chunk_top_k),
-    candidate_pool_dedupe_budget: parseIntField(form.candidate_pool_dedupe_budget),
-    agent_max_depth_per_layer: parseIntField(form.agent_max_depth_per_layer),
-    agent_max_labels_per_node: parseIntField(form.agent_max_labels_per_node),
-    agent_max_edge_reuse: parseIntField(form.agent_max_edge_reuse),
-    agent_max_cycle_reward_per_path: parseFloatField(form.agent_max_cycle_reward_per_path),
-    agent_cycle_reward_distance_threshold: parseFloatField(form.agent_cycle_reward_distance_threshold),
+    retrieval_v1_dense_candidate_budget: parseIntField(form.retrieval_v1_dense_candidate_budget),
+    retrieval_v1_rq_candidate_budget: parseIntField(form.retrieval_v1_rq_candidate_budget),
+    retrieval_v1_bm25_candidate_budget: parseIntField(form.retrieval_v1_bm25_candidate_budget),
+    retrieval_v1_root_entry_budget: parseIntField(form.retrieval_v1_root_entry_budget),
+    retrieval_v1_per_parent_entry_budget: parseIntField(form.retrieval_v1_per_parent_entry_budget),
+    retrieval_v1_layer_entry_budget: parseIntField(form.retrieval_v1_layer_entry_budget),
+    retrieval_v1_max_depth: parseIntField(form.retrieval_v1_max_depth),
+    retrieval_v1_restore_per_hit: parseIntField(form.retrieval_v1_restore_per_hit),
     agent_path_distance_green_threshold: parseFloatField(form.agent_path_distance_green_threshold),
     agent_path_distance_gray_threshold: parseFloatField(form.agent_path_distance_gray_threshold),
     agent_path_distance_hard_threshold: parseFloatField(form.agent_path_distance_hard_threshold),
-    traversal_observation_budget: parseIntField(form.traversal_observation_budget),
-    agent_structure_restore_per_chunk_budget: parseIntField(form.agent_structure_restore_per_chunk_budget),
-    context_path_summary_budget: parseIntField(form.context_path_summary_budget),
-    agent_planning_round_budget: parseIntField(form.agent_planning_round_budget),
-    agent_max_typed_actions_per_round: parseIntField(form.agent_max_typed_actions_per_round),
-    agent_repair_round_budget: parseIntField(form.agent_repair_round_budget),
-    agent_verification_budget: parseIntField(form.agent_verification_budget),
+    agent_answer_unit_limit: parseIntField(form.agent_answer_unit_limit),
+    agent_history_summary_max_chars: parseIntField(form.agent_history_summary_max_chars),
   };
-  if (retrievalGranularity === "coarse") {
-    payload.agent_coarse_initial_budget = parseIntField(form.agent_coarse_initial_budget);
-    payload.agent_coarse_top_k = parseIntField(form.agent_coarse_top_k);
-    payload.agent_mid_per_coarse_budget = parseIntField(form.agent_mid_per_coarse_budget);
-    payload.agent_coarse_drilldown_mid_initial_budget = parseIntField(form.agent_coarse_drilldown_mid_initial_budget);
-  } else {
-    payload.agent_mid_initial_budget = parseIntField(form.agent_mid_initial_budget);
-  }
-  return payload;
 }
-
-const fallbackSuggestions = [
-  "总结这批资料最核心的知识结构",
-  "结合本地资料解释一个重要概念",
-  "找出资料库中容易混淆的概念并比较",
-  "基于资料引用给我一份阅读路线",
-];
 
 export function answerAuditFromTrace(
   trace: AgentTraceEventPayload[] | undefined,
@@ -381,24 +266,6 @@ function answerModelLabel(latestRun: AgentResponse | null, configuredChatModel?:
   return "模型：未调用";
 }
 
-function buildKnowledgeBaseSuggestions(tree: Array<{ title?: string; children?: Array<{ title?: string }> }> | undefined): string[] {
-  const isProductTitle = (title: string | undefined): title is string =>
-    Boolean(
-      title &&
-        !/^[0-9a-f]{64}$/i.test(title) &&
-        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(title),
-    );
-  const partitions = tree?.map((node) => node.title).filter(isProductTitle) ?? [];
-  const documents = tree?.flatMap((node) => node.children?.map((child) => child.title) ?? []).filter(isProductTitle) ?? [];
-  const suggestions = [
-    partitions[0] ? `总结 ${partitions[0]} 的核心内容` : "",
-    partitions[1] ? `比较 ${partitions[0]} 和 ${partitions[1]} 的联系` : "",
-    documents[0] ? `根据 ${documents[0]} 生成整理提纲` : "",
-    partitions[0] ? `从本地资料中找出 ${partitions[0]} 的关键概念` : "",
-  ].filter(Boolean);
-  return suggestions.length ? suggestions.slice(0, 4) : fallbackSuggestions;
-}
-
 export function normalizeMessages(messages: SessionMessage[] | Array<Record<string, unknown>>, conversationState?: ConversationStatePayload | null): ChatTurn[] {
   const referencesByRunId = new Map(conversationState?.history_references.map((reference) => [reference.run_id, reference]) ?? []);
   return (messages as Array<Record<string, unknown>>)
@@ -408,12 +275,17 @@ export function normalizeMessages(messages: SessionMessage[] | Array<Record<stri
       const citationTraceId = messageCitations?.find((citation) => typeof citation.retrieval_trace_id === "string")?.retrieval_trace_id;
       const citationPackageId = messageCitations?.find((citation) => typeof citation.context_package_id === "string")?.context_package_id;
       const runId = typeof item.run_id === "string" ? item.run_id : null;
+      const directAnswerMode =
+        item.direct_answer_mode === "system_capability" || item.direct_answer_mode === "verified_context_reuse"
+          ? item.direct_answer_mode
+          : null;
       const historyReference = runId ? referencesByRunId.get(runId) : undefined;
       return {
         role: item.role as "user" | "assistant",
         content: String(item.content ?? ""),
         run_id: runId,
         route: typeof item.route === "string" ? item.route : null,
+        direct_answer_mode: directAnswerMode,
         citations: messageCitations,
         trace: Array.isArray(item.trace) ? (item.trace as AgentTraceEventPayload[]) : undefined,
         retrieval_trace_id: typeof item.retrieval_trace_id === "string" ? item.retrieval_trace_id : citationTraceId ?? historyReference?.retrieval_trace_id ?? null,
@@ -446,32 +318,14 @@ export function preserveTurnTraces(nextTurns: ChatTurn[], currentTurns: ChatTurn
   }));
 }
 
-async function hydrateHistoricalTurnTraces(turns: ChatTurn[]): Promise<ChatTurn[]> {
-  const hydrated = turns.map((turn) => ({ ...turn }));
-  const candidates = hydrated
-    .map((turn, index) => ({ turn, index }))
-    .filter(({ turn }) => turn.role === "assistant" && Boolean(turn.run_id) && !turn.trace?.length)
-    .slice(-8);
-  for (const { turn, index } of candidates) {
-    try {
-      const status = await fetchTaskStatus(turn.run_id as string);
-      if (status.trace?.length) {
-        hydrated[index] = { ...turn, trace: status.trace };
-      }
-    } catch {
-      // Historical trace replay is an optional product projection. The
-      // persisted answer and citations remain usable when a run is too old.
-    }
-  }
-  return hydrated;
-}
-
 function ChatHeader({
   latestRun,
   configuredChatModel,
+  modelLoading,
 }: {
   latestRun: AgentResponse | null;
   configuredChatModel?: string | null;
+  modelLoading: boolean;
 }) {
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-3 px-1">
@@ -481,8 +335,17 @@ function ChatHeader({
       </div>
       <div className="flex w-full flex-wrap gap-2">
         <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
-          <BrainCircuit data-icon="inline-start" />
-          {answerModelLabel(latestRun, configuredChatModel)}
+          {modelLoading ? (
+            <>
+              <Loader2 data-icon="inline-start" className="animate-spin" />
+              正在读取模型配置...
+            </>
+          ) : (
+            <>
+              <BrainCircuit data-icon="inline-start" />
+              {answerModelLabel(latestRun, configuredChatModel)}
+            </>
+          )}
         </span>
       </div>
     </div>
@@ -611,8 +474,6 @@ function AgentSettingsDialog({
   onChange,
   onReset,
   onSave,
-  retrievalGranularity,
-  onRetrievalGranularityChange,
   isLoading,
   error,
   isSaving,
@@ -624,16 +485,12 @@ function AgentSettingsDialog({
   onChange: <K extends keyof AgentSettingsForm>(key: K, value: AgentSettingsForm[K]) => void;
   onReset: () => void;
   onSave: () => void;
-  retrievalGranularity: RetrievalGranularity;
-  onRetrievalGranularityChange: (value: RetrievalGranularity) => void;
   isLoading: boolean;
   error: Error | null;
   isSaving: boolean;
   savedMessage: { kind: "success" | "error"; text: string } | null;
 }) {
   const disabled = isLoading || isSaving || !form;
-  const modeFields = retrievalGranularity === "mid" ? midModeRetrievalFields : coarseModeRetrievalFields;
-  const modeTitle = retrievalGranularity === "mid" ? "普通模式入口参数" : "摘要模式入口参数";
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex h-[min(46rem,calc(100dvh-2rem))] max-h-[calc(100dvh-2rem)] w-[min(58rem,calc(100vw-2rem))] flex-col overflow-hidden border border-cyan-200/14 bg-[rgba(3,10,22,0.96)] p-0 text-white shadow-[0_30px_90px_rgba(0,0,0,0.48)] backdrop-blur-2xl sm:!max-w-[58rem]">
@@ -642,7 +499,7 @@ function AgentSettingsDialog({
             <SlidersHorizontal className="size-5 text-cyan-100/78" />
             智能体参数
           </DialogTitle>
-          <DialogDescription className="text-cyan-50/58">保存后通过运行时热加载影响下一次检索、对话和引用验证。</DialogDescription>
+          <DialogDescription className="text-cyan-50/58">模型会为每个问题选择 coarse、mid 或 chunk 入口；这里只设置执行器硬预算。</DialogDescription>
         </DialogHeader>
         <form
           className="flex min-h-0 flex-1 flex-col"
@@ -656,79 +513,13 @@ function AgentSettingsDialog({
             {error ? <ErrorBlock message={error.message} /> : null}
             {form ? (
               <div className="grid gap-6">
-                <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/8 pb-5">
-                  <div className="min-w-[14rem] flex-1">
-                    <p className="text-sm font-semibold text-white">
-                      <AgentParameterName label="模型双语查询词面" className="text-sm font-semibold normal-case tracking-normal text-white" />
-                    </p>
-                    <p className="mt-1 text-sm leading-6 text-white/55">要求查询词面提取为显式概念补充中英文别名。</p>
-                  </div>
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={form.query_facet_bilingual_enabled}
-                    disabled={disabled}
-                    onClick={() => onChange("query_facet_bilingual_enabled", !form.query_facet_bilingual_enabled)}
-                    className={`relative h-8 w-16 rounded-full border transition ${
-                      form.query_facet_bilingual_enabled ? "border-cyan-100/40 bg-cyan-300/70" : "border-white/14 bg-white/10"
-                    } disabled:cursor-not-allowed disabled:opacity-60`}
-                  >
-                    <span className={`absolute top-1 size-6 rounded-full bg-white shadow transition ${form.query_facet_bilingual_enabled ? "left-9" : "left-1"}`} />
-                  </button>
-                </div>
-
-                <section className="grid gap-4 rounded-xl border border-cyan-200/12 bg-cyan-200/[0.025] p-4">
-                  <div className="flex flex-wrap items-center justify-between gap-4">
-                    <div className="min-w-[14rem] flex-1">
-                      <p className="text-sm font-semibold text-white">Query facet posterior calibration</p>
-                      <p className="mt-1 text-xs leading-5 text-white/52">
-                        hot_reloadable · 影响下一次 search / QA / repair retrieval · 不触发切块、Qdrant 或图谱重建。仅使用确定性有界图观察，LLM sample budget 固定为 0。
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-label="Query facet posterior calibration"
-                      aria-checked={form.query_facet_posterior_enabled}
-                      disabled={disabled}
-                      onClick={() => onChange("query_facet_posterior_enabled", !form.query_facet_posterior_enabled)}
-                      className={`relative h-8 w-16 rounded-full border transition ${
-                        form.query_facet_posterior_enabled ? "border-cyan-100/40 bg-cyan-300/70" : "border-white/14 bg-white/10"
-                      } disabled:cursor-not-allowed disabled:opacity-60`}
-                    >
-                      <span className={`absolute top-1 size-6 rounded-full bg-white shadow transition ${form.query_facet_posterior_enabled ? "left-9" : "left-1"}`} />
-                    </button>
-                  </div>
-                  <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                    {queryFacetPosteriorFields.map((field) => (
-                      <AgentSettingsField
-                        key={field.key}
-                        field={field}
-                        value={form[field.key]}
-                        onChange={(value) => onChange(field.key, value)}
-                        disabled={disabled || !form.query_facet_posterior_enabled}
-                      />
-                    ))}
-                  </div>
-                  <p className="text-xs leading-5 text-amber-100/62">
-                    posterior 不是事实证据、引用来源或 gray-zone authority；它只能在未覆盖 facet 数量相同的候选之间做确定性 tie-break。
-                  </p>
-                </section>
-
-                <section className="grid gap-3 rounded-lg border border-white/8 bg-white/[0.025] p-4">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div className="min-w-[14rem]">
-                      <p className="text-sm font-semibold text-white">检索模式</p>
-                      <p className="mt-1 text-xs leading-5 text-white/48">这里只显示当前模式会读取的入口预算参数。</p>
-                    </div>
-                    <RetrievalGranularitySelector value={retrievalGranularity} onChange={onRetrievalGranularityChange} disabled={disabled} />
-                  </div>
-                </section>
-
                 <section className="grid gap-4">
-                  <p className="text-sm font-semibold text-white">检索与证据包</p>
+                  <div className="border-b border-cyan-100/12 pb-3">
+                    <p className="text-sm font-semibold text-white">候选、入口与证据包</p>
+                    <p className="mt-1 text-xs leading-5 text-white/48">Dense、RQ 与 BM25 独立提名；权重和入口由本轮冻结计划决定。</p>
+                  </div>
                   <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                    {commonRetrievalFields.map((field) => (
+                    {retrievalBudgetFields.map((field) => (
                       <AgentSettingsField
                         key={field.key}
                         field={field}
@@ -740,25 +531,11 @@ function AgentSettingsDialog({
                   </div>
                 </section>
 
-                {modeFields.length ? (
-                  <section className="grid gap-4">
-                    <p className="text-sm font-semibold text-white">{modeTitle}</p>
-                    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                      {modeFields.map((field) => (
-                        <AgentSettingsField
-                          key={field.key}
-                          field={field}
-                          value={form[field.key]}
-                          onChange={(value) => onChange(field.key, value)}
-                          disabled={disabled}
-                        />
-                      ))}
-                    </div>
-                  </section>
-                ) : null}
-
                 <section className="grid gap-4">
-                  <p className="text-sm font-semibold text-white">遍历、修复与验证</p>
+                  <div className="border-b border-cyan-100/12 pb-3">
+                    <p className="text-sm font-semibold text-white">遍历与一次生成</p>
+                    <p className="mt-1 text-xs leading-5 text-white/48">灰区由本地确定性规则裁决；来源准入通过后只生成一次。</p>
+                  </div>
                   <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                     {agentControlFields.map((field) => (
                       <AgentSettingsField
@@ -837,26 +614,7 @@ function ChatActionRail({
   );
 }
 
-function SuggestionChips({ suggestions, onPick }: { suggestions: string[]; onPick: (value: string) => void }) {
-  return (
-    <div className="mx-auto flex max-w-3xl flex-wrap justify-center gap-2 px-1">
-      {suggestions.map((suggestion) => (
-        <motion.button
-          key={suggestion}
-          type="button"
-          whileHover={{ y: -2 }}
-          whileTap={{ scale: 0.98 }}
-          onClick={() => onPick(suggestion)}
-          className="kg-micro-chip max-w-full rounded-full px-3 py-2 text-xs transition hover:border-cyan-200/30 hover:text-white sm:px-4 sm:text-sm"
-        >
-          {suggestion}
-        </motion.button>
-      ))}
-    </div>
-  );
-}
-
-function EmptyChatState({ suggestions, onPick }: { suggestions: string[]; onPick: (value: string) => void }) {
+function EmptyChatState() {
   return (
     <div className="grid min-h-[calc(100dvh-21rem)] place-items-center px-2 pb-44 pt-12 text-center sm:px-4">
       <div className="-translate-y-16 sm:-translate-y-24">
@@ -869,9 +627,6 @@ function EmptyChatState({ suggestions, onPick }: { suggestions: string[]; onPick
         <p className="mx-auto mt-3 max-w-[21rem] text-sm leading-7 text-white/56 sm:max-w-2xl">
           系统会从资料中寻找相关内容、补充必要上下文，并生成带来源的回答。
         </p>
-        <div className="mt-7">
-          <SuggestionChips suggestions={suggestions} onPick={onPick} />
-        </div>
       </div>
     </div>
   );
@@ -906,6 +661,11 @@ export function MessageBubble({
         <div className="mb-3 flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-white/38">
           {isUser ? <CircleDot /> : <BrainCircuit />}
           {isUser ? "你" : "智能体"}
+          {!isUser && turn.direct_answer_mode ? (
+            <span className="rounded-full border border-cyan-200/15 px-2 py-1 text-[10px] tracking-[0.12em] text-cyan-50/55">
+              {turn.direct_answer_mode === "system_capability" ? "系统能力回答" : "复用已验证证据"}
+            </span>
+          ) : null}
         </div>
         {!isUser && turn.trace?.length ? <AgentTraceStream trace={turn.trace} compact className="mb-5" /> : null}
         <MarkdownRenderer content={turn.content} className={cn(isUser ? "text-white/78" : "text-white/74")} />
@@ -933,7 +693,7 @@ export function GeneratingBubble({ content, trace }: { content: string; trace: A
     <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="flex justify-start">
       <div className="w-full max-w-[min(860px,92%)] border-l border-cyan-200/18 px-5 py-4 text-white">
         <div className="mb-3 flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-cyan-100/50">
-          <span className="tech-dot" />
+          <Loader2 className="size-4 animate-spin" />
           {content ? "正在输出" : "智能体运行中"}
         </div>
         {!content ? <AgentTraceStream trace={trace} isRunning defaultExpanded compact className="mb-5" /> : null}
@@ -944,12 +704,7 @@ export function GeneratingBubble({ content, trace }: { content: string; trace: A
           </div>
         ) : (
           <div className="flex items-center gap-2 text-sm text-white/56">
-            <span className="context-bars">
-              <span />
-              <span />
-              <span />
-              <span />
-            </span>
+            <Loader2 className="size-5 animate-spin text-cyan-100" />
             正在查找资料并核对来源...
           </div>
         )}
@@ -960,20 +715,18 @@ export function GeneratingBubble({ content, trace }: { content: string; trace: A
 
 export function MessageList({
   turns,
+  isLoading,
   isGenerating,
   draftAnswer,
   trace,
-  onPickSuggestion,
   onOpenCitations,
-  suggestions,
 }: {
   turns: ChatTurn[];
+  isLoading: boolean;
   isGenerating: boolean;
   draftAnswer: string;
   trace: AgentTraceEventPayload[];
-  onPickSuggestion: (value: string) => void;
   onOpenCitations: (citations: Citation[]) => void;
-  suggestions: string[];
 }) {
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const scrollFrameRef = useRef<number | null>(null);
@@ -982,16 +735,17 @@ export function MessageList({
   useEffect(() => {
     const hasNewTurn = turns.length !== previousTurnCountRef.current;
     previousTurnCountRef.current = turns.length;
-    const distanceToBottom = document.documentElement.scrollHeight - window.innerHeight - window.scrollY;
-    const shouldStickToBottom = distanceToBottom < 280;
-    if (!hasNewTurn && (!isGenerating || !shouldStickToBottom)) {
+    if (!hasNewTurn && !isGenerating) {
       return undefined;
     }
     if (scrollFrameRef.current !== null) {
       window.cancelAnimationFrame(scrollFrameRef.current);
     }
     scrollFrameRef.current = window.requestAnimationFrame(() => {
-      bottomRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+      bottomRef.current?.scrollIntoView({
+        behavior: isGenerating ? "smooth" : "auto",
+        block: "end",
+      });
       scrollFrameRef.current = null;
     });
     return () => {
@@ -1004,8 +758,10 @@ export function MessageList({
 
   return (
     <div className="relative min-h-[calc(100dvh-21rem)]">
-      {turns.length === 0 && !isGenerating ? (
-        <EmptyChatState suggestions={suggestions} onPick={onPickSuggestion} />
+      {isLoading && turns.length === 0 && !isGenerating ? (
+        <LoadingBlock rows={3} />
+      ) : turns.length === 0 && !isGenerating ? (
+        <EmptyChatState />
       ) : (
         <div className="mx-auto flex max-w-5xl flex-col gap-8 px-1 pb-6 pt-4">
           {turns.map((turn, index) => (
@@ -1024,85 +780,6 @@ export function MessageList({
   );
 }
 
-export function RetrievalGranularitySelector({
-  value,
-  onChange,
-  disabled,
-}: {
-  value: RetrievalGranularity;
-  onChange: (value: RetrievalGranularity) => void;
-  disabled?: boolean;
-}) {
-  const [tooltipMode, setTooltipMode] = useState<RetrievalGranularity | null>(null);
-  const tooltipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const activeOption = retrievalGranularityOptions.find((option) => option.value === value) ?? retrievalGranularityOptions[0];
-
-  const clearTooltipTimer = () => {
-    if (tooltipTimerRef.current) {
-      clearTimeout(tooltipTimerRef.current);
-      tooltipTimerRef.current = null;
-    }
-  };
-
-  const queueTooltip = (mode: RetrievalGranularity) => {
-    clearTooltipTimer();
-    tooltipTimerRef.current = setTimeout(() => {
-      setTooltipMode(mode);
-      tooltipTimerRef.current = null;
-    }, 1000);
-  };
-
-  const hideTooltip = () => {
-    clearTooltipTimer();
-    setTooltipMode(null);
-  };
-
-  useEffect(() => {
-    return () => clearTooltipTimer();
-  }, []);
-
-  return (
-    <div className="relative flex flex-wrap items-center gap-2" aria-label="检索模式">
-      <div className="flex rounded-full border border-white/10 bg-black/16 p-1" role="group" aria-label="检索粒度模式">
-        {retrievalGranularityOptions.map((option) => {
-          const selected = option.value === value;
-          return (
-            <button
-              key={option.value}
-              type="button"
-              data-testid={`retrieval-granularity-${option.value}`}
-              aria-pressed={selected}
-              disabled={disabled}
-              onClick={() => onChange(option.value)}
-              onMouseEnter={() => queueTooltip(option.value)}
-              onMouseLeave={hideTooltip}
-              onFocus={() => queueTooltip(option.value)}
-              onBlur={hideTooltip}
-              className={cn(
-                "inline-flex h-8 min-w-0 items-center gap-1.5 rounded-full px-3 text-[11px] font-medium transition disabled:cursor-not-allowed disabled:opacity-55",
-                selected ? "bg-cyan-200 text-slate-950 shadow-[0_0_18px_rgba(86,217,255,0.18)]" : "text-white/58 hover:bg-white/8 hover:text-white/82",
-              )}
-            >
-              {option.value === "mid" ? <Layers3 /> : <FileText />}
-              <span className="whitespace-nowrap">{option.label}</span>
-            </button>
-          );
-        })}
-      </div>
-      <span className="min-w-0 truncate text-[11px] text-white/42">{activeOption.value === "mid" ? "适合具体问题" : "适合主题总览"}</span>
-      {tooltipMode ? (
-        <div
-          role="tooltip"
-          data-testid="retrieval-granularity-tooltip"
-          className="absolute bottom-[calc(100%+0.5rem)] left-0 max-w-[min(22rem,calc(100vw-3rem))] rounded-lg border border-cyan-200/18 bg-[#071124] px-3 py-2 text-xs leading-5 text-white/70 shadow-[0_16px_42px_rgba(0,0,0,0.34)]"
-        >
-          {retrievalGranularityOptions.find((option) => option.value === tooltipMode)?.description}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 function ChatComposer({
   value,
   onChange,
@@ -1110,8 +787,6 @@ function ChatComposer({
   onCancel,
   isPending,
   activeSessionId,
-  retrievalGranularity,
-  onRetrievalGranularityChange,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -1119,8 +794,6 @@ function ChatComposer({
   onCancel: () => void;
   isPending: boolean;
   activeSessionId: string | null;
-  retrievalGranularity: RetrievalGranularity;
-  onRetrievalGranularityChange: (value: RetrievalGranularity) => void;
 }) {
   const handleSubmit = () => {
     if (isPending || !value.trim()) {
@@ -1133,7 +806,7 @@ function ChatComposer({
     <motion.div
       initial={{ opacity: 0, y: 18 }}
       animate={{ opacity: 1, y: 0 }}
-      className="pointer-events-none fixed inset-x-4 bottom-4 z-[45] lg:left-[calc(76px+1.75rem)] lg:right-7"
+      className="pointer-events-none fixed inset-x-4 bottom-20 z-[45] lg:bottom-4 lg:left-[calc(76px+1.75rem)] lg:right-7"
     >
       <div className="pointer-events-auto mx-auto w-full max-w-5xl">
         <div
@@ -1151,7 +824,7 @@ function ChatComposer({
               <span className="kg-micro-chip max-w-full truncate rounded-full px-2.5 py-1 text-[11px]">
                 {activeSessionId ? "会话已建立" : "新建会话"}
               </span>
-              <RetrievalGranularitySelector value={retrievalGranularity} onChange={onRetrievalGranularityChange} disabled={isPending} />
+              <span className="hidden text-[11px] text-white/42 sm:inline">入口与通道由本轮意图计划选择</span>
             </div>
             <div className="flex items-end gap-3">
               <Textarea
@@ -1167,7 +840,7 @@ function ChatComposer({
                   }
                 }}
                 className="max-h-44 min-h-[72px] resize-none border-0 bg-transparent px-2 text-base text-white shadow-none placeholder:text-white/30 focus-visible:ring-0"
-                placeholder="输入问题，系统会检索、评估、回答并给出引用..."
+                placeholder="输入问题，系统会规划检索、核对来源并给出一次有引用的回答..."
               />
               <Button
                 type="button"
@@ -1207,7 +880,7 @@ function SessionsDrawer({
   onOpenChange: (open: boolean) => void;
   sessions: SessionSummary[];
   activeSessionId: string | null;
-  onSelect: (sessionId: string) => void | Promise<void>;
+  onSelect: (sessionId: string) => Promise<void>;
   onDelete: (sessionId: string) => void | Promise<void>;
   onNew: () => void;
   isPending: boolean;
@@ -1254,8 +927,9 @@ function SessionsDrawer({
                     if (isPending) {
                       return;
                     }
-                    onSelect(session.id);
-                    onOpenChange(false);
+                    void onSelect(session.id)
+                      .finally(() => onOpenChange(false))
+                      .catch(() => undefined);
                   }}
                   className="min-w-0 flex-1 text-left"
                 >
@@ -1294,13 +968,13 @@ function CitationsDrawer({
 }) {
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent className="w-full border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-xl">
+      <SheetContent className="w-full min-w-0 overflow-hidden border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-xl">
         <SheetHeader className="border-b border-white/8 p-6">
           <SheetTitle>引用</SheetTitle>
           <SheetDescription>查看回答所依据的资料片段、页码和章节位置。</SheetDescription>
         </SheetHeader>
-        <ScrollArea className="h-[calc(100dvh-8rem)] p-6">
-          <div className="flex flex-col gap-3">
+        <ScrollArea className="h-[calc(100dvh-8rem)] min-w-0 overflow-hidden p-6">
+          <div className="flex min-w-0 max-w-full flex-col gap-3 overflow-hidden">
             {citations.length === 0 ? (
               <div className="kg-glass-line rounded-3xl px-6 py-10 text-center text-sm text-white/55">
                 <Archive className="mx-auto mb-4 text-cyan-100/70" />
@@ -1339,6 +1013,8 @@ export function ConversationStatePanel({ state }: { state: ConversationStatePayl
     retrieving: "查找资料",
     answering: "整理回答",
     verifying: "核对来源",
+    cancelled: "本轮已停止",
+    failed: "本轮未完成",
   };
   const taskStatusLabel =
     taskStatusLabels[state.task_state.status] ?? "进行中";
@@ -1365,11 +1041,6 @@ export function ConversationStatePanel({ state }: { state: ConversationStatePayl
 function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBaseId: string | null }) {
   const queryClient = useQueryClient();
   const storageScope = selectedKnowledgeBaseId ?? "unassigned";
-  const dashboardQuery = useQuery({
-    queryKey: ["dashboard", selectedKnowledgeBaseId],
-    queryFn: () => fetchDashboard(selectedKnowledgeBaseId, { includeGraph: false }),
-    enabled: Boolean(selectedKnowledgeBaseId),
-  });
   const sessionsQuery = useQuery({
     queryKey: ["sessions", selectedKnowledgeBaseId],
     queryFn: () => fetchSessions(selectedKnowledgeBaseId),
@@ -1378,20 +1049,40 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
   const modelSettingsQuery = useQuery({ queryKey: ["model-settings"], queryFn: fetchModelSettings });
   const [question, setQuestion] = useLocalStorage(`qa.question.${storageScope}`, "");
   const [activeSessionId, setActiveSessionId] = useLocalStorage<string | null>(`qa.sessionId.${storageScope}`, null);
+  const [autoResumeSuppressed, setAutoResumeSuppressed] = useLocalStorage(
+    `qa.autoResumeSuppressed.${storageScope}`,
+    false,
+  );
+  const [activeStream, setActiveStream] = useLocalStorage<ActiveStreamState | null>(`qa.activeStream.${storageScope}`, null);
   // PostgreSQL session/answer/trace rows are the durable conversation source.
   // Large citations, trace audits and AgentResponse payloads must stay in
   // memory; persisting them redundantly in localStorage exceeds browser quota
   // and can prevent the final turn from rendering.
-  const [turns, setTurns] = useState<ChatTurn[]>([]);
+  const cachedSession = activeSessionId
+    ? queryClient.getQueryData<SessionMessagesResponse>(["session-messages", activeSessionId])
+    : undefined;
+  const cachedTurns = cachedSession
+    ? normalizeMessages(cachedSession.messages, cachedSession.conversation_state)
+    : activeStream?.question
+      ? [{ role: "user" as const, content: activeStream.question }]
+      : [];
+  const cachedLatestAssistant = [...cachedTurns]
+    .reverse()
+    .find((turn) => turn.role === "assistant");
+  const [turns, setTurns] = useState<ChatTurn[]>(() => cachedTurns);
   const [draftAnswer, setDraftAnswer] = useState("");
-  const [citations, setCitations] = useState<Citation[]>([]);
-  const [trace, setTrace] = useState<AgentTraceEventPayload[]>([]);
+  const [citations, setCitations] = useState<Citation[]>(() => cachedLatestAssistant?.citations ?? []);
+  const [trace, setTrace] = useState<AgentTraceEventPayload[]>(() => cachedLatestAssistant?.trace ?? []);
   const [latestRun, setLatestRun] = useState<AgentResponse | null>(null);
-  const [conversationState, setConversationState] = useState<ConversationStatePayload | null>(null);
-  const [activeStream, setActiveStream] = useLocalStorage<ActiveStreamState | null>(`qa.activeStream.${storageScope}`, null);
-  const [retrievalGranularity, setRetrievalGranularity] = useLocalStorage<RetrievalGranularity>(`qa.retrievalGranularity.${storageScope}`, "mid");
+  const [conversationState, setConversationState] = useState<ConversationStatePayload | null>(
+    () => cachedSession?.conversation_state ?? null,
+  );
   const [streamError, setStreamError] = useState<string | null>(null);
   const streamAbortControllerRef = useRef<AbortController | null>(null);
+  const runViewRevisionRef = useRef(0);
+  const [sessionReplayVersion, setSessionReplayVersion] = useState(0);
+  const [sessionSelectionPending, setSessionSelectionPending] = useState(false);
+  const [hydratingSessionId, setHydratingSessionId] = useState<string | null>(null);
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [citationsOpen, setCitationsOpen] = useState(false);
   const [citationDrawerCitations, setCitationDrawerCitations] = useState<Citation[]>([]);
@@ -1413,10 +1104,30 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
     }
   }, [storageScope]);
 
+  useEffect(() => () => {
+    const controller = streamAbortControllerRef.current;
+    streamAbortControllerRef.current = null;
+    controller?.abort();
+  }, []);
+
+  useEffect(() => {
+    const latestSession = sessionsQuery.data?.[0];
+    if (
+      activeSessionId
+      || activeStream
+      || autoResumeSuppressed
+      || !latestSession
+    ) {
+      return;
+    }
+    hydratedSessionIdRef.current = null;
+    setActiveSessionId(latestSession.id);
+  }, [activeSessionId, activeStream, autoResumeSuppressed, sessionsQuery.data, setActiveSessionId]);
+
   useEffect(() => {
     if (
       !activeSessionId
-      || activeRunId
+      || activeStream
       || hydratedSessionIdRef.current === activeSessionId
     ) {
       return;
@@ -1424,25 +1135,50 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
     let cancelled = false;
     hydratedSessionIdRef.current = activeSessionId;
     void (async () => {
+      setHydratingSessionId(activeSessionId);
       try {
-        const response = await fetchSessionMessages(activeSessionId);
-        const nextTurns = await hydrateHistoricalTurnTraces(
-          normalizeMessages(response.messages, response.conversation_state),
-        );
+        const response = await queryClient.fetchQuery({
+          queryKey: ["session-messages", activeSessionId],
+          queryFn: () => fetchSessionMessages(activeSessionId),
+          staleTime: Number.POSITIVE_INFINITY,
+        });
+        const nextTurns = normalizeMessages(response.messages, response.conversation_state);
         if (cancelled) {
           return;
         }
-        setTurns(nextTurns);
+        setTurns((current) => preserveTurnTraces(nextTurns, current));
         setConversationState(response.conversation_state);
         const latestAssistant = [...nextTurns]
           .reverse()
           .find((turn) => turn.role === "assistant");
         setCitations(latestAssistant?.citations ?? []);
         setTrace(latestAssistant?.trace ?? []);
+        setStreamError((current) => current === missingSessionMessage ? null : current);
       } catch (error) {
         if (!cancelled) {
           hydratedSessionIdRef.current = null;
-          setStreamError(productQaErrorMessage(error));
+          if (responseStatus(error) === 404) {
+            queryClient.setQueryData<SessionSummary[]>(
+              ["sessions", selectedKnowledgeBaseId],
+              (current) => current?.filter((session) => session.id !== activeSessionId),
+            );
+            void queryClient.invalidateQueries({
+              queryKey: ["sessions", selectedKnowledgeBaseId],
+            });
+            setActiveSessionId(null);
+            setAutoResumeSuppressed(true);
+            setTurns([]);
+            setConversationState(null);
+            setCitations([]);
+            setTrace([]);
+            setStreamError(missingSessionMessage);
+          } else {
+            setStreamError(productQaErrorMessage(error));
+          }
+        }
+      } finally {
+        if (!cancelled) {
+          setHydratingSessionId((current) => current === activeSessionId ? null : current);
         }
       }
     })();
@@ -1456,7 +1192,15 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
         hydratedSessionIdRef.current = null;
       }
     };
-  }, [activeRunId, activeSessionId]);
+  }, [
+    activeStream,
+    activeSessionId,
+    queryClient,
+    selectedKnowledgeBaseId,
+    sessionReplayVersion,
+    setActiveSessionId,
+    setAutoResumeSuppressed,
+  ]);
 
   const runStatusQuery = useQuery({
     queryKey: ["agent-run", activeRunId],
@@ -1478,21 +1222,59 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
     },
   });
 
-  const cancelRunMutation = useMutation({
-    mutationFn: (runId: string) => cancelAgentRun(runId),
-    onSuccess: (status) => {
-      if (status.trace?.length) {
-        setTrace(status.trace);
+  const finishRunFromStatus = useCallback((status: TaskStatusResponse, sessionId?: string | null) => {
+    const controller = streamAbortControllerRef.current;
+    // Detach before aborting: closing an already terminal run is not a user cancel.
+    streamAbortControllerRef.current = null;
+    controller?.abort();
+    setDraftAnswer("");
+    setActiveStream(null);
+    if (status.trace?.length) {
+      setTrace(status.trace);
+    }
+    const runState = status.status ?? status.state;
+    if (runState === "completed" || runState === "needs_clarification") {
+      setStreamError(null);
+      if (status.answer) {
+        setTurns((current) => current.some((turn) => turn.role === "assistant" && turn.run_id === status.run_id)
+          ? current
+          : [...current, {
+            role: "assistant",
+            content: status.answer ?? "",
+            run_id: status.run_id,
+            route: status.route,
+            direct_answer_mode: status.direct_answer_mode,
+            trace: status.trace ?? [],
+          }]);
       }
-      const runState = status.status ?? status.state;
-      if (runState === "failed" || runState === "cancelled") {
-        setStreamError(productQaErrorMessage(status.error ?? "回答生成已停止"));
+      void queryClient.invalidateQueries({ queryKey: ["sessions", selectedKnowledgeBaseId] });
+    } else {
+      setStreamError(runState === "cancelled" ? userCancelledMessage : productQaErrorMessage(status.error));
+    }
+    if (sessionId) {
+      // Rehydrate every terminal state. Failed/cancelled runs do not append an
+      // answer, but they still persist the authoritative conversation task state.
+      hydratedSessionIdRef.current = null;
+      setAutoResumeSuppressed(false);
+      setActiveSessionId(sessionId);
+      setSessionReplayVersion((current) => current + 1);
+      void queryClient.invalidateQueries({ queryKey: ["session-messages", sessionId] });
+    }
+  }, [queryClient, selectedKnowledgeBaseId, setActiveSessionId, setActiveStream, setAutoResumeSuppressed]);
+
+  const cancelRunMutation = useMutation({
+    mutationFn: ({ runId }: { runId: string; viewRevision: number }) => cancelAgentRun(runId),
+    onSuccess: (status, { viewRevision }) => {
+      if (runViewRevisionRef.current === viewRevision
+        && ["completed", "needs_clarification", "failed", "cancelled"].includes(status.status ?? status.state ?? "")) {
+        finishRunFromStatus(status, status.session_id ?? activeSessionId);
       }
       void queryClient.invalidateQueries({ queryKey: ["agent-run", status.run_id] });
-      void queryClient.invalidateQueries({ queryKey: ["agent-pe-audit", status.run_id] });
     },
-    onError: (error) => {
-      setStreamError(productQaErrorMessage(error));
+    onError: (error, { viewRevision }) => {
+      if (runViewRevisionRef.current === viewRevision) {
+        setStreamError(productQaErrorMessage(error));
+      }
     },
   });
 
@@ -1502,16 +1284,36 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
       if (!nextQuestion) {
         return;
       }
+      runViewRevisionRef.current += 1;
       setStreamError(null);
       setDraftAnswer("");
       setCitations([]);
       setCitationDrawerCitations([]);
       setTrace([]);
       setLatestRun(null);
-      setActiveStream({ question: nextQuestion, retrievalGranularity, startedAt: new Date().toISOString() });
+      setActiveStream({ question: nextQuestion, startedAt: new Date().toISOString() });
       const controller = new AbortController();
       streamAbortControllerRef.current = controller;
+      const isCurrentStream = () => streamAbortControllerRef.current === controller && !controller.signal.aborted;
+      let receivedRunId: string | null = null;
       const nextTraceEvents: AgentTraceEventPayload[] = [];
+      const recoverPersistedRun = (message: string, transportInterrupted = false) => {
+        streamAbortControllerRef.current = null;
+        setDraftAnswer("");
+        if (receivedRunId) {
+          setStreamError(transportInterrupted
+            ? "实时连接已中断，正在读取本轮任务状态。"
+            : productQaErrorMessage(message));
+          setActiveStream((current) => current ? {
+            ...current,
+            runId: receivedRunId,
+          } : current);
+          void queryClient.invalidateQueries({ queryKey: ["agent-run", receivedRunId] });
+          return;
+        }
+        setStreamError(productQaErrorMessage(message));
+        setActiveStream(null);
+      };
       setTurns((current) => [...current, { role: "user", content: nextQuestion }]);
       setQuestion("");
       try {
@@ -1520,45 +1322,57 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
             question: nextQuestion,
             session_id: activeSessionId,
             knowledge_base_id: selectedKnowledgeBaseId,
-            retrieval_granularity: retrievalGranularity,
           },
           {
             onTrace: (event) => {
+              if (!isCurrentStream()) return;
               nextTraceEvents.push(event);
               setTrace((current) => [...current, event]);
             },
-            onToken: (token) => setDraftAnswer((current) => `${current}${token}`),
-            onCitations: (next) => setCitations(next),
+            onToken: (token) => {
+              if (isCurrentStream()) setDraftAnswer((current) => `${current}${token}`);
+            },
+            onAnswerReplace: (answer) => {
+              if (isCurrentStream()) setDraftAnswer(answer);
+            },
+            onCitations: (next) => {
+              if (isCurrentStream()) setCitations(next);
+            },
             onMeta: (meta) => {
+              if (!isCurrentStream()) return;
+              receivedRunId = meta.run_id ?? receivedRunId;
               if (meta.session_id) {
+                setAutoResumeSuppressed(false);
                 setActiveSessionId(meta.session_id);
               }
               if (meta.run_id || meta.session_id) {
-                setActiveStream((current) => ({
-                  question: current?.question ?? nextQuestion,
-                  startedAt: current?.startedAt ?? new Date().toISOString(),
-                  retrievalGranularity: meta.retrieval_granularity ?? current?.retrievalGranularity ?? retrievalGranularity,
-                  runId: meta.run_id ?? current?.runId ?? null,
-                  sessionId: meta.session_id ?? current?.sessionId ?? null,
-                }));
+                setActiveStream((current) => current ? {
+                  ...current,
+                  runId: meta.run_id ?? current.runId ?? null,
+                  sessionId: meta.session_id ?? current.sessionId ?? null,
+                } : current);
               }
             },
             onFinal: (response) => {
+              if (!isCurrentStream()) return;
+              streamAbortControllerRef.current = null;
               const finalTrace = response.trace.length ? response.trace : nextTraceEvents;
               setLatestRun(response);
               setConversationState(response.conversation_state ?? null);
-              hydratedSessionIdRef.current = response.session_id;
+              setAutoResumeSuppressed(false);
+              hydratedSessionIdRef.current = null;
               setActiveSessionId(response.session_id);
               setCitations(response.citations);
               setDraftAnswer("");
               setTrace(finalTrace);
-              setTurns((current) => [
+              setTurns((current) => current.some((turn) => turn.role === "assistant" && turn.run_id === response.run_id) ? current : [
                 ...current,
                 {
                   role: "assistant",
                   content: response.answer,
                   run_id: response.run_id,
                   route: response.route,
+                  direct_answer_mode: response.direct_answer_mode,
                   citations: response.citations,
                   trace: finalTrace,
                   retrieval_trace_id: response.retrieval_trace_id,
@@ -1566,20 +1380,41 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
                 },
               ]);
               setActiveStream(null);
-              void queryClient.invalidateQueries({ queryKey: ["agent-pe-audit", response.run_id] });
               void queryClient.invalidateQueries({ queryKey: ["sessions", selectedKnowledgeBaseId] });
               void queryClient.invalidateQueries({ queryKey: ["session-messages", response.session_id] });
+              setSessionReplayVersion((current) => current + 1);
             },
             onError: (message) => {
-              setStreamError(productQaErrorMessage(message));
-              setActiveStream(null);
+              if (!isCurrentStream()) return;
+              recoverPersistedRun(message);
             },
           },
           { signal: controller.signal },
         );
+        if (isCurrentStream()) {
+          if (receivedRunId) {
+            // EOF without final: recover from durable status instead of guessing success.
+            void queryClient.invalidateQueries({ queryKey: ["agent-run", receivedRunId] });
+          } else {
+            setStreamError(productQaErrorMessage("connection closed before run metadata"));
+            setDraftAnswer("");
+            setActiveStream(null);
+          }
+        }
       } catch (error) {
-        setStreamError(isAbortError(error) ? userCancelledMessage : productQaErrorMessage(error));
-        setActiveStream(null);
+        if (isCurrentStream()) {
+          if (isAbortError(error)) {
+            // Explicit cancellation detaches the controller ref before abort.
+            // Reaching this branch therefore means the observer transport was
+            // interrupted; the independently owned run must stay recoverable.
+            recoverPersistedRun("stream observer closed", true);
+          } else {
+            recoverPersistedRun(
+              error instanceof Error ? error.message : String(error),
+              true,
+            );
+          }
+        }
       } finally {
         if (streamAbortControllerRef.current === controller) {
           streamAbortControllerRef.current = null;
@@ -1590,103 +1425,74 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
 
   const handleCancelActiveRun = () => {
     const runId = activeStream?.runId;
-    streamAbortControllerRef.current?.abort();
+    const controller = streamAbortControllerRef.current;
+    streamAbortControllerRef.current = null;
+    controller?.abort();
+    const viewRevision = ++runViewRevisionRef.current;
     setDraftAnswer("");
     setActiveStream(null);
     setStreamError(userCancelledMessage);
     if (runId) {
-      cancelRunMutation.mutate(runId);
+      cancelRunMutation.mutate({ runId, viewRevision });
     }
   };
 
   useEffect(() => {
     const status = runStatusQuery.data;
-    if (!activeStream || !status) {
+    if (!activeStream || !status || status.run_id !== activeStream.runId) {
       return;
     }
-    if (status.session_id) {
-      setActiveSessionId(status.session_id);
-      if (status.session_id !== activeStream.sessionId) {
-        setActiveStream((current) => (current ? { ...current, sessionId: status.session_id } : current));
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      const runState = status.status ?? status.state;
+      if (["completed", "needs_clarification", "failed", "cancelled"].includes(runState ?? "")) {
+        finishRunFromStatus(status, status.session_id ?? activeStream.sessionId);
+        return;
       }
-    }
-    if (status.trace?.length) {
-      const statusTrace = status.trace;
-      queueMicrotask(() => setTrace(statusTrace));
-    }
-    const runState = status.status ?? status.state;
-    if (runState === "completed") {
-      void queryClient.invalidateQueries({ queryKey: ["agent-pe-audit", status.run_id] });
-      const sessionId = status.session_id ?? activeStream.sessionId;
-      queueMicrotask(() => {
-        setDraftAnswer("");
-        setActiveStream(null);
-        if (!sessionId && status.answer) {
-          setTurns((current) =>
-            current.some((turn) => turn.run_id === status.run_id && turn.role === "assistant")
-              ? current
-              : [
-                  ...current,
-                  {
-                    role: "assistant",
-                    content: status.answer ?? "",
-                    run_id: status.run_id,
-                    route: status.route,
-                    trace: status.trace ?? [],
-                  },
-                ],
-          );
+      if (status.session_id) {
+        setAutoResumeSuppressed(false);
+        setActiveSessionId(status.session_id);
+        if (status.session_id !== activeStream.sessionId) {
+          setActiveStream((current) => (current ? { ...current, sessionId: status.session_id } : current));
         }
-      });
-      if (sessionId) {
-        void (async () => {
-          const response = await fetchSessionMessages(sessionId);
-          const nextTurns = normalizeMessages(response.messages, response.conversation_state);
-          const statusBoundTurns = nextTurns.map((turn) => (
-            turn.role === "assistant" && turn.run_id === status.run_id && status.trace?.length
-              ? { ...turn, trace: status.trace }
-              : turn
-          ));
-          setTurns((current) => preserveTurnTraces(statusBoundTurns, current));
-          hydratedSessionIdRef.current = sessionId;
-          setConversationState(response.conversation_state);
-          const latestAssistant = [...nextTurns].reverse().find((turn) => turn.role === "assistant");
-          setCitations(latestAssistant?.citations ?? []);
-          await queryClient.invalidateQueries({ queryKey: ["sessions", selectedKnowledgeBaseId] });
-          await queryClient.invalidateQueries({ queryKey: ["session-messages", sessionId] });
-        })();
       }
-    } else if (runState === "failed" || runState === "cancelled") {
-      window.queueMicrotask(() => {
-        if (status.error === "cancelled_by_user") {
-          setStreamError(userCancelledMessage);
-          setActiveStream(null);
-          return;
-        }
-        setStreamError(productQaErrorMessage(status.error ?? "回答生成失败"));
-        setActiveStream(null);
-      });
-    }
+      if (status.trace?.length) setTrace(status.trace);
+    });
+    return () => { cancelled = true; };
   }, [
     activeStream,
-    queryClient,
+    finishRunFromStatus,
     runStatusQuery.data,
-    selectedKnowledgeBaseId,
     setActiveSessionId,
+    setAutoResumeSuppressed,
     setActiveStream,
-    setCitations,
-    setConversationState,
-    setDraftAnswer,
-    setTrace,
-    setTurns,
   ]);
 
   const deleteSessionMutation = useMutation({
     mutationFn: (sessionId: string) => deleteSession(sessionId),
-    onSuccess: async (_data, sessionId) => {
+    onMutate: async (sessionId) => {
+      const queryKey = ["sessions", selectedKnowledgeBaseId] as const;
+      await queryClient.cancelQueries({ queryKey });
+      const previousSessions = queryClient.getQueryData<SessionSummary[]>(queryKey);
+      queryClient.setQueryData<SessionSummary[]>(
+        queryKey,
+        (current) => current?.filter((session) => session.id !== sessionId) ?? [],
+      );
+      return { previousSessions, queryKey };
+    },
+    onError: (_error, _sessionId, context) => {
+      if (context?.previousSessions) {
+        queryClient.setQueryData(context.queryKey, context.previousSessions);
+      }
+    },
+    onSuccess: (_data, sessionId) => {
+      queryClient.removeQueries({ queryKey: ["session-messages", sessionId] });
       if (sessionId === activeSessionId) {
+        runViewRevisionRef.current += 1;
         hydratedSessionIdRef.current = null;
         setActiveSessionId(null);
+        setAutoResumeSuppressed(true);
         setTurns([]);
         setDraftAnswer("");
         setCitations([]);
@@ -1697,7 +1503,9 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
         setActiveStream(null);
         setQuestion("");
       }
-      await queryClient.invalidateQueries({ queryKey: ["sessions", selectedKnowledgeBaseId] });
+      void queryClient.invalidateQueries({
+        queryKey: ["sessions", selectedKnowledgeBaseId],
+      });
     },
   });
 
@@ -1721,23 +1529,19 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
     void modelSettingsQuery.refetch();
   };
 
-  const suggestions = useMemo(() => buildKnowledgeBaseSuggestions(dashboardQuery.data?.tree), [dashboardQuery.data?.tree]);
-  const isGenerating = askMutation.isPending || Boolean(activeStream);
+  const isGenerating = Boolean(activeStream);
   const activeAgentSettingsForm = agentSettingsForm ?? (modelSettingsQuery.data ? agentSettingsFormFromSettings(modelSettingsQuery.data) : null);
 
-  if (dashboardQuery.isLoading) {
-    return <LoadingBlock rows={4} />;
-  }
-  if (dashboardQuery.error) {
-    return <ErrorBlock message={(dashboardQuery.error as Error).message} />;
-  }
-
   return (
-    <div className="kg-page relative -mx-4 -my-5 min-h-[calc(100dvh-4.25rem)] px-4 pb-52 pt-5 lg:-mx-7 lg:-my-7 lg:px-7 lg:pt-7">
+    <div className="kg-page relative -mx-4 -my-5 min-h-[calc(100dvh-4.25rem)] px-4 pb-52 pt-5 lg:-mx-6 lg:-my-7 lg:px-6 lg:pt-7 xl:-mx-8 xl:px-8 2xl:-mx-10 2xl:px-10">
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_0%,rgba(86,217,255,0.11),transparent_34%),radial-gradient(circle_at_88%_20%,rgba(124,92,255,0.11),transparent_30%),linear-gradient(rgba(120,180,255,0.026)_1px,transparent_1px),linear-gradient(90deg,rgba(120,180,255,0.023)_1px,transparent_1px)] bg-[size:auto,auto,48px_48px,48px_48px]" />
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-64 bg-gradient-to-t from-[#030714] via-[#030714]/88 to-transparent" />
       <div className="relative z-10 flex flex-col gap-7">
-        <ChatHeader latestRun={latestRun} configuredChatModel={modelSettingsQuery.data?.chat_model} />
+        <ChatHeader
+          latestRun={latestRun}
+          configuredChatModel={modelSettingsQuery.data?.chat_model}
+          modelLoading={modelSettingsQuery.isLoading}
+        />
         <ChatActionRail
           onOpenSessions={() => setSessionsOpen(true)}
           onOpenCitations={() => openCitationDrawer(citations)}
@@ -1750,12 +1554,16 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
           <ConversationStatePanel state={conversationState} />
           <MessageList
             turns={turns}
+            isLoading={Boolean(selectedKnowledgeBaseId) && (
+              sessionsQuery.isLoading || (
+                hydratingSessionId !== null &&
+                hydratingSessionId === activeSessionId
+              )
+            )}
             isGenerating={isGenerating}
             draftAnswer={draftAnswer}
             trace={trace}
-            onPickSuggestion={setQuestion}
             onOpenCitations={openCitationDrawer}
-            suggestions={suggestions}
           />
         </main>
 
@@ -1763,7 +1571,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
           value={question}
           onChange={setQuestion}
           onSubmit={() => {
-            if (isGenerating) {
+            if (isGenerating || streamAbortControllerRef.current) {
               return;
             }
             askMutation.mutate();
@@ -1771,8 +1579,6 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
           onCancel={handleCancelActiveRun}
           isPending={isGenerating}
           activeSessionId={activeSessionId}
-          retrievalGranularity={retrievalGranularity}
-          onRetrievalGranularityChange={setRetrievalGranularity}
         />
       </div>
 
@@ -1783,24 +1589,57 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
         activeSessionId={activeSessionId}
         onDelete={(sessionId) => deleteSessionMutation.mutate(sessionId)}
         onSelect={async (sessionId) => {
-          hydratedSessionIdRef.current = sessionId;
-          setActiveSessionId(sessionId);
-          setDraftAnswer("");
-          setCitations([]);
-          setCitationDrawerCitations([]);
-          setTrace([]);
-          setLatestRun(null);
-          setActiveStream(null);
-          const response = await fetchSessionMessages(sessionId);
-          const nextTurns = await hydrateHistoricalTurnTraces(
-            normalizeMessages(response.messages, response.conversation_state),
-          );
-          setTurns((current) => preserveTurnTraces(nextTurns, current));
-          setConversationState(response.conversation_state);
-          const latestAssistant = [...nextTurns].reverse().find((turn) => turn.role === "assistant");
-          setCitations(latestAssistant?.citations ?? []);
+          setSessionSelectionPending(true);
+          try {
+            const response = await queryClient.fetchQuery({
+              queryKey: ["session-messages", sessionId],
+              queryFn: () => fetchSessionMessages(sessionId),
+              staleTime: Number.POSITIVE_INFINITY,
+            });
+            const nextTurns = normalizeMessages(response.messages, response.conversation_state);
+            runViewRevisionRef.current += 1;
+            setAutoResumeSuppressed(false);
+            hydratedSessionIdRef.current = sessionId;
+            setActiveSessionId(sessionId);
+            setDraftAnswer("");
+            setCitationDrawerCitations([]);
+            setTrace([]);
+            setLatestRun(null);
+            setActiveStream(null);
+            setTurns((current) => preserveTurnTraces(nextTurns, current));
+            setConversationState(response.conversation_state);
+            const latestAssistant = [...nextTurns].reverse().find((turn) => turn.role === "assistant");
+            setCitations(latestAssistant?.citations ?? []);
+            setStreamError(null);
+          } catch (error) {
+            if (responseStatus(error) === 404) {
+              queryClient.setQueryData<SessionSummary[]>(
+                ["sessions", selectedKnowledgeBaseId],
+                (current) => current?.filter((session) => session.id !== sessionId),
+              );
+              await queryClient.invalidateQueries({
+                queryKey: ["sessions", selectedKnowledgeBaseId],
+              });
+              if (activeSessionId === sessionId) {
+                hydratedSessionIdRef.current = null;
+                setActiveSessionId(null);
+                setAutoResumeSuppressed(true);
+                setTurns([]);
+                setConversationState(null);
+                setCitations([]);
+                setTrace([]);
+              }
+              setStreamError(missingSessionMessage);
+            } else {
+              setStreamError(productQaErrorMessage(error));
+            }
+          } finally {
+            setSessionSelectionPending(false);
+          }
         }}
         onNew={() => {
+          runViewRevisionRef.current += 1;
+          setAutoResumeSuppressed(true);
           hydratedSessionIdRef.current = null;
           setActiveSessionId(null);
           setTurns([]);
@@ -1812,9 +1651,8 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
           setConversationState(null);
           setActiveStream(null);
           setQuestion("");
-          setRetrievalGranularity("mid");
         }}
-        isPending={isGenerating}
+        isPending={isGenerating || sessionSelectionPending || deleteSessionMutation.isPending}
       />
       <AgentSettingsDialog
         open={agentSettingsOpen}
@@ -1822,11 +1660,9 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
         form={activeAgentSettingsForm}
         onChange={updateAgentSettingsForm}
         onReset={resetAgentSettingsForm}
-        retrievalGranularity={retrievalGranularity}
-        onRetrievalGranularityChange={setRetrievalGranularity}
         onSave={() => {
           if (activeAgentSettingsForm) {
-            saveAgentSettingsMutation.mutate(buildAgentSettingsPayload(activeAgentSettingsForm, retrievalGranularity));
+            saveAgentSettingsMutation.mutate(buildAgentSettingsPayload(activeAgentSettingsForm));
           }
         }}
         isLoading={modelSettingsQuery.isLoading}

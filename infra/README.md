@@ -1,207 +1,79 @@
-# Infra
+# Docker 运行环境
 
-## Default recovery scheduler
+Compose 定义见 [docker-compose.yml](docker-compose.yml)。根启动器负责 API 镜像、后端服务与就绪检查；Web 使用宿主原生 Node.js。
 
-The default stack runs `course-kg-beat` as a separate Celery Beat process. It
-publishes `reconcile_interrupted_ingestion_batches` every 60 seconds; the
-`course-kg-worker` process only consumes tasks and never embeds Beat. The Beat
-health check verifies both the PID 1 command and the persistent schedule file.
+## 服务与数据
 
-```powershell
-docker compose -f infra/docker-compose.yml ps beat
-docker logs --tail 100 course-kg-beat
-```
+| Compose service | 容器 | 作用 |
+|---|---|---|
+| `api` | `course-kg-api` | FastAPI，开发模式挂载源码 |
+| `worker` | `course-kg-worker` | 有界后台任务，复用 API 镜像 |
+| `beat` | `course-kg-beat` | 独立 Celery 调度器 |
+| `postgres` | `course-kg-postgres` | 元数据、生命周期和审计 |
+| `redis` | `course-kg-redis` | 队列、缓存和运行时版本 |
+| `qdrant` | `course-kg-qdrant` | 向量索引 |
+| `model-bridge` | `course-kg-model-bridge` | 可选私有模型路由桥 |
 
-## Application data volume
+应用数据卷 `symbograph-data` 挂载为 `/app/data`，其他持久卷为 `postgres-data`、`redis-data`、`qdrant-data`。Docker 会加 Compose project 前缀。仓库 `data/` 只用于忽略的本地输入，不是默认应用卷。
 
-The default API and worker `DATA_ROOT=/app/data` is a shared Docker managed
-volume (`symbograph-data`), not a host bind mount. Source documents enter the
-system through the Upload API/frontend or the guarded rebuild workflow; the
-Compose stack does not mount a repository-specific sample directory.
+恢复已有环境必须沿用根 `.env` 中的 Compose project 配置；改变 project identity 可能连到另一组空卷。
 
-## 项目简介
+## 配置
 
-`infra` 保存 SymboGraph 默认 Docker Compose 运行环境，包含 API、Worker、Web、PostgreSQL、Redis 和 Qdrant。
+根 `.env` 只保存秘密、连接、路径、端口和进程/服务启动参数；根 `settings.json` 只保存非秘密产品、检索、预算和构建参数。Compose 将两者分别挂载到 `/workspace/.env` 和 `/workspace/settings.json`，服务通过 `RUNTIME_ENV_FILE` 与 `RUNTIME_SETTINGS_FILE` 读取。两个文件不能含同名键。容器内数据库和派生存储使用 Compose 网络地址；不要把宿主 `localhost` 当作另一个容器。
 
-## 目录
+| 模型用途 | 协议与地址规则 |
+|---|---|
+| chat、graph | 各自独立选择 `openai` 或 `anthropic` |
+| OpenAI-compatible | base 后追加 `/chat/completions`；例如 `https://models.invalid/v1` |
+| Anthropic Messages | base 使用 provider 根或前缀，不能以 `/v1` 或 `/v1/messages` 结尾；客户端追加 `/v1/messages` |
+| embedding | 当前仅 `openai`，base 后追加 `/embeddings` |
 
-| 路径 | 职责 |
-| --- | --- |
-| `docker-compose.yml` | 默认本地 Docker 栈：API、Worker、Web dev server、PostgreSQL、Redis、Qdrant。 |
-| `README.md` | Compose 运行说明。 |
+三组模型配置、密钥和协议互不替代。模型桥不改变来源、认证和错误边界；真实秘密和部署连接只存根 `.env`，本机 `settings.json` 与 `.env` 均被 Git 忽略，仓库只保存脱敏 example。旧单文件环境先运行 `python scripts/migrate_runtime_config.py` 查看只读计划，核对后再显式加 `--execute`。设置变更的生命周期见[白皮书](../docs/technical-spec.md#配置与运行)。
 
-## 产品定位
+## 常用操作
 
-默认运行路径是 Docker Compose。涉及 PostgreSQL、Qdrant、Redis、模型接口和无 fallback 的集成路径必须在该栈内验证。
-
-## 技术栈
-
-| 服务 | 技术 |
-| --- | --- |
-| API | FastAPI container |
-| Worker | Celery container |
-| Web | Next.js container |
-| Metadata | PostgreSQL 16 |
-| Cache / broker | Redis 7 |
-| Vector index | Qdrant 1.17.1 |
-
-## 主链路
-
-```mermaid
-flowchart TB
-    WEB["course-kg-web"] --> API["course-kg-api"]
-    API --> PG["course-kg-postgres"]
-    API --> R["course-kg-redis"]
-    API --> Q["course-kg-qdrant"]
-    W["course-kg-worker"] --> R
-    W --> PG
-    W --> Q
-    API --> M["OpenAI-compatible / Anthropic models"]
-    W --> M
-```
-
-## 环境配置
-
-首次启动前创建 `.env`：
+资源管理器双击根目录 `start-app.bat` 可一键启动完整环境；仅启动 Web 可双击 `start-web.bat`。两个窗口在成功或失败后都会显示明确终态并等待按键，不再自动关闭。服务在后台运行，关闭启动窗口不会停止服务。命令行调用使用 PowerShell 入口：
 
 ```powershell
-Copy-Item .env.example .env
+.\start-app.ps1 -NoBrowser
+.\start-web.ps1 -NoBrowser
+.\rebuild-images.ps1
+docker compose -p knowledgegraph-dev-20260820 --env-file .env -f infra/docker-compose.yml ps
 ```
 
-关键模型配置：
+自动化若必须调用 `.bat`，可在当前进程设置 `SYMBOGRAPH_NO_PAUSE=1`；该变量只控制批处理窗口等待，不进入根 `.env`，也不改变服务配置、Compose project 或数据卷。
 
-```env
-CHAT_API_KEY=...
-CHAT_API_PROTOCOL=openai
-CHAT_BASE_URL=https://your-chat-endpoint/v1
-CHAT_MODEL=your-chat-model
-GRAPH_API_KEY=...
-GRAPH_API_PROTOCOL=openai
-GRAPH_BASE_URL=https://your-graph-endpoint/v1
-GRAPH_MODEL=your-graph-model
-EMBEDDING_API_KEY=...
-EMBEDDING_API_PROTOCOL=openai
-EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1
-EMBEDDING_MODEL=your-embedding-model
-EMBEDDING_DIMENSIONS=1024
-ENABLE_MODEL_FALLBACK=false
-ENABLE_DATABASE_FALLBACK=false
-```
-
-`CHAT_API_PROTOCOL`, `GRAPH_API_PROTOCOL`, and `EMBEDDING_API_PROTOCOL` are independent. For Anthropic chat/graph, use the provider root/path prefix and do not end the base URL in `/v1` or `/v1/messages`; the client and bridge append `/v1/messages`. OpenAI-compatible chat/graph append `/chat/completions`. Embedding currently accepts only `EMBEDDING_API_PROTOCOL=openai`, appends `/embeddings`, and is rebuild-required; Anthropic Messages is not an embedding protocol.
-
-### Single root runtime env
-
-The repository-root `.env` is the only configuration authority. Compose uses
-it for initial process injection and bind-mounts the repository at `/workspace`;
-API, Worker and Beat all set `RUNTIME_ENV_FILE=/workspace/.env`. The API mount
-is writable so the Settings endpoint can atomically replace that exact file;
-Worker and Beat mounts are read-only. No runtime-config volume, `desired.env`,
-service-local env file or database value snapshot exists.
-
-The Settings endpoint validates the complete prospective configuration before
-an atomic root-file replacement. Hot-reloadable keys are applied to the current
-API process and broadcast through Redis. Rebuild-required keys remain pending
-until the candidate/shadow/evaluation/promotion lifecycle completes. Service-
-recreate-required keys are visible in `.env` immediately but the running
-process keeps its startup value until explicit Compose recreation.
-
-An in-process version refresh reverse-applies only keys declared by the
-runtime-settings lifecycle. Deployment settings such as `DATA_ROOT`,
-`DATABASE_URL`, and `REDIS_URL` are never overwritten from this file during a
-refresh. A process-local value changed explicitly after the preceding managed
-refresh is preserved only when it is outside that lifecycle set. Runtime keys
-remain root-file authoritative, and sibling API/Worker processes consume
-the same file independently at their own task/request refresh boundary.
-
-The local settings cache token binds the normalized source path, strong file
-identity (`device`/`inode`/size/mtime/ctime), and a process-keyed content
-digest. Consequently an equal-size atomic replacement with a preserved mtime
-still invalidates `get_settings()`. The keyed digest is used only in process
-and never exposes an env value or a reusable unkeyed secret hash.
-
-When the API mirrors its own successful runtime-settings save into
-`os.environ`, it updates the same managed-value tracker used by later version
-refreshes. A subsequent Worker/API writer can therefore advance that process
-again; the process does not mistake its own previous save for an operator
-override.
-
-The writer lock lives in the operating-system temporary directory and contains
-no settings. Atomic-write temporaries exist only for the duration of a same-
-directory replace; no persistent sibling copy or recovery file is created.
-
-容器内固定覆盖：
-
-```text
-POSTGRES_USER=symbograph
-POSTGRES_PASSWORD=<local-random-password>
-POSTGRES_DB=symbograph
-DATABASE_URL=postgresql+psycopg://symbograph:<local-random-password>@postgres:5432/symbograph
-QDRANT_URL=http://qdrant:6333
-REDIS_URL=redis://redis:6379/0
-DATA_ROOT=/app/data
-```
-
-## 快速启动
-
-启动完整栈：
+重建脚本只构建 API 镜像，Worker/Beat 复用该镜像。digest 引用只能用于运行，不能作为 build 输出 tag。已有匹配镜像可显式指定：
 
 ```powershell
-docker compose -f infra/docker-compose.yml up -d --build
+.\start-app.ps1 -SkipBuild -NoBrowser -ApiImage 'course-kg-api:dev'
 ```
 
-查看服务：
+此命令不会证明镜像与当前源码一致。新依赖或正式发布应重新构建并验证；当前 Compose 的源码挂载与隔离镜像验收是不同范围。
+
+停止宿主 Web 并保留后端：
 
 ```powershell
-docker compose -f infra/docker-compose.yml ps
+.\stop-app.ps1 -KeepBackend
 ```
 
-## 参数列表
-
-| 分类 | 参数 |
-| --- | --- |
-| 镜像与端口 | `API_IMAGE`, `WEB_IMAGE`, `API_HOST_PORT`, `WEB_HOST_PORT` |
-| 数据服务 | `DATABASE_URL`, `QDRANT_URL`, `QDRANT_COLLECTION`, `REDIS_URL` |
-| 数据目录 | `DATA_ROOT`, `STORAGE_ROOT`, `INGESTION_ROOT` |
-| 模型 | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT`, `MODEL_BRIDGE_ADMIN_TOKEN`, `CHAT_*`, `EMBEDDING_*` |
-| Auto TPE | `ENABLE_AUTO_TPE`, `TPE_TRIAL_BUDGET`, `TPE_STARTUP_RANDOM_TRIALS`, `TPE_GOOD_QUANTILE_GAMMA`, `TPE_PROBE_QUERY_BUDGET`, `TPE_TRIAL_TIMEOUT_SECONDS`, `TPE_CANDIDATE_POOL_SIZE`, `OPERATING_POINT_HARD_GATE_*` |
-| Worker | `WORKER_CONCURRENCY`, `INGESTION_TASK_QUEUE` |
-| Fallback | `ENABLE_MODEL_FALLBACK`, `ENABLE_DATABASE_FALLBACK` |
-
-## 验证
+停止当前项目而保留数据：
 
 ```powershell
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:3000
-docker exec -w /app/apps/api course-kg-api python -m pytest tests
+docker compose -p knowledgegraph-dev-20260820 --env-file .env -f infra/docker-compose.yml --profile model-bridge stop
 ```
 
-## 运维测试
+不要用 `down -v`、全局 `docker system prune` 或删卷来处理普通故障。只删除已确认无容器引用的本项目临时候选镜像；不要清理其他项目。
 
-```powershell
-docker compose -f infra/docker-compose.yml logs -f api
-docker compose -f infra/docker-compose.yml logs -f worker
-docker compose -f infra/docker-compose.yml logs -f beat
-docker compose -f infra/docker-compose.yml restart api worker beat
-python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
-python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --execute
-```
+## 就绪与问题排查
 
-不带 `--execute` 的 smoke 只做 GET 预检并输出精确 POST 计划；确认 KB、query、
-`/search`、`/qa` 和持久化影响后，才运行第二条完整验收命令。
+默认宿主 Web 为 `http://127.0.0.1:3000`，API readiness 为 `http://127.0.0.1:8000/api/ready`。Web PID 与日志写入忽略的 `output/`；API 容器工作目录 `/app/apps/api`，脚本挂载 `/app/scripts`，临时结果挂载 `/app/output`。
 
-## 文档
+启动失败先看对应容器状态和安全日志，再用[运维脚本](../scripts/README.md)核对 schema、批次恢复、freshness 或向量对账。实例不可用、空数据卷、模型错误和资料不足分别处理。检查环境时不输出完整 `.env`、容器 Env 或模型响应。
 
-- [../README.md](../README.md)：仓库总览。
-- [../apps/api/README.md](../apps/api/README.md)：API 后端。
-- [../apps/worker/README.md](../apps/worker/README.md)：Worker。
-- [../scripts/README.md](../scripts/README.md)：运维脚本。
+## 目标检索架构的部署边界
 
-## 边界
+当前 Compose 不包含 Web service，且固定 Qdrant v1.17.1；最新官方文本检索文档中的新版本字段不能直接假定在此镜像可用。
 
-- 不绕过 Docker 直接修改生产形态 PostgreSQL、Redis 或 Qdrant。
-- Compose 默认服务名保持 `course-kg-*`。
-- API 容器工作目录是 `/app/apps/api`，脚本挂载到 `/app/scripts`，数据目录挂载到 `/app/data`。
-- 模型桥启用时，容器内客户端地址使用 `host.docker.internal`，宿主机脚本使用 `127.0.0.1`，真实对话和向量 endpoint 保存在 `CHAT_BASE_URL`/`EMBEDDING_BASE_URL`；图谱构建 endpoint 独立保存在 `GRAPH_BASE_URL`。
-- 诊断与 smoke 输出写入被 Git 忽略的 `output/`，核验后可清空；不得写入凭据或 provider 原文。
-- 改动端口、镜像依赖、Celery pool/fork 规模等需要 service recreate 或 rebuild。
+BM25 复用 PostgreSQL 保存原文 postings、词典和版本化统计，由 Docker 内 API service 评分，不新增必需搜索容器。若后续采用 Qdrant sparse 加速或升级镜像，需先验证同 KB 统计、分词、融合秩和结果等价性，再走明确迁移/发布流程。

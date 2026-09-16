@@ -5,7 +5,6 @@ param(
   # Frozen because Docker prefixes the persistent symbograph-data volume with this identity.
   [string]$ComposeProjectName = "knowledgegraph-dev-20260820",
   [string]$ApiImage = "course-kg-api:local",
-  [string]$WebImage = "course-kg-web:local",
   [switch]$SkipBuild,
   [switch]$NoBrowser
 )
@@ -13,7 +12,23 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $EnvFile = Join-Path $Root ".env"
+$EnvExampleFile = Join-Path $Root ".env.example"
+$SettingsFile = Join-Path $Root "settings.json"
+$SettingsExampleFile = Join-Path $Root "settings.example.json"
 $InfraComposeFile = Join-Path $Root "infra\docker-compose.yml"
+
+if (-not (Test-Path -LiteralPath $EnvFile -PathType Leaf)) {
+  if (-not (Test-Path -LiteralPath $EnvExampleFile -PathType Leaf)) {
+    throw "Missing .env and .env.example."
+  }
+  Copy-Item -LiteralPath $EnvExampleFile -Destination $EnvFile
+}
+if (-not (Test-Path -LiteralPath $SettingsFile -PathType Leaf)) {
+  if (-not (Test-Path -LiteralPath $SettingsExampleFile -PathType Leaf)) {
+    throw "Missing settings.json and settings.example.json."
+  }
+  Copy-Item -LiteralPath $SettingsExampleFile -Destination $SettingsFile
+}
 
 function Get-DotEnvValue {
   param(
@@ -144,13 +159,12 @@ if (-not (Test-Path $InfraComposeFile)) {
 if ($ComposeProjectName -cnotmatch '^[a-z0-9][a-z0-9_-]*$') {
   throw "Unsupported ComposeProjectName='$ComposeProjectName'. Use lowercase letters, digits, underscores or hyphens."
 }
-if ([string]::IsNullOrWhiteSpace($ApiImage) -or [string]::IsNullOrWhiteSpace($WebImage)) {
-  throw "ApiImage and WebImage must be non-empty Docker image references."
+if ([string]::IsNullOrWhiteSpace($ApiImage)) {
+  throw "ApiImage must be a non-empty Docker image reference."
 }
 if (-not $SkipBuild) {
   foreach ($buildImage in @(
-    @{ Name = "ApiImage"; Value = $ApiImage },
-    @{ Name = "WebImage"; Value = $WebImage }
+    @{ Name = "ApiImage"; Value = $ApiImage }
   )) {
     $buildValue = [string]$buildImage.Value
     if ($buildValue.Contains("@") -or $buildValue.StartsWith("sha256:", [StringComparison]::OrdinalIgnoreCase)) {
@@ -240,9 +254,8 @@ $BackendUrl = "http://127.0.0.1:$BackendPort/api/ready"
 $FrontendUrl = "http://127.0.0.1:$FrontendPort$OpenPath"
 $env:COMPOSE_PROJECT_NAME = $ComposeProjectName
 $env:API_IMAGE = $ApiImage
-$env:WEB_IMAGE = $WebImage
 $env:API_HOST_PORT = [string]$BackendPort
-$env:WEB_HOST_PORT = [string]$FrontendPort
+$env:NEXT_PUBLIC_API_BASE_URL = "http://127.0.0.1:$BackendPort/api"
 $env:CHAT_BASE_URL = $chatBaseUrl
 $env:CHAT_API_PROTOCOL = $chatApiProtocol
 $env:CHAT_RESOLVE_IP = $chatResolveIp
@@ -414,12 +427,94 @@ function Sync-ModelBridge {
   }
 }
 
-Write-Host "SymboGraph source-mounted local Docker launcher" -ForegroundColor Cyan
+function Stop-NativeWebProcess {
+  param([int]$Port)
+
+  $pidFile = Join-Path $Root "output\web-dev.pid.json"
+  if (-not (Test-Path -LiteralPath $pidFile -PathType Leaf)) {
+    return
+  }
+  try {
+    $record = Get-Content -Raw -Encoding UTF8 -LiteralPath $pidFile | ConvertFrom-Json
+    $processId = [int]$record.pid
+    if ([string]$record.root -ne $Root -or [int]$record.port -ne $Port) {
+      throw "Native Web pid record does not match this workspace and port."
+    }
+    $owner = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+    if ($null -eq $owner) {
+      Remove-Item -LiteralPath $pidFile -Force
+      return
+    }
+    $commandLine = [string]$owner.CommandLine
+    if ($commandLine -notmatch "npm" -or $commandLine -notmatch "workspace\s+web") {
+      throw "Refusing to stop PID $processId because it is not the recorded npm Web launcher."
+    }
+    $descendants = @()
+    $frontier = @($processId)
+    while ($frontier.Count -gt 0) {
+      $parentId = [int]$frontier[0]
+      $frontier = @($frontier | Select-Object -Skip 1)
+      $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $parentId" -ErrorAction SilentlyContinue)
+      foreach ($child in $children) {
+        $descendants += [int]$child.ProcessId
+        $frontier += [int]$child.ProcessId
+      }
+    }
+    foreach ($childId in @($descendants | Select-Object -Unique | Sort-Object -Descending)) {
+      Stop-Process -Id $childId -Force -ErrorAction SilentlyContinue
+    }
+    Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $pidFile -Force
+  } catch {
+    throw "Could not stop the recorded native Web process safely: $($_.Exception.Message)"
+  }
+}
+
+function Start-NativeWebProcess {
+  param([int]$Port)
+
+  $nodeVersion = (& node --version 2>$null)
+  if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v(\d+)\.(\d+)\.') {
+    throw "Node.js 20.9 or newer is required for Next.js 16.2.4."
+  }
+  if ([int]$Matches[1] -lt 20 -or ([int]$Matches[1] -eq 20 -and [int]$Matches[2] -lt 9)) {
+    throw "Node.js 20.9 or newer is required; found $nodeVersion."
+  }
+  if (-not (Test-Path -LiteralPath (Join-Path $Root "node_modules\next\package.json") -PathType Leaf)) {
+    Write-Host "Installing native Web dependencies with npm ci..." -ForegroundColor Cyan
+    & npm.cmd ci
+    if ($LASTEXITCODE -ne 0) {
+      throw "npm ci failed."
+    }
+  }
+  $outputRoot = Join-Path $Root "output"
+  New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
+  Stop-NativeWebProcess -Port $Port
+  $stdout = Join-Path $outputRoot "web-dev.stdout.log"
+  $stderr = Join-Path $outputRoot "web-dev.stderr.log"
+  $process = Start-Process -FilePath "npm.cmd" `
+    -ArgumentList @("run", "dev", "--workspace", "web", "--", "--hostname", "127.0.0.1", "--port", [string]$Port) `
+    -WorkingDirectory $Root `
+    -RedirectStandardOutput $stdout `
+    -RedirectStandardError $stderr `
+    -WindowStyle Hidden `
+    -PassThru
+  @{
+    protocol_version = "symbograph_native_web_pid_v1"
+    pid = $process.Id
+    root = $Root
+    port = $Port
+    started_at = (Get-Date).ToUniversalTime().ToString("o")
+  } | ConvertTo-Json | Set-Content -Encoding UTF8 -LiteralPath (Join-Path $outputRoot "web-dev.pid.json")
+}
+
+Write-Host "SymboGraph backend Docker and native Web launcher" -ForegroundColor Cyan
 Write-Host "Root: $Root"
 Write-Host "Compose project: $ComposeProjectName"
 Write-Host "API image: $ApiImage"
-Write-Host "Web image: $WebImage"
-Write-Host "Runtime settings file: $EnvFile"
+Write-Host "Web runtime: native Node.js / workspace node_modules"
+Write-Host "Environment file: $EnvFile"
+Write-Host "Runtime settings file: $SettingsFile"
 Write-Host "Model bridge enabled: $modelBridgeEnabled"
 if ($modelBridgeEnabled) {
   Write-Host "Model bridge: http://127.0.0.1:$modelBridgePort"
@@ -441,10 +536,9 @@ if (-not $SkipBuild) {
   Write-Host "Building the latest source-mounted local images..." -ForegroundColor Cyan
   & $RebuildImagesScript `
     -ApiBuildTag $ApiImage `
-    -WebBuildTag $WebImage `
     -ComposeProjectName $ComposeProjectName
 } else {
-  foreach ($requiredImage in @($ApiImage, $WebImage)) {
+  foreach ($requiredImage in @($ApiImage)) {
     & docker image inspect $requiredImage *> $null
     if ($LASTEXITCODE -ne 0) {
       throw "Required image '$requiredImage' is missing. Re-run without -SkipBuild."
@@ -512,12 +606,13 @@ Invoke-Compose -Arguments @(
   "compose",
   "-f", $InfraComposeFile,
   "up", "-d", "--force-recreate",
-  "api", "worker", "beat", "web"
+  "api", "worker", "beat"
 )
-$stopCommand = "docker compose --env-file .env --project-name $ComposeProjectName -f infra/docker-compose.yml --profile model-bridge down"
+$stopCommand = ".\stop-app.ps1 -ComposeProjectName $ComposeProjectName -FrontendPort $FrontendPort"
 
 
 Wait-Url -Url $BackendUrl -Name "Backend"
+Start-NativeWebProcess -Port $FrontendPort
 Wait-Url -Url "http://127.0.0.1:$FrontendPort" -Name "Frontend"
 Wait-ContainerHealthy -ContainerName "course-kg-worker" -Name "Worker"
 Wait-ContainerHealthy -ContainerName "course-kg-beat" -Name "Beat"

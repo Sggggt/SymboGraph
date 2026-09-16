@@ -1907,6 +1907,7 @@ def test_context_package_quality_replays_bridge_graph_path_overlap():
     fixture["hit_chunk_ids"] = []
     fixture["restored_chunk_ids"] = ["chunk-1"]
     fixture["bridge_chunk_ids"] = ["chunk-1"]
+    fixture["chunks"][0]["structure_closure"]["bridge_chunk_ids"] = ["chunk-1"]
     fixture["chunks"][0]["role"] = "bridge"
     fixture["chunks"][0]["why_selected"][
         "reason"
@@ -1921,6 +1922,16 @@ def test_context_package_quality_replays_bridge_graph_path_overlap():
     audit = module.audit_context_package_quality(fixture)
 
     assert audit["pass"] is True, audit
+
+
+@pytest.mark.parametrize("bridge_ids", [["unit-test-foreign-bridge"], ["chunk-1"]])
+def test_context_package_quality_rejects_foreign_bridge_closure(bridge_ids):
+    module = _load_quality_gate()
+    fixture = _context_fixture()
+    fixture["chunks"][0]["structure_closure"]["bridge_chunk_ids"] = bridge_ids
+    audit = module.audit_context_package_quality(fixture)
+    assert not audit["pass"]
+    assert "context_package_bridge_closure_mismatch" in {item["code"] for item in audit["findings"]}
 
 
 def test_context_package_quality_accepts_snapshot_verification_superset():
@@ -2102,17 +2113,17 @@ def test_gray_replay_uses_raw_query_not_external_facets_or_typed_controls():
     )
 
 
-def test_v16_quality_gate_protocol_identity_is_frozen():
+def test_v19_quality_gate_protocol_identity_is_frozen():
     from app.services import agent_graph
 
     module = _load_quality_gate()
     assert (
         module.QUALITY_GATE_PROTOCOL_VERSION
-        == "four_layer_acceptance_quality_gate_v16"
+        == "four_layer_acceptance_quality_gate_v19"
     )
     assert module.QUALITY_GATE_PROTOCOL_HASH == (
-        "ef21274a711f7c9c6811a8b8f1d813a4"
-        "3f8766e9a57e4f327c85538f382e2207"
+        "ac17a0d59f9bc6a88a1888ae39103713"
+        "67b419f64abcc434134a3be4d1aab1cf"
     )
     assert module.chunk_facet_priority_protocol_hash() == (
         "d266e9eafef9016518b8d42b2924a598"
@@ -2133,9 +2144,12 @@ def test_v16_quality_gate_protocol_identity_is_frozen():
         "frontier_heap_enqueue_key_serial_v1"
     )
     assert module.EXPECTED_EVIDENCE_FIELDS == (
-        agent_graph.EXPECTED_EVIDENCE_FIELDS
+        agent_graph.LEGACY_EXPECTED_EVIDENCE_FIELDS
     )
     assert module.typed_action_schema_protocol_hash() == (
+        "f5d2e730d3f3c64c574d67746deb71440122019a8c44f33bc92b1ebc839b0f3d"
+    )
+    assert module.stable_hash(module.reflection_typed_action_schema()) == (
         agent_graph.stable_hash(
             {
                 "protocol_version": (
@@ -2388,6 +2402,19 @@ def test_v9_chunk_facet_priority_cards_fail_closed_on_tamper(
     assert expected_code in {
         finding["code"] for finding in audit["findings"]
     }
+
+
+def test_graph_quality_gate_relation_protocol_matches_production_and_rejects_old_rows():
+    from app.services.context_graph import RELATION_PROTOCOL_VERSION
+
+    module = _load_quality_gate()
+    assert module.RELATION_PROTOCOL_VERSION == RELATION_PROTOCOL_VERSION == "dense_only_chunk_relation_graph_v10"
+    fixture = _graph_fixture(module)
+    assert module.audit_graph_quality(fixture)["pass"]
+    fixture["relation_edges"][0]["protocol_version"] = "dense_only_chunk_relation_graph_v9"
+    failed = module.audit_graph_quality(fixture)
+    assert not failed["pass"]
+    assert "relation_row_protocol_or_stats_binding_mismatch" in {item["code"] for item in failed["findings"]}
 
 
 def test_graph_quality_gate_accepts_formula_valid_zero_distance_only_at_unit_strength():
@@ -4343,6 +4370,7 @@ async def test_v3_persisted_context_package_replays_db_and_snapshot_facts(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("historical_answer_executor")
 async def test_v3_persisted_agent_actions_and_retrieval_replay_from_db(
     monkeypatch,
     db_session,
@@ -4465,14 +4493,14 @@ async def test_v3_persisted_agent_actions_and_retrieval_replay_from_db(
         strict=True,
     ):
         for identity_field in (
-            "claim_id",
+            "unit_id",
             "chunk_id",
             "document_id",
             "document_version_id",
             "context_package_id",
             "retrieval_trace_id",
             "answer_session_id",
-            "citation_verification_id",
+            "source_binding_id",
         ):
             assert replayed_citation[identity_field] == live_citation[
                 identity_field
@@ -4480,13 +4508,42 @@ async def test_v3_persisted_agent_actions_and_retrieval_replay_from_db(
         assert replayed_citation["source_span"] == live_citation[
             "source_span"
         ]
-        assert replayed_citation["verification"] == live_citation[
-            "verification"
-        ]
+        assert replayed_citation.get("verification") is None
+        assert live_citation.get("verification") is None
+        assert replayed_citation["source_binding"] == live_citation["source_binding"]
     assert persisted_identity["run"]["knowledge_base_id"] == knowledge_base.id
-    assert persisted_identity["citation_verification_ids"]
+    assert persisted_identity["source_binding_ids"]
+    assert not persisted_identity["citation_verification_ids"]
+    assert evaluator.replay_identity_complete(persisted_identity, persisted_response)
     assert pe_audit["run_id"] == response["run_id"]
     assert pe_audit["counts"]["plans"] == len(pe_audit["plans"])
+
+    for attack in ("raw_span", "trace", "retired_action"):
+        forged = copy.deepcopy(persisted_response)
+        forged_actions = copy.deepcopy(typed_action_facts)
+        if attack == "raw_span":
+            forged["citations"][0]["source_span"]["char_span"][0] += 1
+        elif attack == "trace":
+            forged["trace"][0]["status"] = "failed"
+        else:
+            for plan in forged_actions["plans"]:
+                for action in plan["typed_actions"]:
+                    if action["action_type"] == "build_context_package":
+                        action["action_type"] = "review_answer"
+        result = module.audit_agent_quality(forged, persisted_agent_facts=persisted_agent_facts,
+            retrieval_snapshot=retrieval_snapshot, gray_zone_audit=gray_zone_audit, typed_action_facts=forged_actions)
+        assert result["pass"] is False
+        expected = {
+            "raw_span": {"raw_source_span_matches_persisted_binding"},
+            "trace": {"trace_matches_persisted_events"},
+            "retired_action": {
+                "retrieval_action_closed_and_bounded",
+                "reflection_action_closed_and_bounded",
+            },
+        }[attack]
+        assert expected & {
+            finding["code"] for finding in result["findings"]
+        }
 
 
 def test_quality_gate_cli_returns_zero_for_good_and_nonzero_for_bad(tmp_path):

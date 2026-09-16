@@ -2160,6 +2160,9 @@ async def test_auto_tpe_runs_once_before_active_relation_graph_write(db_session,
     ] == run.runtime_settings_hash
     assert run.chunk_relation_graph_state_id == state.chunk_relation_graph_state_id
     assert db_session.scalar(select(func.count(AutoTpeTrial.id)).where(AutoTpeTrial.run_id == run.id)) == 2
+    trials = list(db_session.scalars(select(AutoTpeTrial).where(AutoTpeTrial.run_id == run.id)))
+    assert all(type(trial.diagnostics_json.get("nomination_count")) is int for trial in trials)
+    assert all(trial.diagnostics_json["nomination_count"] >= trial.diagnostics_json["candidate_count"] for trial in trials)
 
     relation_state = db_session.get(ChunkRelationGraphState, state.chunk_relation_graph_state_id)
     assert relation_state is not None

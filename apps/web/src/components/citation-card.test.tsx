@@ -3,13 +3,13 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { Citation } from "@course-kg/shared";
+import type { Citation, LegacyVerifiedCitation, SourceBoundCitation } from "@course-kg/shared";
 import { auditCitation, CitationCard } from "./citation-card";
 
 const HASH = "a".repeat(64);
 
-function makeCitation(overrides: Partial<Citation> = {}): Citation {
-  const citation: Citation = {
+function makeCitation(overrides: Partial<LegacyVerifiedCitation> = {}): LegacyVerifiedCitation {
+  const citation: LegacyVerifiedCitation = {
     contract_version: "citation_public_v1",
     chunk_id: "chunk:citation_surface",
     citation_index: 1,
@@ -116,8 +116,101 @@ function makeCitation(overrides: Partial<Citation> = {}): Citation {
   return { ...citation, ...overrides };
 }
 
+function makeSourceBoundCitation(): SourceBoundCitation {
+  const legacy = makeCitation();
+  return {
+    ...legacy,
+    contract_version: "citation_public_v2",
+    claim_id: null, claim_index: null, claim_text: null,
+    verification: null, citation_verification_id: null,
+    unit_id: HASH, unit_index: 0, unit_text: "A complete source-based answer unit.",
+    source_binding_id: "unit-test-source-binding",
+    source_span: {
+      ...legacy.source_span, contract_version: "raw_chunk_source_span_v2",
+      verification_id: null, source_binding_id: "unit-test-source-binding",
+    },
+    source_binding: {
+      contract_version: "answer_source_binding_public_v1", protocol_version: "answer_source_binding_v1",
+      status: "source_bound", source_binding_id: "unit-test-source-binding",
+      unit_id: HASH, unit_index: 0, answer_hash: HASH, binding_hash: HASH, reflection_audit_hash: HASH,
+      provenance_status: "valid", structure_context_status: "valid", transactional_replay: true,
+      semantic_entailment_claimed: false,
+    },
+  };
+}
+
 describe("CitationCard", () => {
   afterEach(() => cleanup());
+
+  it("shows structural source binding without claiming semantic verification", () => {
+    const citation = makeSourceBoundCitation();
+    expect(auditCitation(citation)).toEqual({ complete: true, supported: false, sourceBound: true, reasons: [] });
+    render(<CitationCard citation={citation} index={0} />);
+    expect(screen.getByText("来源已核对")).toBeTruthy();
+    expect(screen.getByText("原文地址已核对")).toBeTruthy();
+    expect(screen.queryByText("内容与回答一致")).toBeNull();
+    expect(screen.getByTestId("citation-audit-card").textContent).not.toContain("unit-test-source-binding");
+  });
+
+  it("rejects a mismatched source binding and a fabricated semantic verdict", () => {
+    const citation = makeSourceBoundCitation();
+    expect(auditCitation({ ...citation, source_span: { ...citation.source_span, source_binding_id: "different-binding" } }).complete).toBe(false);
+    expect(auditCitation({
+      ...citation,
+      source_binding: { ...citation.source_binding, semantic_entailment_claimed: true },
+    } as unknown as SourceBoundCitation).complete).toBe(false);
+  });
+
+  it("accepts retrieval-gated source bindings without a fabricated reflection audit", () => {
+    const original = makeSourceBoundCitation();
+    const citation: SourceBoundCitation = {
+      ...original,
+      source_binding: {
+        ...original.source_binding,
+        contract_version: "answer_source_binding_public_v2",
+        protocol_version: "answer_source_binding_v2",
+        reflection_audit_hash: null,
+        retrieval_gate_audit_hash: HASH,
+        retrieval_gate_observation_id: "unit-test-gate",
+      },
+    };
+    expect(auditCitation(citation)).toEqual({ complete: true, supported: false, sourceBound: true, reasons: [] });
+    render(<CitationCard citation={citation} index={0} />);
+    expect(screen.getByText("原文地址已核对")).toBeTruthy();
+    expect(screen.getByTestId("citation-audit-card").textContent).not.toContain("unit-test-gate");
+    expect(auditCitation({
+      ...citation,
+      source_binding: { ...citation.source_binding, reflection_audit_hash: HASH },
+    } as unknown as SourceBoundCitation).complete).toBe(false);
+  });
+
+  it("accepts source-integrity-admitted v3 bindings and rejects mixed authorities", () => {
+    const original = makeSourceBoundCitation();
+    const citation: SourceBoundCitation = {
+      ...original,
+      source_binding: {
+        ...original.source_binding,
+        contract_version: "answer_source_binding_public_v3",
+        protocol_version: "answer_source_binding_v2",
+        reflection_audit_hash: null,
+        retrieval_gate_audit_hash: null,
+        retrieval_gate_observation_id: null,
+        source_integrity_admission_hash: HASH,
+        source_integrity_admission_observation_id: "unit-test-source-admission",
+      },
+    };
+    expect(auditCitation(citation)).toEqual({ complete: true, supported: false, sourceBound: true, reasons: [] });
+    render(<CitationCard citation={citation} index={0} />);
+    expect(screen.getByText("来源已核对")).toBeTruthy();
+    expect(screen.queryByText("这条来源暂时无法核验")).toBeNull();
+    expect(auditCitation({
+      ...citation,
+      source_binding: {
+        ...citation.source_binding,
+        retrieval_gate_audit_hash: HASH,
+      },
+    } as SourceBoundCitation).complete).toBe(false);
+  });
 
   it("shows a concise natural-language source without internal audit identifiers", () => {
     const citation = makeCitation();
@@ -136,6 +229,19 @@ describe("CitationCard", () => {
     expect(card.textContent).not.toContain("trace:citation_surface");
     expect(card.textContent).not.toContain(HASH);
     expect(card.textContent).not.toContain("protocol");
+  });
+
+  it("constrains a long source title to the card text slot", () => {
+    const citation = makeCitation({
+      document_title: "A_very_long_source_title_that_must_not_expand_the_citation_drawer_beyond_its_viewport",
+    });
+    render(<CitationCard citation={citation} index={0} />);
+
+    const title = screen.getByText(citation.document_title!);
+    expect(title.getAttribute("data-overflow-text")).not.toBeNull();
+    expect(title.className).toContain("truncate");
+    expect(title.parentElement?.className).toContain("grid-cols-[minmax(0,1fr)_auto]");
+    expect(screen.getByTestId("citation-audit-card").className).toContain("overflow-hidden");
   });
 
   it("does not label a missing source name as a local file", () => {

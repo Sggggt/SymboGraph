@@ -264,16 +264,16 @@ function FileStatusBadge({ status }: { status: KnowledgeBaseFileStatus }) {
   const meta = fileStatusMeta[status];
   const Icon = status === "parsed" || status === "active" ? CheckCircle2 : status === "failed" ? AlertCircle : status === "parsing" ? LoaderCircle : Clock3;
   return (
-    <span className={cn("inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs", meta.className, status === "parsing" && "animate-pulse")}>
+    <span className={cn("inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs", meta.className)}>
       <Icon className={cn("size-3.5", status === "parsing" && "animate-spin")} />
       {meta.label}
     </span>
   );
 }
 
-const fileProgressMeta: Record<KnowledgeBaseFileStatus, { value: number; barClassName: string; pulse?: boolean }> = {
+const fileProgressMeta: Record<KnowledgeBaseFileStatus, { value: number; barClassName: string }> = {
   pending: { value: 8, barClassName: "bg-amber-200/60" },
-  parsing: { value: 58, barClassName: "bg-[linear-gradient(90deg,#64dfff,#7b7cff,#64dfff)]", pulse: true },
+  parsing: { value: 58, barClassName: "bg-[linear-gradient(90deg,#64dfff,#7b7cff,#64dfff)]" },
   parsed: { value: 100, barClassName: "bg-emerald-300/80" },
   failed: { value: 100, barClassName: "bg-rose-300/72" },
   skipped: { value: 100, barClassName: "bg-white/28" },
@@ -285,7 +285,7 @@ function FileProgressBar({ status }: { status: KnowledgeBaseFileStatus }) {
   return (
     <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/7">
       <div
-        className={cn("h-full rounded-full transition-[width] duration-500", meta.barClassName, meta.pulse && "animate-pulse")}
+        className={cn("h-full rounded-full transition-[width] duration-500", meta.barClassName)}
         style={{ width: `${meta.value}%` }}
       />
     </div>
@@ -863,9 +863,9 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
 
   return (
     <div className="kg-page">
-      <section className="glass-panel relative grid min-h-[calc(100dvh-6rem)] overflow-hidden rounded-[34px] xl:h-[calc(100dvh-6rem)] xl:min-h-0 xl:auto-rows-[minmax(0,1fr)] xl:grid-cols-[minmax(280px,0.82fr)_minmax(420px,1.32fr)_minmax(320px,0.92fr)]">
+      <section className="glass-panel relative grid min-h-[calc(100dvh-6rem)] min-w-0 overflow-hidden rounded-[34px] xl:h-[calc(100dvh-6rem)] xl:min-h-0 xl:auto-rows-[minmax(0,1fr)] xl:grid-cols-[minmax(280px,0.82fr)_minmax(420px,1.32fr)_minmax(320px,0.92fr)]">
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_18%_0%,rgba(86,217,255,0.12),transparent_32%),radial-gradient(circle_at_88%_20%,rgba(34,197,94,0.08),transparent_28%),linear-gradient(180deg,rgba(255,255,255,0.035),transparent_34%)]" />
-        <div className="relative border-b border-white/8 p-6 xl:border-b-0 xl:border-r xl:p-7">
+        <div className="relative min-w-0 border-b border-white/8 p-6 xl:border-b-0 xl:border-r xl:p-7">
         <div className="grid gap-6">
           <div className="space-y-5">
             <p className="section-kicker">导入控制台</p>
@@ -1063,14 +1063,14 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
         </div>
         </div>
 
-        <div className="relative flex min-h-[540px] max-h-[72dvh] flex-col border-b border-white/8 p-6 xl:h-full xl:min-h-0 xl:max-h-none xl:border-b-0 xl:border-r xl:p-7">
-        <div className="flex flex-wrap items-start justify-between gap-4">
-          <div>
+        <div className="relative flex min-h-[540px] min-w-0 max-h-[72dvh] flex-col overflow-hidden border-b border-white/8 p-6 xl:h-full xl:min-h-0 xl:max-h-none xl:border-b-0 xl:border-r xl:p-7">
+        <div className="flex min-w-0 flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0">
             <p className="section-kicker">文件库</p>
             <h3 className="mt-2 text-2xl font-semibold text-white">已入库文件导览</h3>
             <p className="mt-2 text-sm text-white/50">当前资料库存储文件夹中的文件会统一显示在这里。</p>
           </div>
-          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          <div className="flex w-full min-w-0 flex-wrap items-center gap-2 sm:w-auto sm:shrink-0 sm:justify-end">
             <button
               type="button"
               role="switch"
@@ -1117,9 +1117,12 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
           </div>
         </div>
 
-        <div className="custom-scrollbar kg-rounded-scrollbar mt-5 min-h-[18rem] flex-1 overflow-y-auto overscroll-contain rounded-[24px] border border-white/8 bg-black/10 pr-1">
+        <div className="custom-scrollbar kg-rounded-scrollbar mt-5 min-h-[18rem] min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain rounded-[24px] border border-white/8 bg-black/10 pr-1">
           {knowledgeBaseFilesQuery.isLoading && fileItems.length === 0 ? (
-            <div className="kg-shimmer px-5 py-8 text-sm text-white/50">正在加载文件...</div>
+            <div className="flex items-center justify-center gap-3 px-5 py-8 text-sm text-white/50" role="status">
+              <LoaderCircle className="size-5 animate-spin text-cyan-100" />
+              正在加载文件...
+            </div>
           ) : fileItems.length === 0 ? (
             <div className="px-5 py-8 text-sm text-white/50">暂无文件。上传文件后会先显示为待解析。</div>
           ) : (
@@ -1134,12 +1137,11 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
                   file.status !== "parsing" && "cursor-default",
                   isSelected && "bg-cyan-300/[0.08] ring-1 ring-inset ring-cyan-200/35",
                 )}
-                title="按住 Shift 并左键点击可多选文件"
               >
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <p className="max-w-full truncate text-sm font-medium text-white">{file.title || fileNameFromPath(file.source_path)}</p>
+                    <div className="flex min-w-0 items-center gap-2">
+                      <p data-overflow-text className="block min-w-0 flex-1 truncate text-sm font-medium text-white">{file.title || fileNameFromPath(file.source_path)}</p>
                       <FileStatusBadge status={file.status} />
                     </div>
                     {file.error ? <p className="mt-2 break-words text-xs leading-5 text-rose-100/70">{file.error}</p> : null}
@@ -1169,9 +1171,9 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
                     移除
                   </button>
                 </div>
-                <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-white/42">
+                <div className="mt-3 flex min-w-0 flex-wrap gap-2 text-[11px] text-white/42">
                   <span className="rounded-full border border-white/8 px-2.5 py-1">{sourceTypeLabel(file.source_type)}</span>
-                  {file.partition ? <span className="rounded-full border border-white/8 px-2.5 py-1">{file.partition}</span> : null}
+                  {file.partition ? <span data-overflow-text className="inline-block min-w-0 max-w-full truncate rounded-full border border-white/8 px-2.5 py-1">{file.partition}</span> : null}
                   <span className="rounded-full border border-white/8 px-2.5 py-1">{file.chunk_count} 个片段</span>
                   {isSelected ? <span className="rounded-full border border-cyan-200/30 bg-cyan-300/10 px-2.5 py-1 text-cyan-50">已选择</span> : null}
                 </div>
@@ -1182,7 +1184,7 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
         </div>
         </div>
 
-        <div className="relative min-h-0">
+        <div className="relative min-h-0 min-w-0 overflow-hidden">
         <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} className="border-b border-white/8 p-6 xl:p-7">
           <div className="flex items-center justify-between">
             <div>
@@ -1223,7 +1225,6 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
           <div className="mt-6 space-y-5">
             {isGraphBuilding ? (
               <div className="relative overflow-hidden rounded-[22px] border border-cyan-200/22 bg-cyan-300/[0.055] p-5">
-                <div className="absolute inset-0 bg-[linear-gradient(90deg,transparent,rgba(103,232,249,0.12),transparent)] animate-pulse" />
                 <div className="relative flex items-start gap-4">
                   <div className="grid size-12 shrink-0 place-items-center rounded-full border border-cyan-100/20 bg-cyan-200/10">
                     <LoaderCircle className="size-6 animate-spin text-cyan-100" />
@@ -1231,17 +1232,12 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
                   <div className="min-w-0">
                     <p className="text-sm font-semibold text-cyan-50">正在更新四层图谱</p>
                     <p className="mt-2 text-sm leading-6 text-cyan-50/72">片段关系图、RQ-KMeans、概念图、上下文图谱和索引状态正在提交，请不要关闭页面、停止后端或重启服务。</p>
-                    <div className="mt-4 flex items-center gap-2">
-                      {[0, 1, 2, 3].map((item) => (
-                        <span key={item} className="size-2 animate-pulse rounded-full bg-cyan-100/80" style={{ animationDelay: `${item * 150}ms` }} />
-                      ))}
-                    </div>
                   </div>
                 </div>
               </div>
             ) : null}
 
-            <div className="border border-white/8 bg-black/10 p-5">
+            <div className="rounded-2xl border border-white/8 bg-black/10 p-5">
               <div className="flex items-center justify-between gap-4">
                 <p className="text-lg font-medium text-white">{batchStateLabel(visibleBatch?.state)}</p>
                 <p className="text-xs uppercase tracking-[0.26em] text-white/45">{visibleBatch ? "批次已记录" : "无批次"}</p>
@@ -1452,11 +1448,9 @@ function UploadWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledge
           </DialogHeader>
           <div className="space-y-4 px-6 py-5">
             {cleanupPending ? (
-              <div>
-                <p className="text-sm text-white/72">{cleanupTitle}执行中...</p>
-                <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/8">
-                  <div className="h-full w-2/3 animate-pulse rounded-full bg-[linear-gradient(90deg,#64dfff,#7b7cff,#64dfff)]" />
-                </div>
+              <div className="flex items-center gap-3 text-sm text-white/72" role="status">
+                <LoaderCircle className="size-5 animate-spin text-cyan-100" />
+                {cleanupTitle}执行中...
               </div>
             ) : cleanupMessage ? (
               <p className="rounded-2xl border border-emerald-200/16 bg-emerald-300/[0.055] px-4 py-3 text-sm leading-6 text-emerald-50/78">{cleanupMessage}</p>

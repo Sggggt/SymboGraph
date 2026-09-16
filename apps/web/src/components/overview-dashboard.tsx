@@ -1,15 +1,20 @@
 ﻿"use client";
 
 import Link from "next/link";
+import dynamic from "next/dynamic";
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { motion } from "framer-motion";
-import { ArrowRight, Orbit, Radar, Sparkles, Zap } from "lucide-react";
+import { ArrowRight, LoaderCircle, Orbit, Radar, Sparkles, Zap } from "lucide-react";
 
 import { fetchDashboard, fetchGraph } from "@/lib/api";
-import { NetworkCanvas } from "@/components/network-canvas";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
+
+const NetworkCanvas = dynamic(
+  () => import("@/components/network-canvas").then((module) => module.NetworkCanvas),
+  { ssr: false },
+);
 
 const batchStateLabels: Record<string, string> = {
   queued: "排队中",
@@ -118,7 +123,7 @@ export function OverviewDashboard() {
             </div>
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
               {stats.map((stat) => (
-                <div key={stat.label} className="metric-line rounded-[20px] border border-white/8 bg-white/[0.03] px-4 py-3">
+                <div key={stat.label} className="metric-line border-l border-cyan-100/16 px-4 py-3">
                   <p className="text-[11px] uppercase tracking-[0.28em] text-white/45">{stat.label}</p>
                   <p className="mt-1.5 text-2xl font-semibold text-white">{stat.value}</p>
                 </div>
@@ -140,7 +145,8 @@ export function OverviewDashboard() {
           </div>
           <div className="min-h-0 flex-1">
             {graphQuery.isLoading ? (
-              <div className="flex h-[340px] items-center justify-center rounded-[24px] border border-white/8 bg-white/[0.02] text-sm text-white/55">
+              <div className="flex h-[340px] items-center justify-center gap-3 text-sm text-white/55" role="status">
+                <LoaderCircle className="size-6 animate-spin text-cyan-100" />
                 图谱正在加载，概览数据已就绪
               </div>
             ) : graphQuery.error ? (
@@ -162,7 +168,7 @@ export function OverviewDashboard() {
             <Zap className="size-5 text-cyan-200" />
           </div>
           <div className="mt-6 grid gap-4 sm:grid-cols-2">
-            <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
+            <div className="border-l border-cyan-100/14 py-2 pl-5">
               <p className="text-xs uppercase tracking-[0.28em] text-white/45">最新批次</p>
               <p className="mt-3 text-2xl font-semibold text-white">{batchStateLabel(data.batch_status?.state)}</p>
               <p className="mt-2 text-sm text-white/55">
@@ -171,7 +177,7 @@ export function OverviewDashboard() {
                   : "尚未启动全量导入"}
               </p>
             </div>
-            <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
+            <div className="border-l border-cyan-100/14 py-2 pl-5">
               <p className="text-xs uppercase tracking-[0.28em] text-white/45">向量模型模式</p>
               <p className="mt-3 text-2xl font-semibold text-white">{data.degraded_mode ? "降级不可用" : "真实模型链路"}</p>
               <p className="mt-2 text-sm text-white/55">{data.degraded_mode ? "当前未检测到真实模型链路" : "真实向量模型与四层图谱链路已启用"}</p>
@@ -203,7 +209,7 @@ export function OverviewDashboard() {
             </div>
             <div className="mt-6 space-y-4">
               {data.tree.slice(0, 6).map((partition) => (
-                <div key={partition.id} className="rounded-[22px] border border-white/8 bg-white/[0.03] px-5 py-4">
+                <div key={partition.id} className="border-b border-white/8 px-1 py-4 last:border-b-0">
                   <div className="flex items-center justify-between gap-4">
                     <p className="text-base font-medium text-white">{partition.title}</p>
                     <span className="text-xs uppercase tracking-[0.25em] text-white/45">{partition.children?.length ?? 0} 个文档</span>
@@ -230,14 +236,13 @@ export function OverviewDashboard() {
             </div>
             <div className="mt-6 space-y-4">
               {[
-                { href: "/search", title: "搜索实验室", description: "带过滤条件的向量检索与目录联动视图。" },
                 { href: "/qa", title: "问答实验室", description: "流式回答、证据轨迹和命中片段并行展开。" },
                 { href: "/graph", title: "四层图谱", description: "查看片段结构图、片段关系图、中粒度概念图和粗粒度概念图。" },
               ].map((entry) => (
                 <Link
                   key={entry.href}
                   href={entry.href}
-                  className="group block rounded-[22px] border border-white/8 bg-white/[0.03] px-5 py-4 transition hover:border-cyan-300/35 hover:bg-cyan-300/[0.06]"
+                  className="group block border-b border-white/8 px-1 py-4 transition hover:border-cyan-300/35 last:border-b-0"
                 >
                   <div className="flex items-start justify-between gap-4">
                     <div>

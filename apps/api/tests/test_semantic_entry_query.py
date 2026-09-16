@@ -44,7 +44,7 @@ def test_semantic_entry_uses_most_specific_validated_facet_without_gray_authorit
     )
 
     assert semantic["protocol_version"] == (
-        "validated_query_facet_semantic_entry_v1"
+        "validated_query_facet_semantic_entry_v3"
     )
     assert semantic["query"] == "技术必须被什么夹在中间"
     assert semantic["selection_source"] == "validated_required_facet"
@@ -93,7 +93,7 @@ def test_semantic_entry_uses_most_specific_validated_facet_without_gray_authorit
         query_facets=changed_facets,
     )
     assert components["cache_key_protocol_version"] == (
-        "layered_retrieval_full_identity_key_v5"
+        "layered_retrieval_full_identity_key_v6"
     )
     assert components["query"] == RAW_INSTRUCTION_QUERY
     assert components["semantic_entry_query"] == "技术必须被什么夹在中间"
@@ -116,6 +116,95 @@ def test_semantic_entry_keeps_raw_query_for_deterministic_fallback_packet():
     assert semantic["selection_source"] == "raw_query"
     assert semantic["source_packet_model_assisted"] is False
     assert semantic["gray_zone_decision_authority"] is False
+
+
+def test_semantic_entry_preserves_domain_over_longer_generic_procedure_and_replays_history():
+    from app.services import context_graph as graph
+    query = "Compare the summary and details of a synthetic photon survey."
+    facets = graph.query_facets_for_search(query, {"facet_groups": [
+        {"facet": "photon survey", "role": "domain", "aliases": []},
+        {"facet": "summary and detailed section consistency comparison", "role": "procedure", "aliases": []},
+        {"facet": "area duration and pointing count", "role": "constraint", "aliases": []},
+    ], "answer_shape": "comparison", "drop_terms": []})
+    current = graph.semantic_entry_query_for_search(query, facets)
+    assert current["query"] == "photon survey" and current["selected_required_facet_index"] == 0
+    old = graph.semantic_entry_query_for_search(query, facets, _replay_protocol="validated_query_facet_semantic_entry_v1")
+    assert old["selected_required_facet_index"] == 1
+    assert graph.validate_semantic_entry_query_trace_packet(old, query=query, query_facets=facets) == old
+    assert current["packet_hash"] != old["packet_hash"]
+
+
+def test_public_structure_layout_keeps_parser_formula_flag():
+    from app.schemas import ContextStructureLayoutAudit
+    assert ContextStructureLayoutAudit.model_validate({"has_formula": True}).has_formula is True
+
+
+def composite_facets():
+    from app.services import context_graph as graph
+    query = "List the business categories and counts in Aster platform scope."
+    facets = graph.query_facets_for_search(query, {"facet_groups": [
+        {"facet": "Aster platform scope", "role": "domain", "aliases": []},
+        {"facet": "business category classification and category count", "role": "domain", "aliases": []},
+        {"facet": "list only the requested numbers and names", "role": "procedure", "aliases": []},
+    ], "answer_shape": "comparison", "drop_terms": []})
+    return query, facets
+
+
+def test_parallel_domain_preservation_and_versioned_history_replay():
+    from app.services import context_graph as graph
+    query, facets = composite_facets()
+    before = graph.deterministic_gray_query_facets_for_search(query)
+    current = graph.semantic_entry_query_for_search(query, facets)
+    assert current["query"] == "Aster platform scope; business category classification and category count"
+    assert current["selection_source"] == "validated_required_domain_composite"
+    assert current["selected_required_facet_index"] is None
+    assert current["selected_required_facet_indexes"] == [0, 1]
+    assert graph.deterministic_gray_query_facets_for_search(query) == before
+    for version in ("validated_query_facet_semantic_entry_v1", "validated_query_facet_semantic_entry_v2"):
+        old = graph.semantic_entry_query_for_search(query, facets, _replay_protocol=version)
+        assert old["query"] == "business category classification and category count"
+        assert "selected_required_facet_indexes" not in old
+        assert graph.validate_semantic_entry_query_trace_packet(old, query=query, query_facets=facets) == old
+        assert old["packet_hash"] != current["packet_hash"]
+    forged = {**current, "selected_required_facet_indexes": [1]}
+    with pytest.raises(graph.EntrySelectionTraceInvariantError):
+        graph.validate_semantic_entry_query_trace_packet(forged, query=query, query_facets=facets)
+
+
+def test_specific_facet_may_cover_multiple_domains_without_repetition():
+    from app.services import context_graph as graph
+    query = "Compare the components of the Aster platform."
+    facets = graph.query_facets_for_search(query, {"facet_groups": [
+        {"facet": "Aster", "role": "domain", "aliases": []},
+        {"facet": "Aster platform", "role": "domain", "aliases": []},
+        {"facet": "Aster platform components", "role": "constraint", "aliases": []},
+    ], "answer_shape": "comparison", "drop_terms": []})
+    current = graph.semantic_entry_query_for_search(query, facets)
+    assert current["query"] == "Aster platform components"
+    assert current["selected_required_facet_indexes"] == [2]
+
+
+@pytest.mark.asyncio
+async def test_composite_domains_reach_embedding_and_public_dense_replay(monkeypatch, db_session, populated_context_graph, fake_model_stack):
+    from app.schemas import SearchFilters
+    from app.services import context_graph as graph
+    from app.services.retrieval import get_retrieval_trace_steps
+    query, facets = composite_facets()
+    expected = graph.semantic_entry_query_for_search(query, facets)
+    provider = fake_model_stack["EmbeddingProvider"]
+    original = provider.embed_texts
+    observed = []
+    async def embed(self, texts, text_type="document"):
+        if text_type == "query": observed.extend(texts)
+        return await original(self, texts, text_type=text_type)
+    monkeypatch.setattr(provider, "embed_texts", embed)
+    result = await graph.layered_search(db_session, populated_context_graph["knowledge_base"].id, query, SearchFilters(), 3,
+        query_facets=facets, allow_cache_read=False)
+    assert observed == [expected["query"]]
+    assert result.trace.diagnostics_json["semantic_entry_query"] == expected
+    assert result.cache_components["semantic_entry_query_hash"] == expected["packet_hash"]
+    assert get_retrieval_trace_steps(db_session, result.trace.id)
+    assert result.trace.convergence_json["gray_zone_model_call_count"] == 0
 
 
 def test_query_embedding_request_memo_is_strictly_bounded():

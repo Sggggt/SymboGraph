@@ -14,11 +14,15 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
+
+import numpy as np
 
 from sqlalchemy import cast, func, or_, select, true, update
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Session, object_session
+from sqlalchemy import JSON, type_coerce
+from sqlalchemy.orm import Session, object_session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.config import (
@@ -34,6 +38,7 @@ from app.core.config import (
     RQ_MEMBERSHIP_PROTOCOL_DEFAULT,
     TRAVERSAL_OBSERVATION_BUDGET_MAX,
     get_settings,
+    runtime_settings_read_scope,
     validate_path_distance_thresholds,
 )
 from app.models import (
@@ -94,7 +99,16 @@ from app.services.chunking import (
     text_hash as chunk_text_hash,
 )
 from app.services.cancellation import ensure_not_cancelled
+from app.services.build_performance import cold_build, measure, measured
+from app.services.rq_numeric_storage import RQ_NUMERIC_STORAGE_PROTOCOL,pack_rq_vector,read_rq_vector
+from app.services.relation_signal_storage import PROTOCOL as NODE_SIGNAL_STORAGE_PROTOCOL,STATE_KEY as NODE_SIGNAL_POOL_KEY,compact_signal_features,pack_signal_pool,expand_signal_features
+from app.services.graph_build_workspace import (
+    NUMERIC_PROTOCOL, ScoredRow, checkpoint as build_checkpoint,
+    current_workspace, graph_workspace_scope, numeric_distances,
+    workspace_protocol_cache,
+)
 from app.services import cache_manager
+from app.services.qa_performance import qa_sync_timed
 from app.services.conversation_state import anonymous_conversation_state_snapshot
 from app.services.embeddings import (
     ChatProvider,
@@ -149,6 +163,7 @@ from app.services.storage import (
     SOURCE_SNAPSHOT_PROTOCOL_VERSION,
     SourceSnapshotError,
     open_verified_source_file,
+    run_bounded_source_io,
     verify_immutable_file_protection,
 )
 from app.services.strategy_profiles import (
@@ -166,14 +181,14 @@ from app.services.strategy_profiles import (
 from app.services.vector_store import VectorStore, canonical_embedding_vector
 
 
-RELATION_PROTOCOL_VERSION = "dense_only_chunk_relation_graph_v9"
+RELATION_PROTOCOL_VERSION = "dense_only_chunk_relation_graph_v10"
 RAW_SPAN_TEXT_HASH_PROTOCOL_VERSION = "raw_chunk_span_utf8_sha256_v1"
 CHUNK_SCOPE_HASH_PROTOCOL_VERSION = "chunk_scope_complete_address_v2"
 CHUNK_SCOPE_PROTOCOL_DISTRIBUTION_VERSION = "chunk_scope_protocol_distribution_v1"
 CHUNK_VERSION_STATE_PROTOCOL_VERSION = "chunk_version_active_scope_state_v2"
 ACTIVE_SCOPE_MUTATION_STALE_REASON = "active_chunk_scope_changed"
 RETRIEVAL_CACHE_ENVELOPE_PROTOCOL_VERSION = (
-    "layered_retrieval_postgresql_replay_envelope_v1"
+    "layered_retrieval_postgresql_replay_envelope_v2"
 )
 RETRIEVAL_CACHE_REPLAY_PROTOCOL_VERSION = (
     "layered_retrieval_postgresql_strict_replay_v1"
@@ -494,7 +509,7 @@ ENTRY_SEMANTIC_AGGREGATION_PROTOCOL_VERSION = (
 ENTRY_TOPOLOGY_PROTOCOL_VERSION = "active_concept_topology_prior_v1"
 ENTRY_REPLAY_PROOF_PROTOCOL_VERSION = "entry_candidate_frozen_replay_proof_v1"
 SEMANTIC_ENTRY_QUERY_PROTOCOL_VERSION = (
-    "validated_query_facet_semantic_entry_v1"
+    "validated_query_facet_semantic_entry_v3"
 )
 ENTRY_DENSE_REPLAY_PROTOCOL_VERSION = "entry_dense_db_vector_replay_v2"
 ENTRY_DENSE_VECTOR_BUSINESS_FACT_PROTOCOL_VERSION = (
@@ -1144,8 +1159,8 @@ def agent_operating_envelope(settings: Any | None = None) -> dict[str, Any]:
         "context_path_summary_budget": int(settings.context_path_summary_budget),
         "planning_round_budget": int(settings.agent_planning_round_budget),
         "max_typed_actions_per_round": int(settings.agent_max_typed_actions_per_round),
-        "repair_round_budget": int(settings.agent_repair_round_budget),
-        "verification_budget": int(settings.agent_verification_budget),
+        "answer_unit_limit": int(settings.agent_answer_unit_limit),
+        "reflection_round_budget": int(settings.agent_reflection_round_budget),
         "allowed_relation_types": [
             "dense_semantic",
             "dense_cross_document_bridge",
@@ -1163,6 +1178,10 @@ def normalize_agent_operating_envelope(
     envelope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     effective = agent_operating_envelope()
+    if envelope and "verification_budget" in envelope and "answer_unit_limit" not in envelope:
+        # Read-only replay of a frozen pre-reflection envelope keeps its exact field set.
+        effective.pop("answer_unit_limit", None)
+        effective.pop("reflection_round_budget", None)
     if envelope:
         effective.update(dict(envelope))
     protocol_version = str(
@@ -1244,7 +1263,7 @@ def normalize_agent_operating_envelope(
 
 
 TYPED_ACTION_TRAVERSAL_CONTROL_PROTOCOL_VERSION = (
-    "planner_typed_action_executor_v2"
+    "planner_typed_action_executor_v3"
 )
 TYPED_ACTION_TRAVERSAL_OVERRIDE_FIELDS = frozenset(
     {
@@ -1265,7 +1284,7 @@ TYPED_ACTION_TRAVERSAL_OVERRIDE_FIELDS = frozenset(
 TYPED_ACTION_ENTRY_TARGET_LAYERS = frozenset(
     {"coarse", "mid", "rq_membership", "chunk"}
 )
-TYPED_ACTION_CONTROL_FIELDS = frozenset(
+LEGACY_TYPED_ACTION_CONTROL_FIELDS = frozenset(
     {
         "protocol_version",
         "retrieval_granularity",
@@ -1289,6 +1308,10 @@ TYPED_ACTION_CONTROL_FIELDS = frozenset(
         "control_hash",
     }
 )
+TYPED_ACTION_CONTROL_FIELDS = (LEGACY_TYPED_ACTION_CONTROL_FIELDS - {"verification_budget", "repair_round_budget"}) | {"answer_unit_limit", "reflection_round_budget"}
+RETRIEVAL_CONTROL_PROTOCOL = "retrieval_typed_action_executor_v1"
+RETRIEVAL_CONTROL_IDENTITIES = frozenset({"task_hash", "lexical_strategy_hash", "lexical_policy_hash"})
+
 
 
 class TypedActionTraversalControlError(RuntimeError):
@@ -1335,6 +1358,16 @@ class TypedActionTraversalControlError(RuntimeError):
         super().__init__(str(detail))
 
 
+def typed_action_entry_target_limits(envelope: dict[str, Any], granularity: str) -> dict[str, int]:
+    return {
+        "coarse": min(int(envelope["agent_coarse_initial_budget"]), int(envelope["agent_coarse_top_k"])),
+        "mid": min(int(envelope["agent_mid_initial_budget"] if granularity == "mid" else envelope["agent_coarse_drilldown_mid_initial_budget"]),
+            int(envelope["agent_mid_top_k"]), int(envelope["candidate_pool_dedupe_budget"])),
+        "rq_membership": int(envelope["candidate_pool_dedupe_budget"]),
+        "chunk": min(int(envelope["agent_chunk_initial_budget"]), int(envelope["candidate_pool_dedupe_budget"])),
+    }
+
+
 def validate_typed_action_traversal_controls(
     controls: dict[str, Any] | None,
     *,
@@ -1355,8 +1388,13 @@ def validate_typed_action_traversal_controls(
         return None, normalized_base
     if not isinstance(controls, dict):
         raise ValueError("typed action traversal controls must be an object")
-    missing = sorted(TYPED_ACTION_CONTROL_FIELDS - set(controls))
-    extra = sorted(set(controls) - TYPED_ACTION_CONTROL_FIELDS)
+    legacy_controls = controls.get("protocol_version") == "planner_typed_action_executor_v2"
+    retrieval_controls = controls.get("protocol_version") == RETRIEVAL_CONTROL_PROTOCOL
+    expected_fields = LEGACY_TYPED_ACTION_CONTROL_FIELDS if legacy_controls else TYPED_ACTION_CONTROL_FIELDS
+    if retrieval_controls:
+        expected_fields = expected_fields | RETRIEVAL_CONTROL_IDENTITIES
+    missing = sorted(expected_fields - set(controls))
+    extra = sorted(set(controls) - expected_fields)
     if missing or extra:
         raise ValueError(
             "typed action traversal control schema mismatch: "
@@ -1364,9 +1402,16 @@ def validate_typed_action_traversal_controls(
         )
     if (
         controls.get("protocol_version")
-        != TYPED_ACTION_TRAVERSAL_CONTROL_PROTOCOL_VERSION
+        not in {TYPED_ACTION_TRAVERSAL_CONTROL_PROTOCOL_VERSION, "planner_typed_action_executor_v2", RETRIEVAL_CONTROL_PROTOCOL}
     ):
         raise ValueError("typed action traversal control protocol mismatch")
+    if retrieval_controls:
+        if controls.get("reflection_round_budget") != 0:
+            raise ValueError("retrieval_control_cannot_authorize_post_generation_reflection")
+        for identity_key in RETRIEVAL_CONTROL_IDENTITIES:
+            value = controls.get(identity_key)
+            if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise ValueError("retrieval_control_identity_invalid")
     if controls.get("retrieval_granularity") != retrieval_granularity:
         raise ValueError("typed action traversal granularity mismatch")
     if (
@@ -1375,8 +1420,8 @@ def validate_typed_action_traversal_controls(
     ):
         raise ValueError("typed action traversal result top-k mismatch")
     bounded_scalar_fields = {
-        "verification_budget": "verification_budget",
-        "repair_round_budget": "repair_round_budget",
+        **({"verification_budget": "verification_budget", "repair_round_budget": "repair_round_budget"} if legacy_controls else
+           {"answer_unit_limit": "answer_unit_limit", "reflection_round_budget": "reflection_round_budget"}),
         "context_package_token_budget": "context_package_token_budget",
         "structure_restore_per_chunk_budget": "structure_restore_per_chunk_budget",
     }
@@ -1476,6 +1521,10 @@ def validate_typed_action_traversal_controls(
         normalized_overrides[key] = value
         effective_envelope[key] = value
     effective_envelope = normalize_agent_operating_envelope(effective_envelope)
+    if retrieval_controls:
+        # This protocol uses a frozen TaskContract for attribution. The old
+        # frequency posterior remains available to the legacy search protocol.
+        effective_envelope["query_facet_posterior_enabled"] = False
     for key in (
         "path_distance_green_threshold",
         "path_distance_gray_threshold",
@@ -1495,30 +1544,7 @@ def validate_typed_action_traversal_controls(
         raise ValueError(
             "typed action coarse targets are not executable under locked mid granularity"
         )
-    target_limits = {
-        "coarse": min(
-            int(effective_envelope["agent_coarse_initial_budget"]),
-            int(effective_envelope["agent_coarse_top_k"]),
-        ),
-        "mid": min(
-            int(
-                effective_envelope["agent_mid_initial_budget"]
-                if retrieval_granularity == "mid"
-                else effective_envelope[
-                    "agent_coarse_drilldown_mid_initial_budget"
-                ]
-            ),
-            int(effective_envelope["agent_mid_top_k"]),
-            int(effective_envelope["candidate_pool_dedupe_budget"]),
-        ),
-        "rq_membership": int(
-            effective_envelope["candidate_pool_dedupe_budget"]
-        ),
-        "chunk": min(
-            int(effective_envelope["agent_chunk_initial_budget"]),
-            int(effective_envelope["candidate_pool_dedupe_budget"]),
-        ),
-    }
+    target_limits = typed_action_entry_target_limits(effective_envelope, retrieval_granularity)
     for layer, maximum in target_limits.items():
         if len(normalized_targets[layer]) > maximum:
             raise ValueError(
@@ -1682,7 +1708,7 @@ def _canonical_vector_payload_digest(
         encoded = value.encode("utf-8")
         canonical.extend(len(encoded).to_bytes(8, byteorder="big", signed=False))
         canonical.extend(encoded)
-    vector_bytes = b"".join(struct.pack(">f", value) for value in canonical_vector)
+    vector_bytes = struct.pack(f">{len(canonical_vector)}f", *canonical_vector)
     canonical.extend(len(vector_bytes).to_bytes(8, byteorder="big", signed=False))
     canonical.extend(vector_bytes)
     return hashlib.sha256(canonical).hexdigest()
@@ -1811,6 +1837,7 @@ def distance_from_strength(raw_strength: float) -> float:
     return 0.0 if abs(distance) < 1e-9 else round(distance, 6)
 
 
+@workspace_protocol_cache
 def relation_rank_score_protocol_hash() -> str:
     return stable_hash(
         {
@@ -1837,6 +1864,7 @@ def channel_rank_score(*, rank: int, candidate_count: int) -> float:
     return round((candidate_count - rank + 1) / candidate_count, 6)
 
 
+@workspace_protocol_cache
 def chunk_node_quality_protocol_hash() -> str:
     return stable_hash(
         {
@@ -1853,6 +1881,7 @@ def chunk_node_quality_protocol_hash() -> str:
     )
 
 
+@workspace_protocol_cache
 def out_evidence_mass_protocol_hash() -> str:
     return stable_hash(
         {
@@ -1870,6 +1899,7 @@ def out_evidence_mass_protocol_hash() -> str:
     )
 
 
+@workspace_protocol_cache
 def in_acceptance_capacity_protocol_hash() -> str:
     return stable_hash(
         {
@@ -1890,6 +1920,7 @@ def in_acceptance_capacity_protocol_hash() -> str:
     )
 
 
+@workspace_protocol_cache
 def relation_quota_protocol_hash() -> str:
     return stable_hash(
         {
@@ -2007,6 +2038,7 @@ def relation_quota_card(*, lower: int, upper: int, signal: float, signal_role: s
     }
 
 
+@workspace_protocol_cache
 def relation_raw_strength_protocol_hash() -> str:
     return stable_hash(
         {
@@ -2043,6 +2075,7 @@ def relation_raw_strength(
 
 def relation_edge_rank_trace_payload(edge: Any) -> dict[str, Any]:
     features = dict(getattr(edge, "features_json", None) or {})
+    features = expand_signal_features(edge,features)
     return {
         "edge_id": getattr(edge, "id", None),
         "source_chunk_id": getattr(edge, "source_chunk_id", None),
@@ -2179,6 +2212,7 @@ def edge_projection_protocol_hash() -> str:
     )
 
 
+@workspace_protocol_cache
 def edge_semantic_uncertainty_protocol_hash() -> str:
     return stable_hash(
         {
@@ -2190,6 +2224,7 @@ def edge_semantic_uncertainty_protocol_hash() -> str:
     )
 
 
+@workspace_protocol_cache
 def rq_boundary_protocol_hash() -> str:
     return stable_hash(
         {
@@ -3230,6 +3265,10 @@ def graph_state_protocol_identities(
             str(effective_envelope["gray_zone_rule_protocol_version"])
         )
     identities = {
+        "numeric_protocol": NUMERIC_PROTOCOL,
+        "numeric_storage_protocol": RQ_NUMERIC_STORAGE_PROTOCOL,
+        "node_signal_storage_protocol": NODE_SIGNAL_STORAGE_PROTOCOL,
+        "rq_index_protocol": RQ_INDEX_PROTOCOL_VERSION,
         "relation_protocol_version": RELATION_PROTOCOL_VERSION,
         "structure_mapping_protocol_version": STRUCTURE_MAPPING_PROTOCOL_VERSION,
         "rank_score_protocol_hash": relation_rank_score_protocol_hash(),
@@ -3569,6 +3608,7 @@ def context_graph_cache_key_components(
         "semantic_entry_query": semantic_entry["query"],
         "semantic_entry_query_hash": semantic_entry["packet_hash"],
         "filters": filter_payload,
+        "source_filter_protocol": "active_source_filters_v2",
         "embedding_text_version": CURRENT_EMBEDDING_TEXT_VERSION,
         "local_hint_protocol_version": LOCAL_CONTEXT_HINT_PROTOCOL_VERSION,
         "contextual_index_hash": (
@@ -4149,6 +4189,8 @@ def contextual_index_state_hashes(
     chunks: list[Chunk],
     *,
     vector_runtime_target: Any | None = None,
+    _prepared_chunk_references: Any | None = None,
+    _prepared_vector_records: Sequence[VectorRecord] | None = None,
 ) -> dict[str, str]:
     target = _vector_runtime_target_for_kb(
         db,
@@ -4157,7 +4199,9 @@ def contextual_index_state_hashes(
     )
     schema = target.schema
     chunk_ids = [str(chunk.id) for chunk in chunks]
-    chunk_refs = chunk_business_references(db, chunks)
+    chunk_refs = _prepared_chunk_references or chunk_business_references(db, chunks)
+    if set(chunk_refs.key_by_id) != set(chunk_ids):
+        raise ValueError("contextual_index_prepared_chunk_scope_changed")
     context_rows = {
         str(row.chunk_id): row
         for row in db.scalars(
@@ -4167,18 +4211,15 @@ def contextual_index_state_hashes(
             )
         ).all()
     }
-    vector_rows = {
-        str(row.chunk_id): row
-        for row in db.scalars(
-            select(VectorRecord).where(
-                VectorRecord.chunk_id.in_(chunk_ids),
-                VectorRecord.embedding_model == schema.embedding_model,
-                VectorRecord.embedding_dimension == schema.embedding_dimension,
-                VectorRecord.embedding_text_version == schema.embedding_text_version,
-                VectorRecord.chunk_schema_version == schema.chunk_schema_version,
-            )
-        ).all()
-    }
+    prepared_records = (_contextual_index_vector_rows(db, chunks=chunks, schema=schema)
+                        if _prepared_vector_records is None else _prepared_vector_records)
+    for row in prepared_records:
+        if (str(row.chunk_id) not in chunk_refs.key_by_id or row.embedding_model != schema.embedding_model
+            or row.embedding_dimension != schema.embedding_dimension
+            or row.embedding_text_version != schema.embedding_text_version
+            or row.chunk_schema_version != schema.chunk_schema_version):
+            raise ValueError("contextual_index_prepared_vector_scope_changed")
+    vector_rows = {str(row.chunk_id): row for row in prepared_records}
     cards: list[dict[str, Any]] = []
     business_cards: list[dict[str, Any]] = []
     for chunk_id in sorted(chunk_ids):
@@ -4722,6 +4763,7 @@ def write_chunks_and_structure(
         db.flush()
 
     nodes = write_structure_graph(db, knowledge_base=knowledge_base, document=document, version=version, prepared=prepared)
+    mapping_index = StructureMappingIndex(nodes)
     chunks: list[Chunk] = []
     for fixed in fixed_chunks:
         chunk = Chunk(
@@ -4808,7 +4850,7 @@ def write_chunks_and_structure(
                     confidence=max(0.0, min(1.0, float(coordinate.get("confidence") or 0.0))),
                 )
             )
-        write_structure_mappings_for_chunk(db, chunk=chunk, nodes=nodes)
+        write_structure_mappings_for_chunk(db, chunk=chunk, nodes=nodes, candidate_index=mapping_index)
     if write_version_descriptor:
         if chunk_state != "active":
             raise ValueError("only an active chunk scope may write ChunkVersion active state")
@@ -4825,6 +4867,7 @@ def write_chunks_and_structure(
     return chunks
 
 
+@measured("structure_graph")
 def write_structure_graph(
     db: Session,
     *,
@@ -4847,6 +4890,9 @@ def write_structure_graph(
         layout: dict[str, Any] | None = None,
         previous_sibling_id: str | None = None,
     ) -> ChunkStructureNode:
+        for field_name, field_value in (("title", title), ("path", path)):
+            if field_value is not None and "\x00" in field_value:
+                raise ValueError(f"structure_text_invalid_control:{field_name}")
         node = ChunkStructureNode(
             knowledge_base_id=knowledge_base.id,
             document_id=document.id,
@@ -5107,7 +5153,36 @@ def write_structure_graph(
     return nodes
 
 
-def write_structure_mappings_for_chunk(db: Session, *, chunk: Chunk, nodes: list[ChunkStructureNode]) -> None:
+class StructureMappingIndex:
+    """Exact address prefilter; the existing admission still verifies each hit."""
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.starts = np.asarray([node.char_start if node.char_start is not None else 0 for node in nodes], dtype=np.int64)
+        self.ends = np.asarray([node.char_end if node.char_end is not None else 0 for node in nodes], dtype=np.int64)
+        self.valid_spans = np.asarray([node.char_start is not None and node.char_end is not None for node in nodes], dtype=bool)
+        self.pages = defaultdict(list)
+        self.containers = []
+        self.sections = [node for node in nodes if node.node_type == "section"]
+        for i,node in enumerate(nodes):
+            if node.node_type == "document" or (node.node_type == "section" and not self.valid_spans[i]):
+                self.containers.append(i)
+            bbox = _native_bbox_payload(dict(node.bbox_json or {}),
+                coordinate_system=(node.layout_json or {}).get("coordinate_system"), page_number=node.page_number)
+            if bbox and bbox.get("page_number") is not None:
+                self.pages[(bbox["page_number"],bbox["coordinate_system"])].append(i)
+
+    def candidates(self, chunk, coordinates):
+        selected = set(np.flatnonzero(self.valid_spans & (self.starts < chunk.char_end) & (self.ends > chunk.char_start)).tolist())
+        selected.update(self.containers)
+        for coordinate in coordinates:
+            bbox = _native_bbox_payload(dict(coordinate.get("bbox") or {}),
+                coordinate_system=coordinate.get("coordinate_system"),page_number=coordinate.get("page_number"))
+            if bbox and bbox.get("page_number") is not None:
+                selected.update(self.pages.get((bbox["page_number"],bbox["coordinate_system"]), []))
+        return [self.nodes[i] for i in sorted(selected)]
+
+
+def write_structure_mappings_for_chunk(db: Session, *, chunk: Chunk, nodes: list[ChunkStructureNode], candidate_index: StructureMappingIndex | None = None) -> None:
     chunk_coordinates = _chunk_mapping_coordinates(db, chunk)
     chunk_layout_ids = sorted(
         {
@@ -5119,12 +5194,12 @@ def write_structure_mappings_for_chunk(db: Session, *, chunk: Chunk, nodes: list
     denominator = max(1, chunk.char_end - chunk.char_start)
     exact_section_candidate_ids = {
         str(node.id)
-        for node in nodes
+        for node in (candidate_index.sections if candidate_index else nodes)
         if node.node_type == "section"
         and _same_structure_mapping_scope(chunk, node)
         and _is_exact_canonical_section_path(chunk.section_path, node.path)
     }
-    for node in nodes:
+    for node in (candidate_index.candidates(chunk, chunk_coordinates) if candidate_index else nodes):
         span_available = node.char_start is not None and node.char_end is not None
         overlap = (
             max(
@@ -6017,6 +6092,8 @@ async def write_contextual_indexes(
         "credential_value_persisted": False,
     }
     if compensated_embedding_recovery_cards is not None:
+        if cold_build():
+            raise RuntimeError("Cold build cannot reuse compensated embedding results")
         vectors, embedding_recovery = _validated_compensated_embedding_vectors(
             knowledge_base=knowledge_base,
             index_inputs=index_inputs,
@@ -6453,6 +6530,16 @@ class ActiveContextGraphAdmissionError(RuntimeError):
         self.context_graph_hash = context_graph_hash
         self.expected_freshness_hashes = dict(expected_freshness_hashes or {})
         self.checked_at = checked_at
+
+
+def _contextual_index_vector_rows(db: Session, *, chunks: Sequence[Chunk], schema: Any) -> list[VectorRecord]:
+    """The original contextual-index domain, including malformed KB ownership."""
+    return list(db.scalars(select(VectorRecord).where(
+        VectorRecord.chunk_id.in_([str(chunk.id) for chunk in chunks]),
+        VectorRecord.embedding_model == schema.embedding_model,
+        VectorRecord.embedding_dimension == schema.embedding_dimension,
+        VectorRecord.embedding_text_version == schema.embedding_text_version,
+        VectorRecord.chunk_schema_version == schema.chunk_schema_version)).all())
 
 
 def _active_contextual_vector_records(
@@ -7525,7 +7612,10 @@ async def _rebuild_context_graph_locked(
     reuse_source_mid_state = provider_semantic_reuse_source_mid_state
     reuse_source_coarse_state = provider_semantic_reuse_source_coarse_state
     reuse_source_selection = "explicit"
-    if state_scope == "active":
+    if cold_build():
+        reuse_source_mid_state = reuse_source_coarse_state = None
+        reuse_source_selection = "cold_build"
+    elif state_scope == "active":
         if reuse_source_mid_state is None:
             reuse_source_mid_state = latest_mid_state(db, knowledge_base_id)
             reuse_source_selection = "latest_active"
@@ -7720,8 +7810,8 @@ def context_graph_batch_heartbeat(batch_id: str | None, phase: str, metrics: dic
             batch.stats = stats
             batch.heartbeat_at = now
             session.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        raise RuntimeError("Graph build progress audit write failed") from exc
     reserved_log_keys = {"batch_id", "event", "log_id", "message", "phase", "timestamp", "context_graph_phase"}
     log_payload = {key: value for key, value in metrics_payload.items() if key not in reserved_log_keys}
     log_payload["phase"] = f"context_graph:{phase}"
@@ -7735,6 +7825,20 @@ def context_graph_heartbeat_message(phase: str, metrics: dict[str, Any]) -> str:
         "chunk_relation": "片段关系图",
         "chunk_relation:chunk_edges": "关系边生成",
         "chunk_relation:rq_prefixes": "RQ 前缀与归属",
+        "chunk_relation:similarity": "精确向量相似度计算",
+        "chunk_relation:neighbor_order": "候选邻居排序",
+        "chunk_relation:candidate_thresholds": "候选阈值校验",
+        "chunk_relation:quota_signals": "候选配额计算",
+        "chunk_relation:candidate_edges": "候选关系边生成",
+        "chunk_relation:relation_persist": "关系边写入",
+        "chunk_relation:rq_training": "RQ 中心训练",
+        "chunk_relation:rq_encoding": "RQ 层级归属编码",
+        "chunk_relation:rq_support_index": "RQ 支撑边索引",
+        "chunk_relation:rq_pair_diagnostics": "RQ 关系支撑核验",
+        "chunk_relation:rq_projection": "RQ 支撑投影",
+        "chunk_relation:rq_integrity": "RQ 持久事实复核",
+        "chunk_relation:rq_pair_write": "RQ 诊断批写",
+        "chunk_relation:rq_membership_write": "RQ 归属批写",
         "mid_concepts": "中粒度概念",
         "coarse_concepts": "粗粒度概念",
         "context_state": "Context Graph 状态",
@@ -7768,6 +7872,7 @@ def auto_tpe_promotion_identity(
     return run_id, best_trial_id
 
 
+@graph_workspace_scope
 def build_chunk_relation_graph(
     db: Session,
     knowledge_base_id: str,
@@ -7810,20 +7915,20 @@ def build_chunk_relation_graph(
     contextual_index_business_hash = contextual_index_hash_payload[
         "business_hash"
     ]
-    vectors = {
-        chunk.id: vector_for_chunk(
-            db,
-            chunk.id,
-            vector_runtime_target=target,
-        )
-        for chunk in chunks
-    }
+    with runtime_settings_read_scope():
+        vectors = {
+            chunk.id: vector_for_chunk(db, chunk.id, vector_runtime_target=target)
+            for chunk in chunks
+        }
     missing_vector_chunk_ids = sorted(str(chunk_id) for chunk_id, vector in vectors.items() if not vector)
     if missing_vector_chunk_ids:
         raise RuntimeError(
             "Cannot build chunk relation graph with missing current contextual vectors: "
             f"{missing_vector_chunk_ids[:8]}"
         )
+    workspace = current_workspace()
+    if workspace is not None:
+        workspace.bind(chunks, vectors)
     tpe_context: dict[str, Any] = {}
     if operating_point is None:
         fallback_operating_point = previous_operating_point or dense_graph_operating_point()
@@ -7953,93 +8058,125 @@ def build_chunk_relation_graph(
     ensure_not_cancelled(db, batch_id)
     if emit_heartbeats:
         context_graph_batch_heartbeat(batch_id, "chunk_relation:rq_prefixes", {"chunk_edges": len(edges)})
-    rq_prefixes = build_rq_prefixes(db, graph_state, chunks, vectors, edges)
-    annotate_relation_edges_with_rq_boundaries(db, graph_state, edges)
-    ensure_not_cancelled(db, batch_id)
-    pair_diagnostics = dict(
-        (graph_state.diagnostics_json or {}).get("rq_prefix_pair_diagnostics")
-        or {}
-    )
-    rq_prefix_pair_diagnostics_hash = str(
-        pair_diagnostics.get("diagnostic_hash") or ""
-    )
-    if len(rq_prefix_pair_diagnostics_hash) != 64:
-        raise RuntimeError(
-            "Chunk relation state requires the canonical RQ prefix-pair diagnostic hash"
+    with measure("rq_complete"), runtime_settings_read_scope():
+        if workspace is not None:
+            workspace.best_candidate = None
+            workspace.last_candidate = None
+            from app.services.resource_guard import release_unused_memory
+            release_unused_memory()
+        rq_prefixes = build_rq_prefixes(db, graph_state, chunks, vectors, edges)
+        annotate_relation_edges_with_rq_boundaries(db, graph_state, edges)
+        ensure_not_cancelled(db, batch_id)
+        pair_diagnostics = dict(
+            (graph_state.diagnostics_json or {}).get("rq_prefix_pair_diagnostics")
+            or {}
         )
-    stats = {
-        **relation_graph_stats(chunks, list(edges.values()), rq_prefixes),
-        "rq_prefix_pair_diagnostic_count": int(
-            pair_diagnostics.get("diagnostic_count") or 0
-        ),
-        "rq_prefix_pair_diagnostic_count_by_type": dict(
-            pair_diagnostics.get("diagnostic_count_by_type") or {}
-        ),
-    }
-    graph_state.stats_json = stats
-    graph_state.diagnostics_json = {
-        **(graph_state.diagnostics_json or {}),
-        "orphan_chunk_rate": stats["orphan_chunk_rate"],
-        "singleton_rate": stats["singleton_rate"],
-        "bridge_edge_count": stats["bridge_edges"],
-        "protocol": RELATION_PROTOCOL_VERSION,
-    }
-    db.flush()
-    relation_hash_card = build_relation_state_hash_card(
-        db,
-        graph_state,
-        chunks,
-        protocol_identities=graph_state_protocol_identities(scope="relation"),
-        vector_identity=canonical_vector_identity_card(target),
-    )
-    rq_state_card = dict(relation_hash_card["rq_state_card"])
-    rq_pair_state_card = dict(relation_hash_card["rq_pair_state_card"])
-    rq_prefix_facts_hash = str(
-        (rq_state_card.get("component_hashes") or {}).get("prefix_facts")
-        or rq_state_card.get("prefix_facts_hash")
-        or ""
-    )
-    # The active protocol replaces the UUID-bearing legacy membership aggregate with the
-    # complete codebook/prefix/membership/role state identity.
-    rq_membership_hash = str(rq_state_card["state_hash"])
-    rq_membership_diagnostics = dict(
-        (graph_state.diagnostics_json or {}).get("rq_membership") or {}
-    )
-    rq_kmeans_diagnostics = dict(
-        (graph_state.diagnostics_json or {}).get("rq_kmeans") or {}
-    )
-    graph_state.diagnostics_json = {
-        **(graph_state.diagnostics_json or {}),
-        "rq_prefix_facts_hash": rq_prefix_facts_hash,
-        "rq_membership_hash": rq_membership_hash,
-        "rq_membership": {
-            **rq_membership_diagnostics,
-            "membership_hash": rq_membership_hash,
-            "canonical_state_hash_protocol_version": rq_state_card[
-                "protocol_version"
+        rq_prefix_pair_diagnostics_hash = str(
+            pair_diagnostics.get("diagnostic_hash") or ""
+        )
+        if len(rq_prefix_pair_diagnostics_hash) != 64:
+            raise RuntimeError(
+                "Chunk relation state requires the canonical RQ prefix-pair diagnostic hash"
+            )
+        stats = {
+            **relation_graph_stats(chunks, list(edges.values()), rq_prefixes),
+            "rq_prefix_pair_diagnostic_count": int(
+                pair_diagnostics.get("diagnostic_count") or 0
+            ),
+            "rq_prefix_pair_diagnostic_count_by_type": dict(
+                pair_diagnostics.get("diagnostic_count_by_type") or {}
+            ),
+        }
+        graph_state.stats_json = stats
+        graph_state.diagnostics_json = {
+            **(graph_state.diagnostics_json or {}),
+            "orphan_chunk_rate": stats["orphan_chunk_rate"],
+            "singleton_rate": stats["singleton_rate"],
+            "bridge_edge_count": stats["bridge_edges"],
+            "protocol": RELATION_PROTOCOL_VERSION,
+        }
+        from app.services.graph_state_hashes import freeze_constructed_row_json
+        build_memberships=getattr(graph_state,"_build_membership_rows",None)
+        for row in list(edges.values())+list(build_memberships or []):
+            freeze_constructed_row_json(row)
+        db.flush()
+        try:
+            relation_hash_card = build_relation_state_hash_card(
+                db,
+                graph_state,
+                chunks,
+                protocol_identities=graph_state_protocol_identities(scope="relation"),
+                vector_identity=canonical_vector_identity_card(target),
+                relation_edges_override=list(edges.values()),
+                memberships_override=build_memberships,
+                chunk_references=getattr(graph_state,"_build_chunk_references",None),
+                membership_reference_environment=getattr(graph_state,"_build_membership_references",None),
+            )
+        finally:
+            graph_state.__dict__.pop("_build_membership_rows",None)
+            graph_state.__dict__.pop("_build_chunk_references",None)
+            graph_state.__dict__.pop("_build_membership_references",None)
+        build_memberships=None
+        rq_state_card = dict(relation_hash_card["rq_state_card"])
+        rq_pair_state_card = dict(relation_hash_card["rq_pair_state_card"])
+        rq_prefix_facts_hash = str(
+            (rq_state_card.get("component_hashes") or {}).get("prefix_facts")
+            or rq_state_card.get("prefix_facts_hash")
+            or ""
+        )
+        # The active protocol replaces the UUID-bearing legacy membership aggregate with the
+        # complete codebook/prefix/membership/role state identity.
+        rq_membership_hash = str(rq_state_card["state_hash"])
+        rq_membership_diagnostics = dict(
+            (graph_state.diagnostics_json or {}).get("rq_membership") or {}
+        )
+        rq_kmeans_diagnostics = dict(
+            (graph_state.diagnostics_json or {}).get("rq_kmeans") or {}
+        )
+        graph_state.diagnostics_json = {
+            **(graph_state.diagnostics_json or {}),
+            "rq_prefix_facts_hash": rq_prefix_facts_hash,
+            "rq_membership_hash": rq_membership_hash,
+            "rq_membership": {
+                **rq_membership_diagnostics,
+                "membership_hash": rq_membership_hash,
+                "canonical_state_hash_protocol_version": rq_state_card[
+                    "protocol_version"
+                ],
+            },
+            "rq_kmeans": {
+                **rq_kmeans_diagnostics,
+                "membership_hash": rq_membership_hash,
+            },
+            "rq_prefix_pair_diagnostics_hash": rq_prefix_pair_diagnostics_hash,
+            "rq_prefix_pair_diagnostics_protocol_hash": (
+                rq_prefix_pair_diagnostic_protocol_hash()
+            ),
+            "rq_prefix_pair_aggregate_hash": rq_pair_state_card["state_hash"],
+            "canonical_state_hash_card": relation_hash_card,
+            "chunk_business_scope_hash": relation_hash_card[
+                "chunk_business_scope_hash"
             ],
-        },
-        "rq_kmeans": {
-            **rq_kmeans_diagnostics,
-            "membership_hash": rq_membership_hash,
-        },
-        "rq_prefix_pair_diagnostics_hash": rq_prefix_pair_diagnostics_hash,
-        "rq_prefix_pair_diagnostics_protocol_hash": (
-            rq_prefix_pair_diagnostic_protocol_hash()
-        ),
-        "rq_prefix_pair_aggregate_hash": rq_pair_state_card["state_hash"],
-        "canonical_state_hash_card": relation_hash_card,
-        "chunk_business_scope_hash": relation_hash_card[
-            "chunk_business_scope_hash"
-        ],
-    }
-    graph_state.state_hash = str(relation_hash_card["state_hash"])
-    for edge in edges.values():
-        edge.graph_state_hash = graph_state.state_hash
-    if promoted_tpe_run_id:
-        from app.services.auto_tpe import mark_auto_tpe_relation_state
+        }
+        graph_state.state_hash = str(relation_hash_card["state_hash"])
+        from sqlalchemy.orm.attributes import set_committed_value
+        edge_rows=list(edges.values())
+        for offset in range(0,len(edge_rows),256):
+            build_checkpoint("rq_state_binding",offset,len(edge_rows))
+            rows=edge_rows[offset:offset+256]
+            result=db.execute(ChunkRelationEdge.__table__.update().where(
+                ChunkRelationEdge.graph_state_id == graph_state.id,
+                ChunkRelationEdge.id.in_([row.id for row in rows]),
+            ).values(graph_state_hash=graph_state.state_hash))
+            if result.rowcount != len(rows):
+                raise RuntimeError("Relation state binding did not update its complete edge batch")
+            for row in rows:
+                set_committed_value(row,"graph_state_hash",graph_state.state_hash)
+        if promoted_tpe_run_id:
+            from app.services.auto_tpe import mark_auto_tpe_relation_state
 
-        mark_auto_tpe_relation_state(db, promoted_tpe_run_id, graph_state.id)
+            mark_auto_tpe_relation_state(db, promoted_tpe_run_id, graph_state.id)
+        db.flush()
     return graph_state
 
 
@@ -9275,17 +9412,18 @@ def relation_quota_node_signals(
         }
         return {}, empty_diagnostics
 
-    spans_by_chunk: dict[str, list[ChunkSpan]] = defaultdict(list)
-    for row in db.scalars(select(ChunkSpan).where(ChunkSpan.chunk_id.in_(chunk_ids))).all():
-        spans_by_chunk[str(row.chunk_id)].append(row)
-
-    coordinates_by_chunk: dict[str, list[ChunkCoordinate]] = defaultdict(list)
-    for row in db.scalars(select(ChunkCoordinate).where(ChunkCoordinate.chunk_id.in_(chunk_ids))).all():
-        coordinates_by_chunk[str(row.chunk_id)].append(row)
-
-    structure_summaries_by_chunk = _relation_quota_structure_summaries(
-        db,
-        chunk_ids,
+    def load_static_support():
+        spans = defaultdict(list)
+        for row in db.scalars(select(ChunkSpan).where(ChunkSpan.chunk_id.in_(chunk_ids))).all():
+            spans[str(row.chunk_id)].append(row)
+        coordinates = defaultdict(list)
+        for row in db.scalars(select(ChunkCoordinate).where(ChunkCoordinate.chunk_id.in_(chunk_ids))).all():
+            coordinates[str(row.chunk_id)].append(row)
+        return spans, coordinates, _relation_quota_structure_summaries(db, chunk_ids)
+    workspace = current_workspace()
+    spans_by_chunk, coordinates_by_chunk, structure_summaries_by_chunk = (
+        workspace.cached("static_support:"+stable_hash(sorted(chunk_ids)), load_static_support)
+        if workspace else load_static_support()
     )
 
     # A previous relation state's RQ memberships are historical diagnostics,
@@ -9326,6 +9464,7 @@ def relation_quota_node_signals(
             else []
         )
     }
+    rq_active_scopes = {key: {str(value) for value in (state.active_chunk_ids_json or [])} for key,state in rq_states_by_id.items()}
     for raw_chunk_id, raw_state_id in rq_membership_state_pairs:
         chunk_id = str(raw_chunk_id)
         state_id = str(raw_state_id)
@@ -9337,7 +9476,7 @@ def relation_quota_node_signals(
         if not compatible:
             rejected_rq_state_reasons[state_id].update(incompatibility_reasons)
             continue
-        active_scope = {str(value) for value in (state.active_chunk_ids_json or [])}
+        active_scope = rq_active_scopes[state_id]
         if chunk_id not in active_scope:
             rejected_rq_state_reasons[state_id].add("chunk_not_in_prior_active_scope")
             continue
@@ -9364,10 +9503,17 @@ def relation_quota_node_signals(
             return "dense_cross_document_bridge"
         return "dense_semantic"
 
+    workspace = current_workspace()
+    numeric_pressure = workspace.pressure(type_thresholds) if workspace and workspace.scores is not None else None
     inbound_pressure: Counter[str] = Counter()
     bridge_opportunity_by_chunk: dict[str, list[float]] = defaultdict(list)
     bridge_domain_available_by_chunk: dict[str, bool] = {chunk_id: False for chunk_id in chunk_ids}
-    for source in chunks:
+    if numeric_pressure is not None:
+        pressure, bridges, available, top4, bridge_counts = numeric_pressure
+        inbound_pressure.update({key: int(pressure[i]) for i, key in enumerate(workspace.ids)})
+        bridge_opportunity_by_chunk.update({key: [float(bridges[i])] if bridge_counts[i] else [] for i,key in enumerate(workspace.ids)})
+        bridge_domain_available_by_chunk.update({key: bool(available[i]) for i,key in enumerate(workspace.ids)})
+    for source in ([] if numeric_pressure is not None else chunks):
         for score, target in scored_by_source.get(str(source.id), []):
             edge_type = edge_type_for(source, target)
             threshold = float(type_thresholds[edge_type])
@@ -9385,66 +9531,81 @@ def relation_quota_node_signals(
     signals_by_id: dict[str, dict[str, Any]] = {}
     for chunk in sorted(chunks, key=lambda item: str(item.id)):
         chunk_id = str(chunk.id)
-        token_count = max(0, int(rough_token_count(chunk.text or "")))
-        token_sufficiency = max(0.0, min(1.0, math.log2(1.0 + token_count) / 8.0))
-        non_whitespace_chars = len(re.sub(r"\s+", "", chunk.text or ""))
-        character_sufficiency = max(0.0, min(1.0, non_whitespace_chars / 64.0))
-        chunk_quality = round(0.60 * token_sufficiency + 0.40 * character_sufficiency, 6)
+        def intrinsic_quality():
+            def intrinsic_text():
+                return max(0, int(rough_token_count(chunk.text or ""))), len(re.sub(r"\s+", "", chunk.text or ""))
+            token_count, non_whitespace_chars = (
+                workspace.cached("intrinsic_text:"+chunk_id+":"+str(chunk.text_hash), intrinsic_text)
+                if workspace else intrinsic_text()
+            )
+            token_sufficiency = max(0.0, min(1.0, math.log2(1.0 + token_count) / 8.0))
+            character_sufficiency = max(0.0, min(1.0, non_whitespace_chars / 64.0))
+            chunk_quality = round(0.60 * token_sufficiency + 0.40 * character_sufficiency, 6)
 
-        coordinates = coordinates_by_chunk.get(chunk_id, [])
-        coordinate_confidences = [max(0.0, min(1.0, float(row.confidence))) for row in coordinates]
-        vector = [float(value) for value in (vectors.get(chunk_id) or [])]
-        vector_integrity = 1.0 if vector and all(math.isfinite(value) for value in vector) and _vector_norm(vector) > 0.0 else 0.0
-        expected_text_hash = chunk_text_hash(chunk.text or "")
-        stored_text_hash = str(chunk.text_hash or "")
-        text_hash_status = (
-            "missing"
-            if not stored_text_hash
-            else "match"
-            if stored_text_hash == expected_text_hash
-            else "mismatch"
-        )
-        text_hash_integrity = float(text_hash_status == "match")
-        lifecycle_integrity = 0.5 * float(chunk.state == "active") + 0.5 * text_hash_integrity
-        node_quality = _availability_weighted_signal_card(
-            protocol_version=CHUNK_NODE_QUALITY_PROTOCOL_VERSION,
-            protocol_hash=chunk_node_quality_protocol_hash(),
-            component_weights=CHUNK_NODE_QUALITY_COMPONENT_WEIGHTS,
-            components={
-                "token_sufficiency": _quota_signal_component(
-                    token_sufficiency,
-                    available=True,
-                    reason="rough_token_count",
-                    diagnostics={"token_count": token_count},
-                ),
-                "parser_coordinate_confidence": _quota_signal_component(
-                    sum(coordinate_confidences) / len(coordinate_confidences) if coordinate_confidences else None,
-                    available=bool(coordinate_confidences),
-                    reason="chunk_coordinates_mean_confidence" if coordinate_confidences else "no_chunk_coordinates",
-                    diagnostics={"coordinate_count": len(coordinate_confidences)},
-                ),
-                "vector_integrity": _quota_signal_component(
-                    vector_integrity,
-                    available=True,
-                    reason="finite_nonzero_vector",
-                    diagnostics={"dimension": len(vector)},
-                ),
-                "lifecycle_integrity": _quota_signal_component(
-                    lifecycle_integrity,
-                    available=True,
-                    reason="active_state_and_exact_chunk_text_hash",
-                    diagnostics={
-                        "state": chunk.state,
-                        "state_is_active": chunk.state == "active",
-                        "chunk_text_hash_protocol_version": CHUNK_TEXT_HASH_PROTOCOL_VERSION,
-                        "stored_text_hash_present": bool(stored_text_hash),
-                        "stored_text_hash": stored_text_hash or None,
-                        "expected_text_hash": expected_text_hash,
-                        "text_hash_status": text_hash_status,
-                        "text_hash_matches": text_hash_status == "match",
-                    },
-                ),
-            },
+            coordinates = coordinates_by_chunk.get(chunk_id, [])
+            coordinate_confidences = [max(0.0, min(1.0, float(row.confidence))) for row in coordinates]
+            vector = [float(value) for value in (vectors.get(chunk_id) or [])]
+            vector_integrity = 1.0 if vector and all(math.isfinite(value) for value in vector) and _vector_norm(vector) > 0.0 else 0.0
+            expected_text_hash = chunk_text_hash(chunk.text or "")
+            stored_text_hash = str(chunk.text_hash or "")
+            text_hash_status = (
+                "missing"
+                if not stored_text_hash
+                else "match"
+                if stored_text_hash == expected_text_hash
+                else "mismatch"
+            )
+            text_hash_integrity = float(text_hash_status == "match")
+            lifecycle_integrity = 0.5 * float(chunk.state == "active") + 0.5 * text_hash_integrity
+            node_quality = _availability_weighted_signal_card(
+                protocol_version=CHUNK_NODE_QUALITY_PROTOCOL_VERSION,
+                protocol_hash=chunk_node_quality_protocol_hash(),
+                component_weights=CHUNK_NODE_QUALITY_COMPONENT_WEIGHTS,
+                components={
+                    "token_sufficiency": _quota_signal_component(
+                        token_sufficiency,
+                        available=True,
+                        reason="rough_token_count",
+                        diagnostics={"token_count": token_count},
+                    ),
+                    "parser_coordinate_confidence": _quota_signal_component(
+                        sum(coordinate_confidences) / len(coordinate_confidences) if coordinate_confidences else None,
+                        available=bool(coordinate_confidences),
+                        reason="chunk_coordinates_mean_confidence" if coordinate_confidences else "no_chunk_coordinates",
+                        diagnostics={"coordinate_count": len(coordinate_confidences)},
+                    ),
+                    "vector_integrity": _quota_signal_component(
+                        vector_integrity,
+                        available=True,
+                        reason="finite_nonzero_vector",
+                        diagnostics={"dimension": len(vector)},
+                    ),
+                    "lifecycle_integrity": _quota_signal_component(
+                        lifecycle_integrity,
+                        available=True,
+                        reason="active_state_and_exact_chunk_text_hash",
+                        diagnostics={
+                            "state": chunk.state,
+                            "state_is_active": chunk.state == "active",
+                            "chunk_text_hash_protocol_version": CHUNK_TEXT_HASH_PROTOCOL_VERSION,
+                            "stored_text_hash_present": bool(stored_text_hash),
+                            "stored_text_hash": stored_text_hash or None,
+                            "expected_text_hash": expected_text_hash,
+                            "text_hash_status": text_hash_status,
+                            "text_hash_matches": text_hash_status == "match",
+                        },
+                    ),
+                },
+            )
+
+            if workspace:
+                from app.services.graph_state_hashes import freeze_graph_input
+                node_quality = freeze_graph_input(node_quality)
+            return token_sufficiency, character_sufficiency, chunk_quality, coordinates, coordinate_confidences, node_quality
+
+        token_sufficiency, character_sufficiency, chunk_quality, coordinates, coordinate_confidences, node_quality = (
+            workspace.cached("intrinsic_quality:"+chunk_id, intrinsic_quality)
+            if workspace else intrinsic_quality()
         )
 
         chunk_spans = spans_by_chunk.get(chunk_id, [])
@@ -9489,10 +9650,13 @@ def relation_quota_node_signals(
             6,
         )
 
-        positive_cosines = sorted(
-            (max(0.0, min(1.0, float(score))) for score, _target in scored_by_source.get(chunk_id, []) if float(score) > 0.0),
-            reverse=True,
-        )[:4]
+        positive_cosines = (
+            top4[workspace.index[chunk_id]]
+            if numeric_pressure is not None else sorted(
+                (max(0.0, min(1.0, float(score))) for score, _target in scored_by_source.get(chunk_id, []) if float(score) > 0.0),
+                reverse=True,
+            )[:4]
+        )
         semantic_density_available = bool(scored_by_source.get(chunk_id))
         semantic_density = sum(positive_cosines) / len(positive_cosines) if positive_cosines else 0.0
 
@@ -9582,7 +9746,7 @@ def relation_quota_node_signals(
                     ),
                     diagnostics={
                         "current_bridge_opportunity": round(current_bridge_opportunity, 6),
-                        "opportunity_count": len(bridge_opportunities),
+                        "opportunity_count": int(bridge_counts[workspace.index[chunk_id]]) if numeric_pressure is not None else len(bridge_opportunities),
                         "historical_rq_role_used": False,
                     },
                 ),
@@ -9951,6 +10115,7 @@ def _upsert_relation_candidate(
     )
 
 
+@runtime_settings_read_scope()
 def relation_edge_candidates(
     db: Session,
     chunks: list[Chunk],
@@ -9958,12 +10123,13 @@ def relation_edge_candidates(
     operating_point: dict[str, Any],
 ) -> tuple[dict[tuple[str, str, str], RelationEdgeCandidate], dict[str, Any]]:
     relation_quota_signal_config(operating_point)
-    documents = {doc.id: doc for doc in db.scalars(select(Document).where(Document.id.in_({chunk.document_id for chunk in chunks}))).all()}
-    language_identities_by_chunk = load_chunk_language_identities(
-        db,
-        chunks,
-        documents=documents,
-    )
+    workspace = current_workspace()
+    def load_documents():
+        return {doc.id: doc for doc in db.scalars(select(Document).where(Document.id.in_({chunk.document_id for chunk in chunks}))).all()}
+    documents = workspace.cached("documents", load_documents) if workspace else load_documents()
+    def load_languages():
+        return load_chunk_language_identities(db, chunks, documents=documents)
+    language_identities_by_chunk = workspace.cached("languages", load_languages) if workspace else load_languages()
     strong_threshold = float(operating_point.get("dense_strong_cosine") or 0.72)
     type_thresholds = {
         "dense_semantic": float(operating_point.get("dense_min_cosine") or 0.30),
@@ -9990,8 +10156,14 @@ def relation_edge_candidates(
             return "dense_cross_document_bridge"
         return "dense_semantic"
 
-    scored_by_source: dict[str, list[tuple[float, Chunk]]] = {}
-    for source in chunks:
+    if workspace:
+        workspace.bind(chunks, vectors)
+        workspace.classify(documents, lambda key: language_for(chunk_by_id[key]))
+        workspace.refine_thresholds([*type_thresholds.values(), strong_threshold])
+        scored_by_source = workspace.rows()
+    else:
+        scored_by_source = {}
+    for source in ([] if workspace else chunks):
         source_vector = vectors.get(source.id) or []
         if not source_vector:
             scored_by_source[str(source.id)] = []
@@ -10020,12 +10192,23 @@ def relation_edge_candidates(
     )
     quota_signal_diagnostics["language_identity"] = language_identity_diagnostics
 
+    frozen_signal_cards = {}
+    def frozen_signal_card(card):
+        if current_workspace() is None:
+            return dict(card)
+        key=id(card)
+        if key not in frozen_signal_cards:
+            from app.services.graph_state_hashes import freeze_graph_input
+            frozen_signal_cards[key]=freeze_graph_input(card)
+        return frozen_signal_cards[key]
+
     def quota_card(min_key: str, max_key: str, signal: float, signal_role: str) -> dict[str, Any]:
         lower = int(operating_point[min_key]) if operating_point.get(min_key) is not None else 1
         upper = int(operating_point[max_key]) if operating_point.get(max_key) is not None else lower
         return relation_quota_card(lower=lower, upper=upper, signal=signal, signal_role=signal_role)
 
-    for source in chunks:
+    for source_index, source in enumerate(chunks):
+        build_checkpoint("candidate_edges", source_index, len(chunks))
         scored = scored_by_source.get(str(source.id), [])
         source_signals = quota_signals_by_id[str(source.id)]
         out_evidence_mass = float(source_signals["out_evidence_mass"]["value"])
@@ -10049,7 +10232,17 @@ def relation_edge_candidates(
                 "out_evidence_mass",
             ),
         }
-        channels = [
+        if isinstance(scored, ScoredRow):
+            row = scored.row
+            values = workspace.scores[row]
+            doc_mask, lang_mask = workspace.masks(row)
+            channels = [
+                ("base_dense_candidates", channel_quota_cards["base_dense_candidates"], scored.filtered(values >= type_thresholds["dense_semantic"])),
+                ("cross_document_candidates", channel_quota_cards["cross_document_candidates"], scored.filtered(doc_mask & (values >= type_thresholds["dense_cross_document_bridge"]))),
+                ("cross_language_candidates", channel_quota_cards["cross_language_candidates"], scored.filtered(lang_mask & (values >= type_thresholds["dense_cross_language_bridge"]))),
+            ]
+        else:
+            channels = [
             (
                 "base_dense_candidates",
                 channel_quota_cards["base_dense_candidates"],
@@ -10109,7 +10302,7 @@ def relation_edge_candidates(
             channel_stats["out_quota_sum"] += int(limit)
             previous_score: float | None = None
             competition_rank = 0
-            for ordinal, (score, target) in enumerate(channel_candidates, start=1):
+            for ordinal, (score, target) in enumerate(channel_candidates[:selected_count], start=1):
                 if previous_score is None or float(score) < previous_score:
                     competition_rank = ordinal
                 previous_score = float(score)
@@ -10313,10 +10506,10 @@ def relation_edge_candidates(
                 "candidate_channels": candidate_channels,
                 "source_out_evidence_mass": float(source_signals["out_evidence_mass"]["value"]),
                 "target_in_acceptance_capacity": float(target_signals["in_acceptance_capacity"]["value"]),
-                "source_out_signal_card": dict(source_signals["out_evidence_mass"]),
-                "target_in_acceptance_signal_card": dict(target_signals["in_acceptance_capacity"]),
-                "source_node_quality_card": dict(source_signals["node_quality"]),
-                "target_node_quality_card": dict(target_signals["node_quality"]),
+                "source_out_signal_card": frozen_signal_card(source_signals["out_evidence_mass"]),
+                "target_in_acceptance_signal_card": frozen_signal_card(target_signals["in_acceptance_capacity"]),
+                "source_node_quality_card": frozen_signal_card(source_signals["node_quality"]),
+                "target_node_quality_card": frozen_signal_card(target_signals["node_quality"]),
                 "source_out_quota_cards": dict(intent.get("source_out_quota_cards") or {}),
                 "target_inbound_quota_card": inbound_quota_card,
                 "quota_signal_scope_hash": quota_signal_diagnostics["signal_scope_hash"],
@@ -10422,6 +10615,8 @@ def relation_edge_candidates(
     return candidates, diagnostics
 
 
+@runtime_settings_read_scope()
+@measured("relation_persist")
 def add_relation_edges(
     db: Session,
     graph_state: ChunkRelationGraphState,
@@ -10430,8 +10625,24 @@ def add_relation_edges(
     edges: dict[tuple[str, str, str], ChunkRelationEdge],
 ) -> None:
     operating_point = dict(graph_state.graph_operating_point_json or dense_graph_operating_point())
-    candidates, diagnostics = relation_edge_candidates(db, chunks, vectors, operating_point)
-    for candidate in candidates.values():
+    workspace = current_workspace()
+    reused = workspace.best_candidate if workspace else None
+    if reused is not None and reused[1] == stable_hash(operating_point):
+        from app.services.auto_tpe import _candidate_adjacency_hash
+        workspace.bind(chunks, vectors)
+        if hashlib.sha256(np.asarray([vectors[chunk.id] for chunk in chunks], dtype=np.float64).tobytes()).hexdigest() != workspace.vector_digest:
+            raise RuntimeError("Selected graph candidate vector identity changed")
+        _score, _theta, candidates, diagnostics, expected_hash = reused
+        language_scope = str(((diagnostics.get("relation_quota_signals") or {}).get("language_identity") or {}).get("scope_hash") or "")
+        actual_scope = language_identity_scope_diagnostics(load_chunk_language_identities(db, chunks))["scope_hash"]
+        if actual_scope != language_scope or _candidate_adjacency_hash(candidates, theta_hash=_theta, language_identity_scope_hash=language_scope) != expected_hash:
+            raise RuntimeError("Selected graph candidate failed identity replay")
+        workspace.counts["selected_candidate_reuses"] += 1
+    else:
+        candidates, diagnostics = relation_edge_candidates(db, chunks, vectors, operating_point)
+    node_signal_pool = {}
+    for candidate_index,candidate in enumerate(candidates.values()):
+        build_checkpoint("relation_persist", len(edges), len(candidates))
         add_chunk_relation_edge(
             db,
             graph_state,
@@ -10439,14 +10650,17 @@ def add_relation_edges(
             candidate.target_chunk_id,
             candidate.edge_type,
             candidate.raw_strength,
-            candidate.features_json,
+            compact_signal_features(candidate.features_json,node_signal_pool),
             edges,
             calibrated_strength=candidate.calibrated_strength,
             is_bridge=candidate.is_bridge,
         )
+        if (candidate_index+1)%256 == 0:
+            db.flush()
     graph_state.diagnostics_json = {
         **(graph_state.diagnostics_json or {}),
         **diagnostics,
+        NODE_SIGNAL_POOL_KEY: pack_signal_pool(node_signal_pool),
     }
     db.flush()
 
@@ -10476,6 +10690,29 @@ def support_chunk_edge_ids_for_chunks(
         for edge in sorted(edges.values(), key=edge_order)
         if edge.id and (edge.source_chunk_id in chunk_set or edge.target_chunk_id in chunk_set)
     ]
+
+
+def support_chunk_edge_index(edges, *, chunk_business_keys, limit: int = 16):
+    """Sort once using exactly the existing support-order contract."""
+    def order(edge):
+        source = str(chunk_business_keys.get(str(edge.source_chunk_id)) or "")
+        target = str(chunk_business_keys.get(str(edge.target_chunk_id)) or "")
+        if not source or not target:
+            raise RuntimeError("RQ support-edge ordering requires complete chunk business keys")
+        left, right = sorted((source, target))
+        return left, right, str(edge.edge_type or "")
+    index = defaultdict(list)
+    for ordinal, edge in enumerate(sorted(edges.values(), key=order)):
+        build_checkpoint("rq_support_index", ordinal, len(edges))
+        if not edge.id:
+            continue
+        for chunk_id in {edge.source_chunk_id, edge.target_chunk_id}:
+            if len(index[chunk_id]) < limit:
+                index[chunk_id].append(edge.id)
+    if current_workspace():
+        current_workspace().counts["support_edge_sort_passes"] += 1
+        current_workspace().counts["support_edge_visits"] += len(edges)
+    return index
 
 
 def support_chunk_edge_ids_between(
@@ -10548,6 +10785,8 @@ def rq_prefix_community_groups(chunks: list[Chunk], edges: dict[tuple[str, str, 
     return labelled
 
 
+@measured("rq_materialization")
+@runtime_settings_read_scope()
 def build_rq_prefixes(
     db: Session,
     graph_state: ChunkRelationGraphState,
@@ -10607,7 +10846,7 @@ RQ_TAU_R = 0.65
 RQ_TAU_L = 0.35
 RQ_MEMBERSHIP_PROTOCOL_VERSION = RQ_MEMBERSHIP_PROTOCOL_DEFAULT
 RQ_PRIMARY_MEMBERSHIPS_PER_CHUNK = RQ_LEVELS
-RQ_INDEX_PROTOCOL_VERSION = "residual_quantized_kmeans_primary_v3"
+RQ_INDEX_PROTOCOL_VERSION = "residual_quantized_kmeans_primary_v5"
 RQ_ENCODING_BATCH_SIZE = 256
 RQ_MEMBERSHIP_ROLE_PROTOCOL_VERSION = "rq_membership_role_primary_entropy_boundary_v2"
 RQ_PREFIX_PAIR_DIAGNOSTIC_PROTOCOL_VERSION = "rq_prefix_pair_diagnostics_v1"
@@ -11047,17 +11286,24 @@ def rq_prefix_pair_persisted_integrity(
         for edge_id in (row.support_chunk_edge_ids_json or [])
         if edge_id
     }
-    support_edges = (
-        list(
-            db.scalars(
-                select(ChunkRelationEdge).where(
-                    ChunkRelationEdge.id.in_(sorted(all_support_edge_ids))
-                )
-            ).all()
-        )
-        if all_support_edge_ids
-        else []
-    )
+    # Replay persisted scalar facts without decoding every repeated feature card.
+    support_edges = []
+    if all_support_edge_ids:
+        query = select(
+            ChunkRelationEdge.id, ChunkRelationEdge.graph_state_id,
+            ChunkRelationEdge.source_chunk_id, ChunkRelationEdge.target_chunk_id,
+            ChunkRelationEdge.edge_type, ChunkRelationEdge.distance,
+            ChunkRelationEdge.weight, ChunkRelationEdge.raw_strength,
+            ChunkRelationEdge.features_json["calibrated_strength"].as_float().label("feature_strength"),
+            ChunkRelationEdge.raw_strength_summary_json["calibrated_strength"].as_float().label("summary_strength"),
+            ChunkRelationEdge.raw_strength_summary_json["max_raw_strength"].as_float().label("summary_raw"),
+        ).where(ChunkRelationEdge.id.in_(sorted(all_support_edge_ids))).execution_options(yield_per=256)
+        for row in db.execute(query):
+            build_checkpoint("rq_integrity", len(support_edges), len(all_support_edge_ids))
+            values = dict(row._mapping)
+            values["features_json"] = {"calibrated_strength": values.pop("feature_strength")}
+            values["raw_strength_summary_json"] = {"calibrated_strength": values.pop("summary_strength"), "max_raw_strength": values.pop("summary_raw")}
+            support_edges.append(SimpleNamespace(**values))
     support_edge_by_id = {str(edge.id): edge for edge in support_edges}
     support_edge_chunk_ids = {
         str(chunk_id)
@@ -11284,6 +11530,7 @@ def build_rq_prefix_pair_diagnostics(
     edges: dict[tuple[str, str, str], ChunkRelationEdge],
 ) -> list[RQPrefixPairDiagnostic]:
     """Build deterministic address diagnostics without creating traversal edges."""
+    build_checkpoint("rq_pair_diagnostics", 0, len(rq_prefixes_by_key))
 
     prefixes = sorted(
         rq_prefixes_by_key.values(),
@@ -11318,6 +11565,23 @@ def build_rq_prefix_pair_diagnostics(
                 str(prefix_by_id[str(row.rq_prefix_id)].rq_prefix_key),
             )
         )
+
+    # Index shared membership once. A valid primary chain has at most one
+    # prefix per chunk and level, hence no same-level overlap; the general
+    # index also preserves exact diagnostics for audited overlapping input.
+    shared_by_pair: dict[tuple[str,str],set[str]] = defaultdict(set)
+    for (chunk_id,_level),rows in memberships_by_chunk_level.items():
+        for index,left_row in enumerate(rows):
+            for right_row in rows[index+1:]:
+                left,right=_rq_symmetric_pair(prefix_by_id[str(left_row.rq_prefix_id)],prefix_by_id[str(right_row.rq_prefix_id)])
+                shared_by_pair[(str(left.id),str(right.id))].add(chunk_id)
+    overlap_by_pair = {}
+    for key,chunk_ids in shared_by_pair.items():
+        ordered=sorted(chunk_ids)
+        overlap_by_pair[key]={"shared_chunk_ids":ordered,"overlap_mass":sum(min(membership_by_prefix[key[0]][chunk_id],membership_by_prefix[key[1]][chunk_id]) for chunk_id in ordered)}
+    if current_workspace():
+        current_workspace().counts["rq_prefix_count"] = len(prefixes)
+        current_workspace().counts["rq_overlap_index_visits"] += len(membership_rows)
 
     referenced_chunk_ids = {
         str(row.chunk_id) for row in membership_rows if row.chunk_id
@@ -11507,6 +11771,7 @@ def build_rq_prefix_pair_diagnostics(
         distance_by_pair: dict[tuple[str, str], float] = {}
         positive_distances: list[float] = []
         for left_index, left in enumerate(level_prefixes):
+            build_checkpoint("rq_prefix_distances",left_index,len(level_prefixes))
             for right in level_prefixes[left_index + 1 :]:
                 source, target = _rq_symmetric_pair(left, right)
                 distance = _rq_prefix_centroid_distance(source, target)
@@ -11542,10 +11807,7 @@ def build_rq_prefix_pair_diagnostics(
                 pair_key = (str(source.id), str(target.id))
                 distance = distance_by_pair[pair_key]
                 centroid_strength = math.exp(-distance / level_tau)
-                overlap = _rq_prefix_pair_overlap(
-                    membership_by_prefix[str(source.id)],
-                    membership_by_prefix[str(target.id)],
-                )
+                overlap = overlap_by_pair.get(pair_key,{"shared_chunk_ids":[],"overlap_mass":0.0})
                 same_parent = (
                     str(source.parent_rq_prefix_id or "rq:root")
                     == str(target.parent_rq_prefix_id or "rq:root")
@@ -11593,7 +11855,8 @@ def build_rq_prefix_pair_diagnostics(
             str(edge.id),
         ),
     )
-    for edge in unique_edges:
+    for edge_index, edge in enumerate(unique_edges):
+        build_checkpoint("rq_projection", edge_index, len(unique_edges))
         edge_strength = float(_edge_calibrated_strength(edge))
         edge_fact = _rq_pair_bottom_edge_fact(edge, chunk_business_key_by_id)
         bottom_edge_business_key_by_id[str(edge.id)] = stable_hash(edge_fact)
@@ -11780,8 +12043,10 @@ def build_rq_prefix_pair_diagnostics(
             )
             for payload in ordered_payloads
         ]
-        db.add_all(rows)
-        db.flush()
+        for offset in range(0,len(rows),256):
+            build_checkpoint("rq_pair_write", offset, len(rows))
+            db.add_all(rows[offset:offset+256])
+            db.flush()
 
     type_counts = Counter(str(row.edge_type) for row in rows)
     graph_state.diagnostics_json = {
@@ -11871,6 +12136,11 @@ def build_rq_kmeans_clusters_and_edges(
     )
     for chunk, _vector in normalized_items:
         encoded = assignments[chunk.id]
+        from app.services.graph_state_hashes import freeze_graph_input
+        encoded["residual_vector"]=freeze_graph_input(encoded["residual_vector"])
+        encoded["reconstructed_vector"]=freeze_graph_input(encoded["reconstructed_vector"])
+        encoded["residual_storage"]=freeze_graph_input(pack_rq_vector(encoded["residual_vector"]))
+        encoded["reconstructed_storage"]=freeze_graph_input(pack_rq_vector(encoded["reconstructed_vector"]))
         chunk.rq_path = encoded["rq_path"]
         chunk.rq_residual_norm = float(encoded["residual_norm"])
 
@@ -12051,14 +12321,7 @@ def build_rq_kmeans_clusters_and_edges(
             rq_prefixes_by_key[key] = cluster
 
     rq_chunk_business_keys = chunk_business_references(db, chunks).key_by_id
-    edge_support_by_chunk = {
-        chunk_id: support_chunk_edge_ids_for_chunks(
-            {chunk_id},
-            edges,
-            chunk_business_keys=rq_chunk_business_keys,
-        )[:16]
-        for chunk_id in assignments
-    }
+    edge_support_by_chunk = support_chunk_edge_index(edges, chunk_business_keys=rq_chunk_business_keys)
     membership_rows: list[RQPrefixMembership] = []
     canonical_membership_facts: list[dict[str, Any]] = []
     for (level, prefix), member_entries in sorted(
@@ -12127,8 +12390,9 @@ def build_rq_kmeans_clusters_and_edges(
                     rank=int(membership["rank"]),
                     support_chunk_edge_ids_json=edge_support_by_chunk[chunk_id],
                     diagnostics_json={
-                        "residual_vector": encoded["residual_vector"],
-                        "reconstructed_vector": encoded["reconstructed_vector"],
+                        "residual_vector": encoded["residual_storage"],
+                        "reconstructed_vector": encoded["reconstructed_storage"],
+                        "numeric_storage_protocol": RQ_NUMERIC_STORAGE_PROTOCOL,
                         "primary_rq_path": encoded["rq_path"],
                         "rq_level": level,
                         "rq_path_prefix": list(prefix),
@@ -12161,8 +12425,18 @@ def build_rq_kmeans_clusters_and_edges(
                     },
                 )
             )
-    db.add_all(membership_rows)
-    db.flush()
+    from app.services.graph_state_hashes import prepare_membership_fact_for_insert
+    build_refs=chunk_business_references(db,chunks)
+    build_prefix_keys={str(prefix.id):str(prefix.rq_prefix_key) for prefix in rq_prefixes_by_key.values()}
+    build_edge_keys=relation_edge_business_keys(list(edges.values()),build_refs.key_by_id)
+    for row in membership_rows:
+        prepare_membership_fact_for_insert(row,chunk_keys=build_refs.key_by_id,prefix_keys=build_prefix_keys,edge_keys=build_edge_keys)
+    graph_state._build_chunk_references=build_refs
+    graph_state._build_membership_references=(build_refs.key_by_id,build_prefix_keys,build_edge_keys)
+    for offset in range(0,len(membership_rows),256):
+        build_checkpoint("rq_membership_write", offset, len(membership_rows))
+        db.add_all(membership_rows[offset:offset+256])
+        db.flush()
 
     build_rq_prefix_pair_diagnostics(
         db,
@@ -12366,7 +12640,7 @@ def build_rq_kmeans_clusters_and_edges(
             "residual_outlier_threshold": residual_outlier_threshold,
             "path_availability": round(len(assignments) / max(len(chunks), 1), 6),
             "hard_parent_tree": True,
-            "membership_write_batch_count": 1 if membership_rows else 0,
+            "membership_write_batch_count": (len(membership_rows)+255)//256,
             "primary_membership": primary_membership_card,
             "renormalized_after_primary_selection": False,
             "artificial_membership_floor": False,
@@ -12375,9 +12649,11 @@ def build_rq_kmeans_clusters_and_edges(
             "rq_pair_diagnostics_only": True,
         },
     }
+    graph_state._build_membership_rows=membership_rows
     db.flush()
 
 
+@runtime_settings_read_scope()
 def annotate_relation_edges_with_rq_boundaries(
     db: Session,
     graph_state: ChunkRelationGraphState,
@@ -12389,8 +12665,10 @@ def annotate_relation_edges_with_rq_boundaries(
     if not edge_rows:
         return
     memberships = list(
-        db.scalars(
-            select(RQPrefixMembership)
+        db.execute(
+            select(RQPrefixMembership.chunk_id, RQPrefixMembership.rq_path,
+                   RQPrefixMembership.rank, RQPrefixMembership.membership_score,
+                   RQPrefixMembership.rq_prefix_id)
             .join(RQPrefix, RQPrefix.id == RQPrefixMembership.rq_prefix_id)
             .where(RQPrefix.graph_state_id == graph_state.id)
         ).all()
@@ -12421,11 +12699,13 @@ def annotate_relation_edges_with_rq_boundaries(
             )
         return path
 
+    primary_paths={chunk_id:primary_path(chunk_id) for chunk_id in rows_by_chunk}
     boundary_count = 0
     uncertain_count = 0
-    for edge in edge_rows:
-        source_path = primary_path(edge.source_chunk_id)
-        target_path = primary_path(edge.target_chunk_id)
+    for edge_index,edge in enumerate(edge_rows):
+        build_checkpoint("rq_boundary_annotation",edge_index,len(edge_rows))
+        source_path = primary_paths.get(edge.source_chunk_id) or primary_path(edge.source_chunk_id)
+        target_path = primary_paths.get(edge.target_chunk_id) or primary_path(edge.target_chunk_id)
         common_prefix_length = 0
         for source_code, target_code in zip(source_path, target_path):
             if source_code != target_code:
@@ -12470,8 +12750,12 @@ def annotate_relation_edges_with_rq_boundaries(
             "crossing_rq_boundary": crossing_rq_boundary,
             "rq_boundary": boundary_audit,
         }
+        from app.services.graph_state_hashes import freeze_constructed_row_json
+        freeze_constructed_row_json(edge)
         uncertain_count += int(bool(features["semantic_uncertain"]))
         boundary_count += int(crossing_rq_boundary)
+        if (edge_index+1)%256 == 0:
+            db.flush()
     graph_state.diagnostics_json = {
         **(graph_state.diagnostics_json or {}),
         "gray_predicates": {
@@ -12497,6 +12781,17 @@ def train_rq_kmeans(
     tau_l: float | None = None,
     membership_protocol: str | None = None,
 ) -> dict[str, Any]:
+    workspace = current_workspace()
+    # Training initialization sorts its input at each level; row permutations
+    # therefore share a codebook, but different vectors/configurations cannot.
+    training_key = stable_hash({
+        "vectors": sorted(hashlib.sha256(np.asarray(vector, dtype=np.float64).tobytes()).hexdigest() for vector in vectors),
+        "levels": levels, "max_k": max_k, "tau_r": tau_r, "tau_l": tau_l,
+        "membership_protocol": membership_protocol, "numeric": NUMERIC_PROTOCOL,
+    })
+    if workspace and training_key in workspace.cache:
+        workspace.counts["rq_training_reuses"] += 1
+        return deepcopy(workspace.cache[training_key])
     residuals = [list(vector) for vector in vectors]
     codebooks: list[list[list[float]]] = []
     for level in range(levels):
@@ -12507,12 +12802,10 @@ def train_rq_kmeans(
         if not codebook:
             break
         codebooks.append(codebook)
-        next_residuals: list[list[float]] = []
-        for residual in residuals:
-            index, center = nearest_code(residual, codebook)
-            _ = index
-            next_residuals.append(_vector_sub(residual, center))
-        residuals = next_residuals
+        residual_matrix = np.asarray(residuals, dtype=np.float64)
+        centers = np.asarray(codebook, dtype=np.float64)
+        selected = np.argmin(numeric_distances(residual_matrix, centers), axis=1)
+        residuals = (residual_matrix - centers[selected]).tolist()
     resolved_tau_r = float(tau_r if tau_r is not None else rq_tau())
     resolved_tau_l = float(tau_l if tau_l is not None else RQ_TAU_L)
     resolved_membership_protocol = str(
@@ -12540,7 +12833,7 @@ def train_rq_kmeans(
             ],
         }
     )
-    return {
+    result = {
         "levels": len(codebooks),
         "max_k": max_k,
         "codebooks": codebooks,
@@ -12555,27 +12848,45 @@ def train_rq_kmeans(
         "membership_protocol_hash": rq_membership_protocol_hash(protocol_config),
         "codebook_hash": codebook_hash,
         "index_protocol": RQ_INDEX_PROTOCOL_VERSION,
+        "numeric_protocol": NUMERIC_PROTOCOL,
+        "numeric_storage_protocol": RQ_NUMERIC_STORAGE_PROTOCOL,
     }
+    if workspace:
+        workspace.cache[training_key] = deepcopy(result)
+        workspace.counts["rq_trainings"] += 1
+    return result
 
 
 def train_kmeans_codebook(vectors: list[list[float]], *, k: int, iterations: int) -> list[list[float]]:
     if not vectors:
         return []
-    ordered = sorted(vectors, key=lambda vector: stable_hash([round(value, 6) for value in vector]))
+    if current_workspace() and len({len(vector) for vector in vectors}) == 1:
+        from app.services.graph_build_workspace import exact_decimal_round
+        hashes=[]
+        for offset in range(0,len(vectors),128):
+            build_checkpoint("rq_initialization",offset,len(vectors))
+            hashes.extend(stable_hash(vector) for vector in exact_decimal_round(np.asarray(vectors[offset:offset+128],dtype=np.float64),6).tolist())
+        ordered=[vectors[index] for index in sorted(range(len(vectors)),key=lambda index:hashes[index])]
+    else:
+        ordered = sorted(vectors, key=lambda vector: stable_hash([round(value, 6) for value in vector]))
+    if current_workspace():
+        current_workspace().counts["rq_codebook_sort_passes"] += 1
+        current_workspace().counts["rq_max_centers"] = max(current_workspace().counts["rq_max_centers"],k)
     if k <= 1:
         return [_centroid(ordered)]
     step = max(1, len(ordered) // k)
-    centers = [ordered[min(index * step, len(ordered) - 1)] for index in range(k)]
+    matrix = np.asarray(ordered, dtype=np.float64)
+    centers = np.asarray([ordered[min(index * step, len(ordered) - 1)] for index in range(k)], dtype=np.float64)
     for _iteration in range(iterations):
-        groups: list[list[list[float]]] = [[] for _ in centers]
-        for vector in ordered:
-            index, _center = nearest_code(vector, centers)
-            groups[index].append(vector)
-        next_centers = [(_centroid(group) if group else centers[index]) for index, group in enumerate(groups)]
-        if all(_sq_distance(left, right) < 1e-12 for left, right in zip(centers, next_centers)):
+        if current_workspace():
+            current_workspace().counts["rq_iterations"] += 1
+        build_checkpoint("rq_training", _iteration, iterations)
+        assignments = np.argmin(numeric_distances(matrix, centers), axis=1)
+        next_centers = np.asarray([matrix[assignments == index].mean(axis=0) if np.any(assignments == index) else center for index,center in enumerate(centers)])
+        if np.all(np.einsum("ij,ij->i", centers-next_centers, centers-next_centers) < 1e-12):
             break
         centers = next_centers
-    return centers
+    return centers.tolist()
 
 
 def rq_soft_assignment(distances: list[float], *, temperature: float) -> list[float]:
@@ -12717,7 +13028,16 @@ def primary_rq_prefix_memberships(
     audit["audit_hash"] = stable_hash(audit)
     return memberships, audit
 
-def encode_rq_vector(vector: list[float], rq_model: dict[str, Any] | None) -> dict[str, Any]:
+def _prepared_rq_centers(rq_model,codebooks,width):
+    workspace=current_workspace()
+    def prepare():
+        fitted=[[_fit_width([float(value) for value in center],width) for center in codebook] for codebook in codebooks]
+        return [(values,np.asarray(values,dtype=np.float64)) for values in fitted]
+    return (workspace.cached("rq_encoder_centers:"+str(rq_model["codebook_hash"])+":"+str(width),prepare)
+        if workspace and rq_model and rq_model.get("codebook_hash") else prepare())
+
+
+def encode_rq_vector(vector: list[float], rq_model: dict[str, Any] | None, *, _precomputed=None) -> dict[str, Any]:
     codebooks = list((rq_model or {}).get("codebooks") or [])
     width = int((rq_model or {}).get("embedding_dimensions") or len(vector))
     tau_r = float((rq_model or {}).get("tau_r") or rq_tau())
@@ -12734,15 +13054,15 @@ def encode_rq_vector(vector: list[float], rq_model: dict[str, Any] | None) -> di
     reconstructed = [0.0 for _ in range(width)]
     path: list[int] = []
     level_assignments: list[dict[str, Any]] = []
+    prepared_centers = _prepared_rq_centers(rq_model,codebooks,width)
     for level, codebook in enumerate(codebooks, start=1):
-        fitted_codebook = [_fit_width([float(value) for value in center], width) for center in codebook]
+        fitted_codebook, center_matrix = prepared_centers[level-1]
         if not fitted_codebook:
             continue
-        index, center = nearest_code(residual, fitted_codebook)
-        distances = [
-            _vector_norm(_vector_sub(residual, candidate_center))
-            for candidate_center in fitted_codebook
-        ]
+        squared = (_precomputed[0][level-1] if _precomputed is not None else numeric_distances(np.asarray([residual], dtype=np.float64), center_matrix)[0])
+        index = int(np.argmin(squared))
+        center = fitted_codebook[index]
+        distances = np.sqrt(squared).tolist()
         probabilities = rq_soft_assignment(distances, temperature=tau_l)
         ordered_indices = sorted(
             range(len(fitted_codebook)),
@@ -12798,8 +13118,11 @@ def encode_rq_vector(vector: list[float], rq_model: dict[str, Any] | None) -> di
                 "full_probability_mass": float(sum(probabilities)),
             }
         )
-        reconstructed = _vector_add(reconstructed, center)
-        residual = _vector_sub(residual, center)
+        if _precomputed is None:
+            reconstructed = _vector_add(reconstructed, center)
+            residual = _vector_sub(residual, center)
+    if _precomputed is not None:
+        residual,reconstructed=_precomputed[1],_precomputed[2]
     residual_norm = _vector_norm(residual)
     gamma = rq_membership_score(residual_norm, tau_r=tau_r)
     prefix_memberships, primary_membership_audit = (
@@ -12832,7 +13155,7 @@ def encode_rq_vector(vector: list[float], rq_model: dict[str, Any] | None) -> di
             "protocol_version": membership_protocol,
             "protocol_hash": membership_protocol_hash,
             "codebook_hash": (rq_model or {}).get("codebook_hash"),
-            "input_vector_hash": stable_hash([round(float(value), 12) for value in _fit_width(vector, width)]),
+            "input_vector_hash": (_precomputed[3] if _precomputed is not None else stable_hash([round(float(value), 12) for value in _fit_width(vector, width)])),
             "primary_path": path,
             "residual_norm": round(residual_norm, 15),
             "gamma": round(gamma, 15),
@@ -12875,13 +13198,49 @@ def encode_rq_vectors_batch(
     )
     if len({chunk_id for chunk_id, _vector in ordered_items}) != len(ordered_items):
         raise ValueError("RQ encoding batch contains duplicate chunk ids")
+    workspace = current_workspace()
+    encoding_key = stable_hash({"model": rq_model, "vectors": [(key, hashlib.sha256(np.asarray(vector, dtype=np.float64).tobytes()).hexdigest()) for key,vector in ordered_items]})
+    if workspace and encoding_key in workspace.cache:
+        workspace.counts["rq_encoding_reuses"] += 1
+        return deepcopy(workspace.cache[encoding_key])
     encoded: dict[str, dict[str, Any]] = {}
     batch_count = 0
     for offset in range(0, len(ordered_items), batch_size):
+        build_checkpoint("rq_encoding", offset, len(ordered_items))
         batch_count += 1
-        for chunk_id, vector in ordered_items[offset : offset + batch_size]:
-            encoded[chunk_id] = encode_rq_vector(vector, rq_model)
-    return encoded, batch_count
+        items=ordered_items[offset : offset + batch_size]
+        prepared=None
+        codebooks=list((rq_model or {}).get("codebooks") or [])
+        width=int((rq_model or {}).get("embedding_dimensions") or 0)
+        if workspace and codebooks and width>0:
+            from app.services.graph_build_workspace import exact_decimal_round
+            residual=np.asarray([_fit_width(vector,width) for _key,vector in items],dtype=np.float64)
+            input_hashes=[stable_hash(vector) for vector in exact_decimal_round(residual,12).tolist()]
+            reconstructed=np.zeros_like(residual)
+            distances=[]
+            for fitted,centers in _prepared_rq_centers(rq_model,codebooks,width):
+                if not fitted:
+                    distances.append(None)
+                    continue
+                squared=numeric_distances(residual,centers)
+                distances.append(squared)
+                selected=centers[np.argmin(squared,axis=1)]
+                residual=residual-selected
+                reconstructed=reconstructed+selected
+            prepared=distances,residual.tolist(),reconstructed.tolist(),input_hashes
+        for row,(chunk_id,vector) in enumerate(items):
+            precomputed=([matrix[row] if matrix is not None else None for matrix in prepared[0]],prepared[1][row],prepared[2][row],prepared[3][row]) if prepared is not None else None
+            result=encode_rq_vector(vector,rq_model,_precomputed=precomputed)
+            if workspace:
+                from app.services.graph_state_hashes import freeze_graph_input
+                result["residual_vector"]=freeze_graph_input(result["residual_vector"])
+                result["reconstructed_vector"]=freeze_graph_input(result["reconstructed_vector"])
+            encoded[chunk_id]=result
+    result = encoded, batch_count
+    if workspace:
+        workspace.cache[encoding_key] = deepcopy(result)
+        workspace.counts["rq_encodings"] += 1
+    return result
 
 
 def rq_prefix_vector(rq_model: dict[str, Any], prefix: list[int]) -> list[float]:
@@ -13027,7 +13386,7 @@ def rq_candidate_score(query_rq: dict[str, Any], membership: RQPrefixMembership)
     candidate_path = [int(value) for value in (membership.rq_path or [])]
     query_path = [int(value) for value in (query_rq.get("rq_path") or [])]
     levels = max(len(query_path), len(candidate_path), 1)
-    candidate_residual = (membership.diagnostics_json or {}).get("residual_vector") or []
+    candidate_residual = read_rq_vector((membership.diagnostics_json or {}).get("residual_vector"))
     query_residual = query_rq.get("residual_vector") or []
     distance = _vector_norm(_vector_sub(_fit_width(query_residual, max(len(query_residual), len(candidate_residual))), _fit_width(candidate_residual, max(len(query_residual), len(candidate_residual)))))
     lcp = lcp_depth(query_path, candidate_path)
@@ -13452,6 +13811,21 @@ def _rq_membership_is_primary(
     )
 
 
+def _membership_summary_select(db):
+    """Read-only DTOs for concept projection; numeric vectors stay in storage.
+
+    RQ retrieval and canonical membership hashing still load the complete row.
+    Only concept consumers which never use residual/reconstruction vectors use
+    this projection, and it cannot overwrite an ORM identity-map instance.
+    """
+    diagnostic = RQPrefixMembership.diagnostics_json
+    if db.get_bind().dialect.name == "postgresql":
+        summary = diagnostic.cast(JSONB).op("-")("residual_vector").op("-")("reconstructed_vector")
+    else:
+        summary = type_coerce(func.json_remove(diagnostic, "$.residual_vector", "$.reconstructed_vector"), JSON)
+    return select(*[column for column in RQPrefixMembership.__table__.c if column.name != "diagnostics_json"], summary.label("diagnostics_json"))
+
+
 def select_mid_concept_eligible_prefixes(
     db: Session,
     prefixes: Sequence[RQPrefix],
@@ -13468,8 +13842,8 @@ def select_mid_concept_eligible_prefixes(
     prefix_ids = [str(prefix.id) for prefix in ordered_prefixes]
     membership_rows = (
         list(
-            db.scalars(
-                select(RQPrefixMembership).where(
+            db.execute(
+            _membership_summary_select(db).where(
                     RQPrefixMembership.rq_prefix_id.in_(prefix_ids),
                     RQPrefixMembership.membership_score > 0.0,
                 )
@@ -13700,6 +14074,7 @@ def select_coarse_concept_eligible_prefixes(
     return [prefix_by_id[prefix_id] for prefix_id in selected_ids], audit
 
 
+@measured("mid_concepts")
 async def build_mid_concept_graph(
     db: Session,
     knowledge_base_id: str,
@@ -13959,6 +14334,13 @@ async def build_mid_concept_graph(
             )
         del batch_results
         live_window.clear()
+    if packet_build_context is not None:
+        # Every packet has completed its full persisted membership replay.
+        # Projection and the final Mid hash need chunk/edge/prefix indexes,
+        # but not these duplicate residual/reconstruction vector objects.
+        packet_build_context.membership_rows_by_prefix.clear()
+    from app.services.resource_guard import release_unused_memory
+    release_unused_memory()
     active_chunk_count = len(
         {str(value) for value in (relation_state.active_chunk_ids_json or [])}
     )
@@ -15848,7 +16230,7 @@ def prepare_concept_packet_build_context(
     prefix_ids = {str(cluster.id) for cluster in clusters}
     membership_rows = list(
         db.scalars(
-            select(RQPrefixMembership).where(
+                select(RQPrefixMembership).where(
                 RQPrefixMembership.rq_prefix_id.in_(sorted(prefix_ids)),
                 RQPrefixMembership.membership_score > 0.0,
             )
@@ -15881,6 +16263,13 @@ def prepare_concept_packet_build_context(
     referenced_chunk_ids.update(
         str(row.chunk_id) for row in membership_rows if row.chunk_id
     )
+    relation_state = db.get(ChunkRelationGraphState, graph_state_id)
+    if relation_state is None:
+        raise RuntimeError("Concept packet snapshot relation state is missing")
+    # Eligibility and bottom edges need not cover isolated/noise chunks. The
+    # final state hash still binds every input chunk in the frozen relation
+    # scope, so its context cannot be inferred from eligible packet support.
+    referenced_chunk_ids.update(str(value) for value in (relation_state.active_chunk_ids_json or []))
     for cluster in clusters:
         referenced_chunk_ids.update(
             str(value)
@@ -19081,8 +19470,8 @@ def build_mid_concept_edges(db: Session, state: MidConceptState, concepts: list[
     if set(prefix_by_id) != prefix_ids:
         raise RuntimeError("Mid projection requires every concept's RQ L3 prefix")
     membership_rows = list(
-        db.scalars(
-            select(RQPrefixMembership).where(
+        db.execute(
+            _membership_summary_select(db).where(
                 RQPrefixMembership.rq_prefix_id.in_(sorted(prefix_ids)),
                 RQPrefixMembership.membership_score > 0.0,
             )
@@ -19762,6 +20151,7 @@ def _persist_coarse_concept_provider_result(
     return coarse
 
 
+@measured("coarse_concepts")
 async def build_coarse_concept_graph(
     db: Session,
     knowledge_base_id: str,
@@ -20065,8 +20455,8 @@ async def build_coarse_concept_graph(
             )
         )
         l2_membership_rows = list(
-            db.scalars(
-                select(RQPrefixMembership)
+            db.execute(
+            _membership_summary_select(db)
                 .where(
                     RQPrefixMembership.rq_prefix_id == l2_prefix.id,
                     RQPrefixMembership.membership_score > 0.0,
@@ -20455,8 +20845,8 @@ async def build_coarse_concept_graph(
     if set(prefix_by_id) != prefix_ids:
         raise RuntimeError("Coarse projection requires every concept's RQ L2 prefix")
     membership_rows = list(
-        db.scalars(
-            select(RQPrefixMembership).where(
+        db.execute(
+            _membership_summary_select(db).where(
                 RQPrefixMembership.rq_prefix_id.in_(sorted(prefix_ids)),
                 RQPrefixMembership.membership_score > 0.0,
             )
@@ -22745,6 +23135,13 @@ def _active_graph_admission_gate_impl(
     current_chunk_scope_hash = compute_chunk_scope_hash(active_chunks)
     if state.chunk_scope_hash != current_chunk_scope_hash:
         reasons.append("context_graph_chunk_scope_stale")
+    prepared_vectors = None
+    prepared_references = None
+    if contextual_index_hashes is None:
+        prepared_references = chunk_business_references(db, active_chunks)
+        prepared_vectors = _contextual_index_vector_rows(db, chunks=active_chunks, schema=vector_schema)
+        if chunk_business_scope_hash is None:
+            chunk_business_scope_hash = prepared_references.scope_hash
     current_contextual_index_hash_payload = (
         dict(contextual_index_hashes)
         if contextual_index_hashes is not None
@@ -22753,6 +23150,8 @@ def _active_graph_admission_gate_impl(
             knowledge_base_id,
             active_chunks,
             vector_runtime_target=vector_target,
+            _prepared_chunk_references=prepared_references,
+            _prepared_vector_records=prepared_vectors,
         )
     )
     current_contextual_index_hash = current_contextual_index_hash_payload[
@@ -23086,12 +23485,13 @@ def _active_graph_admission_gate_impl(
 
     expected_collection = vector_schema.collection_name
     expected_identity_digest = vector_schema.collection_identity_digest
-    records = _active_contextual_vector_records(
+    records = ([row for row in prepared_vectors if row.knowledge_base_id == knowledge_base_id]
+               if prepared_vectors is not None else _active_contextual_vector_records(
         db,
         knowledge_base_id=knowledge_base_id,
         chunks=active_chunks,
         vector_runtime_target=vector_target,
-    )
+    ))
     records_by_chunk: dict[str, VectorRecord] = {}
     for record in records:
         chunk_id = str(record.chunk_id)
@@ -23185,15 +23585,17 @@ def active_graph_admission_gate(
 ) -> ContextGraphState | None:
     """Convert malformed persisted graph cards into a typed fail-closed result."""
 
+    from app.services.qa_performance import qa_stage
     try:
-        return _active_graph_admission_gate_impl(
-            db,
-            knowledge_base_id,
-            chunks=chunks,
-            canonical_counts=canonical_counts,
-            contextual_index_hashes=contextual_index_hashes,
-            chunk_business_scope_hash=chunk_business_scope_hash,
-        )
+        with qa_stage("graph_admission"):
+            return _active_graph_admission_gate_impl(
+                db,
+                knowledge_base_id,
+                chunks=chunks,
+                canonical_counts=canonical_counts,
+                contextual_index_hashes=contextual_index_hashes,
+                chunk_business_scope_hash=chunk_business_scope_hash,
+            )
     except ActiveContextGraphAdmissionError:
         raise
     except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
@@ -23218,6 +23620,172 @@ def active_graph_admission_gate(
         ) from exc
 
 
+def active_graph_online_admission_gate(
+    db: Session,
+    knowledge_base_id: str,
+) -> ContextGraphState:
+    """Replay persisted admission proofs and bounded counts for online serving.
+
+    Full UUID-free fact hashing and exact vector/Qdrant observation remain the
+    responsibility of build, promotion, explicit freshness reconciliation and
+    quality tools. Serving validates their immutable cards, current pointers,
+    all nine freshness rows and current row counts without decoding every edge
+    or vector diagnostic on every question.
+    """
+
+    from app.services.qa_performance import qa_stage
+
+    with qa_stage("graph_admission"):
+        checked_at = datetime.utcnow()
+        state = latest_context_graph_state(db, knowledge_base_id)
+        reasons: list[str] = []
+        if state is None or state.state != "active":
+            raise ActiveContextGraphAdmissionError(
+                "Active context graph admission failed: context_graph_state_not_active",
+                reasons=["context_graph_state_not_active"],
+                context_graph_state_id=state.id if state is not None else None,
+                context_graph_hash=(
+                    state.context_graph_hash if state is not None else None
+                ),
+                expected_freshness_hashes={},
+                checked_at=checked_at,
+            )
+        if str(state.knowledge_base_id) != str(knowledge_base_id):
+            reasons.append("context_graph_knowledge_base_mismatch")
+        diagnostics = dict(state.diagnostics_json or {})
+        if diagnostics.get("protocol") != CONTEXT_GRAPH_PROTOCOL_VERSION:
+            reasons.append("context_graph_protocol_mismatch")
+        if (
+            diagnostics.get("graph_protocol_runtime_identity_hash")
+            != graph_protocol_runtime_identity_hash()
+        ):
+            reasons.append("context_graph_protocol_runtime_identity_mismatch")
+
+        pointer = db.scalar(
+            select(KnowledgeBaseVectorRuntimeState).where(
+                KnowledgeBaseVectorRuntimeState.knowledge_base_id
+                == knowledge_base_id
+            )
+        )
+        if pointer is None:
+            reasons.append("active_vector_runtime_pointer_missing")
+        else:
+            if pointer.active_context_graph_state_id != state.id:
+                reasons.append("active_vector_runtime_context_pointer_mismatch")
+            if diagnostics.get("active_vector_runtime_state_id") != pointer.id:
+                reasons.append("active_vector_runtime_state_id_mismatch")
+            if diagnostics.get("active_vector_runtime_state_hash") != pointer.state_hash:
+                reasons.append("active_vector_runtime_state_hash_mismatch")
+            if diagnostics.get("active_vector_schema_hash") != pointer.vector_schema_hash:
+                reasons.append("active_vector_schema_hash_mismatch")
+
+        expected_hashes = context_graph_freshness_expected_hashes(state)
+        freshness_reasons, _freshness_rows = evaluate_context_graph_freshness_rows(
+            db,
+            state=state,
+            expected_hashes=expected_hashes,
+        )
+        reasons.extend(freshness_reasons)
+
+        active_chunk_scope = active_chunks_query(knowledge_base_id).subquery()
+        count_row = db.execute(
+            select(
+                select(func.count()).select_from(active_chunk_scope).scalar_subquery(),
+                select(func.count(ChunkRelationEdge.id)).where(
+                    ChunkRelationEdge.graph_state_id
+                    == state.chunk_relation_graph_state_id
+                ).scalar_subquery(),
+                select(func.count(RQPrefix.id)).where(
+                    RQPrefix.graph_state_id == state.chunk_relation_graph_state_id,
+                    RQPrefix.state == "active",
+                ).scalar_subquery(),
+                select(func.count(RQPrefixMembership.id))
+                .join(
+                    RQPrefix,
+                    RQPrefix.id == RQPrefixMembership.rq_prefix_id,
+                )
+                .where(
+                    RQPrefix.graph_state_id
+                    == state.chunk_relation_graph_state_id
+                )
+                .scalar_subquery(),
+                select(func.count(RQPrefixPairDiagnostic.id)).where(
+                    RQPrefixPairDiagnostic.graph_state_id
+                    == state.chunk_relation_graph_state_id
+                ).scalar_subquery(),
+                select(func.count(MidConcept.id)).where(
+                    MidConcept.concept_state_id == state.mid_concept_state_id,
+                    MidConcept.state == "active",
+                ).scalar_subquery(),
+                select(func.count(CoarseConcept.id)).where(
+                    CoarseConcept.coarse_state_id == state.coarse_concept_state_id,
+                    CoarseConcept.state == "active",
+                ).scalar_subquery(),
+            )
+        ).one()
+        count_names = (
+            "chunks",
+            "relation_edges",
+            "rq_prefixes",
+            "rq_memberships",
+            "rq_prefix_pair_diagnostics",
+            "mid_concepts",
+            "coarse_concepts",
+        )
+        observed_counts = {
+            name: int(value or 0)
+            for name, value in zip(count_names, count_row, strict=True)
+        }
+        expected_counts = dict(state.stats_json or {})
+        for name in (
+            "chunks",
+            "relation_edges",
+            "rq_prefixes",
+            "rq_prefix_pair_diagnostics",
+            "mid_concepts",
+            "coarse_concepts",
+        ):
+            if observed_counts[name] != int(expected_counts.get(name) or 0):
+                reasons.append(f"context_graph_online_count_mismatch:{name}")
+        if observed_counts["rq_memberships"] != 3 * observed_counts["chunks"]:
+            reasons.append("context_graph_online_count_mismatch:rq_memberships")
+
+        qdrant_proof = (
+            (diagnostics.get("contextual_index_maintenance") or {}).get(
+                "qdrant_freshness"
+            )
+            if isinstance(diagnostics.get("contextual_index_maintenance"), dict)
+            else None
+        )
+        if not isinstance(qdrant_proof, dict):
+            reasons.append("active_qdrant_freshness_proof_missing")
+        else:
+            for field_name, expected_value in {
+                "protocol_version": ACTIVE_QDRANT_FRESHNESS_PROTOCOL_VERSION,
+                "contextual_index_hash": diagnostics.get("contextual_index_hash"),
+                "expected_point_count": observed_counts["chunks"],
+                "postgres_vector_record_count": observed_counts["chunks"],
+                "observed_point_count": observed_counts["chunks"],
+                "verified_point_count": observed_counts["chunks"],
+                "mismatch_count": 0,
+            }.items():
+                if qdrant_proof.get(field_name) != expected_value:
+                    reasons.append(
+                        f"active_qdrant_freshness_{field_name}_mismatch"
+                    )
+        if reasons:
+            raise ActiveContextGraphAdmissionError(
+                "Active context graph online admission failed: "
+                + ", ".join(sorted(set(reasons))[:8]),
+                reasons=sorted(set(reasons)),
+                context_graph_state_id=state.id,
+                context_graph_hash=state.context_graph_hash,
+                expected_freshness_hashes=expected_hashes,
+                checked_at=checked_at,
+            )
+        return state
+
+
 @dataclass
 class LayeredSearchResult:
     results: list[dict[str, Any]]
@@ -23233,6 +23801,17 @@ QUERY_EMBEDDING_REQUEST_MEMO_PROTOCOL_VERSION = (
     "request_scoped_query_embedding_memo_v1"
 )
 QUERY_EMBEDDING_REQUEST_MEMO_MAX_ENTRIES = 4
+
+
+def query_embedding_request_memo_key(
+    knowledge_base_id: str, semantic_entry: Mapping[str, Any], vector_runtime_target: Any
+) -> str:
+    return stable_hash({
+        "protocol_version": QUERY_EMBEDDING_REQUEST_MEMO_PROTOCOL_VERSION,
+        "knowledge_base_id": str(knowledge_base_id),
+        "semantic_entry_query_packet_hash": semantic_entry["packet_hash"],
+        "vector_identity": _entry_dense_vector_identity_from_target(vector_runtime_target),
+    })
 
 
 @dataclass
@@ -23680,8 +24259,7 @@ def replay_layered_retrieval_cache(
         raise RetrievalCacheReplayError("trace_cache_identity_mismatch")
     if (
         package.query != trace.query
-        or set(package.hit_chunk_ids_json or [])
-        != set(trace.result_chunk_ids_json or [])
+        or not set(package.hit_chunk_ids_json or []).issubset(trace.result_chunk_ids_json or [])
         or len(package.hit_chunk_ids_json or [])
         != len(set(package.hit_chunk_ids_json or []))
         or package.profile_hash != cache_components.get("profile_hash")
@@ -23710,7 +24288,9 @@ def replay_layered_retrieval_cache(
     # Local import avoids making retrieval.py <-> context_graph.py a module
     # initialization cycle.  This public replay path validates every persisted
     # step, path label, entry proof and deterministic gray record.
-    from app.services.retrieval import get_retrieval_trace_steps
+    from app.services.retrieval import get_retrieval_trace_steps, get_context_package
+
+    get_context_package(db, package.id)
 
     trace_replay = get_retrieval_trace_steps(db, trace.id)
     if (
@@ -24167,6 +24747,11 @@ def validate_typed_action_entry_targets_against_active_graph(
     }
 
 
+def _admit_layered_chunk_scope(db: Session, knowledge_base_id: str):
+    chunks = list(db.scalars(active_chunks_query(knowledge_base_id)).all())
+    return chunks, active_graph_admission_gate(db, knowledge_base_id, chunks=chunks)
+
+
 async def layered_search(
     db: Session,
     knowledge_base_id: str,
@@ -24239,12 +24824,7 @@ async def layered_search(
             raise ValueError(
                 "conversation state cannot introduce gray-zone model calls"
             )
-    chunks = list(db.scalars(active_chunks_query(knowledge_base_id)).all())
-    context_state = active_graph_admission_gate(
-        db,
-        knowledge_base_id,
-        chunks=chunks,
-    )
+    chunks, context_state = await run_bounded_source_io(_admit_layered_chunk_scope, db, knowledge_base_id)
     if repair_directive is not None:
         if not isinstance(query_facets, dict):
             raise ValueError(
@@ -24317,6 +24897,14 @@ async def layered_search(
                 result_top_k=result_top_k,
             )
         )
+        lexical_identity = (query_facets or {}).get("diagnostics") or {}
+        if (validated_typed_action_controls or {}).get("protocol_version") == RETRIEVAL_CONTROL_PROTOCOL:
+            if (not lexical_identity.get("lexical_only_aliases")
+                or lexical_identity.get("fixed_task_hash") != validated_typed_action_controls["task_hash"]
+                or lexical_identity.get("lexical_strategy_hash") != validated_typed_action_controls["lexical_strategy_hash"]):
+                raise ValueError("retrieval_strategy_identity_mismatch")
+        elif lexical_identity.get("lexical_only_aliases"):
+            raise ValueError("retrieval_strategy_requires_current_executor")
     except (TypeError, ValueError, RuntimeError) as exc:
         if typed_action_controls is None:
             raise
@@ -24377,7 +24965,7 @@ async def layered_search(
     active_prompt_profile_hash = canonical_active_profile_state_hash(
         db, knowledge_base_id
     )
-    active_policy_state_hash = retrieval_policy_state_content_hash(
+    active_policy_state_hash = await run_bounded_source_io(retrieval_policy_state_content_hash,
         db,
         knowledge_base_id,
         policy_identity_frozen=policy_identity_frozen,
@@ -24456,7 +25044,7 @@ async def layered_search(
                     replayed_package,
                     replayed_audit,
                     replayed_snapshot_verifier,
-                ) = replay_layered_retrieval_cache(
+                ) = await run_bounded_source_io(replay_layered_retrieval_cache,
                     db,
                     knowledge_base_id=knowledge_base_id,
                     cache_components=frozen_cache_components,
@@ -24805,15 +25393,8 @@ async def layered_search(
         )
     vector_target = _vector_runtime_target_for_kb(db, knowledge_base_id)
     relation_state = latest_relation_state(db, knowledge_base_id)
-    query_embedding_memo_key = stable_hash(
-        {
-            "protocol_version": QUERY_EMBEDDING_REQUEST_MEMO_PROTOCOL_VERSION,
-            "knowledge_base_id": str(knowledge_base_id),
-            "semantic_entry_query_packet_hash": semantic_entry["packet_hash"],
-            "vector_identity": _entry_dense_vector_identity_from_target(
-                vector_target
-            ),
-        }
+    query_embedding_memo_key = query_embedding_request_memo_key(
+        knowledge_base_id, semantic_entry, vector_target
     )
     query_vector = (
         query_embedding_request_memo.get(
@@ -24879,14 +25460,14 @@ async def layered_search(
         "gray_zone_model_call_count": 0,
     }
     query_rq = encode_query_rq(relation_state, query_vector)
-    dense_entries = dense_chunk_entries(
+    dense_entries = await run_bounded_source_io(dense_chunk_entries,
         db,
         knowledge_base_id,
         query_vector,
         vector_runtime_target=vector_target,
     )
     entry_dense_replay_input, dense_vector_business_fact_hashes = (
-        build_entry_dense_replay_input(
+        await run_bounded_source_io(build_entry_dense_replay_input,
             db,
             knowledge_base_id=knowledge_base_id,
             query=query,
@@ -24897,7 +25478,7 @@ async def layered_search(
         )
     )
     if retrieval_granularity == "coarse":
-        coarse_selection = select_coarse_entries(
+        coarse_selection = await run_bounded_source_io(select_coarse_entries,
             db,
             knowledge_base_id,
             query_facets,
@@ -24935,7 +25516,7 @@ async def layered_search(
             int(mid_entry_top_n)
             + len(validated_repair_directive.get("excluded_mid_ids") or []),
         )
-    mid_selection = select_mid_entries(
+    mid_selection = await run_bounded_source_io(select_mid_entries,
         db,
         knowledge_base_id,
         query_facets,
@@ -24952,7 +25533,7 @@ async def layered_search(
             "excluded_mid_ids"
         ) or []:
             mid_entries.pop(str(excluded_mid_id), None)
-    rq_membership_entries = select_rq_membership_entries(db, knowledge_base_id, query_vector, query_rq, mid_entries)
+    rq_membership_entries = await run_bounded_source_io(select_rq_membership_entries, db, knowledge_base_id, query_vector, query_rq, mid_entries)
     for target_id in typed_action_entry_targets.get("rq_membership") or []:
         rq_membership_entries[target_id] = max(
             rq_membership_entries.get(target_id, 0.0), 1.0
@@ -24960,7 +25541,7 @@ async def layered_search(
     for target_id in typed_action_entry_targets.get("chunk") or []:
         dense_entries[target_id] = max(dense_entries.get(target_id, 0.0), 1.0)
     snapshot_verifier = SnapshotIntegrityVerifier()
-    traversal = execute_priority_queue_traversal(
+    traversal = await run_bounded_source_io(execute_priority_queue_traversal,
         db,
         knowledge_base_id=knowledge_base_id,
         query=query,
@@ -25021,7 +25602,7 @@ async def layered_search(
     }
     validate_entry_selection_trace_audit(traversal["entry_selection_audit"])
     results = traversal["results"]
-    trace = write_retrieval_trace(
+    trace = await run_bounded_source_io(write_retrieval_trace,
         db,
         knowledge_base_id,
         query,
@@ -25423,6 +26004,8 @@ def query_facets_for_search(query: str, llm_facets: dict[str, Any] | None = None
 def semantic_entry_query_for_search(
     query: str,
     query_facets: dict[str, Any] | None,
+    *,
+    _replay_protocol: str | None = None,
 ) -> dict[str, Any]:
     """Derive the only text allowed to drive semantic entry embedding.
 
@@ -25464,18 +26047,47 @@ def semantic_entry_query_for_search(
             ):
                 continue
             candidates.append((index, facet))
-    if candidates:
+    protocol = _replay_protocol or SEMANTIC_ENTRY_QUERY_PROTOCOL_VERSION
+    if protocol not in {"validated_query_facet_semantic_entry_v1", "validated_query_facet_semantic_entry_v2", SEMANTIC_ENTRY_QUERY_PROTOCOL_VERSION}:
+        raise EntrySelectionTraceInvariantError("unsupported semantic entry query protocol")
+    selected: list[tuple[int, str]] = []
+    if protocol != "validated_query_facet_semantic_entry_v1" and candidates:
+        groups = list(facets.get("facet_groups") or [])
+        domains = [(index, facet) for index, facet in candidates if groups[index].get("role") == "domain"]
+        if domains:
+            topic_keys = [_facet_dedupe_key(facet).replace(" ", "") for _, facet in domains]
+            if protocol == SEMANTIC_ENTRY_QUERY_PROTOCOL_VERSION:
+                if len(domains) > QUERY_FACET_MAX_REQUIRED:
+                    raise EntrySelectionTraceInvariantError("semantic entry required domain capacity exceeded")
+                # Each co-required topic keeps an anchor. A more specific
+                # facet may represent several topics only if it contains all
+                # their complete normalized names; length alone is insufficient.
+                for topic in topic_keys:
+                    covering = [candidate for candidate in candidates
+                        if topic in _facet_dedupe_key(candidate[1]).replace(" ", "")]
+                    winner = min(covering, key=lambda item: (-len(item[1]), item[0]))
+                    if winner not in selected:
+                        selected.append(winner)
+            else:
+                candidates = [(index, facet) for index, facet in candidates
+                    if groups[index].get("role") == "domain"
+                    or any(topic and topic in _facet_dedupe_key(facet).replace(" ", "") for topic in topic_keys)]
+    if not selected and candidates:
         selected_index, semantic_query = min(
             candidates,
             key=lambda item: (-len(item[1]), item[0]),
         )
-        selection_source = "validated_required_facet"
+        selected = [(selected_index, semantic_query)]
+    if selected:
+        selected_index = selected[0][0] if len(selected) == 1 else None
+        semantic_query = "; ".join(facet for _, facet in selected)
+        selection_source = "validated_required_facet" if len(selected) == 1 else "validated_required_domain_composite"
     else:
         selected_index = None
         semantic_query = normalized_raw_query
         selection_source = "raw_query"
     packet = {
-        "protocol_version": SEMANTIC_ENTRY_QUERY_PROTOCOL_VERSION,
+        "protocol_version": protocol,
         "query": semantic_query,
         "selection_source": selection_source,
         "selected_required_facet_index": selected_index,
@@ -25496,6 +26108,8 @@ def semantic_entry_query_for_search(
         "selection_model_call_count": 0,
         "gray_zone_model_call_count": 0,
     }
+    if protocol == SEMANTIC_ENTRY_QUERY_PROTOCOL_VERSION:
+        packet["selected_required_facet_indexes"] = [index for index, _ in selected]
     packet["packet_hash"] = stable_hash(packet)
     return packet
 
@@ -25506,7 +26120,8 @@ def validate_semantic_entry_query_trace_packet(
     query: str,
     query_facets: dict[str, Any],
 ) -> dict[str, Any]:
-    expected = semantic_entry_query_for_search(query, query_facets)
+    expected = semantic_entry_query_for_search(query, query_facets,
+        _replay_protocol=(raw_packet or {}).get("protocol_version") if isinstance(raw_packet, dict) else None)
     if not isinstance(raw_packet, dict) or raw_packet != expected:
         raise EntrySelectionTraceInvariantError(
             "persisted semantic entry query does not match the frozen raw query/facet packet"
@@ -25629,7 +26244,8 @@ def matched_query_facet_term_witnesses_for_text(
         if not facet_text:
             continue
         group = groups_by_facet.get(_facet_dedupe_key(facet_text)) or {"facet": facet_text, "aliases": []}
-        candidates = [group.get("facet"), *(group.get("aliases") or [])]
+        lexical_only = bool((query_facets.get("diagnostics") or {}).get("lexical_only_aliases"))
+        candidates = list(group.get("aliases") or []) if lexical_only else [group.get("facet"), *(group.get("aliases") or [])]
         matched_terms: list[str] = []
         for candidate in candidates:
             candidate_text = _normalize_query_facet_text(candidate)
@@ -26918,6 +27534,7 @@ def select_intent_aware_concept_entries(
     )
 
 
+@qa_sync_timed("graph_entry_selection")
 def select_coarse_entries(
     db: Session,
     knowledge_base_id: str,
@@ -26972,6 +27589,7 @@ def select_coarse_entries(
     )
 
 
+@qa_sync_timed("graph_entry_selection")
 def select_mid_entries(
     db: Session,
     knowledge_base_id: str,
@@ -27132,6 +27750,7 @@ class DenseChunkCandidateScopeError(RuntimeError):
     """Raised when an active dense candidate is not backed by active document facts."""
 
 
+@qa_sync_timed("graph_dense_scoring")
 def dense_chunk_entries(
     db: Session,
     knowledge_base_id: str,
@@ -27152,6 +27771,11 @@ def dense_chunk_entries(
     candidate_rows = list(
         db.execute(
             select(VectorRecord, Chunk, DocumentVersion, Document)
+            .options(
+                load_only(Chunk.id, Chunk.knowledge_base_id, Chunk.document_id, Chunk.document_version_id, Chunk.state),
+                load_only(DocumentVersion.id, DocumentVersion.document_id, DocumentVersion.is_active),
+                load_only(Document.id, Document.knowledge_base_id, Document.is_active),
+            )
             .join(Chunk, Chunk.id == VectorRecord.chunk_id)
             .outerjoin(DocumentVersion, DocumentVersion.id == Chunk.document_version_id)
             .outerjoin(Document, Document.id == Chunk.document_id)
@@ -27353,6 +27977,7 @@ def entry_dense_vector_business_fact_hashes(
     return result
 
 
+@qa_sync_timed("graph_entry_selection")
 def build_entry_dense_replay_input(
     db: Session,
     *,
@@ -27424,7 +28049,8 @@ def validate_entry_dense_replay_input(
 ) -> dict[str, Any]:
     packet = dict(raw_packet or {})
     failures: list[str] = []
-    semantic_entry = semantic_entry_query_for_search(query, query_facets)
+    semantic_entry = semantic_entry_query_for_search(query, query_facets,
+        _replay_protocol=packet.get("semantic_entry_query_protocol_version"))
     if packet.get("protocol_version") != ENTRY_DENSE_REPLAY_PROTOCOL_VERSION:
         failures.append("protocol_version")
     if str(packet.get("knowledge_base_id") or "") != str(knowledge_base_id):
@@ -30802,6 +31428,7 @@ def execute_layer_priority_walk(
     }
 
 
+@qa_sync_timed("graph_traversal")
 def execute_priority_queue_traversal(
     db: Session,
     *,
@@ -32215,6 +32842,7 @@ def execute_priority_queue_traversal(
                     ),
                 }
             )
+        candidates = [item for item in candidates if passes_filters(db,chunk_by_id.get(str(item['id'])),filters)]
         parent_dedupe = CandidatePoolDedupeBudget(
             scope=f"chunk_by_mid:{mid_id}",
             limit=candidate_dedupe_limit,
@@ -32623,13 +33251,10 @@ def execute_priority_queue_traversal(
             )
         }
 
-    adjacency: dict[str, list[ChunkRelationEdge]] = defaultdict(list)
-    if relation_state:
-        for edge in db.scalars(select(ChunkRelationEdge).where(ChunkRelationEdge.graph_state_id == relation_state.id)).all():
-            if edge.edge_type not in effective_allowed_relation_types:
-                continue
-            adjacency[edge.source_chunk_id].append(edge)
-            adjacency[edge.target_chunk_id].append(edge)
+    from app.services.retrieval_adjacency import CompleteChunkAdjacency
+    adjacency = CompleteChunkAdjacency(db, graph_state_id=relation_state.id if relation_state else None,
+        allowed_types=effective_allowed_relation_types)
+    adjacency.preload(seed_strengths)
     structure_mapped_chunk_ids = (
         set(
             db.scalars(
@@ -33915,9 +34540,27 @@ def execute_priority_queue_traversal(
 
 
 def passes_filters(db: Session, chunk: Chunk, filters: SearchFilters) -> bool:
+    if chunk is None:
+        return False
     document = db.get(Document, chunk.document_id)
     if document is None:
         return False
+    if filters.document_ids and chunk.document_id not in filters.document_ids:
+        return False
+    if filters.source_paths and document.source_path not in filters.source_paths:
+        return False
+    if filters.chunk_version is not None and chunk.chunk_version != filters.chunk_version:
+        return False
+    if filters.page_range and any(value is not None for value in filters.page_range):
+        lower, upper = filters.page_range
+        start, end = chunk.page_start, chunk.page_end
+        if start is None or end is None or (lower is not None and end < lower) or (upper is not None and start > upper):
+            return False
+    if filters.content_kinds:
+        metadata = chunk.metadata_json or {}
+        kinds = {metadata.get('content_kind'), *(metadata.get('protected_object_kinds') or [])}
+        if not kinds.intersection(filters.content_kinds):
+            return False
     if filters.source_type and document.source_type != filters.source_type:
         return False
     if filters.tags and not set(filters.tags).intersection(set(document.tags or [])):
@@ -34117,6 +34760,7 @@ def chunk_source_span(
     retrieval_trace_id: str | None = None,
     verification_id: str | None = None,
     snapshot_verifier: SnapshotIntegrityVerifier | None = None,
+    replay_source_span: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     document_version = db.get(DocumentVersion, chunk.document_version_id)
     document = db.get(Document, chunk.document_id)
@@ -34151,18 +34795,49 @@ def chunk_source_span(
         document_version=document_version,
     )
 
+    protocol = "raw_chunk_source_span_v3"
+    if replay_source_span is not None:
+        protocol = replay_source_span.get("contract_version")
+        if protocol not in {"raw_chunk_source_span_v1", "raw_chunk_source_span_v3"}:
+            raise ChunkSourceProvenanceError("source_span_protocol_invalid")
     coordinate = db.scalar(
         select(ChunkCoordinate)
         .where(ChunkCoordinate.chunk_id == chunk.id)
-        .order_by(ChunkCoordinate.confidence.desc())
+        .order_by(ChunkCoordinate.confidence.desc(), ChunkCoordinate.id)
     )
     structure_rows = db.execute(
         select(ChunkStructureMapping, ChunkStructureNode)
         .join(ChunkStructureNode, ChunkStructureMapping.structure_node_id == ChunkStructureNode.id)
         .where(ChunkStructureMapping.chunk_id == chunk.id)
-        .order_by(ChunkStructureMapping.mapping_weight.desc(), ChunkStructureNode.depth.desc())
+        .order_by(ChunkStructureMapping.mapping_weight.desc(), ChunkStructureNode.depth.desc(), ChunkStructureNode.id, ChunkStructureMapping.id)
         .limit(8)
     ).all()
+    if protocol == "raw_chunk_source_span_v1":
+        selected_ids = replay_source_span.get("structure_node_ids") or []
+        if len(selected_ids) != len(set(selected_ids)) or len(selected_ids) != len(structure_rows):
+            raise ChunkSourceProvenanceError("source_span_legacy_node_selection_invalid")
+        selected_rows = db.execute(select(ChunkStructureMapping, ChunkStructureNode).join(
+            ChunkStructureNode, ChunkStructureMapping.structure_node_id == ChunkStructureNode.id).where(
+            ChunkStructureMapping.chunk_id == chunk.id, ChunkStructureNode.id.in_(selected_ids))).all()
+        by_id = {node.id: (mapping, node) for mapping, node in selected_rows}
+        if len(selected_rows) != len(selected_ids) or set(by_id) != set(selected_ids):
+            raise ChunkSourceProvenanceError("source_span_legacy_node_selection_invalid")
+        legacy_rows = [by_id[node_id] for node_id in selected_ids]
+        rank = lambda rows: [(mapping.mapping_weight, node.depth) for mapping, node in rows]
+        if rank(legacy_rows) != rank(structure_rows):
+            raise ChunkSourceProvenanceError("source_span_legacy_node_rank_invalid")
+        structure_rows = legacy_rows
+        if coordinate is not None:
+            tied_coordinates = list(db.scalars(select(ChunkCoordinate).where(ChunkCoordinate.chunk_id == chunk.id,
+                ChunkCoordinate.confidence == coordinate.confidence).order_by(ChunkCoordinate.id)))
+            fallback_bbox = next((dict(node.bbox_json) for _mapping, node in structure_rows if node.bbox_json), {})
+            def same_address(row):
+                pages = row.page_range_json or {"start": chunk.page_start, "end": chunk.page_end}
+                return ([pages.get("start"), pages.get("end")] == replay_source_span.get("page_range")
+                    and (row.bbox_json or fallback_bbox) == (replay_source_span.get("bbox") or {}))
+            coordinate = next((row for row in tied_coordinates if same_address(row)), None)
+            if coordinate is None:
+                raise ChunkSourceProvenanceError("source_span_legacy_coordinate_invalid")
     section_path = chunk.section_path or next(
         (
             node.path or node.title
@@ -34176,7 +34851,7 @@ def chunk_source_span(
         bbox = next((dict(node.bbox_json or {}) for _mapping, node in structure_rows if node.bbox_json), {})
     page_range = (coordinate.page_range_json if coordinate and coordinate.page_range_json else {"start": chunk.page_start, "end": chunk.page_end})
     return {
-        "contract_version": "raw_chunk_source_span_v1",
+        "contract_version": protocol,
         "document_version_id": chunk.document_version_id,
         "chunk_id": chunk.id,
         "source_path": document_version.storage_path,
@@ -34226,6 +34901,7 @@ def search_payload_for_chunk(
         "section": chunk.section_path,
         "page_number": chunk.page_start,
         "snippet": snippet,
+        "retrieval_trace_id": source_span["retrieval_trace_id"],
         "source_span": source_span,
     }
     return {
@@ -34248,6 +34924,7 @@ def search_payload_for_chunk(
     }
 
 
+@qa_sync_timed("graph_trace_write")
 def write_retrieval_trace(
     db: Session,
     knowledge_base_id: str,
@@ -34995,9 +35672,20 @@ def build_context_package(
     restore_per_chunk_budget: int | None = None,
     snapshot_verifier: SnapshotIntegrityVerifier | None = None,
     restoration_directive: dict[str, Any] | None = None,
+    reflection_source_package: ContextPackage | None = None,
+    reflection_restore_chunk_ids: list[str] | None = None,
+    reflection_preserve_chunk_ids: list[str] | None = None,
+    reflection_expansion_chunk_ids: list[str] | None = None,
+    reserved_token_budget: int = 0,
+    packing_priority_chunk_ids: list[str] | None = None,
+    required_scope_chunk_ids: list[str] | None = None,
+    scope_context_chunk_ids: list[str] | None = None,
 ) -> ContextPackage:
     settings = get_settings()
     token_budget = token_budget or int(settings.context_package_token_budget or 2400)
+    if type(reserved_token_budget) is not int or not 0 <= reserved_token_budget < token_budget:
+        raise ValueError("context_package_reserved_budget_invalid")
+    selection_token_budget = token_budget - reserved_token_budget
     restore_per_chunk_budget = int(
         restore_per_chunk_budget
         if restore_per_chunk_budget is not None
@@ -35007,6 +35695,121 @@ def build_context_package(
     )
     if restore_per_chunk_budget < 0:
         raise ValueError("restore_per_chunk_budget cannot be negative")
+    reflection_restore_chunk_ids = list(dict.fromkeys(reflection_restore_chunk_ids or []))
+    reflection_preserve_chunk_ids = list(dict.fromkeys(reflection_preserve_chunk_ids or []))
+    reflection_expansion_chunk_ids = list(dict.fromkeys(reflection_expansion_chunk_ids or []))
+    required_scope_chunk_ids = list(dict.fromkeys(required_scope_chunk_ids or []))
+    scope_context_chunk_ids = list(dict.fromkeys(scope_context_chunk_ids or []))
+    scope_context_audit: dict[str, Any] | None = None
+    if required_scope_chunk_ids:
+        scope_execution = dict(
+            (trace.diagnostics_json or {}).get("source_scope_execution") or {}
+        )
+        target_plan = dict(scope_execution.get("target_plan") or {})
+        admitted_targets = {
+            str(item) for item in target_plan.get("target_chunk_ids") or []
+        }
+        if (
+            trace.retrieval_mode != "intent_execution_retrieval_v1"
+            or scope_execution.get("protocol_version")
+            != "intent_source_scope_execution_v1"
+            or len(required_scope_chunk_ids) > 256
+            or not set(required_scope_chunk_ids) <= admitted_targets
+        ):
+            raise ValueError("context_package_source_scope_authority_invalid")
+    if scope_context_chunk_ids:
+        scope_execution = dict(
+            (trace.diagnostics_json or {}).get("source_scope_execution") or {}
+        )
+        target_plan = dict(scope_execution.get("target_plan") or {})
+        admitted_targets = {
+            str(item) for item in target_plan.get("target_chunk_ids") or []
+        }
+        source_chunk_ids = {
+            str(item) for item in scope_execution.get("source_chunk_ids") or []
+        }
+        scope_context_budget = int(
+            target_plan.get("overlap_target_budget") or 0
+        )
+        authority_ids = admitted_targets | set(scope_context_chunk_ids)
+        relevant_document_versions = {
+            row.document_version_id
+            for row in db.scalars(
+                select(Chunk).where(Chunk.id.in_(admitted_targets))
+            )
+        }
+        authority_rows = {
+            str(row.id): row
+            for row in db.scalars(
+                select(Chunk).where(
+                    Chunk.document_version_id.in_(relevant_document_versions),
+                    Chunk.id.in_(source_chunk_ids),
+                )
+            )
+        }
+        ordered_scope_rows: dict[str, list[Chunk]] = {}
+        for row in authority_rows.values():
+            ordered_scope_rows.setdefault(str(row.document_version_id), []).append(row)
+        scope_positions: dict[str, int] = {}
+        for rows in ordered_scope_rows.values():
+            rows.sort(key=lambda item: (int(item.chunk_index), str(item.id)))
+            scope_positions.update(
+                {str(row.id): index for index, row in enumerate(rows)}
+            )
+        # At a document boundary all of a per-anchor budget may extend in one
+        # direction, so the largest permitted ordinal distance equals the
+        # full bounded count.
+        max_distance = max(1, scope_context_budget)
+        if (
+            not admitted_targets
+            or not required_scope_chunk_ids
+            or set(required_scope_chunk_ids) != admitted_targets
+            or len(scope_context_chunk_ids) > 256
+            or len(scope_context_chunk_ids)
+            > len(admitted_targets) * scope_context_budget
+            or not set(scope_context_chunk_ids) <= source_chunk_ids
+            or not authority_ids <= set(authority_rows)
+            or any(
+                not any(
+                    authority_rows[context_id].document_version_id
+                    == authority_rows[target_id].document_version_id
+                    and abs(
+                        scope_positions[context_id]
+                        - scope_positions[target_id]
+                    )
+                    <= max_distance
+                    for target_id in admitted_targets
+                )
+                for context_id in scope_context_chunk_ids
+            )
+        ):
+            raise ValueError("context_package_source_scope_context_authority_invalid")
+        scope_context_audit = {
+            "protocol_version": "source_scope_chunk_adjacency_v1",
+            "source_scope_execution_hash": scope_execution.get("audit_hash"),
+            "target_chunk_ids": sorted(admitted_targets),
+            "context_chunk_ids": list(scope_context_chunk_ids),
+            "per_target_budget": scope_context_budget,
+            "max_ordinal_distance": max_distance,
+            "validated": True,
+        }
+        scope_context_audit["audit_hash"] = stable_hash(scope_context_audit)
+    if reflection_source_package is not None:
+        source_ids = {item["chunk_id"] for item in (reflection_source_package.package_json or {}).get("chunks", [])}
+        lineage = (trace.diagnostics_json or {}).get("reflection_restoration") or {}
+        if (
+            restoration_directive is not None
+            or reflection_source_package.knowledge_base_id != knowledge_base_id
+            or reflection_source_package.query != query
+            or lineage.get("protocol_version") not in {"reflection_structure_restoration_v1", "reflection_source_structure_expansion_v1"}
+            or lineage.get("source_context_package_id") != reflection_source_package.id
+            or lineage.get("source_retrieval_trace_id") != reflection_source_package.retrieval_trace_id
+            or trace.id == reflection_source_package.retrieval_trace_id
+            or not set(reflection_restore_chunk_ids + reflection_preserve_chunk_ids).issubset(source_ids)
+        ):
+            raise ValueError("reflection restoration scope or immutable trace lineage mismatch")
+    elif reflection_restore_chunk_ids or reflection_preserve_chunk_ids or reflection_expansion_chunk_ids:
+        raise ValueError("reflection restoration requires its persisted source package")
     validated_restoration_directive = validate_typed_repair_directive(
         db,
         knowledge_base_id=knowledge_base_id,
@@ -35028,7 +35831,16 @@ def build_context_package(
     profile_hash = active_profile_hash(db, knowledge_base_id)
     hit_ids = [item["chunk_id"] for item in results]
     hit_id_set = set(hit_ids)
+    priorities = list(packing_priority_chunk_ids or [])
+    if priorities:
+        lineage = (trace.diagnostics_json or {}).get('reflection_restoration') or {}
+        if (reflection_source_package is None or len(priorities) > 256 or len(set(priorities)) != len(priorities)
+                or lineage.get('packing_priority_protocol') != 'scope_interval_repacking_v1'
+                or lineage.get('packing_priority_chunk_ids') != priorities
+                or not set(priorities).issubset(hit_id_set | source_ids)):
+            raise ValueError('scope_packing_priority_authority_invalid')
     selected_ids: list[str] = []
+    source_filters = SearchFilters.model_validate(trace.filters_json or {})
     bridge_ids: set[str] = set()
     graph_path_chunk_ids: set[str] = set()
     parent_node_ids: set[str] = set()
@@ -35074,6 +35886,10 @@ def build_context_package(
         chunk = db.get(Chunk, chunk_id)
         if chunk is None or chunk.knowledge_base_id != knowledge_base_id or chunk.state != "active":
             return
+        if not passes_filters(db,chunk,source_filters):
+            if chunk_id in hit_id_set:
+                raise ValueError('context_package_hit_filter_scope_invalid')
+            return
         chunks_by_id[chunk.id] = chunk
         selected_ids.append(chunk.id)
 
@@ -35083,9 +35899,30 @@ def build_context_package(
                 if path_chunk_id and path_chunk_id not in hit_id_set:
                     graph_path_chunk_ids.add(path_chunk_id)
 
-    for chunk_id in hit_ids:
+    for chunk_id in reflection_preserve_chunk_ids:
+        add_chunk_id(chunk_id)
+    for chunk_id in priorities:
+        add_chunk_id(chunk_id)
+    for chunk_id in reflection_expansion_chunk_ids:
+        add_chunk_id(chunk_id)
+    for chunk_id in required_scope_chunk_ids:
+        add_chunk_id(chunk_id)
+    for chunk_id in scope_context_chunk_ids:
+        add_chunk_id(chunk_id)
+    reflection_focused = bool(reflection_source_package is not None and (trace.diagnostics_json.get("reflection_restoration") or {}).get("protocol_version") == "reflection_source_structure_expansion_v1")
+    if reflection_focused:
+        original_items = {item["chunk_id"]: item for item in reflection_source_package.package_json["chunks"]}
+        for chunk_id in reflection_restore_chunk_ids + reflection_preserve_chunk_ids:
+            if (original_items.get(chunk_id) or {}).get("role") == "bridge":
+                bridge_ids.add(chunk_id)
+    ordered_anchors = reflection_restore_chunk_ids + hit_ids if reflection_focused else hit_ids + reflection_restore_chunk_ids
+    for chunk_id in list(dict.fromkeys(ordered_anchors)):
         chunk = db.get(Chunk, chunk_id)
         add_chunk_id(chunk_id)
+        if reflection_focused:
+            # New source spans were selected with their explicit structure witnesses.
+            # Do not spend the targeted budget on every old hit's neighbors again.
+            continue
         restore_candidates: list[tuple[str | None, str]] = []
         if chunk:
             mapped_rows = list(
@@ -35103,7 +35940,7 @@ def build_context_package(
             )
             for mapping in mapped_rows:
                 parent_node_ids.add(mapping.structure_node_id)
-            if validated_restoration_directive and mapped_rows:
+            if (validated_restoration_directive or chunk_id in reflection_restore_chunk_ids) and mapped_rows:
                 mapped_node_ids = {
                     str(mapping.structure_node_id) for mapping in mapped_rows
                 }
@@ -35414,6 +36251,10 @@ def build_context_package(
         }
 
     package_chunks: list[dict[str, Any]] = []
+    from app.services.context_packing import PACKING_PROTOCOL, MAX_PACKING_CANDIDATES
+    packing_candidate_ids = list(selected_ids)
+    if len(packing_candidate_ids) > MAX_PACKING_CANDIDATES:
+        raise ValueError("context_packing_candidate_capacity_exceeded")
     clipped_chunk_ids: list[str] = []
     skipped_budget_chunk_ids: list[str] = []
     snapshot_verifier = snapshot_verifier or SnapshotIntegrityVerifier()
@@ -35421,7 +36262,7 @@ def build_context_package(
     for chunk_id in selected_ids:
         chunk = chunks_by_id[chunk_id]
         chunk_tokens = rough_token_count(chunk.text)
-        remaining_tokens = token_budget - token_count
+        remaining_tokens = selection_token_budget - token_count
         fitted = _fit_context_package_chunk(
             chunk,
             token_limit=remaining_tokens,
@@ -35433,7 +36274,19 @@ def build_context_package(
             continue
         document = db.get(Document, chunk.document_id)
         structure = structure_context(chunk)
-        role = "hit" if chunk.id in hit_id_set else "bridge" if chunk.id in bridge_ids else "graph_path" if chunk.id in graph_path_chunk_ids else "restored_context"
+        role = (
+            "hit"
+            if chunk.id in hit_id_set
+            else "bridge"
+            if chunk.id in bridge_ids
+            else "graph_path"
+            if chunk.id in graph_path_chunk_ids
+            else "source_scope"
+            if chunk.id in required_scope_chunk_ids
+            else "source_scope_context"
+            if chunk.id in scope_context_chunk_ids
+            else "restored_context"
+        )
         source_span = chunk_source_span(
             db,
             chunk,
@@ -35507,6 +36360,33 @@ def build_context_package(
         raise RuntimeError("Context package token count audit mismatch during build")
     if token_count > token_budget:
         raise RuntimeError("Context package token hard budget exceeded during build")
+    # Candidate discovery precedes packing. Only materialized raw spans may
+    # contribute package roles, explanations or evidence coverage; the trace
+    # continues to own the complete original retrieval result/path scope.
+    selected_ids = [item["chunk_id"] for item in package_chunks]
+    packaged_ids = set(selected_ids)
+    # Phase targets may reorder packing priority. The hit audit retains the
+    # original executor ranking; it is separate from candidate/source order.
+    hit_ids = [chunk_id for chunk_id in trace.result_chunk_ids_json or []
+        if chunk_id in hit_id_set and chunk_id in packaged_ids]
+    bridge_ids.intersection_update(packaged_ids)
+    graph_path_chunk_ids.intersection_update(packaged_ids)
+    parent_node_ids = {node["node_id"] for item in package_chunks for node in item["structure_nodes"]}
+    used_contribution_ids = {
+        path["contribution_id"] for item in package_chunks for path in item["why_selected"].get("reached_by_paths", [])
+    }
+    reached_by_paths = [path for path in reached_by_paths if path["contribution_id"] in used_contribution_ids]
+    packed_contributions = []
+    for summary in node_contributions:
+        paths = [path for path in summary.get("reached_by_paths", []) if path["contribution_id"] in used_contribution_ids]
+        if paths:
+            packed_contributions.append({
+                "contract_version": summary["contract_version"], "layer": summary["layer"], "node_id": summary["node_id"],
+                **retrieval_node_contribution_facts(paths), "reached_by_paths": paths,
+            })
+    node_contributions = packed_contributions
+    for item in package_chunks:
+        item["structure_closure"]["bridge_chunk_ids"] = sorted(bridge_ids)
     # ``graph_path_ids`` is the exact executor-accepted coarse/mid/chunk
     # path-label scope bound to the retrieval trace.  ``reached_by_paths``
     # remains the richer, de-duplicated contribution view for the selected
@@ -35530,6 +36410,10 @@ def build_context_package(
             if chunk_id in bridge_ids
             else "graph_path"
             if chunk_id in graph_path_chunk_ids
+            else "source_scope"
+            if chunk_id in required_scope_chunk_ids
+            else "source_scope_context"
+            if chunk_id in scope_context_chunk_ids
             else "restored_context",
         )
         for chunk_id in selected_ids
@@ -35592,7 +36476,9 @@ def build_context_package(
         profile_hash=profile_hash,
         citation_spans_json=[],
         diagnostics_json={
-            "context_restoration_protocol": "previous_next_structure_bridge_v1",
+            "context_restoration_protocol": (
+                "reflection_source_structure_expansion_v1" if reflection_focused else "previous_next_structure_bridge_v1"
+            ),
             "repair_protocol_version": (
                 validated_restoration_directive or {}
             ).get("protocol_version"),
@@ -35631,6 +36517,12 @@ def build_context_package(
                 "graph_path_chunks": len(graph_path_chunk_ids),
                 "parent_structure_nodes": len(parent_node_ids),
                 "per_hit_chunk_budget": restore_per_chunk_budget,
+                "required_scope_chunks": len(
+                    set(required_scope_chunk_ids) & set(selected_ids)
+                ),
+                "source_scope_context_chunks": len(
+                    set(scope_context_chunk_ids) & set(selected_ids)
+                ),
             },
             "token_budget_audit": {
                 "token_budget": token_budget,
@@ -35638,13 +36530,16 @@ def build_context_package(
                 "within_budget": token_count <= token_budget,
                 "clipped_chunk_ids": clipped_chunk_ids,
                 "skipped_chunk_ids": skipped_budget_chunk_ids,
-                "packing_protocol": "whole_chunk_then_empty_package_raw_prefix_v1",
+                "packing_protocol": PACKING_PROTOCOL,
+                "candidate_chunk_ids": packing_candidate_ids,
+                "selection_token_budget": selection_token_budget,
             },
             "snapshot_integrity": {
                 "protocol_version": SOURCE_SNAPSHOT_PROTOCOL_VERSION,
                 "verified_document_version_count": snapshot_verifier.verification_count,
                 "fail_closed": True,
             },
+            "source_scope_context": scope_context_audit,
         },
     )
     db.add(package)
@@ -35780,10 +36675,10 @@ def build_context_package(
         .order_by(GraphRetrievalStep.step_index.asc())
     )
     if structure_step is None:
-        next_index = (
-            db.scalar(select(func.max(GraphRetrievalStep.step_index)).where(GraphRetrievalStep.retrieval_trace_id == trace.id))
-            or -1
-        ) + 1
+        highest_step_index = db.scalar(
+            select(func.max(GraphRetrievalStep.step_index)).where(GraphRetrievalStep.retrieval_trace_id == trace.id)
+        )
+        next_index = (highest_step_index if highest_step_index is not None else -1) + 1
         structure_step = GraphRetrievalStep(
             retrieval_trace_id=trace.id,
             knowledge_base_id=knowledge_base_id,
@@ -36574,7 +37469,17 @@ def _rq_membership_node_metadata_by_chunk(
     return by_chunk
 
 
-def graph_layer_payload(db: Session, knowledge_base_id: str, layer: str, *, limit: int = 200) -> dict[str, Any]:
+def graph_layers_payload(
+    db: Session, knowledge_base_id: str, layers: Sequence[str], *, limit: int = 200,
+) -> dict[str, Any]:
+    """Share one read preparation; the caller owns the multi-layer snapshot."""
+    requested=tuple(layers)
+    if not requested or len(set(requested))!=len(requested) or any(layer not in {
+        'chunk-structure','chunk-relation','mid-concepts','coarse-concepts'} for layer in requested):
+        raise ValueError('graph_layer_selection_invalid')
+    if (len(requested)>1 and db.get_bind().dialect.name=='postgresql'
+            and db.connection().get_isolation_level()!='REPEATABLE READ'):
+        raise ValueError('graph_layers_require_repeatable_read')
     active_chunks = list(
         db.scalars(active_chunks_query(knowledge_base_id)).all()
     )
@@ -36587,6 +37492,19 @@ def graph_layer_payload(db: Session, knowledge_base_id: str, layer: str, *, limi
         state=context_state,
         bound_layers=(relation_state, mid_state, coarse_state),
     )
+    return {'stats':stats,'layers':{layer:_graph_layer_from_read_snapshot(
+        db,knowledge_base_id,layer,limit=limit,active_chunks=active_chunks,context_state=context_state,
+        bound_layers=(relation_state,mid_state,coarse_state),stats=stats) for layer in requested}}
+
+
+def graph_layer_payload(db: Session, knowledge_base_id: str, layer: str, *, limit: int = 200) -> dict[str, Any]:
+    return graph_layers_payload(db,knowledge_base_id,(layer,),limit=limit)['layers'][layer]
+
+
+def _graph_layer_from_read_snapshot(
+    db,knowledge_base_id,layer,*,limit,active_chunks,context_state,bound_layers,stats,
+):
+    relation_state,mid_state,coarse_state=bound_layers
     active_document_versions = _active_document_version_ids(active_chunks)
     full_counts = stats["full_counts_by_layer"].get(layer, _layer_full_counts(stats["counts"], layer))
     if layer == "chunk-structure":

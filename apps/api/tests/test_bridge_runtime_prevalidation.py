@@ -430,6 +430,10 @@ def test_single_root_env_retains_service_start_secret_without_hot_applying_it(
 
     env_path = tmp_path / ".env"
     example_path = tmp_path / ".env.example"
+    settings_path = tmp_path / "settings.json"
+    repository_settings_example = Path(__file__).resolve().parents[3] / "settings.example.json"
+    if not repository_settings_example.exists():
+        repository_settings_example = Path("/workspace/settings.example.json")
     env_path.write_bytes(
         b"MODEL_BRIDGE_ADMIN_TOKEN=stale-managed-secret\nCHAT_MODEL=unit-model\n"
     )
@@ -438,6 +442,8 @@ def test_single_root_env_retains_service_start_secret_without_hot_applying_it(
     )
     monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
     monkeypatch.setattr(runtime_settings, "ENV_EXAMPLE_PATH", example_path)
+    settings_path.write_bytes(repository_settings_example.read_bytes())
+    monkeypatch.setattr(runtime_settings, "SETTINGS_PATH", settings_path)
 
     initial_status = runtime_settings.env_sync_status()
 

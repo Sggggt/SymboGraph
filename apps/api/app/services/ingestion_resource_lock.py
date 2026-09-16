@@ -271,6 +271,7 @@ def active_ingestion_batch_recoveries(
     return list(
         db.scalars(
             select(IngestionBatchRecovery)
+            .execution_options(populate_existing=True)
             .where(
                 IngestionBatchRecovery.knowledge_base_id == knowledge_base_id,
                 IngestionBatchRecovery.status.in_(

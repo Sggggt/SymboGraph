@@ -13,12 +13,12 @@ fail_closed_native_windows_production_before_settings()
 
 from app.core.config import get_settings
 from app.services.runtime_settings import (
-    initialize_runtime_env_from_root_file,
+    initialize_runtime_configuration_from_root_files,
     refresh_runtime_settings_if_needed,
 )
 
 
-WORKER_RUNTIME_ENV_INITIALIZATION = initialize_runtime_env_from_root_file()
+WORKER_RUNTIME_CONFIGURATION_INITIALIZATION = initialize_runtime_configuration_from_root_files()
 settings = get_settings()
 WORKER_STORAGE_DURABILITY_CAPABILITY = ensure_storage_durability_ready(
     settings=settings,
@@ -34,18 +34,22 @@ celery_app.conf.beat_schedule = {
     "reconcile-interrupted-ingestion-every-minute": {
         "task": "reconcile_interrupted_ingestion_batches",
         "schedule": 60,
+        "options": {"expires": 60},
     },
     "reconcile-vector-store-every-30-minutes": {
         "task": "reconcile_vector_store",
         "schedule": 30 * 60,
+        "options": {"expires": 30 * 60},
     },
     "update-policy-backfill-every-5-minutes": {
         "task": "update_policy_backfill",
         "schedule": 5 * 60,
+        "options": {"expires": 5 * 60},
     },
     "reconcile-profile-lifecycle-every-minute": {
         "task": "reconcile_profile_lifecycle",
         "schedule": 60,
+        "options": {"expires": 60},
     },
 }
 celery_app.autodiscover_tasks(["worker_app"])

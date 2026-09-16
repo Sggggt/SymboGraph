@@ -209,7 +209,7 @@ def test_single_root_env_save_persists_all_lifecycles_and_only_hot_applies(
     next_chat_model = f"{settings.chat_model}-next"
     next_chunk_size = settings.fixed_chunk_size_tokens + 16
     next_worker_concurrency = settings.worker_concurrency + 1
-    result = runtime_settings.save_model_settings_to_root_env(
+    result = runtime_settings.save_model_settings_to_root_configuration(
         db_session,
         {
             "chat_model": next_chat_model,
@@ -238,7 +238,8 @@ def test_single_root_env_save_persists_all_lifecycles_and_only_hot_applies(
 
     root_entries = runtime_settings._env_entries(runtime_settings.ENV_PATH)
     assert root_entries["CHAT_MODEL"] == next_chat_model
-    assert root_entries["FIXED_CHUNK_SIZE_TOKENS"] == str(next_chunk_size)
+    assert "FIXED_CHUNK_SIZE_TOKENS" not in root_entries
+    assert runtime_settings._runtime_settings_values()["fixed_chunk_size_tokens"] == next_chunk_size
     assert root_entries["WORKER_CONCURRENCY"] == str(next_worker_concurrency)
     assert get_settings().chat_model == next_chat_model
     assert get_settings().fixed_chunk_size_tokens == settings.fixed_chunk_size_tokens
@@ -274,7 +275,7 @@ def test_service_setting_is_written_once_and_becomes_effective_after_restart_loa
         },
     )
     before = get_settings().worker_concurrency
-    result = runtime_settings.save_model_settings_to_root_env(
+    result = runtime_settings.save_model_settings_to_root_configuration(
         db_session,
         {"worker_concurrency": before + 1},
     )
@@ -352,10 +353,23 @@ def test_pending_rebuild_audit_survives_process_restart_without_value_mirror(
     requested = min(get_settings().dense_knn_k_max, current + 1)
     if requested == current:
         requested = max(1, current - 1)
-    runtime_settings._update_env_file({"dense_knn_k_min": requested})
+    from app.core.runtime_config import (
+        atomic_replace_runtime_settings,
+        runtime_settings_bytes,
+    )
+
+    settings_values = runtime_settings._runtime_settings_values()
+    settings_values["dense_knn_k_min"] = requested
+    atomic_replace_runtime_settings(
+        runtime_settings.SETTINGS_PATH,
+        runtime_settings_bytes(
+            settings_values,
+            allowed_keys=runtime_settings.RUNTIME_JSON_SETTINGS,
+        ),
+    )
     monkeypatch.setenv("DENSE_KNN_K_MIN", str(requested))
     get_settings.cache_clear()
-    identity = runtime_settings.runtime_env_file_identity(runtime_settings.ENV_PATH)
+    identity = runtime_settings.runtime_configuration_identity()
     row = RuntimeSettingsAudit(
         protocol_version="runtime_settings_audit_v1",
         version_hash="e" * 64,
@@ -1313,7 +1327,7 @@ def test_runtime_version_publish_reuses_intent_identity_on_retry(
     )
     assert len(rows) == 1
     assert rows[0].managed_env_identity_hash == (
-        runtime_settings.runtime_env_file_identity(managed)["identity_hash"]
+        runtime_settings.runtime_configuration_identity()["identity_hash"]
     )
     assert [name for name, _value in redis_calls] == [
         "set",
@@ -1369,12 +1383,14 @@ async def test_runtime_settings_candidate_api_exposes_dry_run_stage_and_status(
         "settings": {"dense_knn_k_min": requested},
         "source": "route_test",
     }
+    assert get_settings().model_bridge_enabled is False
     with TestClient(app) as client:
+        assert get_settings().model_bridge_enabled is False
         dry_run = client.post(
             "/api/settings/runtime-candidates",
             json={**request, "dry_run_only": True},
         )
-        assert dry_run.status_code == 200
+        assert dry_run.status_code == 200, dry_run.text
         assert dry_run.json()["preview"]["requires_four_layer_shadow"] is True
         assert dry_run.json()["preview"][
             "gray_zone_rule_decision_model_call_count"
@@ -1406,3 +1422,13 @@ async def test_runtime_settings_candidate_api_exposes_dry_run_stage_and_status(
         assert recreate.status_code == 200
         assert recreate.json()["requires_service_recreate"] is True
         assert recreate.json()["active_mutated"] is False
+
+
+def test_bm25_scoring_changes_require_the_candidate_rebuild_lifecycle():
+    from app.core.config import HOT_RELOAD_SETTINGS, REBUILD_REQUIRED_SETTINGS
+    from app.schemas import ModelSettingsUpdate
+
+    assert {"bm25_k1", "bm25_b"} <= REBUILD_REQUIRED_SETTINGS
+    assert not {"bm25_k1", "bm25_b"}.intersection(HOT_RELOAD_SETTINGS)
+    update = ModelSettingsUpdate(bm25_k1=1.6, bm25_b=.5)
+    assert update.bm25_k1 == 1.6 and update.bm25_b == .5

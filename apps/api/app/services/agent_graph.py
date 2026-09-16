@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.agent_reflection import PROMPT_PRIORITY_RULES
+
 import asyncio
 import json
 import math
@@ -10,8 +12,11 @@ from collections import Counter
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from copy import deepcopy
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from threading import RLock
+from typing import Any, Literal
+from app.services.qa_performance import QAPerformance, qa_request_scope, qa_stage
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -40,12 +45,26 @@ from app.models import (
 )
 from app.schemas import (
     AgentRequest,
+    AnswerModelAudit,
     ChatMessage,
     ExpectedEvidenceAudit,
     ModelAudit,
     RetrievalGranularity,
 )
 from app.services.agent_admission import AgentAdmissionError, AgentAdmissionLease, acquire_agent_request_slot
+from app.services.answer_stream import use_answer_stream_sink
+from app.services.agent_direct_answer import (
+    DIRECT_ANSWER_ROUTE_PROTOCOL_VERSION,
+    SYSTEM_CAPABILITY_CARD_PROTOCOL_VERSION,
+    VERIFIED_CONTEXT_REUSE_EVALUATOR_PROTOCOL_VERSION,
+    build_system_direct_answer,
+    evaluate_verified_context_reuse,
+)
+from app.services.agent_intent import (
+    QUESTION_PERCEPTION_IMMUTABLE_CONTRACT,
+    QUESTION_PERCEPTION_PROTOCOL_VERSION,
+    validate_question_perception_output,
+)
 from app.services.context_graph import (
     ActiveContextGraphAdmissionError,
     LayeredSearchResult,
@@ -77,6 +96,7 @@ from app.services import cache_manager
 from app.services.conversation_state import (
     ConversationStateSnapshot,
     append_completed_turn,
+    append_pending_user_turn,
     initialize_new_session_state,
     load_conversation_state,
     merge_search_filters_with_conversation_constraints,
@@ -102,7 +122,7 @@ from app.services.citation_provenance import (
     replay_citation_provenance_for_persistence,
 )
 from app.services.model_output import coerce_confidence
-from app.services.storage import run_bounded_source_io
+from app.services.storage import raise_if_source_io_cancelled, run_bounded_source_io
 from app.services.policy import (
     POLICY_ARMS,
     POLICY_FAMILY,
@@ -156,7 +176,8 @@ from app.services.strategy_profiles import (
 )
 
 
-_TRACE_SUBSCRIBERS: dict[str, set[asyncio.Queue[dict]]] = {}
+_TRACE_SUBSCRIBERS: dict[str, dict[asyncio.Queue[dict], asyncio.AbstractEventLoop]] = {}
+_TRACE_SUBSCRIBERS_LOCK = RLock()
 _ACTIVE_AGENT_TASKS: dict[str, asyncio.Task] = {}
 TERMINAL_AGENT_RUN_STATUSES = {
     "completed",
@@ -166,6 +187,17 @@ TERMINAL_AGENT_RUN_STATUSES = {
 }
 CANCELLED_BY_USER = "cancelled_by_user"
 CANCEL_TRACE_NODE = "cancelled_by_user"
+
+
+@dataclass(frozen=True)
+class AgentStreamExecution:
+    """A durable run owner observed by zero or more transient SSE streams."""
+
+    run_id: str
+    session_id: str
+    task: asyncio.Task
+    performance: QAPerformance
+    answer_queue: asyncio.Queue[dict[str, str]]
 
 
 def _summarize(text: str, limit: int = 280) -> str:
@@ -221,23 +253,38 @@ def evidence_insufficient_answer(question: str, verdict: str) -> str:
 
 
 def _publish_trace_event(run_id: str, payload: dict) -> None:
-    for queue in list(_TRACE_SUBSCRIBERS.get(run_id, ())):
-        queue.put_nowait(payload)
+    with _TRACE_SUBSCRIBERS_LOCK:
+        subscribers = list(_TRACE_SUBSCRIBERS.get(run_id, {}).items())
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+    for queue, loop in subscribers:
+        if loop is current_loop:
+            queue.put_nowait(deepcopy(payload))
+        elif not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, deepcopy(payload))
+            except RuntimeError:
+                if not loop.is_closed():
+                    raise
 
 
 def _subscribe_trace(run_id: str) -> asyncio.Queue[dict]:
     queue: asyncio.Queue[dict] = asyncio.Queue()
-    _TRACE_SUBSCRIBERS.setdefault(run_id, set()).add(queue)
+    with _TRACE_SUBSCRIBERS_LOCK:
+        _TRACE_SUBSCRIBERS.setdefault(run_id, {})[queue] = asyncio.get_running_loop()
     return queue
 
 
 def _unsubscribe_trace(run_id: str, queue: asyncio.Queue[dict]) -> None:
-    subscribers = _TRACE_SUBSCRIBERS.get(run_id)
-    if not subscribers:
-        return
-    subscribers.discard(queue)
-    if not subscribers:
-        _TRACE_SUBSCRIBERS.pop(run_id, None)
+    with _TRACE_SUBSCRIBERS_LOCK:
+        subscribers = _TRACE_SUBSCRIBERS.get(run_id)
+        if not subscribers:
+            return
+        subscribers.pop(queue, None)
+        if not subscribers:
+            _TRACE_SUBSCRIBERS.pop(run_id, None)
 
 
 def trace_event_to_payload(event: AgentTraceEvent) -> dict:
@@ -410,6 +457,15 @@ STOP_CONDITION_FIELDS = {
     "all_claims_supported",
     "no_semantic_progress",
 }
+LEGACY_ALLOWED_TYPED_ACTIONS = frozenset(ALLOWED_TYPED_ACTIONS)
+LEGACY_REQUIRED_TYPED_ACTIONS = tuple(REQUIRED_TYPED_ACTIONS)
+LEGACY_EXPECTED_EVIDENCE_FIELDS = frozenset(EXPECTED_EVIDENCE_FIELDS)
+LEGACY_STOP_CONDITION_FIELDS = frozenset(STOP_CONDITION_FIELDS)
+ALLOWED_TYPED_ACTIONS = (set(LEGACY_ALLOWED_TYPED_ACTIONS) - {"verify_citations", "repair_missing_citation", "repair_concept_gap", "repair_bridge_gap", "repair_structure_context"}) | {"review_answer"}
+REQUIRED_TYPED_ACTIONS = [action if action != "verify_citations" else "review_answer" for action in LEGACY_REQUIRED_TYPED_ACTIONS]
+EXPECTED_EVIDENCE_FIELDS = (set(LEGACY_EXPECTED_EVIDENCE_FIELDS) - {"required_verification_stage", "failure_card_hashes", "canonical_target_refs"}) | {"required_review_stage"}
+STOP_CONDITION_FIELDS = (set(LEGACY_STOP_CONDITION_FIELDS) - {"citation_verification_passes", "all_claims_supported"}) | {"answer_review_passes"}
+
 EVIDENCE_EVALUATOR_VERDICTS = {
     "sufficient",
     "need_more_same_node",
@@ -427,7 +483,8 @@ QUERY_FACET_OUTPUT_CONTRACT_VERSION = "query_facet_nonempty_output_contract_v2"
 QUERY_FACET_EMPTY_GROUP_REPAIR_PROTOCOL_VERSION = (
     "query_facet_empty_group_schema_repair_v1"
 )
-AGENT_PLANNER_JSON_MAX_TOKENS = 8192
+AGENT_PLANNER_JSON_MAX_TOKENS = 12000
+PLANNER_EXECUTION_PREFLIGHT_PROTOCOL = "planner_execution_preflight_v1"
 EVIDENCE_EVALUATOR_JSON_MAX_TOKENS = 8192
 CITATION_VERIFICATION_JSON_MAX_TOKENS = 4096
 CITATION_VERIFICATION_MICROBATCH_PROTOCOL_VERSION = (
@@ -446,12 +503,19 @@ FORBIDDEN_GRAY_PLANNER_OUTPUTS = {
     "follow_as_bridge",
     "request_structure_closure",
 }
-TYPED_ACTION_EXECUTOR_PROTOCOL_VERSION = "planner_typed_action_executor_v2"
+TYPED_ACTION_EXECUTOR_PROTOCOL_VERSION = "planner_typed_action_executor_v3"
 EVIDENCE_EVALUATOR_PROTOCOL_VERSION = "bounded_graph_evidence_evaluator_v4"
 EVIDENCE_EVALUATOR_OUTPUT_CONTRACT_VERSION = (
     "evidence_evaluator_closed_output_contract_v1"
 )
 AGENT_PLANNER_PROTOCOL_VERSION = "layered_pe_planner_v3"
+AGENT_PLANNER_OBSERVATION_PROTOCOL_VERSION = (
+    "agent_planner_observation_projection_v1"
+)
+AGENT_PLANNER_OBSERVATION_MAX_ITEMS = 3
+AGENT_PLANNER_OBSERVATION_MAX_CHARS = 12_000
+AGENT_PLANNER_OBSERVATION_MAX_SPANS = 4
+AGENT_PLANNER_OBSERVATION_MAX_RESULT_IDS = 16
 AGENT_REPLAN_PROGRESS_PROTOCOL_VERSION = (
     "agent_replan_semantic_progress_v1"
 )
@@ -459,9 +523,20 @@ AGENT_PLANNER_AUDIT_PROTOCOL_VERSION = (
     "planner_canonical_typed_actions_hash_v1"
 )
 AGENT_PLANNER_NESTED_OBJECT_CONTRACT_VERSION = (
-    "planner_typed_action_nested_object_contract_v1"
+    "planner_typed_action_nested_object_contract_v3"
 )
-TYPED_ACTION_SCHEMA_PROTOCOL_VERSION = "typed_action_schema_v4"
+AGENT_PLANNER_ENTRY_SCOPE_RULE = (
+    "Immutable retrieval entry rule: this run starts at {retrieval_granularity}. "
+    "For EVERY action, expected_evidence.start_layer is the GLOBAL retrieval entry, not the layer of that action. "
+    "Omit start_layer, or set it exactly to {retrieval_granularity}; never set it to chunk. "
+    "Use target_layer=chunk, valid target_ids and allowed budgets for downstream chunk expansion. "
+    "A need_chunk_expansion directive keeps the same locked entry and cannot authorize changing start_layer."
+    " target_ids must have a real layer allowed for THAT action. drill_down_layer takes parent nodes "
+    "(coarse or mid as allowed), never chunk IDs; target_layer=chunk names a destination and does not "
+    "change the type of a supplied ID. Put known chunk IDs in recall_chunks or restore_context_package "
+    "as appropriate. Use [] if no valid parent ID is available; never substitute child or document IDs."
+)
+TYPED_ACTION_SCHEMA_PROTOCOL_VERSION = "typed_action_schema_v5"
 HISTORICAL_TYPED_ACTION_SCHEMA_REQUIRED_ACTIONS_BY_HASH = {
     # Early v3 predated the required ``build_context_package`` phase.
     "46cf68bf72801b62562fe25715c6578c597804d6412a980907b8ebf63ff46f46": (
@@ -474,19 +549,21 @@ HISTORICAL_TYPED_ACTION_SCHEMA_REQUIRED_ACTIONS_BY_HASH = {
     # Late v3 already required the current phase set; v4 made that identity
     # change explicit instead of silently retaining the old version label.
     "606a629895e3e02450708a767f797c228b5790b9ee40bdbf97b8fdf909483455": tuple(
-        REQUIRED_TYPED_ACTIONS
+        LEGACY_REQUIRED_TYPED_ACTIONS
     ),
+    "f5d2e730d3f3c64c574d67746deb71440122019a8c44f33bc92b1ebc839b0f3d": LEGACY_REQUIRED_TYPED_ACTIONS,
 }
 HISTORICAL_TYPED_ACTION_SCHEMA_PROTOCOL_HASHES = {
     "typed_action_schema_v3": frozenset(
-        HISTORICAL_TYPED_ACTION_SCHEMA_REQUIRED_ACTIONS_BY_HASH
+        {"46cf68bf72801b62562fe25715c6578c597804d6412a980907b8ebf63ff46f46", "606a629895e3e02450708a767f797c228b5790b9ee40bdbf97b8fdf909483455"}
     ),
+    "typed_action_schema_v4": frozenset({"f5d2e730d3f3c64c574d67746deb71440122019a8c44f33bc92b1ebc839b0f3d"}),
 }
 AGENT_EARLY_REPLAY_PROTOCOL_VERSION = (
-    "agent_provider_free_postgresql_replay_v1"
+    "agent_provider_free_postgresql_replay_v2"
 )
 AGENT_EARLY_REPLAY_POINTER_PROTOCOL_VERSION = (
-    "agent_provider_free_replay_pointer_v1"
+    "agent_provider_free_replay_pointer_v2"
 )
 AGENT_EARLY_PERCEPTION_PACKET_PROTOCOL_VERSION = (
     "agent_closed_query_perception_replay_packet_v1"
@@ -601,6 +678,7 @@ def _default_budget_for_action(action_type: str, envelope: dict[str, Any]) -> di
         "restore_context_package": {"structure_restore_per_chunk_budget": int(envelope.get("structure_restore_per_chunk_budget") or 0)},
         "build_context_package": {"context_package_token_budget": int(envelope.get("context_package_token_budget") or 0)},
         "verify_citations": {"verification_budget": int(envelope.get("verification_budget") or 0)},
+        "review_answer": {"answer_unit_limit": int(envelope.get("answer_unit_limit") or 12), "reflection_round_budget": int(envelope.get("reflection_round_budget") or 0)},
         "repair_missing_citation": {"repair_round_budget": int(envelope.get("repair_round_budget") or 0)},
         "repair_concept_gap": {"repair_round_budget": int(envelope.get("repair_round_budget") or 0)},
         "repair_bridge_gap": {"repair_round_budget": int(envelope.get("repair_round_budget") or 0)},
@@ -613,18 +691,15 @@ def _default_budget_for_action(action_type: str, envelope: dict[str, Any]) -> di
 
 
 def fallback_typed_actions(question: str, envelope: dict[str, Any]) -> list[dict[str, Any]]:
-    formula_hint = any(token in question.lower() for token in ("formula", "table", "equation", "公式", "表格"))
     actions = [
         "select_entry_nodes",
         "walk_graph_frontier",
         "recall_chunks",
         "restore_context_package",
         "build_context_package",
-        "verify_citations",
+        "review_answer",
         "drill_down_layer",
     ]
-    if formula_hint and int(envelope.get("repair_round_budget") or 0) > 0:
-        actions.append("repair_structure_context")
     actions = actions[: max(1, int(envelope.get("max_typed_actions_per_round") or 1))]
     return [
         {
@@ -633,7 +708,7 @@ def fallback_typed_actions(question: str, envelope: dict[str, Any]) -> list[dict
             "reason": "Route through the four-layer context graph under the active operating envelope.",
             "budget_request": _default_budget_for_action(action_type, envelope),
             "expected_evidence": {"source": "context_graph", "requires_chunk_spans": True},
-            "stop_condition": {"sufficient_evidence": action_type in {"build_context_package", "verify_citations"}},
+            "stop_condition": {"sufficient_evidence": action_type in {"build_context_package", "review_answer"}},
         }
         for action_type in actions
     ]
@@ -652,12 +727,25 @@ ACTION_TARGET_LAYERS: dict[str, set[str]] = {
     "recall_chunks": {"rq_membership", "chunk"},
     "restore_context_package": {"chunk"},
     "build_context_package": {"chunk"},
+    "review_answer": {"chunk"},
     "verify_citations": {"chunk"},
     "repair_missing_citation": {"coarse", "mid", "rq_membership", "chunk"},
     "repair_concept_gap": {"coarse", "mid", "rq_membership"},
     "repair_bridge_gap": {"coarse", "mid", "rq_membership", "chunk"},
     "repair_structure_context": {"rq_membership", "chunk"},
 }
+
+
+def planner_action_compatible(action_type: str, retrieval_granularity: str | None) -> bool:
+    return not (retrieval_granularity == "mid" and action_type == "activate_coarse_concepts")
+
+
+def planner_target_contracts(retrieval_granularity: str) -> dict[str, dict[str, Any]]:
+    return {action: {
+        "allowed_target_id_layers": sorted(ACTION_TARGET_LAYERS.get(action, set()) - ({"coarse"} if retrieval_granularity == "mid" else set())),
+        "target_ids_mean": "parent_nodes_to_expand" if action == "drill_down_layer" else "existing_nodes_or_addresses_in_allowed_layers",
+        "empty_target_ids_allowed": True,
+    } for action in sorted(ALLOWED_TYPED_ACTIONS) if planner_action_compatible(action, retrieval_granularity)}
 
 
 def _target_id_layers(db: Session, knowledge_base_id: str, target_ids: list[str]) -> dict[str, set[str]]:
@@ -692,9 +780,11 @@ def heuristic_query_intent(question: str, history: list[dict] | None = None) -> 
         intent = "definition"
     return {
         "intent": intent,
+        "direct_answer_kind": "none",
         "entities": [],
         "sub_queries": [question],
         "needs_graph": True,
+        "suggested_strategy": "hybrid",
         "history_turns": len(history or []),
     }
 
@@ -705,7 +795,14 @@ async def perceive_query_intent(question: str, history: list[dict] | None = None
         try:
             result = await provider.perceive_question(question, history or [])
             if isinstance(result, dict):
-                return {**heuristic_query_intent(question, history), **result}
+                validated = validate_question_perception_output(
+                    result,
+                    question=question,
+                )
+                return {
+                    **validated,
+                    "history_turns": len(history or []),
+                }
         except Exception:
             raise
     return heuristic_query_intent(question, history)
@@ -786,7 +883,7 @@ async def propose_query_facets(question: str, history: list[dict] | None, query_
     try:
         raw = await classify_json_with_budget(
             provider,
-            system_prompt=system,
+            system_prompt=system + "\n\n" + PROMPT_PRIORITY_RULES,
             user_prompt=user_prompt,
             fallback=fallback_marker,
             max_tokens=QUERY_FACET_JSON_MAX_TOKENS,
@@ -883,6 +980,205 @@ async def propose_query_facets(question: str, history: list[dict] | None, query_
     return facets
 
 
+def _planner_bounded_value(
+    value: Any,
+    *,
+    depth: int = 0,
+) -> Any:
+    if depth >= 4:
+        return None
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:240]
+    if isinstance(value, list):
+        return [
+            _planner_bounded_value(item, depth=depth + 1)
+            for item in value[:8]
+        ]
+    if isinstance(value, dict):
+        return {
+            str(key)[:80]: _planner_bounded_value(
+                item,
+                depth=depth + 1,
+            )
+            for key, item in list(value.items())[:24]
+        }
+    return str(value)[:240]
+
+
+def planner_observation_projection_packet(
+    bounded_observations: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    projected: list[dict[str, Any]] = []
+    for raw_item in (bounded_observations or [])[
+        -AGENT_PLANNER_OBSERVATION_MAX_ITEMS:
+    ]:
+        item = dict(raw_item or {})
+        if item.get("protocol_version") == (
+            AGENT_PLANNER_OBSERVATION_PROTOCOL_VERSION
+        ):
+            projected.append(_strict_json_clone(item))
+            continue
+        graph = dict(item.get("bounded_graph_observation") or {})
+        evaluator = dict(item.get("evidence_evaluator") or {})
+        if graph:
+            required_facets = [
+                str(value)[:160]
+                for value in graph.get("required_facets") or []
+            ][:16]
+            covered_facets = [
+                str(value)[:160]
+                for value in graph.get("covered_facets") or []
+            ][:16]
+            covered_set = set(covered_facets)
+            span_summaries = []
+            for summary in (
+                graph.get("candidate_chunk_span_summaries") or []
+            )[:AGENT_PLANNER_OBSERVATION_MAX_SPANS]:
+                if not isinstance(summary, dict):
+                    continue
+                span_summaries.append(
+                    {
+                        "chunk_id": str(
+                            summary.get("chunk_id") or ""
+                        )[:80],
+                        "summary_hash": str(
+                            summary.get("summary_hash") or ""
+                        )[:80],
+                        "document_title": str(
+                            summary.get("document_title") or ""
+                        )[:160],
+                        "text_excerpt": str(
+                            summary.get("text_excerpt") or ""
+                        )[:360],
+                        "source_span_address": _planner_bounded_value(
+                            dict(
+                                summary.get("source_span_address")
+                                or {}
+                            )
+                        ),
+                    }
+                )
+            projection = {
+                "protocol_version": (
+                    AGENT_PLANNER_OBSERVATION_PROTOCOL_VERSION
+                ),
+                "plan_index": int(graph.get("plan_index") or 0),
+                "source_observation_hash": str(
+                    graph.get("observation_hash") or ""
+                ),
+                "retrieval_granularity": graph.get(
+                    "retrieval_granularity"
+                ),
+                "typed_action_control_hash": graph.get(
+                    "typed_action_control_hash"
+                ),
+                "required_facets": required_facets,
+                "covered_facets": covered_facets,
+                "missing_facets": [
+                    facet
+                    for facet in required_facets
+                    if facet not in covered_set
+                ],
+                "evidence_roles": [
+                    str(value)[:120]
+                    for value in graph.get("evidence_roles") or []
+                ][:16],
+                "result_chunk_ids": [
+                    str(value)[:80]
+                    for value in graph.get("result_chunk_ids") or []
+                ][:AGENT_PLANNER_OBSERVATION_MAX_RESULT_IDS],
+                "result_count": int(graph.get("result_count") or 0),
+                "citable_span_count": int(
+                    graph.get("citable_span_count") or 0
+                ),
+                "independent_support_path_count": int(
+                    graph.get("independent_support_path_count") or 0
+                ),
+                "candidate_span_summaries": span_summaries,
+                "entry_counts": _planner_bounded_value(
+                    dict(graph.get("entry_counts") or {})
+                ),
+                "stage_counts": _planner_bounded_value(
+                    dict(graph.get("stage_counts") or {})
+                ),
+                "convergence": _planner_bounded_value(
+                    dict(graph.get("convergence") or {})
+                ),
+                "hard_budget": _planner_bounded_value(
+                    dict(graph.get("hard_budget") or {})
+                ),
+                "evaluator_directive": {
+                    "verdict": str(
+                        evaluator.get("verdict") or ""
+                    )[:80],
+                    "reason": str(
+                        evaluator.get("reason") or ""
+                    )[:240],
+                    "target_ids": [
+                        str(value)[:80]
+                        for value in evaluator.get("target_ids") or []
+                    ][:8],
+                    "expected_evidence": _planner_bounded_value(
+                        dict(
+                            evaluator.get("expected_evidence") or {}
+                        )
+                    ),
+                },
+            }
+            projection["projection_hash"] = stable_hash(projection)
+            projected.append(projection)
+            continue
+        validation = dict(item.get("typed_action_validation") or {})
+        if validation:
+            projection = {
+                "protocol_version": (
+                    AGENT_PLANNER_OBSERVATION_PROTOCOL_VERSION
+                ),
+                "observation_type": "typed_action_validation",
+                "valid": bool(validation.get("valid")),
+                "rejected": [
+                    {
+                        "action_type": str(
+                            rejected.get("action_type") or ""
+                        )[:80],
+                        "reason": str(
+                            rejected.get("reason") or ""
+                        )[:240],
+                    }
+                    for rejected in validation.get("rejected") or []
+                    if isinstance(rejected, dict)
+                ][:8],
+            }
+            projection["projection_hash"] = stable_hash(projection)
+            projected.append(projection)
+
+    serialized = json.dumps(
+        projected,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    if len(serialized) > AGENT_PLANNER_OBSERVATION_MAX_CHARS:
+        raise RuntimeError(
+            "Agent planner observation projection exceeded its hard bound"
+        )
+    packet = {
+        "protocol_version": AGENT_PLANNER_OBSERVATION_PROTOCOL_VERSION,
+        "observations": projected,
+        "serialized_char_count": len(serialized),
+        "max_serialized_char_count": (
+            AGENT_PLANNER_OBSERVATION_MAX_CHARS
+        ),
+        "full_graph_observation_forwarded": False,
+        "raw_provider_response_forwarded": False,
+    }
+    packet["packet_hash"] = stable_hash(packet)
+    return packet
+
+
 async def propose_agent_plan(
     question: str,
     history: list[dict],
@@ -895,7 +1191,12 @@ async def propose_agent_plan(
     evaluator_directive: dict[str, Any] | None = None,
     policy_operating_prior: dict[str, Any] | None = None,
     policy_knowledge_base_id: str | None = None,
+    validation_db: Session | None = None,
+    requested_result_top_k: int | None = None,
 ) -> tuple[list[Any], dict[str, Any]]:
+    planner_observation_packet = planner_observation_projection_packet(
+        bounded_observations
+    )
     if policy_operating_prior is not None:
         if not policy_knowledge_base_id:
             raise PolicyStateValidationError(
@@ -926,6 +1227,9 @@ async def propose_agent_plan(
     fallback = {"typed_actions": schema_example_typed_actions}
     profile = active_profile_json()
     system = profile_prompt(profile, "agent_planner_system", DEFAULT_AGENT_PLANNER_SYSTEM)
+    system += "\n\n" + AGENT_PLANNER_ENTRY_SCOPE_RULE.format(retrieval_granularity=retrieval_granularity)
+    target_contracts = planner_target_contracts(retrieval_granularity)
+    from app.services.context_graph import typed_action_entry_target_limits, normalize_agent_operating_envelope
     typed_action_output_contract = {
         "protocol_version": AGENT_PLANNER_NESTED_OBJECT_CONTRACT_VERSION,
         "top_level_exact_shape": {"typed_actions": ["action objects"]},
@@ -957,6 +1261,12 @@ async def propose_agent_plan(
         "schema_example_is_executor_authority": False,
         "action_type_uniqueness": "at most one action per action_type",
         "output_size_contract": {
+            "component_max_tokens": AGENT_PLANNER_JSON_MAX_TOKENS,
+            "execution_preflight_protocol": PLANNER_EXECUTION_PREFLIGHT_PROTOCOL,
+            "distinct_target_limits_by_layer": typed_action_entry_target_limits(normalize_agent_operating_envelope(envelope), retrieval_granularity),
+            "target_union_rule": "All target_ids across actions share the per-layer distinct target limit. The final result top-k is a separate limit. Use only necessary targets, not every observed chunk.",
+            "rq_and_chunk_combined_limit": min(int(envelope["agent_chunk_initial_budget"]),
+                requested_result_top_k if requested_result_top_k is not None else get_settings().retrieval_result_top_k_default),
             "max_actions": int(
                 envelope.get("max_typed_actions_per_round") or 1
             ),
@@ -976,18 +1286,20 @@ async def propose_agent_plan(
             action_type: sorted(
                 _default_budget_for_action(action_type, envelope)
             )
-            for action_type in sorted(ALLOWED_TYPED_ACTIONS)
+            for action_type in target_contracts
         },
+        "target_contracts_by_action": target_contracts,
         "retrieval_granularity_contract": {
             "locked_value": retrieval_granularity,
             "rewrite_allowed": False,
-            "mid_forbids_coarse_start_layer": (
-                retrieval_granularity == "mid"
-            ),
+            "start_layer_allowed_values_on_every_action": [retrieval_granularity],
+            "start_layer_means_global_entry": True,
+            "downstream_chunk_layer_field": "target_layer",
+            "chunk_expansion_changes_entry": False,
         },
-        "verify_citations_contract": {
-            "required_verification_stage_if_present": (
-                "structure_plus_llm_entailment"
+        "review_answer_contract": {
+            "required_review_stage_if_present": (
+                "source_binding_and_optional_reflection"
             )
         },
     }
@@ -998,7 +1310,14 @@ async def propose_agent_plan(
             "query_intent": query_intent,
             "operating_envelope": envelope,
             "plan_index": int(plan_index),
-            "bounded_prior_observations": (bounded_observations or [])[-3:],
+            "bounded_prior_observations": planner_observation_packet[
+                "observations"
+            ],
+            "planner_observation_projection": {
+                key: value
+                for key, value in planner_observation_packet.items()
+                if key != "observations"
+            },
             "evidence_evaluator_directive": evaluator_directive or {},
             "policy_operating_prior": policy_operating_prior or {},
             "policy_contract": (
@@ -1007,8 +1326,8 @@ async def propose_agent_plan(
                 "path-distance thresholds, or decide any gray-zone path."
             ),
             "request_retrieval_granularity": retrieval_granularity,
-            "retrieval_granularity_contract": "The user-selected value is fixed for this run. Do not rewrite it to hybrid, dual-start, or any unimplemented mode.",
-            "allowed_action_types": sorted(ALLOWED_TYPED_ACTIONS),
+            "retrieval_granularity_contract": AGENT_PLANNER_ENTRY_SCOPE_RULE.format(retrieval_granularity=retrieval_granularity),
+            "allowed_action_types": sorted(target_contracts),
             "required_action_types": REQUIRED_TYPED_ACTIONS,
             "required_action_fields": sorted(TYPED_ACTION_REQUIRED_FIELDS),
             "typed_action_output_contract": typed_action_output_contract,
@@ -1024,18 +1343,21 @@ async def propose_agent_plan(
     )
     provider = ChatProvider()
     planner_errors: list[str] = []
+    model_call_count = 1
+    preflight_rejection_count = 0
     try:
         output = await classify_json_with_budget(
             provider,
-            system_prompt=system,
+            system_prompt=system + "\n\n" + PROMPT_PRIORITY_RULES,
             user_prompt=user_prompt,
             fallback=fallback,
             max_tokens=AGENT_PLANNER_JSON_MAX_TOKENS,
         )
-    except ExternalServiceError:
+    except ExternalServiceError as exc:
         # Transport/completion failures have no provider JSON object to
         # repair. A second call would repeat external cost without satisfying
         # the schema-repair precondition.
+        exc.planner_sampling = planner_sampling_audit(model_call_count=1)
         raise
     except Exception as exc:
         output = {}
@@ -1044,7 +1366,10 @@ async def propose_agent_plan(
     if isinstance(output, dict) and not output_fields_valid:
         planner_errors.append(f"top_level_schema:{sorted(output)}")
     actions = output.get("typed_actions") if output_fields_valid else None
-    if not isinstance(actions, list):
+    preflight_feedback = planner_execution_preflight(actions, envelope, db=validation_db, knowledge_base_id=policy_knowledge_base_id,
+        retrieval_granularity=retrieval_granularity, requested_result_top_k=requested_result_top_k)
+    preflight_rejection_count += bool(preflight_feedback)
+    if not isinstance(actions, list) or preflight_feedback:
         repair_system = (
             f"{system} "
             + profile_prompt(profile, "agent_planner_repair_suffix", DEFAULT_AGENT_PLANNER_REPAIR_SUFFIX)
@@ -1052,12 +1377,13 @@ async def propose_agent_plan(
         repair_prompt = str(
             {
                 "invalid_response_keys": sorted(output.keys()) if isinstance(output, dict) else [],
+                "execution_preflight": preflight_feedback,
                 "required_shape": {"typed_actions": ["typed action objects"]},
                 "typed_action_output_contract": (
                     typed_action_output_contract
                 ),
                 "required_action_types": REQUIRED_TYPED_ACTIONS,
-                "allowed_action_types": sorted(ALLOWED_TYPED_ACTIONS),
+                "allowed_action_types": sorted(target_contracts),
                 "required_action_fields": sorted(TYPED_ACTION_REQUIRED_FIELDS),
                 "allowed_expected_evidence_fields": sorted(EXPECTED_EVIDENCE_FIELDS),
                 "allowed_stop_condition_fields": sorted(STOP_CONDITION_FIELDS),
@@ -1067,7 +1393,16 @@ async def propose_agent_plan(
                     "query_intent": query_intent,
                     "operating_envelope": envelope,
                     "plan_index": int(plan_index),
-                    "bounded_prior_observations": (bounded_observations or [])[-3:],
+                    "bounded_prior_observations": (
+                        planner_observation_packet["observations"]
+                    ),
+                    "planner_observation_projection": {
+                        key: value
+                        for key, value in (
+                            planner_observation_packet.items()
+                        )
+                        if key != "observations"
+                    },
                     "evidence_evaluator_directive": evaluator_directive or {},
                     "policy_operating_prior": policy_operating_prior or {},
                     "request_retrieval_granularity": retrieval_granularity,
@@ -1075,6 +1410,7 @@ async def propose_agent_plan(
             }
         )
         try:
+            model_call_count += 1
             repaired = await classify_json_with_budget(
                 provider,
                 system_prompt=repair_system,
@@ -1087,16 +1423,71 @@ async def propose_agent_plan(
                 planner_errors.append(f"repair_top_level_schema:{sorted(repaired)}")
             repaired_actions = repaired.get("typed_actions") if repaired_fields_valid else None
             if isinstance(repaired_actions, list):
-                output = {**repaired, "planner_repair": {"attempted": True, "errors": planner_errors}}
+                output = {**repaired, "planner_repair": {"attempted": True, "errors": planner_errors,
+                    "execution_preflight": preflight_feedback}}
                 actions = repaired_actions
+        except ExternalServiceError as exc:
+            exc.planner_sampling = planner_sampling_audit(model_call_count=model_call_count,
+                preflight_rejection_count=preflight_rejection_count)
+            raise
         except Exception as exc:
             planner_errors.append(f"repair_request:{public_exception_message(exc)}")
     if not isinstance(actions, list):
         if not get_settings().enable_model_fallback:
             detail = f" ({'; '.join(planner_errors)})" if planner_errors else ""
-            raise RuntimeError(f"Agent planner returned invalid JSON after repair: typed_actions array is required{detail}")
+            failure = RuntimeError(f"Agent planner returned invalid JSON after repair: typed_actions array is required{detail}")
+            failure.planner_sampling = planner_sampling_audit(model_call_count=model_call_count,
+                preflight_rejection_count=preflight_rejection_count)
+            raise failure
         actions = fallback["typed_actions"]
-    return list(actions), output if isinstance(output, dict) else {}
+    final_preflight = planner_execution_preflight(actions, envelope, db=validation_db, knowledge_base_id=policy_knowledge_base_id,
+        retrieval_granularity=retrieval_granularity, requested_result_top_k=requested_result_top_k)
+    if final_preflight:
+        raise TypedActionValidationError({"valid": False, "execution_preflight": final_preflight,
+            "planner_sampling": planner_sampling_audit(model_call_count=model_call_count,
+                preflight_rejection_count=preflight_rejection_count + 1)})
+    return list(actions), {**(output if isinstance(output, dict) else {}),
+        "planner_sampling": planner_sampling_audit(model_call_count=model_call_count,
+            preflight_rejection_count=preflight_rejection_count)}
+
+
+def planner_sampling_audit(*, model_call_count: int = 1, preflight_rejection_count: int = 0,
+    cache_hit: bool = False) -> dict[str, Any]:
+    if type(model_call_count) is not int or not 0 <= model_call_count <= 2:
+        raise ValueError("planner sampling count invalid")
+    if type(preflight_rejection_count) is not int or not 0 <= preflight_rejection_count <= 2:
+        raise ValueError("planner preflight count invalid")
+    if cache_hit != (model_call_count == 0):
+        raise ValueError("planner cache sampling count invalid")
+    return {"protocol_version": "planner_sampling_audit_v1", "model_call_count": model_call_count,
+        "schema_repair_count": max(0, model_call_count - 1), "execution_preflight_rejection_count": preflight_rejection_count,
+        "cache_hit": cache_hit, "provider_response_recorded": False}
+
+
+def planner_execution_preflight(actions: Any, envelope: dict[str, Any], *, db: Session | None,
+    knowledge_base_id: str | None, retrieval_granularity: RetrievalGranularity,
+    requested_result_top_k: int | None) -> dict[str, Any]:
+    if db is None or not isinstance(actions, list):
+        return {}
+    accepted, validation = validate_typed_actions(actions, envelope, db=db, knowledge_base_id=knowledge_base_id,
+        retrieval_granularity=retrieval_granularity)
+    feedback = {"protocol_version": PLANNER_EXECUTION_PREFLIGHT_PROTOCOL}
+    if not validation["valid"]:
+        return {**feedback, "reason": "typed_action_validation_failed", "rejected_action_count": len(validation["rejected"])}
+    controls = compile_typed_action_execution_controls(accepted, envelope,
+        requested_result_top_k=requested_result_top_k or int(get_settings().retrieval_result_top_k_default),
+        retrieval_granularity=retrieval_granularity, validation_diagnostics=validation)
+    from app.services.context_graph import validate_typed_action_traversal_controls, typed_action_entry_target_limits, normalize_agent_operating_envelope
+    try:
+        validate_typed_action_traversal_controls(controls, base_envelope=envelope, retrieval_granularity=retrieval_granularity,
+            result_top_k=controls["effective_result_top_k"])
+    except ValueError:
+        effective = {**normalize_agent_operating_envelope(envelope), **controls["traversal_envelope_overrides"]}
+        return {**feedback, "reason": "execution_controls_invalid",
+            "distinct_target_counts": {layer: len(ids) for layer, ids in controls["entry_targets_by_layer"].items()},
+            "distinct_target_limits": typed_action_entry_target_limits(effective, retrieval_granularity),
+            "rq_and_chunk_combined_limit": min(int(effective["agent_chunk_initial_budget"]), controls["effective_result_top_k"])}
+    return {}
 
 
 def validate_typed_actions(
@@ -1109,23 +1500,44 @@ def validate_typed_actions(
     retrieval_granularity: RetrievalGranularity | None = None,
     required_actions_override: tuple[str, ...] | None = None,
     historical_target_layers_override: dict[str, list[str]] | None = None,
+    execution_scope: Literal["answer_reflection", "retrieval_only"] = "answer_reflection",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if execution_scope not in {"answer_reflection", "retrieval_only"}:
+        raise ValueError("typed_action_execution_scope_invalid")
+    if execution_scope == "retrieval_only" and (
+        required_actions_override is not None or historical_target_layers_override is not None
+    ):
+        raise ValueError("retrieval_control_cannot_use_historical_action_overrides")
+    legacy_schema = required_actions_override is not None and "verify_citations" in required_actions_override
+    allowed_actions = LEGACY_ALLOWED_TYPED_ACTIONS if legacy_schema else ALLOWED_TYPED_ACTIONS
+    evidence_fields = LEGACY_EXPECTED_EVIDENCE_FIELDS if legacy_schema else EXPECTED_EVIDENCE_FIELDS
+    stop_fields = LEGACY_STOP_CONDITION_FIELDS if legacy_schema else STOP_CONDITION_FIELDS
+    review_action_type = "verify_citations" if legacy_schema else "review_answer"
+    review_field = "required_verification_stage" if legacy_schema else "required_review_stage"
+    review_stage = "structure_plus_llm_entailment" if legacy_schema else "source_binding_and_optional_reflection"
     effective_required_actions = list(
         required_actions_override
         if required_actions_override is not None
         else REQUIRED_TYPED_ACTIONS
     )
+    schema_protocol = TYPED_ACTION_SCHEMA_PROTOCOL_VERSION
+    if execution_scope == "retrieval_only":
+        allowed_actions = set(ALLOWED_TYPED_ACTIONS) - {"review_answer"}
+        effective_required_actions = [action for action in REQUIRED_TYPED_ACTIONS if action != "review_answer"]
+        evidence_fields = set(EXPECTED_EVIDENCE_FIELDS) - {"required_review_stage"}
+        stop_fields = set(STOP_CONDITION_FIELDS) - {"answer_review_passes"}
+        schema_protocol = "retrieval_typed_action_schema_v1"
     max_actions = int(envelope.get("max_typed_actions_per_round") or 1)
     diagnostics: dict[str, Any] = {
-        "typed_action_schema_protocol_version": TYPED_ACTION_SCHEMA_PROTOCOL_VERSION,
+        "typed_action_schema_protocol_version": schema_protocol,
         "typed_action_schema_protocol_hash": stable_hash(
             {
-                "protocol_version": TYPED_ACTION_SCHEMA_PROTOCOL_VERSION,
-                "allowed_actions": sorted(ALLOWED_TYPED_ACTIONS),
+                "protocol_version": schema_protocol,
+                "allowed_actions": sorted(allowed_actions),
                 "required_actions": effective_required_actions,
                 "required_fields": sorted(TYPED_ACTION_REQUIRED_FIELDS),
-                "expected_evidence_fields": sorted(EXPECTED_EVIDENCE_FIELDS),
-                "stop_condition_fields": sorted(STOP_CONDITION_FIELDS),
+                "expected_evidence_fields": sorted(evidence_fields),
+                "stop_condition_fields": sorted(stop_fields),
             }
         ),
         "accepted": [],
@@ -1228,10 +1640,10 @@ def validate_typed_actions(
             )
             continue
         action_type = str(action.get("action_type") or "")
-        if action_type not in ALLOWED_TYPED_ACTIONS:
+        if action_type not in allowed_actions:
             diagnostics["rejected"].append({"index": index, "action_type": action_type, "reason": "unsupported_action_type"})
             continue
-        if retrieval_granularity == "mid" and action_type == "activate_coarse_concepts":
+        if not planner_action_compatible(action_type, retrieval_granularity):
             diagnostics["rejected"].append(
                 {
                     "index": index,
@@ -1277,7 +1689,6 @@ def validate_typed_actions(
             continue
         planner_semantic_payload = repr(
             {
-                "reason": action.get("reason"),
                 "expected_evidence": action.get("expected_evidence"),
                 "stop_condition": action.get("stop_condition"),
             }
@@ -1287,6 +1698,9 @@ def validate_typed_actions(
             for token in [*FORBIDDEN_GRAY_PLANNER_OUTPUTS, "gray_zone", "gray-zone", "gray path"]
             if token.casefold() in planner_semantic_payload
         )
+        forbidden_gray_mentions = sorted(set(forbidden_gray_mentions).union(
+            token for token in FORBIDDEN_GRAY_PLANNER_OUTPUTS if token.casefold() in str(action.get("reason") or "").casefold()
+        ))
         if forbidden_gray_mentions:
             diagnostics["rejected"].append(
                 {
@@ -1325,7 +1739,7 @@ def validate_typed_actions(
             continue
 
         expected_evidence = dict(action["expected_evidence"])
-        unknown_evidence_fields = sorted(set(expected_evidence) - EXPECTED_EVIDENCE_FIELDS)
+        unknown_evidence_fields = sorted(set(expected_evidence) - evidence_fields)
         if unknown_evidence_fields:
             diagnostics["rejected"].append(
                 {
@@ -1337,7 +1751,7 @@ def validate_typed_actions(
             )
             continue
         stop_condition = dict(action["stop_condition"])
-        unknown_stop_fields = sorted(set(stop_condition) - STOP_CONDITION_FIELDS)
+        unknown_stop_fields = sorted(set(stop_condition) - stop_fields)
         if unknown_stop_fields:
             diagnostics["rejected"].append(
                 {
@@ -1377,7 +1791,7 @@ def validate_typed_actions(
             "source",
             "start_layer",
             "target_layer",
-            "required_verification_stage",
+            review_field,
             "protocol_version",
             "executor_mechanism",
             "action_input_hash",
@@ -1392,11 +1806,11 @@ def validate_typed_actions(
         for key in ("start_layer", "target_layer"):
             if key in expected_evidence and isinstance(expected_evidence[key], str) and expected_evidence[key] not in allowed_evidence_layers:
                 invalid_evidence_types.append(key)
-        if "required_verification_stage" in expected_evidence and (
-            action_type != "verify_citations"
-            or expected_evidence["required_verification_stage"] != "structure_plus_llm_entailment"
+        if review_field in expected_evidence and (
+            action_type != review_action_type
+            or expected_evidence[review_field] != review_stage
         ):
-            invalid_evidence_types.append("required_verification_stage")
+            invalid_evidence_types.append(review_field)
         if "action_input_hash" in expected_evidence and not re.fullmatch(
             r"[0-9a-f]{64}", str(expected_evidence["action_input_hash"])
         ):
@@ -1563,8 +1977,8 @@ def validate_typed_actions(
         if action_type in {"restore_context_package", "build_context_package"}:
             restore_modes = set(expected_evidence.get("required_restore_modes") or [])
             expected_evidence["required_restore_modes"] = sorted(set(required_restore_modes).union(restore_modes))
-        if action_type == "verify_citations":
-            expected_evidence["required_verification_stage"] = "structure_plus_llm_entailment"
+        if action_type == review_action_type:
+            expected_evidence[review_field] = review_stage
         expected_evidence.setdefault("allowed_relation_types", sorted(allowed_relation_types))
         action_validation = {
             "valid": True,
@@ -1576,7 +1990,7 @@ def validate_typed_actions(
             "fallback_disabled_checked": True,
             "bridge_protection_checked": True,
             "required_restore_modes": required_restore_modes,
-            "required_verification_stage": expected_evidence.get("required_verification_stage"),
+            review_field: expected_evidence.get(review_field),
         }
         normalized = {
             "action_type": action_type,
@@ -1615,8 +2029,8 @@ def validate_typed_actions(
                 "required_restore_modes": list(envelope.get("required_restore_modes") or []),
                 "allowed_relation_types": list(envelope.get("allowed_relation_types") or []),
             }
-            if required == "verify_citations":
-                inserted_expected_evidence["required_verification_stage"] = "structure_plus_llm_entailment"
+            if required == review_action_type:
+                inserted_expected_evidence[review_field] = review_stage
             inserted = {
                 "action_type": required,
                 "target_ids": [],
@@ -1694,7 +2108,7 @@ def historical_typed_action_required_actions_for_replay(
 ) -> tuple[str, ...] | None:
     if (
         str(persisted.get("typed_action_schema_protocol_version") or "")
-        != "typed_action_schema_v3"
+        not in HISTORICAL_TYPED_ACTION_SCHEMA_PROTOCOL_HASHES
     ):
         return None
     return HISTORICAL_TYPED_ACTION_SCHEMA_REQUIRED_ACTIONS_BY_HASH.get(
@@ -1718,6 +2132,9 @@ def compile_typed_action_execution_controls(
     inputs.
     """
 
+    legacy_controls = str((validation_diagnostics or {}).get("typed_action_schema_protocol_version") or "") in HISTORICAL_TYPED_ACTION_SCHEMA_PROTOCOL_HASHES
+    answer_unit_limit = int(envelope.get("answer_unit_limit") or 12)
+    reflection_round_budget = int(envelope.get("reflection_round_budget") or 0)
     effective_result_top_k = int(requested_result_top_k)
     verification_budget = int(envelope.get("verification_budget") or 0)
     repair_round_budget = int(envelope.get("repair_round_budget") or 0)
@@ -1745,6 +2162,7 @@ def compile_typed_action_execution_controls(
         "restore_context_package": {"structure_restore_per_chunk_budget"},
         "build_context_package": {"context_package_token_budget"},
         "verify_citations": {"verification_budget"},
+        "review_answer": {"answer_unit_limit", "reflection_round_budget"},
         "repair_missing_citation": {"repair_round_budget"},
         "repair_concept_gap": {"repair_round_budget"},
         "repair_bridge_gap": {"repair_round_budget"},
@@ -1824,6 +2242,9 @@ def compile_typed_action_execution_controls(
             and "agent_chunk_top_k" in action_budget_overrides
         ):
             effective_result_top_k = min(effective_result_top_k, action_budget_overrides["agent_chunk_top_k"])
+        if action_type == "review_answer":
+            answer_unit_limit = min(answer_unit_limit, action_budget_overrides.get("answer_unit_limit", answer_unit_limit))
+            reflection_round_budget = min(reflection_round_budget, action_budget_overrides.get("reflection_round_budget", reflection_round_budget))
         if action_type == "verify_citations" and "verification_budget" in action_budget_overrides:
             verification_budget = min(verification_budget, action_budget_overrides["verification_budget"])
         if action_type in DEFERRED_REPAIR_ACTION_TYPES and "repair_round_budget" in action_budget_overrides:
@@ -1904,7 +2325,7 @@ def compile_typed_action_execution_controls(
         for action_type, target_ids in phase_target_ids_by_action.items()
     }
     controls = {
-        "protocol_version": TYPED_ACTION_EXECUTOR_PROTOCOL_VERSION,
+        "protocol_version": "planner_typed_action_executor_v2" if legacy_controls else TYPED_ACTION_EXECUTOR_PROTOCOL_VERSION,
         "retrieval_granularity": retrieval_granularity,
         "requested_result_top_k": int(requested_result_top_k),
         "effective_result_top_k": max(1, int(effective_result_top_k)),
@@ -1928,6 +2349,11 @@ def compile_typed_action_execution_controls(
         "path_distance_thresholds_modified": False,
         "gray_zone_model_call_count": 0,
     }
+    if not legacy_controls:
+        controls.pop("verification_budget")
+        controls.pop("repair_round_budget")
+        controls["answer_unit_limit"] = answer_unit_limit
+        controls["reflection_round_budget"] = reflection_round_budget
     controls["control_hash"] = stable_hash(controls)
     return controls
 
@@ -2064,13 +2490,15 @@ def _agent_replay_perception_packet(
         raise RuntimeError("Agent replay perception must be an object")
     required_fields = {
         "intent",
+        "direct_answer_kind",
         "entities",
         "sub_queries",
         "needs_graph",
+        "suggested_strategy",
         "history_turns",
         "conversation_state",
     }
-    allowed_fields = required_fields | {"suggested_strategy"}
+    allowed_fields = required_fields
     if not required_fields.issubset(query_intent) or not set(
         query_intent
     ).issubset(allowed_fields):
@@ -2078,6 +2506,7 @@ def _agent_replay_perception_packet(
             "Agent replay perception packet is not closed"
         )
     intent = query_intent.get("intent")
+    direct_answer_kind = query_intent.get("direct_answer_kind")
     entities = query_intent.get("entities")
     sub_queries = query_intent.get("sub_queries")
     needs_graph = query_intent.get("needs_graph")
@@ -2087,6 +2516,9 @@ def _agent_replay_perception_packet(
         not isinstance(intent, str)
         or not intent.strip()
         or len(intent) > 128
+        or not isinstance(direct_answer_kind, str)
+        or not direct_answer_kind.strip()
+        or len(direct_answer_kind) > 64
         or not isinstance(entities, list)
         or len(entities) > 64
         or any(
@@ -2121,6 +2553,28 @@ def _agent_replay_perception_packet(
         raise RuntimeError(
             "Agent replay perception strategy is invalid"
         )
+    validate_question_perception_output(
+        {
+            key: deepcopy(query_intent[key])
+            for key in (
+                "intent",
+                "direct_answer_kind",
+                "entities",
+                "sub_queries",
+                "needs_graph",
+                "suggested_strategy",
+            )
+        },
+        question=str(
+            (
+                raw_upstream_identity.get(
+                    "provider_free_retrieval_identity"
+                )
+                or {}
+            ).get("query")
+            or ""
+        ),
+    )
     if cache_manager.strict_json_sha256(
         {"conversation_planner_context": conversation_state}
     ) != raw_upstream_identity.get(
@@ -2224,7 +2678,7 @@ def _agent_query_provider_protocol_hash(
         {
             "protocol_version": AGENT_EARLY_REPLAY_PROTOCOL_VERSION,
             "query_perception_protocol": (
-                "chat_provider_perceive_question_validated_merge_v1"
+                QUESTION_PERCEPTION_PROTOCOL_VERSION
             ),
             "query_perception_prompt": {
                 "system_template": profile_prompt(
@@ -2241,6 +2695,9 @@ def _agent_query_provider_protocol_hash(
                     profile,
                     "entity_label",
                     "source-grounded concepts",
+                ),
+                "immutable_contract": (
+                    QUESTION_PERCEPTION_IMMUTABLE_CONTRACT
                 ),
             },
             "query_facet_protocol": {
@@ -2288,6 +2745,10 @@ def _agent_query_provider_protocol_hash(
                 TYPED_ACTION_EXECUTOR_PROTOCOL_VERSION
             ),
             "planner_closed_contract": {
+                "nested_contract_protocol": AGENT_PLANNER_NESTED_OBJECT_CONTRACT_VERSION,
+                "execution_preflight_protocol": PLANNER_EXECUTION_PREFLIGHT_PROTOCOL,
+                "immutable_entry_scope_rule": AGENT_PLANNER_ENTRY_SCOPE_RULE,
+                "target_contracts_by_granularity": {level: planner_target_contracts(level) for level in ("mid", "coarse")},
                 "allowed_action_types": sorted(
                     ALLOWED_TYPED_ACTIONS
                 ),
@@ -3558,7 +4019,7 @@ async def evaluate_graph_evidence(
     provider = ChatProvider()
     raw = await classify_json_with_budget(
         provider,
-        system_prompt=system,
+        system_prompt=system + "\n\n" + PROMPT_PRIORITY_RULES,
         user_prompt=str(request_payload),
         fallback=fallback,
         max_tokens=EVIDENCE_EVALUATOR_JSON_MAX_TOKENS,
@@ -3635,6 +4096,11 @@ def record_agent_plan_and_actions(
                 [
                     AGENT_PLANNER_PROTOCOL_VERSION,
                     TYPED_ACTION_SCHEMA_PROTOCOL_VERSION,
+                    AGENT_PLANNER_NESTED_OBJECT_CONTRACT_VERSION,
+                    PLANNER_EXECUTION_PREFLIGHT_PROTOCOL,
+                    AGENT_PLANNER_ENTRY_SCOPE_RULE,
+                    validation.get("retrieval_granularity"),
+                    planner_target_contracts(validation.get("retrieval_granularity") or "mid"),
                     profile_prompt(active_profile_json(), "agent_planner_system", DEFAULT_AGENT_PLANNER_SYSTEM),
                 ]
             ),
@@ -3820,7 +4286,9 @@ def create_or_get_session(db: Session, knowledge_base_id: str, session_id: str |
             db,
             knowledge_base_id=knowledge_base_id,
             session_id=session_id,
-            validate_references=True,
+            # A stale historical source may disable verified reuse, but it must
+            # not make the transcript unreadable or prevent a new retrieval.
+            validate_references=False,
             for_update=True,
         )
     if session is None:
@@ -3830,7 +4298,13 @@ def create_or_get_session(db: Session, knowledge_base_id: str, session_id: str |
     return session
 
 
-def create_agent_run_context(db: Session, request: AgentRequest) -> tuple[QASession, AgentRun]:
+def create_agent_run_context(
+    db: Session,
+    request: AgentRequest,
+    *,
+    persist_user_turn: bool = True,
+) -> tuple[QASession, AgentRun]:
+    raise_if_source_io_cancelled()
     knowledge_base = resolve_knowledge_base(db, request.knowledge_base_id)
     session = create_or_get_session(db, knowledge_base.id, request.session_id, request.question)
     conversation = prepare_session_for_turn(
@@ -3853,11 +4327,11 @@ def create_agent_run_context(db: Session, request: AgentRequest) -> tuple[QASess
         session_id=session.id,
         question=request.question,
         status="queued",
-        route="layered_context_graph",
+        route="intent_execution_retrieval_v1",
         metadata_json={
             "top_k": result_top_k,
             "filters": request.filters.model_dump(),
-            "retrieval_granularity": request.retrieval_granularity,
+            "intent_execution_protocol_version": "intent_execution_retrieval_v1",
             "conversation_state_scope_hash": conversation.scope_hash,
             "conversation_state": conversation.retrieval_audit(),
             "conversation_state_planner_context": {
@@ -3871,6 +4345,15 @@ def create_agent_run_context(db: Session, request: AgentRequest) -> tuple[QASess
         },
     )
     db.add(run)
+    db.flush()
+    if persist_user_turn:
+        append_pending_user_turn(
+            db,
+            session_id=session.id,
+            question=request.question,
+            run_id=run.id,
+        )
+    raise_if_source_io_cancelled()
     db.commit()
     db.refresh(run)
     return session, run
@@ -3913,7 +4396,7 @@ def _cancel_task(task: asyncio.Task) -> None:
 
 def mark_agent_run_cancelled(db: Session, run: AgentRun) -> None:
     db.refresh(run)
-    if run.status == "completed":
+    if run.status in TERMINAL_AGENT_RUN_STATUSES:
         return
     already_cancelled = (
         run.status == "cancelled"
@@ -3924,6 +4407,16 @@ def mark_agent_run_cancelled(db: Session, run: AgentRun) -> None:
         run.current_node = None
         run.completed_at = datetime.utcnow()
         run.error_message = CANCELLED_BY_USER
+        from app.services.conversation_state import (
+            mark_session_task_terminal_for_run,
+        )
+
+        mark_session_task_terminal_for_run(
+            db,
+            session_id=run.session_id,
+            run_id=run.id,
+            status="cancelled",
+        )
         db.commit()
         db.refresh(run)
         trace(
@@ -3952,6 +4445,15 @@ def mark_agent_run_admission_failed(db: Session, run: AgentRun, error_code: str)
     if run.status in TERMINAL_AGENT_RUN_STATUSES:
         return
     set_run_state(db, run, "failed", current_node=None, error=error_code)
+    from app.services.conversation_state import mark_session_task_terminal_for_run
+
+    mark_session_task_terminal_for_run(
+        db,
+        session_id=run.session_id,
+        run_id=run.id,
+        status="failed",
+    )
+    db.commit()
     trace(
         db,
         run.id,
@@ -3994,6 +4496,9 @@ def append_session_turn(
     answer_session_id: str | None = None,
     retrieval_trace_id: str | None = None,
     task_status: str = "active",
+    route: str | None = None,
+    direct_answer_mode: str | None = None,
+    commit: bool = True,
 ) -> ConversationStateSnapshot:
     return append_completed_turn(
         db,
@@ -4005,6 +4510,9 @@ def append_session_turn(
         answer_session_id=answer_session_id,
         retrieval_trace_id=retrieval_trace_id,
         task_status=task_status,
+        route=route,
+        direct_answer_mode=direct_answer_mode,
+        commit=commit,
     )
 
 
@@ -5806,50 +6314,28 @@ async def execute_typed_repair_round(
             raise ValueError(
                 "repair structure closure requires a provenance-valid supported source"
             )
-        source_chunks = {
-            str(item.get("chunk_id")): item
-            for item in (package.package_json or {}).get("chunks", [])
-            if item.get("chunk_id")
-        }
-        repair_results: list[dict[str, Any]] = []
-        for chunk_id in sorted(supported_source_ids):
-            source_item = source_chunks.get(chunk_id)
-            if source_item is None:
-                continue
-            why_selected = source_item.get("why_selected") or {}
-            repair_results.append(
-                {
-                    "chunk_id": chunk_id,
-                    "metadata": {
-                        "traversal": {
-                            "path": [chunk_id],
-                            "path_edge_ids": list(
-                                why_selected.get("path_edge_ids") or []
-                            ),
-                            "covered_facets": list(
-                                why_selected.get("covered_facets") or []
-                            ),
-                            "evidence_roles": list(
-                                why_selected.get("roles") or []
-                            ),
-                            "why_selected": "repair_structure_context_seed",
-                        }
-                    },
-                }
-            )
-        repaired_package = await run_bounded_source_io(
-            build_context_package,
-            db,
-            knowledge_base_id=run.knowledge_base_id,
-            query=request.question,
-            trace=source_trace,
-            results=repair_results,
-            restoration_directive=directive,
-        )
-        repaired_trace = source_trace
+        directive = validate_typed_repair_directive(db, knowledge_base_id=run.knowledge_base_id,
+            query_facets=frozen_query_facets, retrieval_granularity=retrieval_granularity,
+            conversation_state_scope_hash=conversation_state_scope_hash, repair_directive=directive)
+        if directive is None:
+            raise RuntimeError("typed repair directive validation disappeared")
+        # This historical adapter shares the native immutable source service;
+        # it cannot overwrite the source trace's one structure-step binding.
+        from app.services.reflection_context import restore_reflection_context
+        repaired_package, _contexts = await run_bounded_source_io(restore_reflection_context, db,
+            source_package=package, target_chunk_ids=sorted(supported_source_ids),
+            preserve_chunk_ids=sorted(supported_source_ids | set(directive.get("carry_forward_supported_chunk_ids") or [])),
+            token_budget=package.token_budget,
+            restore_per_chunk_budget=int(source_trace.diagnostics_json["agent_operating_envelope"]["structure_restore_per_chunk_budget"]),
+            query_facets=frozen_query_facets)
+        repaired_package.diagnostics_json = {**repaired_package.diagnostics_json,
+            "repair_action_type": action_type, "repair_executor_mechanism": "supported_chunk_structure_closure_v1",
+            "repair_directive": directive}
+        flag_modified(repaired_package, "diagnostics_json")
+        repaired_trace = db.get(RetrievalTrace, repaired_package.retrieval_trace_id)
         repair_audit = {
             "executor_mechanism": "supported_chunk_structure_closure_v1",
-            "source_chunk_ids": [item["chunk_id"] for item in repair_results],
+            "source_chunk_ids": sorted(supported_source_ids),
             "layered_search_called": False,
         }
     elif not current_package_rebind_accepted:
@@ -6593,6 +7079,9 @@ async def record_answer_audit(
     citation_verification_action: AgentAction | None = None,
     typed_action_control_hash: str | None = None,
     frozen_agent_operating_envelope: dict[str, Any] | None = None,
+    answer_route: str = "layered_context_graph",
+    policy_update_eligible: bool = True,
+    direct_answer_audit: dict[str, Any] | None = None,
 ) -> AnswerSession:
     reward_agent_operating_envelope = dict(
         frozen_agent_operating_envelope
@@ -6958,8 +7447,25 @@ async def record_answer_audit(
         answer=answer,
         chunk_ids_json=list(package.hit_chunk_ids_json or []),
         prompt_protocol_version=answer_prompt_protocol_version,
-        model_json=answer_model_audit,
+        model_json={
+            **answer_model_audit,
+            "route": answer_route,
+            "policy_update_eligible": policy_update_eligible,
+            "direct_answer_audit": direct_answer_audit or {},
+        },
         diagnostics_json={
+            "route": answer_route,
+            "policy_update_eligible": policy_update_eligible,
+            "direct_answer_audit": direct_answer_audit or {},
+            "direct_answer_mode": (
+                (direct_answer_audit or {}).get("response_mode")
+            ),
+            "direct_answer_protocol_version": (
+                (direct_answer_audit or {}).get("protocol_version")
+            ),
+            "direct_answer_decision_hash": (
+                (direct_answer_audit or {}).get("decision_hash")
+            ),
             "context_package_id": package.id,
             "citation_count": len(citations),
             "context_token_count": package.token_count,
@@ -7139,6 +7645,19 @@ async def record_answer_audit(
         }
         flag_modified(answer_session, "model_json")
         db.flush()
+    if not policy_update_eligible:
+        if answer_route != "direct_answer" or not direct_answer_audit:
+            raise ValueError(
+                "policy-ineligible answer audit requires a closed direct-answer identity"
+            )
+        db.commit()
+        db.refresh(answer_session)
+        if rejected_attempt and raise_after_rejected_audit:
+            raise ValueError(
+                "final direct answer persistence rejected after writing the immutable "
+                "claim/prompt grounding audit"
+            )
+        return answer_session
     reward_retrieval_trace = db.get(
         RetrievalTrace, str(package.retrieval_trace_id or "")
     )
@@ -7214,7 +7733,7 @@ async def record_answer_audit(
             "agent_run_id": agent_run_id,
         },
         action_json={
-            "route": "layered_context_graph",
+            "route": answer_route,
             **answer_prompt_audit,
             "repair_actions": repair_actions or [],
             "policy_operating_prior": validated_policy_prior,
@@ -7283,7 +7802,13 @@ def run_to_task_status(run: AgentRun) -> dict:
         "current_node": run.current_node,
         "retry_count": run.retry_count,
         "route": run.route,
-        "retrieval_granularity": (run.metadata_json or {}).get("retrieval_granularity", "mid"),
+        "direct_answer_mode": (run.metadata_json or {}).get(
+            "direct_answer_mode"
+        ),
+        "entry_layer": (
+            (run.metadata_json or {}).get("accepted_execution_strategy") or {}
+        ).get("entry_layer"),
+        "terminal_outcome": (run.metadata_json or {}).get("terminal_outcome"),
         "answer": run.final_answer,
         "error": run.error_message,
         "created_at": run.created_at,
@@ -7292,11 +7817,481 @@ def run_to_task_status(run: AgentRun) -> dict:
     }
 
 
+def _latest_verified_context_reuse_candidate(
+    db: Session,
+    *,
+    knowledge_base_id: str,
+    conversation_planner_context: dict[str, Any],
+) -> dict[str, Any] | None:
+    from app.retrieval_control_contracts import control_hash
+    from app.services.retrieval import get_context_package, ContextPackagePublicIntegrityError
+    def publicly_replayable(package: ContextPackage) -> bool:
+        try:
+            return get_context_package(db, package.id) is not None
+        except ContextPackagePublicIntegrityError:
+            return False
+    references = list(
+        conversation_planner_context.get("history_references") or []
+    )
+    for reference in reversed(references):
+        if not isinstance(reference, dict):
+            continue
+        answer_session = db.get(
+            AnswerSession, str(reference.get("answer_session_id") or "")
+        )
+        package = db.get(
+            ContextPackage, str(reference.get("context_package_id") or "")
+        )
+        retrieval_trace = db.get(
+            RetrievalTrace, str(reference.get("retrieval_trace_id") or "")
+        )
+        if reference.get("protocol_version") == "answer_context_source_reference_v2":
+            from app.models import AnswerSourceBinding
+            from app.services.answer_sources import source_binding_citations
+            from app.services.agent_reflection import reflection_hash
+            source_ids = sorted(reference.get("source_binding_ids") or [])
+            if (not source_ids or answer_session is None or package is None or retrieval_trace is None
+                or any(row.knowledge_base_id != knowledge_base_id for row in (answer_session, package, retrieval_trace))
+                or answer_session.context_package_id != package.id or answer_session.retrieval_trace_id != retrieval_trace.id
+                or package.retrieval_trace_id != retrieval_trace.id or source_ids != sorted(answer_session.citation_ids_json or [])):
+                continue
+            review = (answer_session.diagnostics_json or {}).get("answer_reflection") or {}
+            current_gate = (answer_session.diagnostics_json or {}).get("retrieval_control") or {}
+            source_integrity = (
+                (answer_session.diagnostics_json or {}).get(
+                    "source_integrity_admission"
+                )
+                or {}
+            )
+            current_source_integrity = (
+                source_integrity.get("protocol_version")
+                == "source_integrity_admission_v1"
+                and source_integrity.get("outcome") == "passed"
+                and source_integrity.get("context_package_id") == package.id
+                and source_integrity.get("retrieval_trace_id") == retrieval_trace.id
+                and source_integrity.get("model_call_count") == 0
+                and source_integrity.get("audit_hash")
+                == control_hash(
+                    {
+                        key: value
+                        for key, value in source_integrity.items()
+                        if key != "audit_hash"
+                    }
+                )
+            )
+            if (
+                not current_gate
+                and not current_source_integrity
+                and (
+                    review.get("outcome")
+                    not in {"accepted_without_reflection", "accepted_after_reflection"}
+                    or review.get("audit_hash")
+                    != reflection_hash(
+                        {
+                            key: value
+                            for key, value in review.items()
+                            if key != "audit_hash"
+                        }
+                    )
+                )
+            ):
+                continue
+            bindings = list(db.scalars(select(AnswerSourceBinding).where(AnswerSourceBinding.answer_session_id == answer_session.id)))
+            if sorted(row.id for row in bindings) != source_ids:
+                continue
+            try:
+                from app.services.retrieval_answer_record import replay_answer_bindings
+                replay_answer_bindings(db, answer=answer_session, package=package)
+                contexts = context_package_to_contexts(package)
+            except ValueError:
+                continue
+            if not publicly_replayable(package):
+                continue
+            return {"reference": dict(reference), "answer_session": answer_session, "context_package": package,
+                    "retrieval_trace": retrieval_trace, "verifications": [], "source_bindings": bindings, "contexts": contexts}
+        verification_ids = [
+            str(item)
+            for item in (
+                reference.get("citation_verification_ids") or []
+            )
+            if item
+        ]
+        if (
+            answer_session is None
+            or package is None
+            or retrieval_trace is None
+            or not verification_ids
+            or str(answer_session.knowledge_base_id) != str(knowledge_base_id)
+            or str(package.knowledge_base_id) != str(knowledge_base_id)
+            or str(retrieval_trace.knowledge_base_id) != str(knowledge_base_id)
+            or str(answer_session.context_package_id or "") != str(package.id)
+            or str(answer_session.retrieval_trace_id or "")
+            != str(retrieval_trace.id)
+            or str(package.retrieval_trace_id or "")
+            != str(retrieval_trace.id)
+            or sorted(answer_session.citation_ids_json or [])
+            != sorted(verification_ids)
+        ):
+            continue
+        verifications = [
+            db.get(CitationVerification, verification_id)
+            for verification_id in verification_ids
+        ]
+        if any(
+            verification is None
+            or str(verification.knowledge_base_id) != str(knowledge_base_id)
+            or str(verification.answer_session_id or "")
+            != str(answer_session.id)
+            or str(verification.context_package_id or "") != str(package.id)
+            or str(verification.retrieval_trace_id or "")
+            != str(retrieval_trace.id)
+            or str(verification.verdict or "") != "supported"
+            for verification in verifications
+        ):
+            continue
+        contexts = context_package_to_contexts(package)
+        if not contexts or not publicly_replayable(package):
+            continue
+        return {
+            "reference": dict(reference),
+            "answer_session": answer_session,
+            "context_package": package,
+            "retrieval_trace": retrieval_trace,
+            "verifications": verifications,
+            "contexts": contexts,
+        }
+    return None
+
+
+def _verified_context_direct_decision(
+    *,
+    candidate: dict[str, Any],
+    evaluator: dict[str, Any],
+    request_conversation_state_scope_hash: str,
+) -> dict[str, Any]:
+    reference = dict(candidate["reference"])
+    decision = {
+        "protocol_version": DIRECT_ANSWER_ROUTE_PROTOCOL_VERSION,
+        "response_mode": "verified_context_reuse",
+        "reason_code": "verified_context_evaluator_sufficient",
+        "model_suggestion_hash": evaluator.get("output_hash"),
+        "deterministic_match_rule": None,
+        "system_capability_card_hash": None,
+        "source_answer_session_id": reference.get("answer_session_id"),
+        "source_context_package_id": reference.get("context_package_id"),
+        "source_retrieval_trace_id": reference.get("retrieval_trace_id"),
+        "source_citation_verification_ids": list(
+            reference.get("citation_verification_ids") or []
+        ),
+        "source_binding_ids": list(reference.get("source_binding_ids") or []),
+        "requires_answer_generation": True,
+        "requires_claim_verification": False,
+        "requires_source_binding_and_joint_reflection": True,
+        "tool_call_allowed": False,
+        "policy_update_eligible": False,
+        "model_call_count": int(evaluator.get("model_call_count") or 0),
+        "tool_call_count": 0,
+        "result_cache_enabled": False,
+        "request_conversation_state_scope_hash": (
+            request_conversation_state_scope_hash
+        ),
+        "reuse_evaluator_protocol_version": evaluator.get(
+            "protocol_version"
+        ),
+        "reuse_evaluator_input_hash": evaluator.get("input_hash"),
+        "reuse_evaluator_output_hash": evaluator.get("output_hash"),
+    }
+    decision["decision_hash"] = stable_hash(decision)
+    return decision
+
+
+def _direct_answer_model_audit(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    return AnswerModelAudit.model_validate(payload).model_dump(
+        mode="json",
+        exclude_none=True,
+    )
+
+
+def _execute_system_capability_direct_answer(
+    db: Session,
+    *,
+    request: AgentRequest,
+    session: QASession,
+    run: AgentRun,
+    matched: dict[str, Any],
+    conversation_state_scope_hash: str,
+) -> dict[str, Any]:
+    answer = str(matched["answer"])
+    decision = dict(matched["decision"])
+    capability_card = dict(matched["capability_card"])
+    set_run_state(
+        db,
+        run,
+        "running",
+        current_node="direct_answer_route_gate",
+    )
+    db.refresh(run)
+    run.route = "direct_answer"
+    run.metadata_json = {
+        **dict(run.metadata_json or {}),
+        "direct_answer_mode": "system_capability",
+        "direct_answer_protocol_version": (
+            DIRECT_ANSWER_ROUTE_PROTOCOL_VERSION
+        ),
+        "direct_answer_decision": decision,
+        "policy_update_eligible": False,
+        "tool_call_count": 0,
+    }
+    flag_modified(run, "metadata_json")
+    db.commit()
+    trace(
+        db,
+        run.id,
+        "direct_answer_route_gate",
+        input_summary=request.question,
+        output_summary="system_capability",
+        scores={
+            "response_mode": "system_capability",
+            "reason_code": decision["reason_code"],
+            "decision_hash": decision["decision_hash"],
+            "capability_card_hash": capability_card["card_hash"],
+            "model_call_count": int(
+                decision.get("model_call_count") or 0
+            ),
+            "tool_call_count": 0,
+            "policy_update_eligible": False,
+        },
+    )
+    answer_session = AnswerSession(
+        knowledge_base_id=run.knowledge_base_id,
+        retrieval_trace_id=None,
+        context_package_id=None,
+        qa_session_id=session.id,
+        question=request.question,
+        answer=answer,
+        citation_ids_json=[],
+        chunk_ids_json=[],
+        prompt_protocol_version=(
+            SYSTEM_CAPABILITY_CARD_PROTOCOL_VERSION
+        ),
+        model_json={},
+        diagnostics_json={
+            "route": "direct_answer",
+            "direct_answer_mode": "system_capability",
+            "direct_answer_protocol_version": (
+                DIRECT_ANSWER_ROUTE_PROTOCOL_VERSION
+            ),
+            "direct_answer_decision": decision,
+            "system_capability_card_protocol_version": (
+                capability_card["protocol_version"]
+            ),
+            "system_capability_card_hash": capability_card["card_hash"],
+            "exact_answer_hash": exact_answer_hash(answer),
+            "answer_kind": matched["answer_kind"],
+            "language": matched["language"],
+            "agent_run_id": run.id,
+            "model_call_count": int(
+                decision.get("model_call_count") or 0
+            ),
+            "tool_call_count": 0,
+            "citation_count": 0,
+            "policy_update_eligible": False,
+            "provider_response_persisted": False,
+        },
+    )
+    db.add(answer_session)
+    db.flush()
+    answer_model_audit = _direct_answer_model_audit(
+        {
+            "provider": "chat_question_perception_then_capability_card",
+            "model": None,
+            "external_called": True,
+            "fallback_reason": None,
+            "route": "direct_answer",
+            "conversation_state_scope_hash": (
+                conversation_state_scope_hash
+            ),
+            "answer_model_called": False,
+            "answer_session_id": answer_session.id,
+            "exact_answer_hash": exact_answer_hash(answer),
+            "grounding_outcome": "system_capability",
+            "returned_citation_count": 0,
+            "direct_answer_mode": "system_capability",
+            "direct_answer_protocol_version": (
+                DIRECT_ANSWER_ROUTE_PROTOCOL_VERSION
+            ),
+            "policy_update_eligible": False,
+            "tool_call_count": 0,
+        }
+    )
+    answer_session.model_json = answer_model_audit
+    flag_modified(answer_session, "model_json")
+    db.commit()
+    trace(
+        db,
+        run.id,
+        "direct_answer",
+        input_summary="system_capability_card",
+        output_summary=_summarize(answer),
+        scores={
+            "answer_session_id": answer_session.id,
+            "answer_hash": exact_answer_hash(answer),
+            "citation_count": 0,
+            "tool_call_count": 0,
+        },
+    )
+    final_conversation_state = append_session_turn(
+        db,
+        session,
+        request.question,
+        answer,
+        run.id,
+        [],
+        answer_session_id=answer_session.id,
+        route="direct_answer",
+        direct_answer_mode="system_capability",
+    )
+    set_run_state(db, run, "completed", current_node=None, answer=answer)
+    trace_events = db.scalars(
+        select(AgentTraceEvent)
+        .where(AgentTraceEvent.run_id == run.id)
+        .order_by(AgentTraceEvent.sequence_index.asc())
+    ).all()
+    return {
+        "run_id": run.id,
+        "session_id": session.id,
+        "answer": answer,
+        "citations": [],
+        "used_chunks": [],
+        "route": "direct_answer",
+        "direct_answer_mode": "system_capability",
+        "trace": [trace_event_to_payload(event) for event in trace_events],
+        "degraded_mode": is_degraded_mode(),
+        "context_package_id": None,
+        "retrieval_trace_id": None,
+        "retrieval_granularity": getattr(request, "retrieval_granularity", "mid"),
+        "model_audit": answer_model_audit,
+        "answer_model_audit": answer_model_audit,
+        "conversation_state": final_conversation_state.public_payload(),
+    }
+
+
+async def _try_verified_context_direct_answer(
+    db: Session,
+    *,
+    request: AgentRequest,
+    session: QASession,
+    run: AgentRun,
+    history_payload: list[dict[str, Any]],
+    conversation_state_scope_hash: str,
+    conversation_planner_context: dict[str, Any],
+    query_intent: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    candidate = await run_bounded_source_io(
+        _latest_verified_context_reuse_candidate, db,
+        knowledge_base_id=run.knowledge_base_id,
+        conversation_planner_context=conversation_planner_context,
+    )
+    if candidate is None:
+        if conversation_planner_context.get("history_references"):
+            trace(db, run.id, "direct_answer_fallback", input_summary="verified_context_reuse",
+                  output_summary="既有上下文不满足来源约束，重新检索资料",
+                  scores={"reason": "no_eligible_verified_context", "tool_call_count_before_fallback": 0})
+        return None
+    try:
+        evaluator = await evaluate_verified_context_reuse(
+            question=request.question,
+            history=history_payload,
+            contexts=list(candidate["contexts"]),
+        )
+    except Exception as exc:
+        trace(
+            db,
+            run.id,
+            "direct_answer_fallback",
+            input_summary="verified_context_reuse",
+            output_summary="retrieval_required",
+            scores={
+                "reason": "reuse_evaluator_unavailable",
+                "error_type": type(exc).__name__,
+                "tool_call_count_before_fallback": 0,
+            },
+        )
+        from app.services.reflection_models import classify_answer_model_error
+        raise classify_answer_model_error("reuse_evaluator", exc) from None
+    trace(
+        db,
+        run.id,
+        "direct_answer_reuse_evaluator",
+        input_summary=request.question,
+        output_summary=str(evaluator.get("verdict") or "insufficient"),
+        document_ids=list(evaluator.get("referenced_chunk_ids") or []),
+        scores={
+            "protocol_version": evaluator.get("protocol_version"),
+            "verdict": evaluator.get("verdict"),
+            "reason": evaluator.get("reason"),
+            "input_hash": evaluator.get("input_hash"),
+            "output_hash": evaluator.get("output_hash"),
+            "model_call_count": evaluator.get("model_call_count"),
+            "tool_call_count": 0,
+            "policy_update_eligible": False,
+        },
+    )
+    if evaluator.get("verdict") != "sufficient":
+        if evaluator.get("referenced_chunk_ids"):
+            from app.services.partial_context import prepare_partial_context
+            await run_bounded_source_io(prepare_partial_context, db, run=run,
+                source=candidate["context_package"], source_answer=candidate["answer_session"], evaluator=evaluator)
+        trace(
+            db,
+            run.id,
+            "direct_answer_fallback",
+            input_summary="verified_context_reuse",
+            output_summary="retrieval_required",
+            scores={
+                "reason": "reuse_evaluator_insufficient",
+                "tool_call_count_before_fallback": 0,
+            },
+        )
+        return None
+    decision = _verified_context_direct_decision(
+        candidate=candidate,
+        evaluator=evaluator,
+        request_conversation_state_scope_hash=(
+            conversation_state_scope_hash
+        ),
+    )
+    from app.services.reflection_agent import DirectReuseRequiresRetrieval, execute_reflection_answer
+
+    try:
+        return await execute_reflection_answer(
+            db, request=request, run=run, session=session,
+            package=candidate["context_package"], contexts=list(candidate["contexts"]),
+            history=history_payload, envelope=agent_operating_envelope(), controls={},
+            query_intent=query_intent,
+            direct_answer_audit={**decision, "reuse_evaluator": evaluator},
+        )
+    except DirectReuseRequiresRetrieval:
+        trace(db, run.id, "direct_answer_fallback", input_summary="verified_context_reuse",
+              output_summary="需要补充新证据，进入资料检索",
+              scores={"reason": "reflection_requested_new_evidence", "tool_call_count_before_fallback": 0})
+        return None
+
+
 async def execute_agent_run(db: Session, request: AgentRequest, session: QASession, run: AgentRun) -> dict:
+    from app.services.intent_execution_agent import execute_intent_execution_agent
+    return await execute_intent_execution_agent(db, request, session, run)
+
+
+async def _retired_answer_reflection_executor(db: Session, request: AgentRequest, session: QASession, run: AgentRun) -> dict:
+    if get_settings().app_env != "test":
+        raise RuntimeError("retired_answer_reflection_executor_is_not_a_serving_path")
     try:
         query_embedding_request_memo = QueryEmbeddingRequestMemo()
         result_top_k = resolve_result_top_k(request.top_k)
-        retrieval_granularity = request.retrieval_granularity
+        retrieval_granularity = getattr(request, "retrieval_granularity", "mid")
         run_metadata = dict(run.metadata_json or {})
         conversation_state_scope_hash = str(
             run_metadata.get("conversation_state_scope_hash") or ""
@@ -7314,16 +8309,121 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             raise RuntimeError(
                 "agent run conversation-state scope was not frozen consistently"
             )
-        history_payload = [item.model_dump() for item in request.history]
-        # This PostgreSQL-only gate must run before query perception, facet
-        # extraction, planning, or any other provider/LLM call.
-        context_state = active_graph_admission_gate(
+        from app.services.agent_reflection import history_summary_projection
+        history_summary, history_summary_audit = history_summary_projection(
+            [item.model_dump() for item in request.history],
+            max_characters=get_settings().agent_history_summary_max_chars,
+        )
+        history_payload = [{"role": "assistant", "content": history_summary}] if history_summary else []
+        run.metadata_json = {**run.metadata_json, "history_summary": history_summary, "history_summary_audit": history_summary_audit}
+        flag_modified(run, "metadata_json")
+        db.commit()
+        set_run_state(
+            db,
+            run,
+            "running",
+            current_node="query_understanding",
+        )
+        start = time.perf_counter()
+        query_intent = await perceive_query_intent(
+            request.question,
+            history_payload,
+        )
+        query_intent = {
+            **query_intent,
+            "conversation_state": conversation_planner_context,
+        }
+        ensure_agent_run_not_cancelled(db, run)
+        trace(
+            db,
+            run.id,
+            "query_understanding",
+            input_summary=request.question,
+            output_summary=str(
+                query_intent.get("intent")
+                or "layered_context_graph"
+            ),
+            scores={
+                "top_k": result_top_k,
+                "query_intent": query_intent,
+                "retrieval_granularity": retrieval_granularity,
+                "protocol_version": (
+                    QUESTION_PERCEPTION_PROTOCOL_VERSION
+                ),
+            },
+            duration_ms=int(
+                (time.perf_counter() - start) * 1000
+            ),
+        )
+        if query_intent.get("intent") == "direct_answer":
+            system_direct = build_system_direct_answer(
+                question=request.question,
+                query_intent=query_intent,
+            )
+            return _execute_system_capability_direct_answer(
+                db,
+                request=request,
+                session=session,
+                run=run,
+                matched=system_direct,
+                conversation_state_scope_hash=(
+                    conversation_state_scope_hash
+                ),
+            )
+        trace(
+            db,
+            run.id,
+            "direct_answer_route_gate",
+            input_summary="unified_question_perception",
+            output_summary="retrieval_or_verified_context_required",
+            scores={
+                "protocol_version": (
+                    QUESTION_PERCEPTION_PROTOCOL_VERSION
+                ),
+                "verdict": "retrieval_required",
+                "reason": (
+                    "unified intent is "
+                    f"{query_intent.get('intent')}; "
+                    "direct_answer_kind=none"
+                ),
+                "model_call_count": 1,
+                "tool_call_count": 0,
+                "policy_update_eligible": False,
+            },
+        )
+        set_run_state(
+            db,
+            run,
+            "running",
+            current_node="direct_answer_route_gate",
+        )
+        verified_direct = await _try_verified_context_direct_answer(
+            db,
+            request=request,
+            session=session,
+            run=run,
+            history_payload=history_payload,
+            query_intent=query_intent,
+            conversation_state_scope_hash=(
+                conversation_state_scope_hash
+            ),
+            conversation_planner_context=(
+                conversation_planner_context
+            ),
+        )
+        if verified_direct is not None:
+            return verified_direct
+        # Retrieval-dependent work must pass this PostgreSQL-only gate before
+        # facet extraction, planning, embedding, Qdrant or traversal. Unified
+        # question perception and both direct routes are admitted and audited
+        # before this retrieval-only boundary.
+        context_state = await run_bounded_source_io(active_graph_admission_gate,
             db,
             run.knowledge_base_id,
         )
         envelope = agent_operating_envelope()
         frozen_agent_operating_envelope_hash = stable_hash(envelope)
-        policy_operating_prior = read_policy_operating_prior(
+        policy_operating_prior = await run_bounded_source_io(read_policy_operating_prior,
             db,
             run.knowledge_base_id,
             runtime_settings_hash=runtime_settings_state_hash(),
@@ -7365,6 +8465,10 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
         )
         if early_replay_candidate is not None:
             try:
+                if early_replay_candidate["query_intent"] != query_intent:
+                    raise RuntimeError(
+                        "Agent replay unified question perception changed"
+                    )
                 (
                     replay_typed_actions,
                     replay_validation,
@@ -7415,10 +8519,11 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                     raise RuntimeError(
                         "Agent replay typed-action controls changed"
                     )
-                # This exact-key, cache-only probe intentionally occurs before
-                # perception, facet extraction, planning, embedding, vector
-                # recall, traversal, or any retrieval INSERT.  Redis only
-                # locates a PostgreSQL-frozen plan/trace/package replay.
+                # This exact-key, cache-only probe occurs after the unified
+                # question-perception gate but before facet extraction,
+                # planning, embedding, vector recall, traversal, or any
+                # retrieval INSERT. Redis only locates a PostgreSQL-frozen
+                # plan/trace/package replay.
                 early_search_result = await execute_typed_retrieval_plan(
                     db,
                     knowledge_base_id=run.knowledge_base_id,
@@ -7549,7 +8654,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                 ),
                 "cache_hit": early_cache_hit,
                 "provider_perception_model_call_count": (
-                    0 if early_cache_hit else None
+                    1
                 ),
                 "query_facet_model_call_count": (
                     0 if early_cache_hit else None
@@ -7576,34 +8681,6 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
         }
         flag_modified(run, "metadata_json")
         db.commit()
-        start = time.perf_counter()
-        if early_cache_hit:
-            query_intent = deepcopy(
-                early_replay_candidate["query_intent"]
-            )
-        else:
-            query_intent = await perceive_query_intent(
-                request.question, history_payload
-            )
-            query_intent = {
-                **query_intent,
-                "conversation_state": conversation_planner_context,
-            }
-        ensure_agent_run_not_cancelled(db, run)
-        trace(
-            db,
-            run.id,
-            "query_understanding",
-            input_summary=request.question,
-            output_summary=str(query_intent.get("intent") or "layered_context_graph"),
-            scores={
-                "top_k": result_top_k,
-                "query_intent": query_intent,
-                "retrieval_granularity": retrieval_granularity,
-            },
-            duration_ms=int((time.perf_counter() - start) * 1000),
-        )
-
         start = time.perf_counter()
         if early_cache_hit:
             query_facets = deepcopy(
@@ -7636,6 +8713,10 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             )
         )
         bounded_prior_observations: list[dict[str, Any]] = []
+        if (run.metadata_json or {}).get("partial_context_carry"):
+            from app.services.partial_context import partial_context_observation
+            bounded_prior_observations = await run_bounded_source_io(partial_context_observation, db, run=run,
+                query_facets=query_facets, granularity=retrieval_granularity)
         evaluator_directive: dict[str, Any] | None = None
         plan: AgentPlan | None = None
         action_rows: list[AgentAction] = []
@@ -7646,8 +8727,20 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
         start = time.perf_counter()
 
         for plan_index in range(planning_round_budget):
+            set_run_state(
+                db,
+                run,
+                "running",
+                current_node="agent_planner",
+            )
             planner_started = time.perf_counter()
+            planner_observation_packet = (
+                planner_observation_projection_packet(
+                    bounded_prior_observations
+                )
+            )
             if early_cache_hit:
+                sampling_audit = planner_sampling_audit(model_call_count=0, cache_hit=True)
                 proposed_actions = deepcopy(
                     early_replay_candidate["proposed_actions"]
                 )
@@ -7665,15 +8758,19 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                     envelope,
                     retrieval_granularity,
                     plan_index=plan_index,
-                    bounded_observations=bounded_prior_observations,
+                    bounded_observations=(
+                        planner_observation_packet["observations"]
+                    ),
                     evaluator_directive=evaluator_directive,
                     policy_operating_prior=policy_operating_prior,
                     policy_knowledge_base_id=run.knowledge_base_id,
+                    validation_db=db, requested_result_top_k=result_top_k,
                 )
                 planner_model_audit = _planner_model_audit(
                     raw_planner_output,
                     proposed_actions,
                 )
+                sampling_audit = raw_planner_output.get("planner_sampling") or planner_sampling_audit()
             ensure_agent_run_not_cancelled(db, run)
             typed_actions, validation = validate_typed_actions(
                 proposed_actions,
@@ -7707,6 +8804,18 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                 evaluator_input=evaluator_directive,
                 policy_operating_prior=policy_operating_prior,
             )
+            plan.diagnostics_json = {
+                **(plan.diagnostics_json or {}),
+                "planner_sampling": sampling_audit,
+                "planner_observation_projection": {
+                    key: value
+                    for key, value in (
+                        planner_observation_packet.items()
+                    )
+                    if key != "observations"
+                },
+            }
+            flag_modified(plan, "diagnostics_json")
             db.commit()
             trace(
                 db,
@@ -7902,6 +9011,12 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                 break
             db.commit()
 
+            set_run_state(
+                db,
+                run,
+                "running",
+                current_node="typed_action_executor",
+            )
             search_started = time.perf_counter()
             try:
                 if early_cache_hit:
@@ -8028,6 +9143,12 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             retrieval_duration_ms = int(
                 (time.perf_counter() - search_started) * 1000
             )
+            set_run_state(
+                db,
+                run,
+                "running",
+                current_node="evidence_evaluator",
+            )
             evaluator_started = time.perf_counter()
             if early_cache_hit:
                 evaluator_verdict = deepcopy(
@@ -8109,7 +9230,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                 )
             if replan_requested:
                 for deferred_action in action_rows:
-                    if deferred_action.action_type not in {"restore_context_package", "build_context_package", "verify_citations"}:
+                    if deferred_action.action_type not in {"restore_context_package", "build_context_package", "review_answer"}:
                         continue
                     record_observation(
                         db,
@@ -8204,10 +9325,11 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             int(graph_observation.get("result_count") or 0) > 0
             and int(graph_observation.get("citable_span_count") or 0) > 0
         )
-        evidence_gate_passed = has_citable_evidence and evaluator_verdict["verdict"] == "sufficient"
+        preliminary_evidence_uncertain = has_citable_evidence and evaluator_verdict["verdict"] != "sufficient"
+        evidence_gate_passed = has_citable_evidence
         if not evidence_gate_passed:
             for deferred_action in action_rows:
-                if deferred_action.action_type not in {"restore_context_package", "build_context_package", "verify_citations"}:
+                if deferred_action.action_type not in {"restore_context_package", "build_context_package", "review_answer"}:
                     continue
                 record_observation(
                     db,
@@ -8253,6 +9375,12 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                 document_ids=list(graph_observation["result_chunk_ids"]),
                 scores=model_audit,
             )
+            set_run_state(
+                db,
+                run,
+                "running",
+                current_node="finalizing_response",
+            )
             final_conversation_state = append_session_turn(
                 db,
                 session,
@@ -8262,6 +9390,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                 [],
                 retrieval_trace_id=search_result.trace.id,
                 task_status="waiting_user",
+                route="layered_context_graph",
             )
             set_run_state(db, run, "needs_clarification", current_node=None, answer=clarification)
             trace_events = db.scalars(
@@ -8287,6 +9416,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             **(plan.diagnostics_json or {}),
             "context_package_evidence_gate_passed": True,
             "has_citable_evidence": True,
+            "preliminary_evidence_uncertain": preliminary_evidence_uncertain,
         }
         evidence_gate_audit = {
             "retrieval_trace_id": search_result.trace.id,
@@ -8297,6 +9427,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             "typed_action_control_hash": controls["control_hash"],
             "evidence_evaluator": evaluator_verdict,
             "context_package_evidence_gate_passed": True,
+            "preliminary_evidence_uncertain": preliminary_evidence_uncertain,
             # This event is the authorization boundary immediately before
             # Context Package construction; answer generation has not run.
             "answer_model_called": False,
@@ -8311,6 +9442,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                 f"verdict={evaluator_verdict['verdict']}"
             ),
             output_summary="context package construction authorized",
+            status="review_required" if preliminary_evidence_uncertain else "completed",
             document_ids=list(graph_observation["result_chunk_ids"]),
             scores=evidence_gate_audit,
         )
@@ -8394,7 +9526,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
                 for action_type in (
                     "restore_context_package",
                     "build_context_package",
-                    "verify_citations",
+                    "review_answer",
                 )
                 for target_id in (
                     controls.get("phase_target_ids_by_action", {}).get(
@@ -8429,7 +9561,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             for phase_action_type in (
                 "restore_context_package",
                 "build_context_package",
-                "verify_citations",
+                "review_answer",
             ):
                 action_target_ids = set(
                     controls.get("phase_target_ids_by_action", {}).get(
@@ -8539,7 +9671,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             verdict="sufficient" if package.hit_chunk_ids_json else "insufficient",
         )
         if not cache_package_reused:
-            replay_card = _freeze_agent_early_replay_card(
+            replay_card = None if preliminary_evidence_uncertain else _freeze_agent_early_replay_card(
                 db,
                 raw_upstream_identity=early_pointer_components,
                 search_result=search_result,
@@ -8585,1029 +9717,84 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
 
-        verification_budget = max(
-            1, int(controls.get("verification_budget") or 1)
-        )
-        # Keep answer shape strictly within the downstream verification
-        # envelope.  Six claims is enough for a useful grounded answer while
-        # avoiding deterministic budget failure and unnecessary judge cost.
-        answer_claim_limit = min(verification_budget, 6)
-        start = time.perf_counter()
-        chat_result = await ChatProvider().answer_question_with_meta(
-            request.question,
-            contexts,
-            history_payload,
-            max_factual_claims=answer_claim_limit,
-        )
-        ensure_agent_run_not_cancelled(db, run)
-        answer_model_audit = {
-            "provider": chat_result.provider,
-            "model": chat_result.model,
-            # This audit fact records that the grounded-answer model stage
-            # actually executed. ``external_called`` separately records the
-            # transport/provider behavior of that call.
-            "answer_model_called": True,
-            "answer_claim_limit": answer_claim_limit,
-            "output_token_budget": getattr(
-                chat_result, "output_token_budget", None
-            ),
-            "output_token_budget_protocol_version": getattr(
-                chat_result, "output_token_budget_protocol_version", None
-            ),
-            "provider_call": getattr(
-                chat_result, "provider_call_audit", None
-            ),
-            "external_called": chat_result.external_called,
-            "fallback_reason": chat_result.fallback_reason,
-            "prompt_protocol_version": getattr(
-                chat_result, "prompt_protocol_version", None
-            ),
-            "prompt_protocol_hash": getattr(
-                chat_result, "prompt_protocol_hash", None
-            ),
-            "grounding_envelope_protocol_version": getattr(
-                chat_result, "grounding_envelope_protocol_version", None
-            ),
-            "grounding_envelope_hash": getattr(
-                chat_result, "grounding_envelope_hash", None
-            ),
-            "profile_hash": getattr(chat_result, "profile_hash", None),
-            "context_package_id": package.id,
-            "retrieval_granularity": retrieval_granularity,
-            "agent_plan_id": plan.id,
-            "agent_plan_index": plan.plan_index,
-            "planning_rounds_used": int(plan.plan_index) + 1,
-            "typed_action_control_hash": controls["control_hash"],
-            "evidence_evaluator": evaluator_verdict,
-            "conversation_state_scope_hash": conversation_state_scope_hash,
-        }
-        trace(
-            db,
-            run.id,
-            "grounded_answer",
-            input_summary=request.question,
-            output_summary=_summarize(chat_result.answer),
-            document_ids=list(package.hit_chunk_ids_json or []),
-            scores=answer_model_audit,
-            duration_ms=int((time.perf_counter() - start) * 1000),
-        )
+        from app.services.reflection_agent import execute_reflection_answer
 
-        repair_round_budget = max(
-            0, int(controls.get("repair_round_budget") or 0)
+        return await execute_reflection_answer(
+            db, request=request, run=run, session=session, package=package, contexts=contexts,
+            history=history_payload, envelope=envelope, controls=controls, plan=plan,
+            query_intent=query_intent, query_facets=query_facets,
+            policy_prior=policy_operating_prior, query_embedding_memo=query_embedding_request_memo,
         )
-        verification_bundle = await verify_exact_answer_bundle(
-            answer=chat_result.answer,
-            question=request.question,
-            contexts=contexts,
-            package=package,
-            verification_budget=verification_budget,
-            db=db,
-            knowledge_base_id=run.knowledge_base_id,
-        )
-        ensure_agent_run_not_cancelled(db, run)
-        repair_actions: list[dict[str, Any]] = []
-        attempted_input_hashes_by_action: dict[str, set[str]] = {}
-        exhausted_repair_action_types: set[str] = set()
-        prior_repair_action_output_hashes: list[str] = []
-        repair_convergence_reason = (
-            "initial_answer_all_claims_supported"
-            if verification_bundle["gate"]["all_claims_supported"]
-            else "repair_budget_exhausted"
-        )
-        for repair_round_index in range(repair_round_budget):
-            if verification_bundle["gate"]["all_claims_supported"]:
-                repair_convergence_reason = "all_claims_supported"
-                break
-            remaining_before = repair_round_budget - repair_round_index
-            failure_cards = canonical_failure_cards(
-                answer=chat_result.answer,
-                verification_results=verification_bundle["verifications"],
-                repair_round_index=repair_round_index,
-                remaining_repair_budget=remaining_before,
-                context_package_id=package.id,
-                retrieval_trace_id=package.retrieval_trace_id,
-                structure_closure_status=_repair_structure_closure_status(
-                    package
-                ),
-                covered_facets=list(package.covered_facets_json or []),
-                missing_evidence_roles=_repair_missing_evidence_roles(
-                    verification_bundle["verifications"]
-                ),
-                prior_repair_action_output_hashes=(
-                    prior_repair_action_output_hashes
-                ),
-            )
-            direction = select_repair_direction(
-                failure_cards,
-                attempted_input_hashes_by_action=(
-                    attempted_input_hashes_by_action
-                ),
-                exhausted_action_types=exhausted_repair_action_types,
-            )
-            if direction is None:
-                repair_convergence_reason = "no_untried_typed_repair_direction"
-                break
-            repair_type = str(direction["action_type"])
-            failure_types = sorted(
-                {
-                    str(item.get("failure_type") or "unsupported_claim")
-                    for item in failure_cards
-                }
-            )
-            failure_claim_ids = sorted(
-                {
-                    str(item.get("claim_id"))
-                    for item in failure_cards
-                    if item.get("claim_id")
-                }
-            )
-            failure_source_chunk_ids = sorted(
-                {
-                    str(item.get("chunk_id"))
-                    for item in failure_cards
-                    if item.get("chunk_id")
-                }
-            )
-            concept_mid_target_ids = [
-                str(concept_id)
-                for item in (package.concept_path_json or [])
-                if isinstance(item, dict) and item.get("layer") == "mid"
-                for concept_id in (item.get("ids") or [])
-            ]
-            package_source_chunk_ids = list(
-                dict.fromkeys(
-                    [
-                        *failure_source_chunk_ids,
-                        *[
-                            str(chunk_id)
-                            for chunk_id in (
-                                package.hit_chunk_ids_json or []
-                            )
-                        ],
-                        *[
-                            str(chunk_id)
-                            for chunk_id in (
-                                package.restored_chunk_ids_json or []
-                            )
-                        ],
-                        *[
-                            str(chunk_id)
-                            for chunk_id in (
-                                package.bridge_chunk_ids_json or []
-                            )
-                        ],
-                        *[
-                            str(item.get("chunk_id"))
-                            for item in (
-                                (package.package_json or {}).get(
-                                    "chunks", []
-                                )
-                            )
-                            if isinstance(item, dict)
-                            and item.get("chunk_id")
-                        ],
-                    ]
-                )
-            )
-            if not concept_mid_target_ids and package_source_chunk_ids:
-                package_chunk_id_set = set(package_source_chunk_ids)
-                concept_mid_target_ids = [
-                    str(concept.id)
-                    for concept in db.scalars(
-                        select(MidConcept)
-                        .where(
-                            MidConcept.knowledge_base_id
-                            == run.knowledge_base_id,
-                            MidConcept.state == "active",
-                        )
-                        .order_by(MidConcept.id.asc())
-                    ).all()
-                    if package_chunk_id_set.intersection(
-                        set(concept.support_chunk_ids_json or [])
-                    )
-                ][:TYPED_ACTION_TARGET_ID_LIMIT]
-            package_rq_target_ids: list[str] = []
-            if package_source_chunk_ids:
-                package_rq_target_ids = list(
-                    dict.fromkeys(
-                        str(prefix_id)
-                        for prefix_id in db.scalars(
-                            select(RQPrefix.id)
-                            .join(
-                                RQPrefixMembership,
-                                RQPrefixMembership.rq_prefix_id
-                                == RQPrefix.id,
-                            )
-                            .where(
-                                RQPrefix.knowledge_base_id
-                                == run.knowledge_base_id,
-                                RQPrefix.state == "active",
-                                RQPrefixMembership.chunk_id.in_(
-                                    package_source_chunk_ids
-                                ),
-                            )
-                            .order_by(RQPrefix.rq_level.desc(), RQPrefix.id.asc())
-                        ).all()
-                    )
-                )[:TYPED_ACTION_TARGET_ID_LIMIT]
-            if repair_type == "repair_missing_citation":
-                # ``target_ids`` are graph ids only.  The source package is
-                # already bound in canonical_target_refs; use any verified
-                # source chunks as the graph target.  A citation-missing card
-                # may have no bound span yet, so fall back to the current
-                # package's hit chunks rather than smuggling a package id into
-                # G or persisting an untraceable empty target.
-                repair_target_ids = package_source_chunk_ids
-            elif repair_type in {
-                "repair_bridge_gap",
-                "repair_structure_context",
-            }:
-                repair_target_ids = package_source_chunk_ids
-            else:
-                repair_target_ids = (
-                    concept_mid_target_ids or package_rq_target_ids
-                )
-            repair_target_ids = list(
-                dict.fromkeys(repair_target_ids)
-            )[:TYPED_ACTION_TARGET_ID_LIMIT]
-            canonical_target_refs = {
-                "claim_ids": failure_claim_ids,
-                "source_chunk_ids": package_source_chunk_ids,
-                "source_context_package_id": package.id,
-                "source_retrieval_trace_id": package.retrieval_trace_id,
-                "mid_concept_ids": concept_mid_target_ids,
-            }
-            canonical_target_refs["target_refs_hash"] = stable_hash(
-                canonical_target_refs
-            )
-            raw_repair_action = {
-                "action_type": repair_type,
-                "target_ids": repair_target_ids,
-                "reason": (
-                    "Claim-level verification failures require typed repair: "
-                    + ", ".join(failure_types)
-                ),
-                "budget_request": {"repair_round_budget": 1},
-                "expected_evidence": {
-                    "protocol_version": TYPED_REPAIR_PROTOCOL_VERSION,
-                    "executor_mechanism": direction["executor_mechanism"],
-                    "failure_types": failure_types,
-                    "failure_card_hashes": [
-                        item["failure_card_hash"] for item in failure_cards
-                    ],
-                    "action_input_hash": direction["input_hash"],
-                    "canonical_target_refs": canonical_target_refs,
-                },
-                "stop_condition": {
-                    "all_claims_supported": True,
-                    "no_semantic_progress": True,
-                },
-            }
-            validated_repairs, repair_validation = validate_typed_actions(
-                [raw_repair_action],
-                envelope,
-                db=db,
-                knowledge_base_id=run.knowledge_base_id,
-                require_required_actions=False,
-                retrieval_granularity=retrieval_granularity,
-            )
-            if not repair_validation.get("valid") or len(validated_repairs) != 1:
-                # A server-selected repair direction has no authority until it
-                # passes the same closed typed-action validator as planner
-                # output.  Rejection blocks execution but is an evidence
-                # no-progress outcome, not a reason to discard an otherwise
-                # valid Context Package or turn QA into an unstructured 500.
-                # The final claim gate below will retain only reverified claims
-                # or return the deterministic insufficiency response.
-                repair_convergence_reason = (
-                    "typed_repair_validation_rejected"
-                )
-                trace(
-                    db,
-                    run.id,
-                    "typed_repair_validation",
-                    input_summary=(
-                        f"round={repair_round_index} action={repair_type}"
-                    ),
-                    output_summary=repair_convergence_reason,
-                    document_ids=list(package.hit_chunk_ids_json or []),
-                    scores={
-                        "protocol_version": TYPED_REPAIR_PROTOCOL_VERSION,
-                        "repair_round_index": repair_round_index,
-                        "action_type": repair_type,
-                        "action_executed": False,
-                        "validator_diagnostics": repair_validation,
-                        "gray_zone_model_call_count": 0,
-                        "convergence_reason": repair_convergence_reason,
-                    },
-                    status="rejected",
-                )
-                break
-            validated_repair = validated_repairs[0]
-            repair_action = AgentAction(
-                run_id=run.id,
-                plan_id=plan.id,
-                parent_action_id=(
-                    action_map.get("verify_citations").id
-                    if action_map.get("verify_citations")
-                    else None
-                ),
-                action_index=len(action_rows),
-                action_type=validated_repair["action_type"],
-                target_ids_json=validated_repair["target_ids"],
-                reason=validated_repair["reason"],
-                budget_request_json=validated_repair["budget_request"],
-                expected_evidence_json=validated_repair["expected_evidence"],
-                stop_condition_json=validated_repair["stop_condition"],
-                validation_json={
-                    **(
-                        (repair_validation.get("accepted") or [{}])[0].get(
-                            "validation", {}
-                        )
-                    ),
-                    "typed_action_schema_protocol_version": repair_validation[
-                        "typed_action_schema_protocol_version"
-                    ],
-                    "typed_action_schema_protocol_hash": repair_validation[
-                        "typed_action_schema_protocol_hash"
-                    ],
-                    "repair_protocol_version": TYPED_REPAIR_PROTOCOL_VERSION,
-                    "repair_budget_checked": True,
-                    "repair_round_index": repair_round_index,
-                    "remaining_repair_budget_before": remaining_before,
-                    "action_input_hash": direction["input_hash"],
-                },
-                diagnostics_json={
-                    "failure_cards": failure_cards,
-                    "before_answer_hash": verification_bundle["answer_hash"],
-                    "before_gate_hash": verification_bundle["gate"][
-                        "gate_hash"
-                    ],
-                },
-                status="accepted",
-            )
-            db.add(repair_action)
-            db.flush()
-            action_rows.append(repair_action)
-            before_package = package
-            before_bundle = verification_bundle
-            before_progress = _repair_progress_for_bundle(
-                before_package, before_bundle
-            )
-            repair_execution = await execute_typed_repair_round(
-                db,
-                run=run,
-                request=request,
-                result_top_k=result_top_k,
-                query_facets=query_facets,
-                retrieval_granularity=retrieval_granularity,
-                conversation_state_scope_hash=conversation_state_scope_hash,
-                conversation_state_audit=conversation_state_audit,
-                package=before_package,
-                verification_bundle=before_bundle,
-                action_type=repair_type,
-                action_input_hash=str(direction["input_hash"]),
-                verification_budget=verification_budget,
-                query_embedding_request_memo=(
-                    query_embedding_request_memo
-                ),
-            )
-            ensure_agent_run_not_cancelled(db, run)
-            package = repair_execution["package"]
-            contexts = repair_execution["contexts"]
-            verification_bundle = repair_execution.get(
-                "verification_bundle"
-            ) or await verify_exact_answer_bundle(
-                answer=chat_result.answer,
-                question=request.question,
-                contexts=contexts,
-                package=package,
-                verification_budget=verification_budget,
-                db=db,
-                knowledge_base_id=run.knowledge_base_id,
-                preferred_claim_chunk_ids=repair_execution.get(
-                    "preferred_claim_chunk_ids"
-                ),
-            )
-            ensure_agent_run_not_cancelled(db, run)
-            before_supported_claim_ids = set(
-                (before_bundle.get("gate") or {}).get(
-                    "supported_claim_ids"
-                )
-                or []
-            )
-            after_supported_claim_ids = set(
-                (verification_bundle.get("gate") or {}).get(
-                    "supported_claim_ids"
-                )
-                or []
-            )
-            supported_claim_regression = sorted(
-                before_supported_claim_ids - after_supported_claim_ids
-            )
-            if supported_claim_regression:
-                repair_execution["repair_audit"] = {
-                    **repair_execution["repair_audit"],
-                    "candidate_context_package_id": package.id,
-                    "candidate_retrieval_trace_id": (
-                        package.retrieval_trace_id
-                    ),
-                    "supported_claim_regression_rejected": (
-                        supported_claim_regression
-                    ),
-                    "regression_fail_closed": True,
-                }
-                package = before_package
-                contexts = context_package_to_contexts(before_package)
-                verification_bundle = before_bundle
-            after_progress = _repair_progress_for_bundle(
-                package, verification_bundle
-            )
-            made_progress = repair_made_progress(
-                before_progress, after_progress
-            )
-            repair_candidate_reverted = False
-            if not made_progress:
-                # A repair candidate may not replace a non-empty, already
-                # grounded Context Package with an empty or semantically
-                # regressed package.  Keep the candidate trace for audit, but
-                # continue/finalize from the last valid evidence snapshot.
-                repair_execution["repair_audit"] = {
-                    **repair_execution["repair_audit"],
-                    "candidate_context_package_id": package.id,
-                    "candidate_retrieval_trace_id": package.retrieval_trace_id,
-                    "candidate_semantic_progress_hash": after_progress[
-                        "progress_hash"
-                    ],
-                    "candidate_reverted_to_last_valid_package": True,
-                }
-                package = before_package
-                contexts = context_package_to_contexts(before_package)
-                verification_bundle = before_bundle
-                after_progress = before_progress
-                repair_candidate_reverted = True
-            output_hash = stable_hash(
-                {
-                    "repair_protocol_version": TYPED_REPAIR_PROTOCOL_VERSION,
-                    "action_input_hash": direction["input_hash"],
-                    "directive_hash": repair_execution["directive"][
-                        "directive_hash"
-                    ],
-                    "before_progress_hash": before_progress["progress_hash"],
-                    "after_progress_hash": after_progress["progress_hash"],
-                    "after_answer_hash": verification_bundle["answer_hash"],
-                    "after_gate_hash": verification_bundle["gate"][
-                        "gate_hash"
-                    ],
-                }
-            )
-            prior_repair_action_output_hashes.append(output_hash)
-            attempted_input_hashes_by_action.setdefault(
-                repair_type, set()
-            ).add(str(direction["input_hash"]))
-            if not made_progress:
-                # A no-progress executor result exhausts this repair
-                # direction for the current answer run.  Changing package or
-                # trace addresses must not disguise the same failed direction
-                # as a new attempt.  A direction that produced new semantic
-                # evidence may remain eligible for a genuinely new failure
-                # input, as required by the bounded repair protocol.
-                exhausted_repair_action_types.add(repair_type)
-            before_failures = sorted(
-                {
-                    str(item.get("failure_type") or "unsupported_claim")
-                    for item in before_bundle["verifications"]
-                    if item.get("verdict") != "supported"
-                }
-            )
-            after_failures = sorted(
-                {
-                    str(item.get("failure_type") or "unsupported_claim")
-                    for item in verification_bundle["verifications"]
-                    if item.get("verdict") != "supported"
-                }
-            )
-            remaining_after = remaining_before - 1
-            repair_record = {
-                "protocol_version": TYPED_REPAIR_PROTOCOL_VERSION,
-                "repair_round_index": repair_round_index,
-                "remaining_repair_budget_before": remaining_before,
-                "remaining_repair_budget_after": remaining_after,
-                "action_type": repair_type,
-                "executor_mechanism": direction["executor_mechanism"],
-                "action_input_hash": direction["input_hash"],
-                "action_output_hash": output_hash,
-                "failure_card_hashes": [
-                    item["failure_card_hash"] for item in failure_cards
-                ],
-                "before_failure_types": before_failures,
-                "after_failure_types": after_failures,
-                "before_context_package_id": before_package.id,
-                "repaired_context_package_id": package.id,
-                "before_retrieval_trace_id": before_package.retrieval_trace_id,
-                "repaired_retrieval_trace_id": package.retrieval_trace_id,
-                "before_progress": before_progress,
-                "after_progress": after_progress,
-                "before_progress_hash": before_progress["progress_hash"],
-                "after_progress_hash": after_progress["progress_hash"],
-                "made_semantic_progress": made_progress,
-                "repair_candidate_reverted": repair_candidate_reverted,
-                "convergence_reason": (
-                    "all_claims_supported"
-                    if verification_bundle["gate"]["all_claims_supported"]
-                    else "continue"
-                    if made_progress
-                    else "no_progress_try_alternate_direction"
-                ),
-                "retrieval_granularity": retrieval_granularity,
-                "conversation_state_scope_hash": (
-                    conversation_state_scope_hash
-                ),
-                "query_facets_hash": repair_execution["directive"][
-                    "query_facets_hash"
-                ],
-                "result_top_k": result_top_k,
-                "global_top_k_increased": False,
-                "gray_zone_model_call_count": 0,
-                "gray_zone_decision_authority": (
-                    "deterministic_executor_only"
-                ),
-                "repair_audit": repair_execution["repair_audit"],
-                "validated_targets": {
-                    "action_target_ids": list(
-                        repair_action.target_ids_json or []
-                    ),
-                    "canonical_target_refs": canonical_target_refs,
-                    "supported_source_chunk_ids": list(
-                        repair_execution["directive"].get(
-                            "supported_source_chunk_ids"
-                        )
-                        or []
-                    ),
-                    "carry_forward_supported_chunk_ids": list(
-                        repair_execution["directive"].get(
-                            "carry_forward_supported_chunk_ids"
-                        )
-                        or []
-                    ),
-                    "bridge_seed_chunk_ids": list(
-                        repair_execution["directive"].get(
-                            "bridge_seed_chunk_ids"
-                        )
-                        or []
-                    ),
-                    "excluded_mid_ids": list(
-                        repair_execution["directive"].get(
-                            "excluded_mid_ids"
-                        )
-                        or []
-                    ),
-                    "excluded_result_chunk_ids": list(
-                        repair_execution["directive"].get(
-                            "excluded_result_chunk_ids"
-                        )
-                        or []
-                    ),
-                },
-            }
-            repair_action.output_json = repair_record
-            repair_action.validation_json = {
-                **(repair_action.validation_json or {}),
-                "repair_directive_validator_protocol_version": (
-                    repair_execution["directive"].get(
-                        "validator_protocol_version"
-                    )
-                ),
-                "repair_directive_validator_result": (
-                    repair_execution["directive"].get("validator_result")
-                ),
-                "repair_directive_hash": repair_execution["directive"].get(
-                    "directive_hash"
-                ),
-                "validated_directive_hash": repair_execution[
-                    "directive"
-                ].get("validated_directive_hash"),
-                "validated_targets": repair_record["validated_targets"],
-                "frozen_agent_operating_envelope_hash": (
-                    repair_execution["directive"].get(
-                        "frozen_agent_operating_envelope_hash"
-                    )
-                ),
-                "frozen_traversal_protocol_hash": repair_execution[
-                    "directive"
-                ].get("frozen_traversal_protocol_hash"),
-                "frozen_path_distance_threshold_hash": repair_execution[
-                    "directive"
-                ].get("frozen_path_distance_threshold_hash"),
-            }
-            repair_action.diagnostics_json = {
-                **(repair_action.diagnostics_json or {}),
-                "after_answer_hash": verification_bundle["answer_hash"],
-                "after_gate_hash": verification_bundle["gate"]["gate_hash"],
-                "after_gate_semantic_card": repair_gate_semantic_card(
-                    verification_bundle["gate"]
-                ),
-                "after_failure_cards": canonical_failure_cards(
-                    answer=chat_result.answer,
-                    verification_results=verification_bundle[
-                        "verifications"
-                    ],
-                    repair_round_index=repair_round_index,
-                    remaining_repair_budget=remaining_after,
-                    context_package_id=package.id,
-                    retrieval_trace_id=package.retrieval_trace_id,
-                    structure_closure_status=(
-                        _repair_structure_closure_status(package)
-                    ),
-                    covered_facets=list(
-                        package.covered_facets_json or []
-                    ),
-                    missing_evidence_roles=(
-                        _repair_missing_evidence_roles(
-                            verification_bundle["verifications"]
-                        )
-                    ),
-                    prior_repair_action_output_hashes=(
-                        prior_repair_action_output_hashes
-                    ),
-                ),
-            }
-            repair_action.status = (
-                "completed" if made_progress else "no_progress"
-            )
-            record_observation(
-                db,
-                run_id=run.id,
-                action=repair_action,
-                observation_type="typed_repair_round",
-                observation=repair_record,
-                evidence_chunk_ids=list(
-                    package.hit_chunk_ids_json or []
-                ),
-                verdict=(
-                    "sufficient"
-                    if verification_bundle["gate"]["all_claims_supported"]
-                    else "observed"
-                    if made_progress
-                    else "no_progress"
-                ),
-            )
-            repair_actions.append(repair_record)
-            answer_model_audit = {
-                **answer_model_audit,
-                "context_package_id": package.id,
-                "retrieval_trace_id": package.retrieval_trace_id,
-                "repair_actions": repair_actions,
-                "claim_grounded_gate": verification_bundle["gate"],
-            }
-            db.commit()
-            trace(
-                db,
-                run.id,
-                "repair_executed",
-                input_summary=(
-                    f"round={repair_round_index} action={repair_type}"
-                ),
-                output_summary=(
-                    f"package={package.id} progress={made_progress} "
-                    f"claim_pass={verification_bundle['gate']['claim_pass_rate']}"
-                ),
-                document_ids=list(package.hit_chunk_ids_json or []),
-                scores=repair_record,
-            )
-            if verification_bundle["gate"]["all_claims_supported"]:
-                repair_convergence_reason = "all_claims_supported"
-                break
-            repair_convergence_reason = (
-                "repair_budget_exhausted"
-                if remaining_after == 0
-                else "no_progress_try_alternate_direction"
-                if not made_progress
-                else "repair_continues"
-            )
-
-        evidence_gap: dict[str, Any] = {}
-        grounding_outcome = "grounded_answer"
-        if not verification_bundle["gate"]["all_claims_supported"]:
-            pre_guard_gate = dict(verification_bundle["gate"])
-            partial = supported_partial_answer(
-                chat_result.answer, verification_bundle["gate"]
-            )
-            candidate_answer = str(partial["answer"] or "")
-            evidence_gap = {
-                **(partial.get("evidence_gap") or {}),
-                "repair_convergence_reason": repair_convergence_reason,
-                "repair_round_budget": repair_round_budget,
-                "repair_rounds_used": len(repair_actions),
-                "unsupported_claims_removed": True,
-                "original_answer_hash": pre_guard_gate.get("answer_hash"),
-                "original_claim_count": int(
-                    pre_guard_gate.get("claim_count") or 0
-                ),
-                "original_supported_claim_count": int(
-                    pre_guard_gate.get("supported_claim_count") or 0
-                ),
-                "original_unsupported_claim_count": int(
-                    pre_guard_gate.get("unsupported_claim_count") or 0
-                ),
-                "original_claim_pass_rate": float(
-                    pre_guard_gate.get("claim_pass_rate") or 0.0
-                ),
-                "pre_guard_gate_hash": pre_guard_gate.get("gate_hash"),
-            }
-            for _partial_round in range(
-                max(1, int(verification_bundle["gate"]["claim_count"] or 1))
-            ):
-                if not candidate_answer:
-                    break
-                candidate_bundle = await verify_exact_answer_bundle(
-                    answer=candidate_answer,
-                    question=request.question,
-                    contexts=contexts,
-                    package=package,
-                    verification_budget=verification_budget,
-                    db=db,
-                    knowledge_base_id=run.knowledge_base_id,
-                )
-                ensure_agent_run_not_cancelled(db, run)
-                if candidate_bundle["gate"]["all_claims_supported"]:
-                    verification_bundle = candidate_bundle
-                    break
-                next_partial = supported_partial_answer(
-                    candidate_answer, candidate_bundle["gate"]
-                )
-                next_answer = str(next_partial["answer"] or "")
-                if not next_answer or next_answer == candidate_answer:
-                    candidate_answer = ""
-                    break
-                evidence_gap["dropped_claim_ids"] = list(
-                    dict.fromkeys(
-                        [
-                            *(evidence_gap.get("dropped_claim_ids") or []),
-                            *(next_partial.get("dropped_claim_ids") or []),
-                        ]
-                    )
-                )
-                candidate_answer = next_answer
-            if (
-                candidate_answer
-                and verification_bundle["answer_hash"]
-                == exact_answer_hash(candidate_answer)
-                and verification_bundle["gate"]["all_claims_supported"]
-            ):
-                chat_result = ChatCallResult(
-                    answer=candidate_answer,
-                    provider=chat_result.provider,
-                    model=chat_result.model,
-                    external_called=chat_result.external_called,
-                    fallback_reason=chat_result.fallback_reason,
-                    prompt_protocol_version=chat_result.prompt_protocol_version,
-                    prompt_protocol_hash=chat_result.prompt_protocol_hash,
-                    grounding_envelope_protocol_version=(
-                        chat_result.grounding_envelope_protocol_version
-                    ),
-                    grounding_envelope_hash=(
-                        chat_result.grounding_envelope_hash
-                    ),
-                    profile_hash=chat_result.profile_hash,
-                )
-                answer_model_audit["citation_guard_applied"] = True
-                answer_model_audit[
-                    "unsupported_claims_removed"
-                ] = True
-            else:
-                insufficient_answer = evidence_insufficient_answer(
-                    request.question, "insufficient_corpus"
-                )
-                chat_result = ChatCallResult(
-                    answer=insufficient_answer,
-                    provider=chat_result.provider,
-                    model=chat_result.model,
-                    external_called=chat_result.external_called,
-                    fallback_reason=chat_result.fallback_reason,
-                    prompt_protocol_version=chat_result.prompt_protocol_version,
-                    prompt_protocol_hash=chat_result.prompt_protocol_hash,
-                    grounding_envelope_protocol_version=(
-                        chat_result.grounding_envelope_protocol_version
-                    ),
-                    grounding_envelope_hash=(
-                        chat_result.grounding_envelope_hash
-                    ),
-                    profile_hash=chat_result.profile_hash,
-                )
-                grounding_outcome = "insufficient_evidence"
-                evidence_gap["kind"] = "no_supported_claims"
-                verification_bundle = {
-                    "answer": insufficient_answer,
-                    "answer_hash": exact_answer_hash(insufficient_answer),
-                    "citations": [],
-                    "verifications": [],
-                    "gate": {
-                        **claim_grounding_gate(insufficient_answer, []),
-                        "nonfactual_insufficiency_response": True,
-                    },
-                }
-                answer_model_audit["citation_guard_applied"] = True
-                answer_model_audit["insufficient_evidence"] = True
-            guard_record = {
-                "protocol_version": CLAIM_GROUNDED_GATE_PROTOCOL_VERSION,
-                "typed_action_control_hash": controls["control_hash"],
-                "action_type": "claim_level_final_grounded_gate",
-                "grounding_outcome": grounding_outcome,
-                "exact_answer_hash": verification_bundle["answer_hash"],
-                "claim_grounded_gate": verification_bundle["gate"],
-                "evidence_gap": evidence_gap,
-                "deterministic_citation_guard": True,
-                "gray_zone_model_call_count": 0,
-            }
-            repair_actions.append(guard_record)
-            answer_model_audit = {
-                **answer_model_audit,
-                "context_package_id": package.id,
-                "retrieval_trace_id": package.retrieval_trace_id,
-                "repair_actions": repair_actions,
-                "claim_grounded_gate": verification_bundle["gate"],
-                "repair_convergence_reason": repair_convergence_reason,
-                "evidence_gap": evidence_gap,
-            }
-            record_observation(
-                db,
-                run_id=run.id,
-                action=action_map.get("verify_citations"),
-                observation_type="claim_level_final_grounded_gate",
-                observation=guard_record,
-                evidence_chunk_ids=list(package.hit_chunk_ids_json or []),
-                verdict=(
-                    "sufficient"
-                    if grounding_outcome == "grounded_answer"
-                    else "insufficient"
-                ),
-            )
-            trace(
-                db,
-                run.id,
-                "repair_executed",
-                input_summary="claim_level_final_grounded_gate",
-                output_summary=grounding_outcome,
-                document_ids=list(package.hit_chunk_ids_json or []),
-                scores=guard_record,
-            )
-        answer_model_audit = {
-            **answer_model_audit,
-            "repair_protocol_version": TYPED_REPAIR_PROTOCOL_VERSION,
-            "repair_round_budget": repair_round_budget,
-            "repair_rounds_used": len(
-                [
-                    item
-                    for item in repair_actions
-                    if item.get("repair_round_index") is not None
-                ]
-            ),
-            "repair_convergence_reason": repair_convergence_reason,
-            "claim_grounded_gate_protocol_version": (
-                CLAIM_GROUNDED_GATE_PROTOCOL_VERSION
-            ),
-            "claim_grounded_gate": verification_bundle["gate"],
-            "exact_answer_hash": verification_bundle["answer_hash"],
-            "evidence_gap": evidence_gap,
-        }
-
-        answer_session = await record_answer_audit(
-            db,
-            knowledge_base_id=run.knowledge_base_id,
-            qa_session_id=session.id,
-            question=request.question,
-            answer=chat_result.answer,
-            package=package,
-            contexts=contexts,
-            answer_model_audit=answer_model_audit,
-            repair_actions=repair_actions,
-            preverified_citations=verification_bundle["citations"],
-            preverified_results=verification_bundle["verifications"],
-            preverified_answer_hash=verification_bundle["answer_hash"],
-            grounding_gate_audit=verification_bundle["gate"],
-            evidence_gap=evidence_gap,
-            grounding_outcome=grounding_outcome,
-            raise_after_rejected_audit=True,
-            agent_run_id=run.id,
-            policy_operating_prior=policy_operating_prior,
-            citation_verification_action=action_map.get("verify_citations"),
-            typed_action_control_hash=controls["control_hash"],
-            frozen_agent_operating_envelope=envelope,
-        )
-        verification_by_binding, citation_pass_rate = citation_verification_summary(
-            db, answer_session.id
-        )
-        persisted_grounding_gate = dict(
-            (answer_session.diagnostics_json or {}).get(
-                "claim_grounded_gate"
-            )
-            or {}
-        )
-        if (
-            not persisted_grounding_gate
-            or persisted_grounding_gate.get(
-                "require_persistence_replay"
-            )
-            is not True
-        ):
-            raise RuntimeError(
-                "persisted answer audit did not expose its mandatory "
-                "citation-provenance replay gate"
-            )
-        answer_model_audit.update(
-            {
-                "chat_model": chat_result.model,
-                "retrieval_trace_id": package.retrieval_trace_id,
-                "retrieval_granularity": retrieval_granularity,
-                "answer_session_id": answer_session.id,
-                "raw_citation_verification_pass_rate": citation_pass_rate,
-                "repair_actions": repair_actions,
-                "claim_grounded_gate": persisted_grounding_gate,
-            }
-        )
-        citations = citation_payloads_from_package(
-            package,
-            answer_session_id=answer_session.id,
-            retrieval_trace_id=package.retrieval_trace_id,
-            verification_by_binding=verification_by_binding,
-            answer=chat_result.answer,
-            question=request.question,
-            supported_only=True,
-        )
-        final_citation_pass_rate = float(citation_pass_rate or 0.0)
-        answer_model_audit["citation_verification_pass_rate"] = final_citation_pass_rate
-        answer_model_audit["returned_citation_count"] = len(citations)
-        answer_model_audit["grounding_outcome"] = grounding_outcome
-        answer_session.model_json = dict(answer_model_audit)
-        db.commit()
-        trace(
-            db,
-            run.id,
-            "reward_event",
-            input_summary=f"answer_session={answer_session.id}",
-            output_summary="reward and policy state updated",
-            scores={"runtime_settings_hash": runtime_settings_state_hash(), "agent_operating_envelope_hash": agent_operating_envelope_state_hash()},
-        )
-        final_conversation_state = append_session_turn(
-            db,
-            session,
-            request.question,
-            chat_result.answer,
-            run.id,
-            citations,
-            answer_session_id=answer_session.id,
-            retrieval_trace_id=package.retrieval_trace_id,
-        )
-        set_run_state(db, run, "completed", current_node=None, answer=chat_result.answer)
-        trace_events = db.scalars(select(AgentTraceEvent).where(AgentTraceEvent.run_id == run.id).order_by(AgentTraceEvent.sequence_index.asc())).all()
-        return {
-            "run_id": run.id,
-            "session_id": session.id,
-            "answer": chat_result.answer,
-            "citations": citations,
-            "used_chunks": contexts,
-            "route": "layered_context_graph",
-            "trace": [trace_event_to_payload(event) for event in trace_events],
-            "degraded_mode": is_degraded_mode(),
-            "context_package_id": package.id,
-            "retrieval_trace_id": package.retrieval_trace_id,
-            "retrieval_granularity": retrieval_granularity,
-            "model_audit": answer_model_audit,
-            "answer_model_audit": answer_model_audit,
-            "conversation_state": final_conversation_state.public_payload(),
-        }
     except Exception as exc:
         if isinstance(exc, ActiveContextGraphAdmissionError):
             try:
                 persist_active_graph_admission_failure(db, exc)
             except Exception:
                 db.rollback()
+        db.rollback()
         safe_error = public_exception_message(exc)
+        if getattr(exc, "planner_sampling", None):
+            db.refresh(run)
+            run.metadata_json = {**run.metadata_json, "policy_update_eligible": False, "planner_sampling": exc.planner_sampling}
+            flag_modified(run, "metadata_json")
+            db.flush()
+        if isinstance(exc, TypedActionValidationError) and exc.diagnostics.get("execution_preflight"):
+            db.refresh(run)
+            run.metadata_json = {**run.metadata_json, "policy_update_eligible": False,
+                "planner_preflight_failure": exc.diagnostics}
+            flag_modified(run, "metadata_json")
+            db.flush()
+        from app.services.reflection_models import AnswerReviewModelError, classify_answer_model_error
+        from app.services.agent_reflection import ReflectionContractError
+        if isinstance(exc, (AnswerReviewModelError, ReflectionContractError, ExternalServiceError)):
+            db.refresh(run)
+            classified = classify_answer_model_error(str(run.current_node or "model_request"), exc) if isinstance(exc, ExternalServiceError) else exc
+            run.metadata_json = {**run.metadata_json, "policy_update_eligible": False,
+                "technical_failure": {"stage": getattr(classified, "stage", "answer_reflection"), "code": getattr(classified, "code", safe_error),
+                    "cause_type": getattr(classified, "cause_type", None), "status_code": getattr(classified, "status_code", None),
+                    "external_failure": getattr(classified, "external_failure", {}), "provider_shape": getattr(classified, "provider_shape", None)}}
+            flag_modified(run, "metadata_json")
+            db.flush()
         set_run_state(db, run, "failed", error=safe_error)
         trace(db, run.id, "error", status="failed", output_summary=safe_error, error=safe_error)
         raise
 
 
+@qa_request_scope
 async def run_agent(db: Session, request: AgentRequest, admission: AgentAdmissionLease | None = None) -> dict:
-    lease = admission or await acquire_agent_request_slot("ordinary")
+    if admission is None:
+        with qa_stage("admission_queue"):
+            lease = await acquire_agent_request_slot("ordinary")
+    else:
+        lease = admission
     run: AgentRun | None = None
 
     async def execute_admitted() -> dict:
         nonlocal run
-        session, run = create_agent_run_context(db, request)
+        def prepare_context():
+            nonlocal run
+            session, run = create_agent_run_context(db, request)
+            return session
+        with qa_stage("conversation_prepare"):
+            session = await run_bounded_source_io(prepare_context)
         return await execute_agent_run_with_active_profile(db, request, session, run)
 
     try:
         return await lease.run(execute_admitted())
     except asyncio.CancelledError:
+        db.rollback()
         if run is not None:
-            db.rollback()
             mark_agent_run_cancelled(db, run)
         raise
     except AgentAdmissionError as exc:
+        db.rollback()
         if run is not None:
             mark_agent_run_admission_failed(db, run, exc.code)
+        raise
+    except Exception as exc:
+        if run is not None:
+            setattr(exc, "agent_run_id", run.id)
+            setattr(exc, "agent_session_id", run.session_id)
         raise
     finally:
         await lease.release()
@@ -9633,79 +9820,250 @@ def _consume_detached_task_result(task: asyncio.Task) -> None:
         pass
 
 
-async def stream_agent_events(request: AgentRequest, admission: AgentAdmissionLease | None = None) -> AsyncGenerator[dict, None]:
+def _retire_agent_stream_owner(run_id: str, task: asyncio.Task) -> None:
+    if _ACTIVE_AGENT_TASKS.get(run_id) is task:
+        _ACTIVE_AGENT_TASKS.pop(run_id, None)
+    _consume_detached_task_result(task)
+
+
+async def _run_agent_stream_owner(
+    request: AgentRequest,
+    *,
+    run_id: str,
+    session_id: str,
+    lease: AgentAdmissionLease,
+    performance: QAPerformance,
+    answer_queue: asyncio.Queue[dict[str, str]],
+) -> dict:
+    """Execute one accepted run independently from every transport observer."""
+
     from app.db import SessionLocal
 
-    lease = admission or await acquire_agent_request_slot("sse")
+    db = SessionLocal()
+    try:
+        run = db.get(AgentRun, run_id)
+        session = db.get(QASession, session_id)
+        if run is None or session is None or run.session_id != session.id:
+            raise LookupError("Agent stream owner could not reload its accepted run")
+
+        async def execute_timed() -> dict:
+            with performance.activate():
+                async def enqueue_answer_update(update: dict[str, str]) -> None:
+                    answer_queue.put_nowait(update)
+
+                with use_answer_stream_sink(enqueue_answer_update):
+                    return await _execute_agent_run_and_close(
+                        db,
+                        request,
+                        session,
+                        run,
+                    )
+
+        return await lease.run(execute_timed())
+    except AgentAdmissionError as exc:
+        mark_agent_run_admission_failed_by_id(run_id, exc.code)
+        raise
+    except asyncio.CancelledError:
+        # Explicit cancellation addresses the owner task through
+        # ``cancel_agent_run``. Observer teardown never reaches this branch.
+        mark_agent_run_cancelled_by_id(run_id)
+        raise
+    except BaseException:
+        # The target executor normally persists its own typed terminal state.
+        # This guard covers failures before that executor can acquire the run.
+        from app.db import SessionLocal as RecoverySessionLocal
+
+        with RecoverySessionLocal() as recovery_db:
+            recovery_run = recovery_db.get(AgentRun, run_id)
+            if (
+                recovery_run is not None
+                and recovery_run.status not in TERMINAL_AGENT_RUN_STATUSES
+            ):
+                set_run_state(
+                    recovery_db,
+                    recovery_run,
+                    "failed",
+                    error="agent_stream_owner_failed",
+                )
+                from app.services.conversation_state import (
+                    mark_session_task_terminal_for_run,
+                )
+
+                mark_session_task_terminal_for_run(
+                    recovery_db,
+                    session_id=recovery_run.session_id,
+                    run_id=recovery_run.id,
+                    status="failed",
+                )
+                recovery_db.commit()
+        raise
+    finally:
+        # ``_execute_agent_run_and_close`` closes the ordinary path. Closing a
+        # SQLAlchemy Session twice is safe and covers pre-execution failures.
+        db.close()
+        await lease.release()
+
+
+async def start_agent_stream_execution(
+    request: AgentRequest,
+    admission: AgentAdmissionLease,
+    *,
+    performance: QAPerformance | None = None,
+) -> AgentStreamExecution:
+    """Persist an accepted run, then transfer its lease to a detached owner."""
+
+    from app.db import SessionLocal
+
+    performance = performance or QAPerformance()
     db: Session | None = None
     run: AgentRun | None = None
-    trace_queue: asyncio.Queue[dict] | None = None
-    task: asyncio.Task | None = None
+    session: QASession | None = None
+    owner_started = False
     try:
-        lease.raise_if_lost()
+        admission.raise_if_lost()
         db = SessionLocal()
-        session, run = create_agent_run_context(db, request)
-        trace_queue = _subscribe_trace(run.id)
-        task = asyncio.create_task(lease.run(_execute_agent_run_and_close(db, request, session, run)))
-        _ACTIVE_AGENT_TASKS[run.id] = task
-        task.add_done_callback(_consume_detached_task_result)
-        response: dict | None = None
-        yielded_trace_ids: set[str] = set()
-        try:
-            yield {
-                "type": "meta",
-                "run_id": run.id,
-                "session_id": session.id,
-                "retrieval_granularity": request.retrieval_granularity,
-            }
-            while not task.done():
-                try:
-                    event = await asyncio.wait_for(trace_queue.get(), timeout=0.25)
-                except asyncio.TimeoutError:
-                    continue
-                if request.stream_trace:
-                    yielded_trace_ids.add(event["id"])
-                    yield {"type": "trace", "trace": event}
-            while not trace_queue.empty():
+
+        def prepare_context():
+            nonlocal session, run
+            session, run = create_agent_run_context(db, request)
+
+        with performance.activate(), qa_stage("conversation_prepare"):
+            await admission.run(run_bounded_source_io(prepare_context))
+        if run is None or session is None:
+            raise RuntimeError("Agent stream preparation returned no run")
+        run_id = run.id
+        session_id = session.id
+        answer_queue: asyncio.Queue[dict[str, str]] = asyncio.Queue()
+        db.close()
+        db = None
+        task = asyncio.create_task(
+            _run_agent_stream_owner(
+                request,
+                run_id=run_id,
+                session_id=session_id,
+                lease=admission,
+                performance=performance,
+                answer_queue=answer_queue,
+            ),
+            name=f"agent-run-owner:{run_id}",
+        )
+        _ACTIVE_AGENT_TASKS[run_id] = task
+        task.add_done_callback(
+            lambda completed, accepted_run_id=run_id: _retire_agent_stream_owner(
+                accepted_run_id,
+                completed,
+            )
+        )
+        owner_started = True
+        return AgentStreamExecution(
+            run_id=run_id,
+            session_id=session_id,
+            task=task,
+            performance=performance,
+            answer_queue=answer_queue,
+        )
+    except AgentAdmissionError as exc:
+        if run is not None:
+            mark_agent_run_admission_failed_by_id(run.id, exc.code)
+        raise
+    except asyncio.CancelledError:
+        if run is not None and not owner_started:
+            mark_agent_run_cancelled_by_id(run.id)
+        raise
+    finally:
+        if db is not None:
+            db.close()
+        if not owner_started:
+            await admission.release()
+
+
+async def observe_agent_stream_execution(
+    execution: AgentStreamExecution,
+    *,
+    stream_trace: bool,
+) -> AsyncGenerator[dict, None]:
+    """Observe a run without owning or cancelling the execution task."""
+
+    trace_queue = _subscribe_trace(execution.run_id)
+    yielded_trace_ids: set[str] = set()
+    streamed_answer = ""
+    try:
+        yield {
+            "type": "meta",
+            "run_id": execution.run_id,
+            "session_id": execution.session_id,
+        }
+        while (
+            not execution.task.done()
+            or not trace_queue.empty()
+            or not execution.answer_queue.empty()
+        ):
+            while not execution.answer_queue.empty():
+                update = execution.answer_queue.get_nowait()
+                if update.get("type") == "delta":
+                    delta = str(update.get("text") or "")
+                    if delta:
+                        streamed_answer += delta
+                        yield {"type": "token", "token": delta}
+                elif update.get("type") == "replace":
+                    streamed_answer = str(update.get("text") or "")
+                    yield {
+                        "type": "answer_replace",
+                        "answer": streamed_answer,
+                    }
+            if not trace_queue.empty():
                 event = trace_queue.get_nowait()
-                if request.stream_trace:
+                if stream_trace:
                     yielded_trace_ids.add(event["id"])
                     yield {"type": "trace", "trace": event}
-            response = await task
+                continue
+            if not execution.task.done():
+                await asyncio.sleep(0.05)
+        try:
+            response = await asyncio.shield(execution.task)
         except asyncio.CancelledError:
+            if execution.task.cancelled():
+                yield {"type": "error", "error": CANCELLED_BY_USER}
+                return
+            # The observer was closed. Shielding guarantees that the owner
+            # task remains registered and continues toward its durable state.
             raise
+        except AgentAdmissionError as exc:
+            yield {
+                "type": "error",
+                "error": exc.message,
+                "detail": exc.payload(),
+            }
+            return
         except Exception as exc:
-            if task is not None and not task.done():
-                _cancel_task(task)
-            if isinstance(exc, AgentAdmissionError):
-                mark_agent_run_admission_failed_by_id(run.id, exc.code)
-                yield {"type": "error", "error": exc.message, "detail": exc.payload()}
-            else:
-                yield {"type": "error", "error": public_exception_message(exc)}
+            yield {"type": "error", "error": public_exception_message(exc)}
             return
-        finally:
-            _unsubscribe_trace(run.id, trace_queue)
-            _ACTIVE_AGENT_TASKS.pop(run.id, None)
-            if task is not None and not task.done():
-                _cancel_task(task)
-                with suppress(asyncio.CancelledError, Exception):
-                    await task
-                mark_agent_run_cancelled_by_id(run.id)
-            elif task is not None and task.cancelled():
-                mark_agent_run_cancelled_by_id(run.id)
-        if response is None:
-            return
-        if request.stream_trace:
+        yield {
+            "type": "meta",
+            "run_id": response.get("run_id"),
+            "session_id": response.get("session_id"),
+            "route": response.get("route"),
+            "direct_answer_mode": response.get("direct_answer_mode"),
+            "entry_layer": response.get("entry_layer"),
+            "terminal_outcome": response.get("terminal_outcome"),
+        }
+        if stream_trace:
             for event in response["trace"]:
                 if event["id"] not in yielded_trace_ids:
                     yield {"type": "trace", "trace": event}
         answer = response["answer"] or ""
-        for start in range(0, len(answer), 12):
-            yield {"type": "token", "token": answer[start : start + 12]}
-            await asyncio.sleep(0.01)
+        if streamed_answer:
+            if streamed_answer != answer:
+                streamed_answer = answer
+                yield {"type": "answer_replace", "answer": answer}
+        else:
+            # Service-card routes have no answer-generation provider stream.
+            # Preserve their response without presenting post-hoc chunking as
+            # model-token streaming.
+            yield {"type": "answer_replace", "answer": answer}
         yield {"type": "citations", "citations": response["citations"], "degraded_mode": response["degraded_mode"]}
         final_response = response
-        if request.stream_trace and response.get("trace"):
+        if stream_trace and response.get("trace"):
             # Every trace event has already been sent individually above.  Do
             # not serialize and transfer the same (potentially very large)
             # bounded graph observations a second time in the terminal SSE
@@ -9714,8 +10072,34 @@ async def stream_agent_events(request: AgentRequest, admission: AgentAdmissionLe
             final_response = {**response, "trace": []}
         yield {"type": "final", "response": final_response}
     finally:
-        if run is not None and trace_queue is not None:
-            _unsubscribe_trace(run.id, trace_queue)
-        if db is not None and task is None:
-            db.close()
-        await lease.release()
+        _unsubscribe_trace(execution.run_id, trace_queue)
+
+
+async def stream_agent_events(
+    request: AgentRequest,
+    admission: AgentAdmissionLease | None = None,
+    *,
+    performance: QAPerformance | None = None,
+) -> AsyncGenerator[dict, None]:
+    """Compatibility facade that starts one owner and observes it once."""
+
+    performance = performance or QAPerformance()
+    if admission is None:
+        with performance.activate(), qa_stage("admission_queue"):
+            lease = await acquire_agent_request_slot("sse")
+    else:
+        lease = admission
+    try:
+        execution = await start_agent_stream_execution(
+            request,
+            lease,
+            performance=performance,
+        )
+    except AgentAdmissionError as exc:
+        yield {"type": "error", "error": exc.message, "detail": exc.payload()}
+        return
+    async for event in observe_agent_stream_execution(
+        execution,
+        stream_trace=request.stream_trace,
+    ):
+        yield event

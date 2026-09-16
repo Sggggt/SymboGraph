@@ -46,6 +46,35 @@ def env_example_keys() -> set[str]:
     return keys
 
 
+def settings_example_keys() -> set[str]:
+    runtime_settings_file = str(
+        os.getenv("RUNTIME_SETTINGS_FILE")
+        or os.getenv("RUNTIME_ENV_FILE")
+        or ""
+    ).strip()
+    runtime_workspace_example = (
+        Path(runtime_settings_file).resolve().parent / "settings.example.json"
+        if runtime_settings_file
+        else None
+    )
+    path = (
+        runtime_workspace_example
+        if runtime_workspace_example is not None
+        and runtime_workspace_example.exists()
+        else REPO_ROOT / "settings.example.json"
+    )
+    if not path.exists():
+        return set()
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(value, dict)
+        or value.get("protocol_version") != "symbograph_runtime_settings_v1"
+        or not isinstance(value.get("settings"), dict)
+    ):
+        return set()
+    return set(value["settings"])
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -63,9 +92,11 @@ def main() -> None:
         EDGE_PROJECTION_PROTOCOL_ALLOWLIST,
         EDGE_TYPE_CALIBRATION_PROTOCOL_ALLOWLIST,
         EMBEDDING_API_PROTOCOL_ALLOWLIST,
+        ENV_AUTHORITY_SETTINGS,
         HOT_RELOAD_SETTINGS,
         MODEL_API_PROTOCOL_ALLOWLIST,
         RQ_MEMBERSHIP_PROTOCOL_ALLOWLIST,
+        RUNTIME_JSON_SETTINGS,
         Settings,
     )
     from app.schemas import ModelSettingsUpdate
@@ -79,6 +110,7 @@ def main() -> None:
     shared_response = ts_interface_keys("ModelSettingsResponse")
     shared_update = ts_interface_keys("ModelSettingsUpdate")
     env_keys = env_example_keys()
+    settings_keys = settings_example_keys()
     lifecycle = runtime_lifecycle_payload()
     rebuild_lifecycle = set(lifecycle.get("rebuild_required") or [])
     hot_lifecycle = set(lifecycle.get("hot_reloadable") or [])
@@ -107,10 +139,6 @@ def main() -> None:
         "rq_kmeans_levels",
         "rq_kmeans_max_k",
         "rq_residual_tau",
-        "agent_planning_round_budget",
-        "agent_max_typed_actions_per_round",
-        "agent_repair_round_budget",
-        "agent_verification_budget",
         "traversal_observation_budget",
         "edge_distance_protocol",
         "rq_membership_protocol",
@@ -138,51 +166,23 @@ def main() -> None:
         if key not in settings_fields:
             add_issue(issues, "blocker", "required_setting_missing", f"{key} is missing from Settings.")
 
-    env_aliases = {
-        "CHAT_API_PROTOCOL",
-        "GRAPH_API_PROTOCOL",
-        "EMBEDDING_API_PROTOCOL",
-        "FIXED_CHUNK_SIZE_TOKENS",
-        "FIXED_CHUNK_OVERLAP_TOKENS",
-        "CONTEXT_PACKAGE_TOKEN_BUDGET",
-        "SOURCE_IO_CONCURRENCY",
-        "CONCEPT_I18N_ENABLED",
-        "QUERY_FACET_BILINGUAL_ENABLED",
-        "RQ_KMEANS_LEVELS",
-        "RQ_KMEANS_MAX_K",
-        "RQ_RESIDUAL_TAU",
-        "AGENT_COARSE_INITIAL_BUDGET",
-        "AGENT_COARSE_TOP_K",
-        "AGENT_COARSE_DRILLDOWN_MID_INITIAL_BUDGET",
-        "AGENT_MID_INITIAL_BUDGET",
-        "AGENT_CHUNK_INITIAL_BUDGET",
-        "AGENT_STRUCTURE_RESTORE_PER_CHUNK_BUDGET",
-        "AGENT_PLANNING_ROUND_BUDGET",
-        "AGENT_MAX_TYPED_ACTIONS_PER_ROUND",
-        "AGENT_REPAIR_ROUND_BUDGET",
-        "AGENT_VERIFICATION_BUDGET",
-        "TRAVERSAL_OBSERVATION_BUDGET",
-        "EDGE_DISTANCE_PROTOCOL",
-        "RQ_MEMBERSHIP_PROTOCOL",
-        "EDGE_PROJECTION_PROTOCOL",
-        "EDGE_TYPE_CALIBRATION_PROTOCOL",
-        "RQ_MEMBERSHIP_TEMPERATURE",
-        "ENABLE_AUTO_TPE",
-        "TPE_TRIAL_BUDGET",
-        "TPE_STARTUP_RANDOM_TRIALS",
-        "TPE_GOOD_QUANTILE_GAMMA",
-        "TPE_PROBE_QUERY_BUDGET",
-        "TPE_TRIAL_TIMEOUT_SECONDS",
-        "TPE_CANDIDATE_POOL_SIZE",
-        "OPERATING_POINT_HARD_GATE_MAX_EDGE_DENSITY",
-        "OPERATING_POINT_HARD_GATE_MAX_ISOLATED_RATIO",
-        "OPERATING_POINT_HARD_GATE_MAX_HUBNESS_RATIO",
-        "OPERATING_POINT_HARD_GATE_MIN_STRUCTURE_RECOVERY_RATE",
-        "OPERATING_POINT_HARD_GATE_MAX_CANDIDATE_LATENCY_P95_MS",
-    }
-    missing_env_examples = sorted(env_aliases - env_keys)
+    expected_env_runtime = {key.upper() for key in ENV_AUTHORITY_SETTINGS}
+    missing_env_examples = sorted(expected_env_runtime - env_keys)
     if missing_env_examples:
-        add_issue(issues, "warning", "env_example_missing_runtime_keys", "Some runtime keys are missing from .env.example.", {"missing": missing_env_examples})
+        add_issue(issues, "warning", "env_example_missing_environment_keys", "Some environment-authority keys are missing from .env.example.", {"missing": missing_env_examples})
+    env_runtime_overlap = sorted(env_keys & {key.upper() for key in RUNTIME_JSON_SETTINGS})
+    if env_runtime_overlap:
+        add_issue(issues, "blocker", "env_example_contains_runtime_keys", ".env.example contains settings.json authority keys.", {"overlap": env_runtime_overlap})
+    missing_settings_examples = sorted(set(RUNTIME_JSON_SETTINGS) - settings_keys)
+    extra_settings_examples = sorted(settings_keys - set(RUNTIME_JSON_SETTINGS))
+    if missing_settings_examples or extra_settings_examples:
+        add_issue(
+            issues,
+            "blocker",
+            "settings_example_schema_mismatch",
+            "settings.example.json must contain the complete closed runtime-key set.",
+            {"missing": missing_settings_examples, "extra": extra_settings_examples},
+        )
 
     rebuild_graph_settings = {
         "edge_distance_protocol",
@@ -303,6 +303,8 @@ def main() -> None:
             "shared_model_settings_update": sorted(shared_update),
             "rebuild_required": sorted(rebuild_lifecycle),
             "hot_reloadable": sorted(hot_lifecycle),
+            "env_authority": sorted(ENV_AUTHORITY_SETTINGS),
+            "settings_json_authority": sorted(RUNTIME_JSON_SETTINGS),
         },
     }
     report = write_report("runtime_settings_contract", payload)

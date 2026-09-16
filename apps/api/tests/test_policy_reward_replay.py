@@ -43,14 +43,23 @@ def reward_factory(db_session, sample_knowledge_base):
     from app.services.agent_graph import (
         AGENT_PLANNER_AUDIT_PROTOCOL_VERSION,
         AGENT_PLANNER_PROTOCOL_VERSION,
-        REQUIRED_TYPED_ACTIONS,
-        TYPED_ACTION_EXECUTOR_PROTOCOL_VERSION,
-        TYPED_ACTION_SCHEMA_PROTOCOL_VERSION,
+        LEGACY_REQUIRED_TYPED_ACTIONS as REQUIRED_TYPED_ACTIONS,
         _repair_progress_for_bundle,
         compile_typed_action_execution_controls,
         validate_typed_actions,
+        rebind_historical_typed_action_validation_identity,
     )
     from app.services.chunking import rough_token_count, stable_hash, text_hash
+    TYPED_ACTION_SCHEMA_PROTOCOL_VERSION = "typed_action_schema_v4"
+    TYPED_ACTION_EXECUTOR_PROTOCOL_VERSION = "planner_typed_action_executor_v2"
+
+    def validate_historical_actions(actions, envelope, **kwargs):
+        normalized, validation = validate_typed_actions(actions, envelope,
+            required_actions_override=REQUIRED_TYPED_ACTIONS, **kwargs)
+        validation = rebind_historical_typed_action_validation_identity(
+            {"typed_action_schema_protocol_version": TYPED_ACTION_SCHEMA_PROTOCOL_VERSION,
+             "typed_action_schema_protocol_hash": "f5d2e730d3f3c64c574d67746deb71440122019a8c44f33bc92b1ebc839b0f3d"}, validation)
+        return normalized, validation
     from app.services.context_graph import (
         GRAY_ZONE_RUNTIME_SETTINGS_IDENTITY_PROTOCOL_VERSION,
         GRAY_ZONE_RULE_PROTOCOL_VERSION,
@@ -202,7 +211,9 @@ def reward_factory(db_session, sample_knowledge_base):
 
         runtime_hash = runtime_settings_state_hash()
         envelope = agent_operating_envelope()
-        envelope_hash = agent_operating_envelope_state_hash()
+        envelope["verification_budget"] = envelope.pop("answer_unit_limit")
+        envelope["repair_round_budget"] = envelope.pop("reflection_round_budget")
+        envelope_hash = stable_hash(envelope)
         gray_runtime_hash = gray_zone_runtime_settings_hash(envelope)
         assert envelope_hash == stable_hash(envelope)
         assert gray_runtime_hash != runtime_hash
@@ -562,7 +573,7 @@ def reward_factory(db_session, sample_knowledge_base):
             }
             for action_type in REQUIRED_TYPED_ACTIONS
         ]
-        typed_actions, validation = validate_typed_actions(
+        typed_actions, validation = validate_historical_actions(
             deepcopy(proposed_actions),
             envelope,
             db=db_session,
@@ -796,7 +807,7 @@ def reward_factory(db_session, sample_knowledge_base):
                     "no_semantic_progress": True,
                 },
             }
-            normalized_repairs, repair_validation = validate_typed_actions(
+            normalized_repairs, repair_validation = validate_historical_actions(
                 [deepcopy(raw_repair_action)],
                 envelope,
                 db=db_session,
@@ -1315,7 +1326,8 @@ def test_policy_reward_replays_allowlisted_historical_typed_schema_identity(
 ) -> None:
     from app.services.agent_graph import (
         HISTORICAL_TYPED_ACTION_SCHEMA_REQUIRED_ACTIONS_BY_HASH,
-        REQUIRED_TYPED_ACTIONS,
+        HISTORICAL_TYPED_ACTION_SCHEMA_PROTOCOL_HASHES,
+        LEGACY_REQUIRED_TYPED_ACTIONS as REQUIRED_TYPED_ACTIONS,
     )
     from app.services.policy_reward import (
         PolicyRewardReplayError,
@@ -1330,7 +1342,8 @@ def test_policy_reward_replays_allowlisted_historical_typed_schema_identity(
         for protocol_hash, required_actions in (
             HISTORICAL_TYPED_ACTION_SCHEMA_REQUIRED_ACTIONS_BY_HASH.items()
         )
-        if tuple(required_actions) == tuple(REQUIRED_TYPED_ACTIONS)
+        if protocol_hash in HISTORICAL_TYPED_ACTION_SCHEMA_PROTOCOL_HASHES[historical_version]
+        and tuple(required_actions) == tuple(REQUIRED_TYPED_ACTIONS)
     )
     validation = deepcopy(plan.validation_json)
     validation["typed_action_schema_protocol_version"] = historical_version

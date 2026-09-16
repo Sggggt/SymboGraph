@@ -83,6 +83,9 @@ from app.services.conversation_state import (
     PROMPT_HISTORY_MAX_TURNS,
 )
 from app.services.embeddings import classify_json_with_budget, is_degraded_mode
+from app.services.agent_intent import (
+    QUESTION_PERCEPTION_IMMUTABLE_CONTRACT,
+)
 from app.services.storage import run_bounded_source_io
 from app.services.ingestion import list_knowledge_base_files
 from app.services.strategy_profiles import (
@@ -99,7 +102,7 @@ from app.services.strategy_profiles import (
 
 TERMINAL_BATCH_STATES = {"completed", "failed", "partial_failed", "skipped", "cancelled", "cancel_failed"}
 ORDINARY_QUERY_PERCEPTION_PROTOCOL_VERSION = (
-    "bounded_query_perception_and_facet_proposal_v1"
+    "bounded_query_perception_and_facet_proposal_v2"
 )
 ORDINARY_QUERY_PERCEPTION_MODEL_CALL_BUDGET = 2
 ORDINARY_QUERY_REPLAY_POINTER_PROTOCOL_VERSION = (
@@ -130,6 +133,7 @@ ORDINARY_QUERY_REPLAY_POINTER_FIELDS = frozenset(
 ORDINARY_QUERY_INTENT_FIELDS = frozenset(
     {
         "intent",
+        "direct_answer_kind",
         "entities",
         "sub_queries",
         "needs_graph",
@@ -143,6 +147,7 @@ ORDINARY_QUERY_INTENTS = frozenset(
         "application",
         "procedure",
         "analysis",
+        "formula_table_lookup",
         "unknown",
     }
 )
@@ -538,6 +543,9 @@ def _ordinary_query_perception_protocol_hash(
             "intent_allowlist": sorted(ORDINARY_QUERY_INTENTS),
             "strategy_allowlist": sorted(ORDINARY_QUERY_STRATEGIES),
             "intent_system_prompt": perception_system,
+            "intent_immutable_contract": (
+                QUESTION_PERCEPTION_IMMUTABLE_CONTRACT
+            ),
             "facet_system_prompt": facet_system,
             "query_facet_protocol_hash": (
                 context_graph_service.query_facet_protocol_hash()
@@ -586,6 +594,7 @@ def _ordinary_query_intent_fallback(query: str) -> dict[str, Any]:
         strategy = "global_dense"
     return {
         "intent": intent,
+        "direct_answer_kind": "none",
         "entities": [],
         "sub_queries": [str(query)],
         "needs_graph": True,
@@ -612,6 +621,13 @@ def _validate_ordinary_query_intent_payload(
     intent = str(payload.get("intent") or "").strip().casefold()
     if intent not in ORDINARY_QUERY_INTENTS:
         raise ValueError("ordinary query intent is outside the allowlist")
+    direct_answer_kind = str(
+        payload.get("direct_answer_kind") or ""
+    ).strip().casefold()
+    if direct_answer_kind != "none":
+        raise ValueError(
+            "ordinary search query intent cannot authorize direct answer"
+        )
     strategy = (
         str(payload.get("suggested_strategy") or "")
         .strip()
@@ -650,6 +666,7 @@ def _validate_ordinary_query_intent_payload(
         raise ValueError("ordinary query intent needs_graph must be boolean")
     return {
         "intent": intent,
+        "direct_answer_kind": direct_answer_kind,
         "entities": [str(item).strip() for item in entities],
         "sub_queries": [str(item).strip() for item in sub_queries],
         "needs_graph": bool(payload["needs_graph"]),
@@ -1201,6 +1218,12 @@ async def _bounded_ordinary_query_perception(
             ),
         },
     )
+    perception_system = (
+        f"{perception_system.strip()}\n\n"
+        f"{QUESTION_PERCEPTION_IMMUTABLE_CONTRACT}\n"
+        "This is an explicit search endpoint: direct_answer is outside the "
+        "ordinary search intent allowlist and direct_answer_kind must be none."
+    )
     intent_fallback = _ordinary_query_intent_fallback(query)
     model_call_count += 1
     raw_intent = await classify_json_with_budget(
@@ -1404,7 +1427,7 @@ async def _ordinary_layered_search(
         db,
         knowledge_base_id,
     )
-    pointer_components = _ordinary_query_pointer_components(
+    pointer_components = await run_bounded_source_io(_ordinary_query_pointer_components,
         db,
         knowledge_base_id=knowledge_base_id,
         query=query,
@@ -1873,6 +1896,7 @@ _TRACE_PATH_LABEL_INTERNAL_FIELDS = frozenset(
         "path_edge_distances",
         "path_edge_strengths",
         "cycle_distance_rewards",
+        "entry_channels",
     }
 )
 _TRACE_PATH_LABEL_INTERNAL_SUPPORT_FIELDS = frozenset(
@@ -2701,6 +2725,90 @@ def _closed_trace_path_label_payload(
         ) from exc
 
 
+def _validate_intent_execution_trace_path_facts(
+    db: Session,
+    *,
+    trace: RetrievalTrace,
+    raw_labels: list[dict[str, Any]],
+) -> None:
+    """Replay v1 frozen-plan chunk paths without invoking legacy policy inputs."""
+
+    from app.retrieval_control_contracts import control_hash
+
+    diagnostics = dict(trace.diagnostics_json or {})
+    scores = dict(trace.scores_json or {})
+    traversal_identity = diagnostics.get("traversal_identity")
+    if (
+        diagnostics.get("protocol_version") != "intent_execution_retrieval_v1"
+        or scores.get("protocol_version") != "intent_execution_retrieval_v1"
+        or scores.get("post_retrieval_model_call_count") != 0
+        or scores.get("reward_call_count") != 0
+        or trace.policy_state_hash is not None
+        or not isinstance(traversal_identity, dict)
+        or traversal_identity.get("protocol_version") != "layered_distance_traversal_v2"
+        or control_hash(traversal_identity) != trace.traversal_protocol_hash
+        or diagnostics.get("gray_zone_model_call_count") != 0
+        or diagnostics.get("result_reflection_enabled") is not False
+        or diagnostics.get("generation_sufficiency_model_enabled") is not False
+        or diagnostics.get("policy_update_eligible") is not False
+    ):
+        raise ContextPackagePublicIntegrityError(
+            "intent execution retrieval trace identity cannot be replayed"
+        )
+    for raw in raw_labels:
+        path = [str(item) for item in (raw.get("path") or [])]
+        edge_ids = [str(item) for item in (raw.get("path_edge_ids") or [])]
+        edge_types = [str(item) for item in (raw.get("path_edge_types") or [])]
+        distances = list(raw.get("path_edge_distances") or [])
+        strengths = list(raw.get("path_edge_strengths") or [])
+        rewards = list(raw.get("cycle_distance_rewards") or [])
+        if (
+            not path
+            or len(edge_ids) != len(path) - 1
+            or not (
+                len(edge_ids)
+                == len(edge_types)
+                == len(distances)
+                == len(strengths)
+            )
+            or len(set(path)) != len(path)
+            or len(set(edge_ids)) != len(edge_ids)
+            or rewards
+        ):
+            raise ContextPackagePublicIntegrityError(
+                "intent execution path label shape is invalid"
+            )
+        observed_distance = 0.0
+        for index, edge_id in enumerate(edge_ids):
+            edge = db.get(ChunkRelationEdge, edge_id)
+            if edge is None or edge.knowledge_base_id != trace.knowledge_base_id:
+                raise ContextPackagePublicIntegrityError(
+                    "intent execution path edge is unavailable"
+                )
+            endpoints = {str(edge.source_chunk_id), str(edge.target_chunk_id)}
+            if (
+                endpoints != {path[index], path[index + 1]}
+                or str(edge.edge_type) != edge_types[index]
+                or float(edge.distance) != float(distances[index])
+                or float(edge.raw_strength) != float(strengths[index])
+                or not math.isfinite(float(edge.distance))
+                or float(edge.distance) < 0
+            ):
+                raise ContextPackagePublicIntegrityError(
+                    "intent execution path edge facts changed"
+                )
+            observed_distance += float(edge.distance)
+        if not math.isclose(
+            observed_distance,
+            float(raw.get("distance_so_far") or 0.0),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ContextPackagePublicIntegrityError(
+                "intent execution cumulative path distance changed"
+            )
+
+
 def _validate_context_package_trace_path_binding(
     db: Session,
     *,
@@ -2739,11 +2847,18 @@ def _validate_context_package_trace_path_binding(
         )
         for label in raw_labels
     ]
-    _validate_trace_path_edge_writer_facts(
-        db,
-        trace=trace,
-        raw_labels=raw_labels,
-    )
+    if trace.retrieval_mode == "intent_execution_retrieval_v1":
+        _validate_intent_execution_trace_path_facts(
+            db,
+            trace=trace,
+            raw_labels=raw_labels,
+        )
+    else:
+        _validate_trace_path_edge_writer_facts(
+            db,
+            trace=trace,
+            raw_labels=raw_labels,
+        )
     expected_graph_path_ids = list(
         dict.fromkeys(
             str(edge_id)
@@ -2860,7 +2975,10 @@ def _validate_context_package_trace_path_binding(
                     if not any(
                         ref.parent_layer == required_parent_layer
                         and ref.parent_node_id == required_parent_node_id
-                        and ref.edge_type == required_edge_type
+                        and (
+                            required_edge_type is None
+                            or ref.edge_type == required_edge_type
+                        )
                         and _support_refs_include(
                             contribution.support_refs,
                             ref.support_refs,
@@ -3184,6 +3302,24 @@ def get_context_package(db: Session, package_id: str) -> dict | None:
         {"kind": "parent_structure_nodes", "node_ids": package.parent_structure_node_ids_json or []},
     ]
     raw_diagnostics = dict(package.diagnostics_json or {})
+    from app.models import ContextPackageSourceExpansion
+    has_expansion_rows = db.scalar(select(ContextPackageSourceExpansion.id).where(
+        ContextPackageSourceExpansion.target_context_package_id == package.id).limit(1)) is not None
+    from app.services.context_packing import PACKING_PROTOCOL
+    if ((raw_diagnostics.get("token_budget_audit") or {}).get("packing_protocol") == PACKING_PROTOCOL
+        or raw_diagnostics.get("source_retention") or raw_diagnostics.get("source_expansion") or has_expansion_rows
+        or any(item.get("role") == "preserved_source" for item in raw_chunks)):
+        from app.services.citation_provenance import audit_citation_provenance
+        from app.services.reflection_sources import source_citation
+        from app.services.agent_reflection import ReflectionContractError
+        try:
+            source_replay = audit_citation_provenance(db, knowledge_base_id=package.knowledge_base_id,
+                package=package, contexts=context_graph_service.context_package_to_contexts(package),
+                citations=[source_citation(item, package) for item in raw_chunks])
+        except ReflectionContractError as exc:
+            raise ContextPackagePublicIntegrityError("persisted context source proof is invalid") from exc
+        if not source_replay["all_valid"]:
+            raise ContextPackagePublicIntegrityError("persisted context source provenance is invalid")
     _validate_context_package_trace_path_binding(
         db,
         package=package,
@@ -3280,6 +3416,8 @@ def get_context_package(db: Session, package_id: str) -> dict | None:
                     "restore_counts",
                     "token_budget_audit",
                     "snapshot_integrity",
+                    "source_retention",
+                    "source_expansion",
                 )
             }
         ).model_dump(mode="json")
@@ -3680,12 +3818,217 @@ def validate_entry_selection_trace_diagnostics(
     return audit
 
 
+def _intent_execution_retrieval_trace_steps(
+    db: Session,
+    trace: RetrievalTrace,
+) -> dict:
+    from app.models import GraphRetrievalStep
+    from app.retrieval_control_contracts import control_hash
+
+    diagnostics = dict(trace.diagnostics_json or {})
+    convergence = dict(trace.convergence_json or {})
+    entry_layer = diagnostics.get("entry_layer")
+    if (
+        diagnostics.get("protocol_version") != "intent_execution_retrieval_v1"
+        or entry_layer not in {"coarse", "mid", "chunk"}
+        or convergence.get("protocol_version") != "layered_distance_traversal_v2"
+        or convergence.get("model_call_count") != 0
+        or convergence.get("gray_zone_model_call_count") != 0
+        or convergence.get("cycle_reward") != 0
+        or (trace.scores_json or {}).get("reward_call_count") != 0
+        or (trace.scores_json or {}).get("post_retrieval_model_call_count") != 0
+    ):
+        raise RetrievalTraceAuditError(
+            {
+                "status": "failed",
+                "issues": [{"code": "intent_execution_trace_contract_invalid"}],
+            }
+        )
+    steps = list(
+        db.scalars(
+            select(GraphRetrievalStep)
+            .where(GraphRetrievalStep.retrieval_trace_id == trace.id)
+            .order_by(GraphRetrievalStep.step_index, GraphRetrievalStep.id)
+        )
+    )
+    expected_layers = {
+        "coarse": ["coarse", "mid", "chunk"],
+        "mid": ["mid", "chunk"],
+        "chunk": ["chunk"],
+    }[entry_layer]
+    layer_steps = steps[: len(expected_layers)]
+    structure_steps = steps[len(expected_layers) :]
+    if (
+        [str(item.layer) for item in layer_steps] != expected_layers
+        or any(
+            item.action_type != "deterministic_layer_execution"
+            or float(item.cycle_distance_reward or 0) != 0
+            or (item.diagnostics_json or {}).get("model_call_count") != 0
+            or (item.diagnostics_json or {}).get("reward_call_count") != 0
+            for item in layer_steps
+        )
+        or len(structure_steps) > 1
+        or any(
+            item.layer != "structure"
+            or item.action != "restore_context_package"
+            or item.action_type != "restore_context_package"
+            or float(item.cycle_distance_reward or 0) != 0
+            or (item.diagnostics_json or {}).get(
+                "repair_gray_zone_model_call_count", 0
+            )
+            != 0
+            for item in structure_steps
+        )
+    ):
+        raise RetrievalTraceAuditError(
+            {
+                "status": "failed",
+                "issues": [{"code": "intent_execution_step_contract_invalid"}],
+            }
+        )
+    gray_records = [
+        dict(record)
+        for step in steps
+        for record in (
+            (step.diagnostics_json or {}).get(
+                "intent_execution_gray_zone_decisions"
+            )
+            or []
+        )
+    ]
+    for record in gray_records:
+        inputs = record.get("inputs")
+        if (
+            set(record)
+            != {
+                "protocol_version",
+                "input_hash",
+                "inputs",
+                "matched_rule",
+                "decision",
+                "model_call_count",
+                "edge_id",
+                "source_node_id",
+                "target_node_id",
+            }
+            or record.get("protocol_version")
+            != "deterministic_support_progress_v2"
+            or record.get("model_call_count") != 0
+            or not isinstance(inputs, dict)
+            or record.get("input_hash") != control_hash(inputs)
+        ):
+            raise RetrievalTraceAuditError(
+                {
+                    "status": "failed",
+                    "issues": [
+                        {"code": "intent_execution_gray_zone_replay_invalid"}
+                    ],
+                }
+            )
+    context_package = db.scalar(
+        select(ContextPackage)
+        .where(ContextPackage.retrieval_trace_id == trace.id)
+        .order_by(ContextPackage.created_at.desc())
+        .limit(1)
+    )
+    public_labels = [
+        _public_path_label(
+            item,
+            operating_envelope=_validated_frozen_trace_operating_envelope(trace),
+        )
+        for item in trace.path_labels_json or []
+    ]
+    cache_audit = (trace.scores_json or {}).get("retrieval_cache")
+    scope_execution = diagnostics.get("source_scope_execution")
+    public_diagnostics = {
+        key: diagnostics.get(key)
+        for key in (
+            "protocol_version",
+            "task_hash",
+            "intent_hash",
+            "strategy_hash",
+            "proposal_hash",
+            "capability_hash",
+            "entry_layer",
+            "gray_zone_protocol_version",
+            "traversal_identity",
+            "gray_zone_runtime_settings_hash",
+            "intent_retrieval_cache_identity_hash",
+            "retrieval_cache",
+            "result_reflection_enabled",
+            "generation_sufficiency_model_enabled",
+            "policy_update_eligible",
+        )
+    }
+    if isinstance(scope_execution, dict):
+        public_diagnostics["source_scope_execution"] = {
+            "protocol_version": scope_execution.get("protocol_version"),
+            "audit_hash": scope_execution.get("audit_hash"),
+            "target_plan": scope_execution.get("target_plan"),
+            "source_inventory_count": len(
+                scope_execution.get("source_chunk_ids") or []
+            ),
+            "model_call_count": scope_execution.get("model_call_count"),
+        }
+    return {
+        "contract_version": "intent_execution_retrieval_trace_public_v1",
+        "trace_id": trace.id,
+        "context_package_id": context_package.id if context_package else None,
+        "query": trace.query,
+        "retrieval_mode": trace.retrieval_mode,
+        "entry_layer": entry_layer,
+        "conversation_state_scope_hash": trace.conversation_state_scope_hash,
+        "concept_path": trace.concept_path_json or [],
+        "result_chunk_ids": trace.result_chunk_ids_json or [],
+        "query_facets": trace.query_facets_json or {},
+        "entry_nodes": trace.entry_nodes_json or [],
+        "frontier": trace.frontier_json or [],
+        "stage_queues": trace.stage_queues_json or {},
+        "candidate_pools": trace.candidate_pools_json or {},
+        "topk_selection": trace.topk_selection_json or {},
+        "path_labels": public_labels,
+        "convergence": convergence,
+        "trace_diagnostics": public_diagnostics,
+        "gray_zone_protocol": "deterministic_support_progress_v2",
+        "gray_zone_decision_authority": "executor_local_deterministic_only",
+        "gray_zone_model_call_count": 0,
+        "gray_zone_path_decisions": gray_records,
+        "path_distance_threshold_hits": [
+            item
+            for item in gray_records
+            if (item.get("inputs") or {}).get("zone") != "green"
+        ],
+        "retrieval_cache": cache_audit,
+        "steps": [
+            {
+                "id": item.id,
+                "step_index": item.step_index,
+                "layer": item.layer,
+                "action": item.action,
+                "action_type": item.action_type,
+                "input": item.input_json or {},
+                "output": item.output_json or {},
+                "candidate_pool_ids": item.candidate_pool_ids_json or [],
+                "selected_topk_ids": item.selected_topk_ids_json or [],
+                "dominance_pruned_count": item.dominance_pruned_count,
+                "cycle_distance_reward": 0,
+                "stop_reason": item.stop_reason,
+                "diagnostics": item.diagnostics_json or {},
+                "created_at": item.created_at,
+            }
+            for item in steps
+        ],
+    }
+
+
 def get_retrieval_trace_steps(db: Session, trace_id: str) -> dict | None:
     from app.models import GraphRetrievalStep
 
     trace = db.get(RetrievalTrace, trace_id)
     if trace is None:
         return None
+    if trace.retrieval_mode == "intent_execution_retrieval_v1":
+        return _intent_execution_retrieval_trace_steps(db, trace)
     context_package = db.scalar(
         select(ContextPackage)
         .where(ContextPackage.retrieval_trace_id == trace_id)

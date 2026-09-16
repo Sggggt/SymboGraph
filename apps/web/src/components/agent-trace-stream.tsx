@@ -13,6 +13,7 @@ import {
   FileText,
   Gauge,
   ListTree,
+  LoaderCircle,
   Search,
   XCircle,
 } from "lucide-react";
@@ -180,7 +181,7 @@ function ExplorationTicker({ event, isActive }: { event: AgentTraceEventPayload;
             initial={{ opacity: 0, y: 3 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: Math.min(index * 0.018, 0.3) }}
-            className="inline-flex h-6 items-center border-l border-cyan-200/28 bg-cyan-200/[0.045] px-2 font-mono text-[10px] text-cyan-100/72"
+            className="inline-flex h-6 items-center rounded-lg border border-cyan-200/28 bg-cyan-200/[0.045] px-2 font-mono text-[10px] text-cyan-100/72"
           >
             {index + 1}
           </motion.span>
@@ -215,11 +216,11 @@ function FineTraceDetails({ event }: { event: AgentTraceEventPayload }) {
             className="overflow-hidden"
           >
             <div data-testid="agent-trace-fine-details" className="mt-3 grid gap-3 text-xs text-white/52 lg:grid-cols-2">
-              <div className="border-l border-white/10 bg-black/12 p-3">
+              <div className="rounded-xl border border-white/10 bg-black/12 p-3">
                 <p className="mb-2 text-[11px] uppercase text-white/32">本步输入</p>
                 <p className="break-words text-xs leading-6 text-white/58">{inputText}</p>
               </div>
-              <div className="border-l border-white/10 bg-black/12 p-3">
+              <div className="rounded-xl border border-white/10 bg-black/12 p-3">
                 <p className="mb-2 text-[11px] uppercase text-white/32">本步结果</p>
                 <p className="break-words text-xs leading-6 text-white/58">{outputText}</p>
               </div>
@@ -252,7 +253,11 @@ function TraceEventItem({
       transition={{ duration: 0.18 }}
       className="relative pl-8"
     >
-      <span className={cn("absolute left-[7px] top-3 size-2.5", tone.dot, isLatest ? "animate-pulse" : "")} />
+      {isLatest ? (
+        <LoaderCircle className="absolute left-1 top-2.5 size-4 animate-spin text-cyan-100" />
+      ) : (
+        <span className={cn("absolute left-[7px] top-3 size-2.5", tone.dot)} />
+      )}
       <div className="border-l border-white/10 pb-4 pl-4">
         <button type="button" onClick={() => setOpen((current) => !current)} className="group flex w-full items-start justify-between gap-3 text-left">
             <span className="flex min-w-0 items-start gap-3">
@@ -324,7 +329,7 @@ export function AgentTraceStream({ trace, isRunning = false, defaultExpanded = f
       <button type="button" onClick={() => setExpanded((current) => !current)} className="group flex w-full items-center justify-between gap-4 text-left">
         <span className="min-w-0">
           <span className="flex flex-wrap items-center gap-2">
-            {isRunning ? <span className="tech-dot" /> : <CheckCircle2 className="size-4 text-cyan-100/62" />}
+            {isRunning ? <LoaderCircle className="size-4 animate-spin text-cyan-100" /> : <CheckCircle2 className="size-4 text-cyan-100/62" />}
             <span className="text-sm font-semibold text-white/82">流式轨迹</span>
             <span className="text-[11px] text-white/38">{events.length} 个步骤</span>
           </span>
@@ -370,7 +375,7 @@ export function AgentTraceStream({ trace, isRunning = false, defaultExpanded = f
       </AnimatePresence>
 
       {latest?.error ? (
-        <div className="mt-3 flex items-start gap-2 border-l border-rose-300/35 bg-rose-300/[0.045] px-3 py-2 text-xs text-rose-100/78">
+        <div className="mt-3 flex items-start gap-2 rounded-xl border border-rose-300/35 bg-rose-300/[0.045] px-3 py-2 text-xs text-rose-100/78">
           <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
           <span>{sanitizeTraceDisplayText(latest.error)}</span>
         </div>

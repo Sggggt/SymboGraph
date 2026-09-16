@@ -1446,12 +1446,15 @@ def test_reconcile_selected_pending_after_process_interruption(postgres_tpe_scop
         audit.close()
 
 
-def test_reconcile_expired_running_run_and_trial_as_failed(postgres_tpe_scope):
+def test_reconcile_expired_running_run_and_trial_as_failed(postgres_tpe_scope, monkeypatch):
     from app.db import SessionLocal
     from app.models import AutoTpeRun, AutoTpeTrial
     from app.services.tpe_audit import persist_tpe_run, persist_tpe_trial, reconcile_tpe_audit
 
-    expired_at = (datetime.utcnow() - timedelta(seconds=1)).isoformat()
+    from app.services import tpe_audit
+    frozen_now = datetime.utcnow()
+    monkeypatch.setattr(tpe_audit, "_now", lambda: frozen_now)
+    expired_at = (frozen_now - timedelta(seconds=1)).isoformat()
     origin = SessionLocal()
     try:
         run = _new_run(

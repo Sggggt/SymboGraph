@@ -1,6 +1,5 @@
 ﻿import type {
   AgentResponse,
-  AgentPEAuditResponse,
   AgentTraceEventPayload,
   BatchLogTokenResponse,
   BatchStartResponse,
@@ -11,33 +10,26 @@
   DashboardSnapshot,
   DeleteKnowledgeBaseResponse,
   DeleteResponse,
+  DirectAnswerMode,
   GraphResponse,
   GraphType,
   IngestionBatchSummary,
-  JobStatusResponse,
   ModelSettingsResponse,
   ModelSettingsUpdate,
   AutoTpeStatusResponse,
   ParseUploadedFilesRequest,
   QARequest,
   QAResponse,
-  RebuildGraphRequest,
-  RebuildGraphResponse,
   RefreshResponse,
-  ContextPackageResponse,
-  RetrievalTraceStepsResponse,
   RuntimeCheckResponse,
   RuntimeSettingsCandidateActionRequest,
   RuntimeSettingsCandidateCreate,
   RuntimeSettingsCandidateResponse,
-  SearchRequest,
-  SearchResponse,
   SessionMessagesResponse,
   SessionSummary,
   TaskStatusResponse,
   UploadFileResponse,
   StructuredApiErrorBody,
-  RetrievalGranularity,
   StrategyProfileAssistantRequest,
   StrategyProfileAssistantStateResponse,
   StrategyProfileBindRequest,
@@ -289,14 +281,6 @@ export async function bindStrategyProfile(payload: StrategyProfileBindRequest): 
   return parseResponse<KnowledgeBaseSummary>(response);
 }
 
-export async function fetchProfileAssistantState(sessionId: string): Promise<StrategyProfileAssistantStateResponse> {
-  const response = await fetch(buildApiUrl(`/settings/profile-assistant/${encodeURIComponent(sessionId)}`), {
-    cache: "no-store",
-    headers: authHeaders(),
-  });
-  return parseResponse<StrategyProfileAssistantStateResponse>(response);
-}
-
 export async function streamProfileAssistant(
   payload: StrategyProfileAssistantRequest,
   handlers: {
@@ -399,19 +383,6 @@ export async function cleanupStaleData(knowledgeBaseId?: string | null): Promise
   return parseResponse<CleanupStaleDataResponse>(response);
 }
 
-export async function rebuildGraph(
-  knowledgeBaseId?: string | null,
-  dryRun = false,
-  options: Partial<RebuildGraphRequest> = {},
-): Promise<RebuildGraphResponse> {
-  const response = await fetch(buildApiUrl("/maintenance/rebuild-graph", { knowledge_base_id: knowledgeBaseId }), {
-    method: "POST",
-    headers: jsonHeaders(),
-    body: JSON.stringify({ dry_run: dryRun, ...options } satisfies RebuildGraphRequest),
-  });
-  return parseResponse<RebuildGraphResponse>(response);
-}
-
 export async function fetchGraph(knowledgeBaseId: string | null | undefined, graphType: GraphType, view: GraphResponse["view"] = "overview"): Promise<GraphResponse> {
   const response = await fetch(buildApiUrl("/knowledge_bases/current/graph", {
     knowledge_base_id: knowledgeBaseId,
@@ -423,43 +394,6 @@ export async function fetchGraph(knowledgeBaseId: string | null | undefined, gra
     limit: "100",
   }), { cache: "no-store", headers: authHeaders() });
   return parseResponse<GraphResponse>(response);
-}
-
-export async function fetchContextPackage(packageId: string): Promise<ContextPackageResponse> {
-  const response = await fetch(buildApiUrl(`/context-packages/${encodeURIComponent(packageId)}`), { cache: "no-store", headers: authHeaders() });
-  return parseResponse<ContextPackageResponse>(response);
-}
-
-export async function fetchRetrievalTraceSteps(traceId: string): Promise<RetrievalTraceStepsResponse> {
-  const response = await fetch(buildApiUrl(`/retrieval-traces/${encodeURIComponent(traceId)}/graph-steps`), { cache: "no-store", headers: authHeaders() });
-  return parseResponse<RetrievalTraceStepsResponse>(response);
-}
-
-export async function searchKnowledge(payload: SearchRequest): Promise<SearchResponse> {
-  const response = await fetch(buildApiUrl("/search/graph-enhanced"), {
-    method: "POST",
-    headers: jsonHeaders(),
-    body: JSON.stringify(payload),
-  });
-  return parseResponse<SearchResponse>(response);
-}
-
-export async function askQuestion(payload: QARequest): Promise<QAResponse> {
-  const response = await fetch(buildApiUrl("/qa"), {
-    method: "POST",
-    headers: jsonHeaders(),
-    body: JSON.stringify(payload),
-  });
-  return parseResponse<QAResponse>(response);
-}
-
-export async function callAgent(payload: QARequest): Promise<AgentResponse> {
-  const response = await fetch(buildApiUrl("/agent"), {
-    method: "POST",
-    headers: jsonHeaders(),
-    body: JSON.stringify(payload),
-  });
-  return parseResponse<AgentResponse>(response);
 }
 
 export async function uploadFile(file: File, knowledgeBaseId?: string | null, signal?: AbortSignal): Promise<UploadFileResponse> {
@@ -527,11 +461,6 @@ export function getBatchLogUrl(batchId: string, token: string): string {
   return buildApiUrl(`/ingestion/batches/${batchId}/logs`, { token });
 }
 
-export async function fetchJobStatus(jobId: string): Promise<JobStatusResponse> {
-  const response = await fetch(buildApiUrl(`/jobs/${encodeURIComponent(jobId)}`), { cache: "no-store", headers: authHeaders() });
-  return parseResponse<JobStatusResponse>(response);
-}
-
 export async function fetchBatchStatus(batchId: string): Promise<IngestionBatchSummary> {
   const response = await fetch(buildApiUrl(`/ingestion/batches/${encodeURIComponent(batchId)}`), { cache: "no-store", headers: authHeaders() });
   return parseResponse<IngestionBatchSummary>(response);
@@ -548,14 +477,6 @@ export async function fetchAutoTpeStatus(knowledgeBaseId: string): Promise<AutoT
 export async function fetchTaskStatus(runId: string): Promise<TaskStatusResponse> {
   const response = await fetch(buildApiUrl(`/tasks/${encodeURIComponent(runId)}`), { cache: "no-store", headers: authHeaders() });
   return parseResponse<TaskStatusResponse>(response);
-}
-
-export async function fetchAgentPEAudit(runId: string): Promise<AgentPEAuditResponse> {
-  const response = await fetch(
-    buildApiUrl(`/agent/runs/${encodeURIComponent(runId)}/pe-audit`),
-    { cache: "no-store", headers: authHeaders() },
-  );
-  return parseResponse<AgentPEAuditResponse>(response);
 }
 
 export async function cancelAgentRun(runId: string): Promise<TaskStatusResponse> {
@@ -582,10 +503,11 @@ export async function streamAnswer(
   payload: QARequest,
   handlers: {
     onToken: (value: string) => void;
+    onAnswerReplace?: (value: string) => void;
     onCitations: (value: QAResponse["citations"]) => void;
     onTrace?: (value: AgentTraceEventPayload) => void;
     onFinal?: (value: AgentResponse) => void;
-    onMeta?: (value: { degraded_mode?: boolean; run_id?: string; session_id?: string; route?: string; retrieval_granularity?: RetrievalGranularity }) => void;
+    onMeta?: (value: { degraded_mode?: boolean; run_id?: string; session_id?: string; route?: string; direct_answer_mode?: DirectAnswerMode | null; entry_layer?: "coarse" | "mid" | "chunk" | null; terminal_outcome?: string | null }) => void;
     onError?: (value: string) => void;
   },
   options?: { signal?: AbortSignal },
@@ -609,72 +531,100 @@ export async function streamAnswer(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      const events = buffer.split(/\r?\n\r?\n/);
+      buffer = events.pop() ?? "";
+      if (done && buffer.trim()) {
+        events.push(buffer);
+      }
+      for (const event of events) {
+        const line = event.split(/\r?\n/)
+          .filter((item) => item.startsWith("data:"))
+          .map((item) => item.slice(5).trimStart())
+          .join("\n").trim();
+        if (!line) {
+          continue;
+        }
+        if (line === "[DONE]") {
+          return;
+        }
+        let parsed: {
+          type?: string;
+          token?: string;
+          answer?: string;
+          trace?: AgentTraceEventPayload;
+          citations?: QAResponse["citations"];
+          degraded_mode?: boolean;
+          response?: AgentResponse;
+          error?: string;
+          run_id?: string;
+          session_id?: string;
+          route?: string;
+          direct_answer_mode?: DirectAnswerMode | null;
+          entry_layer?: "coarse" | "mid" | "chunk" | null;
+          terminal_outcome?: string | null;
+        };
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          console.warn("忽略无法解析的 SSE 数据行");
+          continue;
+        }
+        if (parsed.type === "meta") {
+          handlers.onMeta?.({
+            run_id: parsed.run_id,
+            session_id: parsed.session_id,
+            route: parsed.route,
+            direct_answer_mode: parsed.direct_answer_mode,
+            entry_layer: parsed.entry_layer,
+            terminal_outcome: parsed.terminal_outcome,
+          });
+        }
+        if (parsed.type === "trace" && parsed.trace) {
+          handlers.onTrace?.(parsed.trace);
+        }
+        if (parsed.type === "error" && parsed.error) {
+          handlers.onError?.(parsed.error);
+          return;
+        }
+        if (parsed.token) {
+          handlers.onToken(parsed.token);
+        }
+        if (parsed.type === "answer_replace" && typeof parsed.answer === "string") {
+          handlers.onAnswerReplace?.(parsed.answer);
+        }
+        if (parsed.citations) {
+          handlers.onCitations(parsed.citations);
+        }
+        if (parsed.type === "final" && parsed.response) {
+          const response = parsed.response;
+          handlers.onMeta?.({
+            degraded_mode: response.degraded_mode,
+            run_id: response.run_id,
+            session_id: response.session_id,
+            route: response.route,
+            direct_answer_mode: response.direct_answer_mode,
+            entry_layer: response.entry_layer,
+            terminal_outcome: response.terminal_outcome,
+          });
+          handlers.onFinal?.(response);
+          return;
+        }
+        if (typeof parsed.degraded_mode === "boolean") {
+          handlers.onMeta?.({ degraded_mode: parsed.degraded_mode });
+        }
+      }
+      if (done) {
+        return;
+      }
     }
-    buffer += decoder.decode(value, { stream: true });
-    const events = buffer.split("\n\n");
-    buffer = events.pop() ?? "";
-    for (const event of events) {
-      const line = event.replace(/^data:\s*/m, "").trim();
-      if (!line || line === "[DONE]") {
-        continue;
-      }
-      let parsed: {
-        type?: string;
-        token?: string;
-        trace?: AgentTraceEventPayload;
-        citations?: QAResponse["citations"];
-        degraded_mode?: boolean;
-        response?: AgentResponse;
-        error?: string;
-        run_id?: string;
-        session_id?: string;
-        route?: string;
-        retrieval_granularity?: RetrievalGranularity;
-      };
-      try {
-        parsed = JSON.parse(line);
-      } catch (error) {
-        console.warn("忽略无法解析的 SSE 数据行", { line, error });
-        continue;
-      }
-      if (parsed.type === "meta") {
-        handlers.onMeta?.({
-          run_id: parsed.run_id,
-          session_id: parsed.session_id,
-          route: parsed.route,
-          retrieval_granularity: parsed.retrieval_granularity,
-        });
-      }
-      if (parsed.type === "trace" && parsed.trace) {
-        handlers.onTrace?.(parsed.trace);
-      }
-      if (parsed.type === "error" && parsed.error) {
-        handlers.onError?.(parsed.error);
-      }
-      if (parsed.token) {
-        handlers.onToken(parsed.token);
-      }
-      if (parsed.citations) {
-        handlers.onCitations(parsed.citations);
-      }
-      if (parsed.type === "final" && parsed.response) {
-        const response = parsed.response;
-        handlers.onFinal?.(parsed.response);
-        handlers.onMeta?.({
-          degraded_mode: response.degraded_mode,
-          run_id: response.run_id,
-          session_id: response.session_id,
-          route: response.route,
-          retrieval_granularity: response.retrieval_granularity,
-        });
-      }
-      if (typeof parsed.degraded_mode === "boolean") {
-        handlers.onMeta?.({ degraded_mode: parsed.degraded_mode });
-      }
-    }
+  } finally {
+    // A terminal frame is authoritative; transport teardown must not delay it
+    // or replace the result with a cancellation error.
+    void reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
 }

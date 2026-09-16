@@ -13,11 +13,11 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 DISTANCE_REPLAY_ABS_TOLERANCE = 1e-9
-QUALITY_GATE_PROTOCOL_VERSION = "four_layer_acceptance_quality_gate_v16"
+QUALITY_GATE_PROTOCOL_VERSION = "four_layer_acceptance_quality_gate_v19"
 GRAPH_OPERATING_POINT_PROTOCOL_VERSION = (
     "dense_dynamic_knn_bridge_quota_edge_calibration_v2"
 )
-RELATION_PROTOCOL_VERSION = "dense_only_chunk_relation_graph_v9"
+RELATION_PROTOCOL_VERSION = "dense_only_chunk_relation_graph_v10"
 EDGE_DISTANCE_PROTOCOL_VERSION = "edge_distance_log_calibrated_strength_v2"
 EDGE_TYPE_CALIBRATION_PROTOCOL_VERSION = "type_local_winsorized_minmax_v1"
 EDGE_TYPE_CALIBRATION_EDGE_TYPES = (
@@ -151,7 +151,7 @@ HISTORICAL_TYPED_ACTION_SCHEMA_PROTOCOL_HASHES = {
 }
 TYPED_ACTION_EXECUTOR_PROTOCOL_VERSION = "planner_typed_action_executor_v2"
 PERSISTED_AGENT_REPLAY_PROTOCOL_VERSION = "postgres_agent_run_trace_replay_v2"
-AGENT_TRACE_STAGE_PROTOCOL_VERSION = "completed_agent_trace_stage_grammar_v1"
+AGENT_TRACE_STAGE_PROTOCOL_VERSION = "completed_agent_trace_stage_grammar_v2"
 AGENT_TRACE_PLANNING_STAGE_GROUP = (
     "agent_planner",
     "typed_action_validation",
@@ -160,6 +160,7 @@ AGENT_TRACE_PLANNING_STAGE_GROUP = (
 )
 AGENT_TRACE_FIXED_PREFIX = (
     "query_understanding",
+    "direct_answer_route_gate",
     "query_facet_extraction",
 )
 AGENT_TRACE_FIXED_SUFFIX_BEFORE_REPAIR = (
@@ -407,6 +408,10 @@ QUALITY_GATE_PROTOCOL = {
         "cycle_reward_replay": CYCLE_REWARD_REPLAY_PROTOCOL_VERSION,
         "convergence_replay": CONVERGENCE_REPLAY_PROTOCOL_VERSION,
         "typed_action_schema": TYPED_ACTION_SCHEMA_PROTOCOL_VERSION,
+        "reflection_typed_action_schema": "typed_action_schema_v5",
+        "answer_reflection": "agent_answer_reflection_v1",
+        "answer_source_binding": "answer_source_binding_v1",
+        "reflection_reward": "answer_reflection_reward_v1",
         "persisted_agent_replay": PERSISTED_AGENT_REPLAY_PROTOCOL_VERSION,
         "agent_trace_stage": AGENT_TRACE_STAGE_PROTOCOL_VERSION,
     },
@@ -446,6 +451,14 @@ QUALITY_GATE_PROTOCOL = {
             "exact_completed_trace_stage_grammar",
             "run_trace_context_package_answer_reward_reciprocal_binding",
             "raw_retrieval_subgate_recompute",
+        ],
+        "agent_reflection": [
+            "persisted_answer_units_and_audit_identity",
+            "exact_source_span_binding_replay",
+            "joint_gate_and_bounded_closed_actions",
+            "retired_judge_zero_calls",
+            "self_assessment_not_reward_label",
+            "persisted_trace_and_typed_plan_replay",
         ],
         "context_package": [
             "raw_source_span_replay",
@@ -748,6 +761,18 @@ def typed_action_schema_protocol_hash() -> str:
             "stop_condition_fields": sorted(STOP_CONDITION_FIELDS),
         }
     )
+
+
+def reflection_typed_action_schema() -> dict[str, Any]:
+    """The new closed planner contract; the preceding v4 helper is historical."""
+    return {
+        "protocol_version": "typed_action_schema_v5",
+        "allowed_actions": sorted((ALLOWED_TYPED_ACTIONS - {"verify_citations", "repair_missing_citation", "repair_concept_gap", "repair_bridge_gap", "repair_structure_context"}) | {"review_answer"}),
+        "required_actions": ["review_answer" if action == "verify_citations" else action for action in REQUIRED_TYPED_ACTIONS],
+        "required_fields": sorted(TYPED_ACTION_REQUIRED_FIELDS),
+        "expected_evidence_fields": sorted((EXPECTED_EVIDENCE_FIELDS - {"required_verification_stage", "failure_card_hashes", "canonical_target_refs"}) | {"required_review_stage"}),
+        "stop_condition_fields": sorted((STOP_CONDITION_FIELDS - {"citation_verification_passes", "all_claims_supported"}) | {"answer_review_passes"}),
+    }
 
 
 def typed_action_schema_identity_supported(validation: Mapping[str, Any]) -> bool:
@@ -6171,7 +6196,7 @@ def _source_span_valid(span: Mapping[str, Any], *, package_id: str, trace_id: st
     raw_span = span.get("raw_chunk_char_span")
     snapshot = span.get("source_snapshot_verification") or {}
     if not (
-        span.get("contract_version") == "raw_chunk_source_span_v1"
+        span.get("contract_version") in {"raw_chunk_source_span_v1", "raw_chunk_source_span_v3"}
         and span.get("document_version_id")
         and span.get("chunk_id")
         and span.get("source_path")
@@ -6290,14 +6315,278 @@ def _source_span_matches_fact(
     )
 
 
-def audit_context_package_quality(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+def _audit_packing_selection(snapshot, audit):
+    control = (snapshot.get("diagnostics") or {}).get("token_budget_audit") or {}
+    if control.get("packing_protocol") != "whole_chunk_then_empty_package_raw_prefix_v3":
+        return
+    token_re = re.compile(r"[\u4e00-\u9fff]|[A-Za-z]+(?:'[A-Za-z]+)?|\d+(?:\.\d+)?|[^\s]", re.UNICODE)
+    candidates = control.get("candidate_chunk_ids") or []
+    cap = control.get("selection_token_budget")
+    facts = {item["chunk_id"]: item for item in snapshot.get("packing_candidate_facts") or []}
+    trace_hits = snapshot.get("trace_result_chunk_ids") or []
+    valid = (type(cap) is int and cap > 0 and len(candidates) <= 4096 and len(candidates) == len(set(candidates))
+        and set(candidates) == set(facts) and set(trace_hits).issubset(candidates)
+        and all(row.get("state") == "active" and row.get("knowledge_base_id") == snapshot.get("knowledge_base_id") for row in facts.values()))
+    expected, skipped = {}, []
+    used = 0
+    if valid:
+        for cid in candidates:
+            row = facts[cid]
+            text = row["text"]
+            tokens = list(token_re.finditer(text))
+            remaining = cap - used
+            clipped = len(tokens) > remaining
+            if not tokens or remaining <= 0 or clipped and expected:
+                if len(tokens) > remaining:
+                    skipped.append(cid)
+                continue
+            end = tokens[remaining - 1].end() if clipped else len(text)
+            span = [row["char_span"][0], row["char_span"][0] + end] if clipped else row["char_span"]
+            if clipped and (span[0] < 0 or span[1] > row["char_span"][1]):
+                skipped.append(cid)
+                continue
+            expected[cid] = {"text": text[:end], "span": span, "clipped": clipped}
+            used += remaining if clipped else len(tokens)
+        items = snapshot.get("chunks") or []
+        actual = {item["chunk_id"]: item for item in items}
+        retained = {(entry.get("row") or {}).get("chunk_id") for entry in snapshot.get("source_retentions") or []}
+        valid = (len(actual) == len(items) and set(expected).issubset(actual)
+            and (set(actual) - set(expected)).issubset(retained)
+            and [cid for cid in actual if cid in expected] == list(expected)
+            and snapshot.get("hit_chunk_ids") == [cid for cid in trace_hits if cid in expected]
+            and control.get("skipped_chunk_ids") == [cid for cid in skipped if cid not in actual]
+            and control.get("clipped_chunk_ids") == [item["chunk_id"] for item in items if item.get("content_clipped")])
+        for cid, fitted in expected.items():
+            item = actual.get(cid) or {}
+            if cid in retained:
+                span = item.get("char_span") or []
+                valid = bool(valid and len(span) == 2 and span[0] == fitted["span"][0] and span[1] >= fitted["span"][1]
+                    and str(item.get("content") or "").startswith(fitted["text"]))
+            else:
+                valid = bool(valid and item.get("content") == fitted["text"] and item.get("char_span") == fitted["span"]
+                    and item.get("content_clipped") is fitted["clipped"])
+        valid = valid and sum(len(token_re.findall(item.get("content") or "")) for item in items) == snapshot.get("token_count")
+    audit.check("context_packing_selection_replayed", bool(valid), code="context_packing_selection_invalid")
+
+
+def _audit_source_expansions(snapshot, audit, ancestors):
+    entries = snapshot.get("source_expansions") or []
+    declaration = (snapshot.get("diagnostics") or {}).get("source_expansion") or {}
+    if not entries and not declaration:
+        return
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    def projection(raw, public, key=None):
+        if key == "bbox" and raw in ({}, None) and public in ({}, None):
+            return True
+        if isinstance(raw, Mapping):
+            return isinstance(public, Mapping) and all(name in public and projection(value, public[name], name) for name, value in raw.items())
+        if isinstance(raw, list):
+            return isinstance(public, list) and len(raw) == len(public) and all(projection(a, b) for a, b in zip(raw, public))
+        return raw == public
+    protocol = "reflection_source_structure_expansion_v1"
+    ids = [item.get("row", {}).get("chunk_id") for item in entries]
+    scope = (declaration.get("protocol_version") == protocol and declaration.get("graph_hits_added") == 0
+        and declaration.get("gray_zone_model_call_count") == 0 and set(declaration.get("expanded_chunk_ids") or []) == set(ids)
+        and len(ids) == len(set(ids)) and set(ids).issubset(snapshot.get("restored_chunk_ids") or [])
+        and set(ids).isdisjoint(snapshot.get("hit_chunk_ids") or []))
+    audit.check("source_expansion_scope_replayed", scope, code="source_expansion_scope_invalid")
+    checked = {}
+    for index, entry in enumerate(entries):
+        row = entry.get("row") or {}
+        anchor, target = entry.get("anchor_item") or {}, entry.get("target_item") or {}
+        origin = (snapshot.get("retention_origins") or {}).get(row.get("source_context_package_id")) or {}
+        origin_id = origin.get("id")
+        if origin_id not in checked:
+            checked[origin_id] = bool(origin and audit_context_package_quality(origin, _retention_ancestors=(*ancestors, snapshot.get("id")))["pass"])
+        source_item = next((item for item in origin.get("chunks", []) if item.get("chunk_id") == row.get("anchor_chunk_id")), {})
+        target_item = next((item for item in snapshot.get("chunks", []) if item.get("chunk_id") == row.get("chunk_id")), {})
+        path = (row.get("witness_json") or {}).get("structure") or {}
+        navigation = (row.get("witness_json") or {}).get("navigation") or {}
+        budget, slot = navigation.get("per_anchor_budget"), navigation.get("selection_index")
+        count = navigation.get("candidate_count")
+        anchor_ids = navigation.get("anchor_ids") or []
+        navigation_valid = (type(budget) is int and type(slot) is int and 0 <= slot < budget
+            and type(count) is int and 0 < count <= 4096 and slot < count
+            and len(anchor_ids) <= 256 and len(anchor_ids) == len(set(anchor_ids))
+            and row.get("anchor_chunk_id") in anchor_ids
+            and set(anchor_ids).issubset({item.get("chunk_id") for item in origin.get("chunks", [])})
+            and isinstance(navigation.get("query_facets"), Mapping)
+            and navigation.get("query_facet_hash") == digest(navigation.get("query_facets"))
+            and navigation.get("rank_protocol") in {"source_structure_facet_navigation_v1", "source_structure_facet_navigation_v2", "source_structure_facet_navigation_v3"})
+        if navigation.get("rank_protocol") in {"source_structure_facet_navigation_v2", "source_structure_facet_navigation_v3"}:
+            import unicodedata
+            focus = navigation.get("restoration_focus")
+            focus_valid = (isinstance(focus, list) and 0 < len(focus) <= 8
+                and all(isinstance(value, str) and 0 < len(value) <= 180 and value.strip() and "\x00" not in value for value in focus)
+                and len(set(focus)) == len(focus))
+            number_pattern = r"\d{1,3}(?:\.\d{1,3}){0,5}"
+            locator_pattern = re.compile(rf"(?:§\s*({number_pattern})(?!\d|\.\d)|\b(?:section|chapter)\s+({number_pattern})(?!\d|\.\d)\b|第\s*({number_pattern})\s*[章节])"
+                r"(\s*(?:及以后|及之后|及后续|and\s+later|onwards?))?", re.IGNORECASE)
+            expected_locators = []
+            if focus_valid:
+                for value in focus:
+                    for match in locator_pattern.finditer(unicodedata.normalize("NFKC", value)):
+                        raw = next(part for part in match.groups()[:3] if part is not None)
+                        locator = {"section": [int(part) for part in raw.split(".")], "at_or_after": bool(match.group(4))}
+                        if locator not in expected_locators:
+                            expected_locators.append(locator)
+            navigation_valid = bool(navigation_valid and focus_valid and len(expected_locators) <= 8 and navigation.get("section_locators") == expected_locators)
+            direction = navigation.get("continuation_direction")
+            neighbor_valid = False
+            if direction is not None:
+                current_anchor = entry.get("current_continuation_anchor") or {}
+                neighbor_valid = (navigation.get("rank_protocol") == "source_structure_facet_navigation_v3" and direction in {"previous", "next"}
+                    and current_anchor.get("id") == navigation.get("continuation_anchor_chunk_id") == row.get("anchor_chunk_id")
+                    and current_anchor.get(f"{direction}_chunk_id") == row.get("chunk_id")
+                    and current_anchor.get("document_version_id") == target.get("document_version_id")
+                    and current_anchor.get("knowledge_base_id") == snapshot.get("knowledge_base_id"))
+                navigation_valid = bool(navigation_valid and neighbor_valid)
+            section_match = navigation.get("section_match")
+            if section_match:
+                mapping, node = section_match.get("mapping") or {}, section_match.get("node") or {}
+                title = unicodedata.normalize("NFKC", str(node.get("title") or "")).strip().lstrip("# ")
+                matched = re.match(rf"(?:section\s+|chapter\s+)?({number_pattern})(?=[\s.:、：-])", title, re.IGNORECASE)
+                section = [int(part) for part in matched.group(1).split(".")] if matched else None
+                section_valid = (not re.search(r"\.{4,}|…{2,}", title) and section is not None
+                    and section_match.get("section") == section and bool(expected_locators)
+                    and any(tuple(section) >= tuple(item["section"]) if item["at_or_after"]
+                        else section[:len(item["section"])] == item["section"] for item in expected_locators)
+                    and entry.get("current_section_match") == {"mapping": mapping, "node": node}
+                    and mapping.get("chunk_id") == row.get("chunk_id") and mapping.get("structure_node_id") == node.get("id")
+                    and mapping.get("document_version_id") == target.get("document_version_id") == node.get("document_version_id")
+                    and node.get("document_id") == target.get("document_id")
+                    and node.get("knowledge_base_id") == snapshot.get("knowledge_base_id")
+                    and type(mapping.get("overlap_chars")) is int and mapping["overlap_chars"] > 0)
+                navigation_valid = bool(navigation_valid and section_valid)
+            elif expected_locators and navigation.get("summary_section") is not True:
+                summary_anchor = navigation.get("summary_anchor_chunk_id")
+                continuation_valid = (navigation.get("summary_continuation") is True and any(
+                    (prior.get("row") or {}).get("source_context_package_id") == row.get("source_context_package_id")
+                    and (prior.get("row") or {}).get("chunk_id") == summary_anchor
+                    and (((prior.get("row") or {}).get("witness_json") or {}).get("navigation") or {}).get("summary_section") is True
+                    and (prior.get("target_item") or {}).get("document_version_id") == target.get("document_version_id")
+                    for prior in entries))
+                if continuation_valid and navigation.get("rank_protocol") == "source_structure_facet_navigation_v3":
+                    window = navigation.get("summary_window") or {}
+                    reference = next((prior.get("target_item") or {} for prior in entries
+                        if (prior.get("row") or {}).get("source_context_package_id") == row.get("source_context_package_id")
+                        and (prior.get("row") or {}).get("chunk_id") == summary_anchor), {})
+                    start, end = window.get("start"), window.get("end")
+                    target_span, reference_span = target.get("char_span") or [], reference.get("char_span") or []
+                    continuation_valid = bool(type(start) is int and type(end) is int and 0 <= start < end
+                        and len(target_span) == 2 and len(reference_span) == 2
+                        and target_span[0] > reference_span[0] and start <= target_span[0] < end)
+                navigation_valid = bool(navigation_valid and (continuation_valid or neighbor_valid))
+        nodes, edges = path.get("nodes") or [], path.get("edges") or []
+        version = anchor.get("document_version_id")
+        path_valid = bool(nodes and len(nodes) <= 64 and len(edges) == len(nodes) - 1
+            and len({node.get("id") for node in nodes}) == len(nodes)
+            and all(node.get("document_version_id") == version and node.get("knowledge_base_id") == snapshot.get("knowledge_base_id") for node in nodes)
+            and all(node.get("document_id") == anchor.get("document_id") for node in nodes)
+            and path.get("anchor_mapping", {}).get("document_version_id") == version
+            and path.get("target_mapping", {}).get("document_version_id") == version
+            and path.get("anchor_mapping", {}).get("chunk_id") == row.get("anchor_chunk_id")
+            and path.get("target_mapping", {}).get("chunk_id") == row.get("chunk_id")
+            and path.get("anchor_mapping", {}).get("structure_node_id") == nodes[0].get("id")
+            and path.get("target_mapping", {}).get("structure_node_id") == nodes[-1].get("id"))
+        for first, second, edge in zip(nodes, nodes[1:], edges):
+            parent, child = (second, first) if first.get("parent_id") == second.get("id") else (first, second)
+            path_valid = bool(path_valid and child.get("parent_id") == parent.get("id")
+                and edge.get("source_node_id") == parent.get("id") and edge.get("target_node_id") == child.get("id")
+                and edge.get("edge_type") == "parent_child" and edge.get("document_version_id") == version
+                and edge.get("knowledge_base_id") == snapshot.get("knowledge_base_id"))
+        expected_keys = {"knowledge_base_id", "target_context_package_id", "source_context_package_id", "source_retrieval_trace_id",
+            "anchor_chunk_id", "chunk_id", "protocol_version", "anchor_item_hash", "target_item_hash", "witness_json", "witness_hash"}
+        valid = (set(row) == expected_keys and checked[origin_id] and origin_id != snapshot.get("id")
+            and row.get("protocol_version") == protocol and row.get("target_context_package_id") == snapshot.get("id")
+            and row.get("knowledge_base_id") == snapshot.get("knowledge_base_id") == origin.get("knowledge_base_id")
+            and row.get("source_retrieval_trace_id") == origin.get("retrieval_trace_id")
+            and version == target.get("document_version_id") == path.get("document_version_id")
+            and row.get("anchor_item_hash") == digest(anchor) and row.get("target_item_hash") == digest(target)
+            and row.get("witness_hash") == digest({key: value for key, value in row.items() if key != "witness_hash"})
+            and projection(anchor, source_item) and projection(target, target_item)
+            and anchor.get("document_id") == target.get("document_id")
+            and (row.get("witness_json") or {}).get("anchor_chunk_id") == row.get("anchor_chunk_id")
+            and (row.get("witness_json") or {}).get("chunk_id") == row.get("chunk_id")
+            and path == entry.get("current_structure") and path_valid and navigation_valid)
+        audit.check(f"source_expansion_{index}_witness_replayed", valid, code="source_expansion_witness_invalid")
+
+
+def audit_context_package_quality(snapshot: Mapping[str, Any], *, _retention_ancestors: tuple[str, ...] = ()) -> dict[str, Any]:
     audit = _Audit("context_package")
     package_id = str(snapshot.get("id") or "")
+    ancestry_valid = package_id not in _retention_ancestors and len(_retention_ancestors) < 32
+    audit.check("context_retention_ancestry_bounded", ancestry_valid, code="context_retention_ancestry_invalid")
+    if not ancestry_valid:
+        return audit.finish()
+    _audit_source_expansions(snapshot, audit, _retention_ancestors)
+    _audit_packing_selection(snapshot, audit)
     trace_id = str(snapshot.get("retrieval_trace_id")) if snapshot.get("retrieval_trace_id") else None
     chunks = list(snapshot.get("chunks") or [])
     citation_spans = list(snapshot.get("citation_spans") or [])
     diagnostics = snapshot.get("diagnostics") or {}
     budget_audit = diagnostics.get("token_budget_audit") or {}
+    retention = diagnostics.get("source_retention") or {}
+    retained_rows = snapshot.get("source_retentions") or []
+    origins = snapshot.get("retention_origins") or {}
+    preserved_ids = {item.get("chunk_id") for item in chunks if item.get("role") == "preserved_source"}
+    if retention or retained_rows or preserved_ids:
+        def compact_hash(value):
+            return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        def physical(item):
+            value = {key: entry for key, entry in item.items()
+                if key not in {"context_package_id", "retrieval_trace_id", "role", "why_selected", "dedupe_key"}}
+            value["source_span"] = {key: entry for key, entry in (value.get("source_span") or {}).items()
+                if key not in {"context_package_id", "retrieval_trace_id", "verification_id", "source_binding_id"}}
+            value["structure_closure"] = {key: entry for key, entry in (value.get("structure_closure") or {}).items()
+                if key != "bridge_chunk_ids"}
+            return value
+        def projection_matches(raw, public, field=None):
+            # The public raw-span contract canonicalizes an absent bbox from
+            # the writer's empty object to JSON null; populated boxes stay exact.
+            if field == "bbox" and raw in ({}, None) and public in ({}, None):
+                return True
+            if isinstance(raw, Mapping):
+                return isinstance(public, Mapping) and all(key in public and projection_matches(value, public[key], key) for key, value in raw.items())
+            if isinstance(raw, list):
+                return isinstance(public, list) and len(raw) == len(public) and all(projection_matches(a, b) for a, b in zip(raw, public))
+            return raw == public
+        ids = [entry.get("row", {}).get("chunk_id") for entry in retained_rows]
+        scope_valid = (retention.get("protocol_version") == "reflection_bound_source_retention_v1"
+            and retention.get("retrieval_executed") is False and type(retention.get("gray_zone_model_call_count")) is int
+            and retention.get("gray_zone_model_call_count") == 0
+            and set(retention.get("retained_chunk_ids") or []) == set(ids) and len(ids) == len(set(ids))
+            and set(retention.get("preserved_chunk_ids") or []) == preserved_ids and preserved_ids.issubset(ids)
+            and not preserved_ids.intersection((snapshot.get("hit_chunk_ids") or []) + (snapshot.get("restored_chunk_ids") or []) + (snapshot.get("bridge_chunk_ids") or [])))
+        audit.check("context_retention_scope_replayed", scope_valid, code="context_retention_scope_invalid")
+        checked_origins = {}
+        for index, entry in enumerate(retained_rows):
+            row, source, target = entry.get("row") or {}, entry.get("source_item") or {}, entry.get("target_item") or {}
+            origin_id, cid = row.get("source_context_package_id"), row.get("chunk_id")
+            origin = origins.get(origin_id) or {}
+            if origin_id not in checked_origins:
+                checked_origins[origin_id] = bool(origin and audit_context_package_quality(origin,
+                    _retention_ancestors=(*_retention_ancestors, package_id))["pass"])
+            public_source = next((item for item in origin.get("chunks", []) if item.get("chunk_id") == cid), {})
+            public_target = next((item for item in chunks if item.get("chunk_id") == cid), {})
+            keys = {"knowledge_base_id", "target_context_package_id", "source_context_package_id", "source_retrieval_trace_id",
+                    "chunk_id", "protocol_version", "source_item_hash", "retention_hash"}
+            valid = (set(row) == keys and row.get("protocol_version") == "reflection_bound_source_retention_v1"
+                and row.get("target_context_package_id") == package_id and origin_id != package_id
+                and row.get("knowledge_base_id") == snapshot.get("knowledge_base_id") == origin.get("knowledge_base_id")
+                and row.get("source_retrieval_trace_id") == origin.get("retrieval_trace_id")
+                and row.get("retention_hash") == compact_hash({key: value for key, value in row.items() if key != "retention_hash"})
+                and row.get("source_item_hash") == compact_hash(source) and checked_origins[origin_id]
+                and physical(source) == physical(target) and projection_matches(source, public_source)
+                and projection_matches(target, public_target)
+                and (target.get("role") != "preserved_source" or not (target.get("why_selected") or {}).get("reached_by_paths")))
+            audit.check(f"context_retention_{index}_origin_replayed", valid, code="context_retention_origin_invalid", actual={
+                "origin_passed": checked_origins[origin_id], "physical_identity": physical(source) == physical(target),
+                "source_projection": projection_matches(source, public_source), "target_projection": projection_matches(target, public_target),
+                "source_projection_mismatched_fields": [key for key in source if key not in public_source or not projection_matches(source[key], public_source[key], key)],
+                "target_projection_mismatched_fields": [key for key in target if key not in public_target or not projection_matches(target[key], public_target[key], key)],
+            })
     token_budget = snapshot.get("token_budget")
     token_count = snapshot.get("token_count")
     source_facts = snapshot.get("source_facts")
@@ -6359,6 +6648,7 @@ def audit_context_package_quality(snapshot: Mapping[str, Any]) -> dict[str, Any]
     total_chunk_tokens = 0
     source_by_chunk: dict[str, Mapping[str, Any]] = {}
     role_counts: Counter[str] = Counter()
+    bridge_ids = set(_unique_strings(snapshot.get("bridge_chunk_ids")))
     for item in chunks:
         chunk_id = str(item.get("chunk_id") or "missing")
         source_span = item.get("source_span") or {}
@@ -6381,7 +6671,7 @@ def audit_context_package_quality(snapshot: Mapping[str, Any]) -> dict[str, Any]
         audit.check(
             f"context_chunk_{chunk_id}_closure_and_reason",
             item.get("context_package_id") == package_id
-            and item.get("role") in {"hit", "bridge", "graph_path", "restored_context"}
+            and item.get("role") in {"hit", "bridge", "graph_path", "restored_context", "preserved_source"}
             and bool(item.get("structure_closure"))
             and bool(item.get("why_selected"))
             and isinstance(item.get("structure_node_ids"), list)
@@ -6390,6 +6680,12 @@ def audit_context_package_quality(snapshot: Mapping[str, Any]) -> dict[str, Any]
             and type(original_tokens) is int
             and original_tokens >= content_tokens,
             code="context_chunk_closure_or_token_invalid",
+            scope=chunk_id,
+        )
+        audit.check(
+            f"context_chunk_{chunk_id}_bridge_closure_scope",
+            set(str(value) for value in (item.get("structure_closure") or {}).get("bridge_chunk_ids") or []) == bridge_ids,
+            code="context_package_bridge_closure_mismatch",
             scope=chunk_id,
         )
         if type(content_tokens) is int and content_tokens >= 0:
@@ -6437,7 +6733,6 @@ def audit_context_package_quality(snapshot: Mapping[str, Any]) -> dict[str, Any]
     )
     hit_ids = set(_unique_strings(snapshot.get("hit_chunk_ids")))
     restored_ids = set(_unique_strings(snapshot.get("restored_chunk_ids")))
-    bridge_ids = set(_unique_strings(snapshot.get("bridge_chunk_ids")))
     actual_by_role = {
         "hit": {str(item.get("chunk_id")) for item in chunks if item.get("role") == "hit"},
         "restored": {str(item.get("chunk_id")) for item in chunks if item.get("role") == "restored_context"},
@@ -7214,6 +7509,7 @@ def persisted_agent_snapshot_hash(
             "run": snapshot.get("run"),
             "trace_events": snapshot.get("trace_events"),
             "bindings": snapshot.get("bindings"),
+            **({"reflection": snapshot["reflection"]} if "reflection" in snapshot else {}),
         }
     )
 
@@ -7549,6 +7845,263 @@ def _agent_reciprocal_bindings_valid(
     )
 
 
+def audit_reflection_agent_quality(response, *, persisted_agent_facts, retrieval_snapshot, gray_zone_audit, typed_action_facts):
+    audit = _Audit("agent_reflection")
+    def without_null_defaults(value):
+        # Public Pydantic spans expand optional address/bbox fields to null.
+        if isinstance(value, Mapping):
+            return {key: without_null_defaults(item) for key, item in value.items() if item is not None}
+        if isinstance(value, list):
+            return [without_null_defaults(item) for item in value]
+        return value
+    compact_hash = lambda value: hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+    model = response.get("answer_model_audit") or response.get("model_audit") or {}
+    summary = model.get("answer_reflection") or {}
+    persisted = persisted_agent_facts if isinstance(persisted_agent_facts, Mapping) else {}
+    run = persisted.get("run") or {}
+    answer_row = (persisted.get("bindings") or {}).get("answer_session") or {}
+    reflection = persisted.get("reflection") or {}
+    answer_audit = reflection.get("answer_audit") or {}
+    review = answer_audit.get("answer_reflection") or {}
+    draft = answer_audit.get("structured_answer") or {}
+    bindings = reflection.get("source_bindings") or []
+    citations = response.get("citations") or []
+    answer = str(response.get("answer") or "")
+    answer_hash = hashlib.sha256(answer.encode("utf-8")).hexdigest()
+    audit.check("persisted_snapshot_bound", bool(persisted) and persisted.get("snapshot_hash") == persisted_agent_snapshot_hash(persisted)
+        and run.get("id") == response.get("run_id") and run.get("final_answer") == answer
+        and answer_row.get("answer") == answer and answer_row.get("id") == model.get("answer_session_id"))
+    audit.check("answer_scope_matches_run", bool(run.get("knowledge_base_id"))
+        and run.get("knowledge_base_id") == answer_row.get("knowledge_base_id")
+        and run.get("question") == answer_row.get("question")
+        and run.get("session_id") == answer_row.get("qa_session_id")
+        and answer_row.get("context_package_id") == response.get("context_package_id")
+        and answer_row.get("retrieval_trace_id") == response.get("retrieval_trace_id"))
+    audit.check("reflection_audit_bound", review.get("protocol_version") == "agent_answer_reflection_v1"
+        and review.get("audit_hash") == compact_hash({key:value for key,value in review.items() if key != "audit_hash"})
+        and summary.get("reflection_audit_hash") == review.get("audit_hash")
+        and review.get("delivered_answer_hash") == answer_hash
+        and review.get("delivered_draft_hash") == compact_hash(draft))
+    units = draft.get("answer_units") or []
+    audit.check("structured_units_render_exact_answer", bool(units) and "\n\n".join(str(unit.get("text") or "") for unit in units) == answer)
+    expected_unit_ids = set()
+    position = 0
+    for index, unit in enumerate(units):
+        text = str(unit.get("text") or "")
+        identity = {"unit_index":index,"kind":unit.get("kind"),"text":text,"source_handles":unit.get("source_handles"),"answer_hash":answer_hash,"char_span":[position,position+len(text)]}
+        if unit.get("kind") == "factual":
+            expected_unit_ids.add(compact_hash({"protocol":"answer_unit_identity_v1",**identity}))
+        position += len(text)+2
+    audit.check("factual_units_have_source_bindings", expected_unit_ids == {row.get("unit_id") for row in bindings})
+    binding_by_id = {row.get("id"):row for row in bindings}
+    audit.check("source_count_matches_rows", len(binding_by_id) == len(bindings) == len(citations) == summary.get("source_binding_count"))
+    for index, citation in enumerate(citations):
+        binding = binding_by_id.get(citation.get("source_binding_id")) or {}
+        identity = (binding.get("diagnostics_json") or {}).get("binding_identity") or {}
+        span = citation.get("source_span") or {}
+        public = citation.get("source_binding") or {}
+        expected_span = {**(binding.get("source_span_json") or {}), "contract_version": "raw_chunk_source_span_v2",
+                         "verification_id": None, "source_binding_id": binding.get("id")}
+        audit.check("source_binding_identity", bool(binding)
+            and binding.get("binding_hash") == compact_hash(identity)
+            and public.get("binding_hash") == binding.get("binding_hash")
+            and identity.get("answer_hash") == binding.get("answer_hash") == citation.get("answer_hash") == answer_hash
+            and binding.get("answer_session_id") == model.get("answer_session_id")
+            and binding.get("chunk_id") == citation.get("chunk_id") == span.get("chunk_id")
+            and binding.get("unit_id") == citation.get("unit_id") == public.get("unit_id")
+            and binding.get("unit_index") == citation.get("unit_index")
+            and binding.get("unit_text") == citation.get("unit_text")
+            and binding.get("context_package_id") == response.get("context_package_id")
+            and binding.get("retrieval_trace_id") == response.get("retrieval_trace_id"), scope=f"source[{index}]")
+        audit.check("raw_source_span_matches_persisted_binding", without_null_defaults(span) == without_null_defaults(expected_span)
+            and identity.get("source_span") == binding.get("source_span_json")
+            and identity.get("reflection_audit_hash") == review.get("audit_hash"), scope=f"source[{index}]")
+        audit.check("source_binding_not_semantic_verdict", citation.get("contract_version") == "citation_public_v2"
+            and citation.get("verification") is None and public.get("semantic_entailment_claimed") is False
+            and public.get("status") == "source_bound" and public.get("transactional_replay") is True
+            and public.get("provenance_status") == "valid" and span.get("source_binding_id") == binding.get("id")
+            and (span.get("source_snapshot_verification") or {}).get("verified") is True, scope=f"source[{index}]")
+    events = response.get("trace") or []
+    audit.check("trace_matches_persisted_events", bool(events)
+        and [agent_trace_event_replay_payload(event) for event in events]
+            == [agent_trace_event_replay_payload(event) for event in persisted.get("trace_events") or []]
+        and [event.get("sequence_index") for event in events] == list(range(len(events))))
+    nodes = [event.get("node") for event in events]
+    audit.check("retired_judge_not_executed", summary.get("citation_judge_model_call_count") == 0 and "citation_verification" not in nodes)
+    audit.check("joint_gate_and_sources_present", "reflection_gate" in nodes and "answer_source_binding" in nodes and "answer_generation" in nodes)
+    audit.check("self_score_not_reward_label", summary.get("self_assessment_is_reward_label") is False and review.get("self_assessment_is_reward_label") is False)
+    audit.check("reflection_rounds_bounded", type(review.get("reflection_rounds_used")) is int and 0 <= review["reflection_rounds_used"] <= review.get("round_budget",-1))
+    if response.get("route") != "direct_answer":
+        facts = typed_action_facts if isinstance(typed_action_facts, Mapping) else {}
+        plans = facts.get("plans") or []
+        contract = reflection_typed_action_schema()
+        audit.check("reflection_plans_match_run", bool(plans) and facts.get("run_id") == run.get("id")
+            and all(plan.get("run_id") == run.get("id") and plan.get("knowledge_base_id") == run.get("knowledge_base_id") for plan in plans))
+        for plan in plans:
+            validation = plan.get("validation") or {}
+            actions = plan.get("typed_actions") or []
+            rows = plan.get("actions") or []
+            envelope = plan.get("envelope") or {}
+            audit.check("reflection_planner_protocol", validation.get("valid") is True
+                and validation.get("typed_action_schema_protocol_version") == contract["protocol_version"]
+                and validation.get("typed_action_schema_protocol_hash") == stable_hash(contract))
+            audit.check("reflection_required_actions", set(contract["required_actions"]).issubset(action.get("action_type") for action in actions)
+                and len(rows) == len(actions))
+            for index, action in enumerate(actions):
+                kind = action.get("action_type")
+                expected = action.get("expected_evidence") or {}
+                stop = action.get("stop_condition") or {}
+                budgets = action.get("budget_request") or {}
+                budget_keys = {"answer_unit_limit", "reflection_round_budget"} if kind == "review_answer" else TYPED_ACTION_BUDGET_KEYS.get(kind, set())
+                audit.check("reflection_action_closed_and_bounded", set(action) == set(contract["required_fields"])
+                    and kind in contract["allowed_actions"]
+                    and set(expected).issubset(contract["expected_evidence_fields"])
+                    and set(stop).issubset(contract["stop_condition_fields"])
+                    and set(budgets).issubset(budget_keys)
+                    and all(type(value) is int and 0 <= value <= envelope.get(key, -1) for key, value in budgets.items())
+                    and (kind != "review_answer" or expected.get("required_review_stage") == "source_binding_and_optional_reflection"), scope=f"action[{index}]")
+                row = rows[index] if index < len(rows) else {}
+                audit.check("reflection_action_matches_persisted_row", row.get("run_id") == run.get("id") and row.get("action_index") == index
+                    and all(row.get(key) == action.get(key) for key in contract["required_fields"])
+                    and (row.get("validation") or {}).get("valid") is True, scope=f"action[{index}]")
+        recomputed = audit_retrieval_quality(retrieval_snapshot, gray_zone_audit=gray_zone_audit) if isinstance(retrieval_snapshot,Mapping) else {}
+        audit.check("retrieval_quality_passed", recomputed.get("pass") is True)
+    audit.metrics.update(source_binding_count=len(bindings), reflection_rounds=summary.get("reflection_rounds_used"), old_citation_judge_calls=summary.get("citation_judge_model_call_count"))
+    return audit.finish()
+
+
+def audit_retrieval_agent_quality(response, *, persisted_agent_facts, retrieval_snapshot, gray_zone_audit, typed_action_facts):
+    """Replay the current gate and source records without historical judges."""
+    from app.retrieval_control_contracts import (control_hash,TaskContract,LexicalStrategy,DecisionPanel,
+        PathEvaluationParameters,PathFeatureCandidate,PathFeatureSummary)
+    from app.services.retrieval_path_features import compute_path_features
+    from app.services.retrieval_fsm import RetrievalControlState,next_control_state
+    audit = _Audit('agent')
+    facts = persisted_agent_facts or {}
+    run = facts.get('run') or {}
+    current = facts.get('retrieval_control') or {}
+    answer_row = (facts.get('bindings') or {}).get('answer_session') or {}
+    model = response.get('answer_model_audit') or response.get('model_audit') or {}
+    summary = model.get('retrieval_control') or {}
+    answer_audit = current.get('answer_audit') or {}
+    record = answer_audit.get('retrieval_control') or {}
+    text = str(response.get('answer') or '')
+    audit.check('current_answer_identity', bool(text) and run.get('final_answer') == text == answer_row.get('answer')
+        and model.get('answer_session_id') == answer_row.get('id') and run.get('status') == 'completed')
+    audit.check('current_answer_scope', run.get('knowledge_base_id') == answer_row.get('knowledge_base_id')
+        and run.get('question') == answer_row.get('question') and run.get('session_id') == answer_row.get('qa_session_id')
+        and answer_row.get('context_package_id') == response.get('context_package_id'))
+    audit.check('trace_matches_persisted_events', bool(response.get('trace'))
+        and [agent_trace_event_replay_payload(event) for event in response.get('trace') or []]
+            == [agent_trace_event_replay_payload(event) for event in facts.get('trace_events') or []])
+    from app.services.agent_graph import REQUIRED_TYPED_ACTIONS
+    allowed = set(REQUIRED_TYPED_ACTIONS) - {'review_answer','verify_citations'}
+    plans = (typed_action_facts or {}).get('plans') or []
+    audit.check('retrieval_action_closed_and_bounded',bool(plans) and all(
+        action.get('action_type') in allowed for plan in plans for action in plan.get('typed_actions') or []))
+    audit.check('single_generation_no_post_review', record.get('generation_call_count') == summary.get('generation_call_count') == 1
+        and record.get('post_generation_review_count') == summary.get('post_generation_review_count') == 0)
+    audit.check('current_answer_audit_hash', record.get('audit_hash') == control_hash({key:value for key,value in record.items() if key!='audit_hash'})
+        and summary.get('audit_hash') == record.get('audit_hash'))
+    rows = current.get('observations') or []
+    audit.check('run_observation_ownership', bool(rows) and all(row.get('run_id') == run.get('id') for row in rows))
+    transitions = sorted((row['payload'] for row in rows if row['type']=='retrieval_state_transition'),key=lambda row:row['sequence_index'])
+    previous = None
+    try:
+        for index,event in enumerate(transitions,1):
+            before,after = RetrievalControlState.model_validate(event['before']),RetrievalControlState.model_validate(event['after'])
+            expected = next_control_state(before,after.state,task_hash=after.task_hash,strategy_hash=after.strategy_hash)
+            audit.check('current_fsm_replay', event['sequence_index']==index and after==expected and (previous is None or before==previous)
+                and event['event_hash']==control_hash({key:value for key,value in event.items() if key!='event_hash'}))
+            previous=after
+        audit.check('current_fsm_terminal', previous==RetrievalControlState.model_validate(current['state']))
+        gates = {row['id']:row['payload'] for row in rows if row['type']=='retrieval_gate'}
+        for gate in gates.values():
+            inputs=gate['feature_input']
+            features=compute_path_features(task=TaskContract.model_validate(inputs['task']),strategy=LexicalStrategy.model_validate(inputs['strategy']),
+                panels=tuple(DecisionPanel.model_validate(item) for item in inputs['panels']),
+                packaged_candidates=tuple(PathFeatureCandidate.model_validate(item) for item in inputs['package']),
+                parameters=PathEvaluationParameters.model_validate(inputs['parameters']))
+            audit.check('current_features_replayed',features==PathFeatureSummary.model_validate(gate['features'])
+                and gate['decision']['feature_hash']==control_hash(features.model_dump(mode='json')))
+        final_gate=gates.get(record.get('gate_observation_id'),{})
+        audit.check('final_source_gate_bound', bool(final_gate) and final_gate.get('source_admission_hash')==record.get('source_admission_hash')
+            and final_gate.get('context_package_id')==response.get('context_package_id'))
+        scope_selection=(final_gate.get('feature_input') or {}).get('parameters',{}).get('scope_selection')
+        if scope_selection is not None:
+            from app.retrieval_control_contracts import SemanticScopeSelection,SourceLocationRequest
+            from app.services.source_location import selection_from_record,location_packet
+            selection=SemanticScopeSelection.model_validate(scope_selection)
+            owner=next((row for row in rows if row['type']=='retrieval_scope_resolution' and row['id']==selection.observation_id),None)
+            audit.check('source_location_ledger_present',owner is not None)
+            if owner is not None:
+                payload=owner['payload']
+                request=SourceLocationRequest.model_validate(payload['request'])
+                task=TaskContract.model_validate(final_gate['feature_input']['task'])
+                audit.check('source_location_selection_bound',owner['run_id']==selection.run_id==record['run_id']
+                    and payload.get('status')=='completed' and payload.get('protocol_version')=='source_location_call_v1'
+                    and payload.get('audit_hash')==selection.ledger_hash==control_hash({k:v for k,v in payload.items() if k!='audit_hash'})
+                    and selection==selection_from_record(owner['id'],owner['run_id'],payload)
+                    and selection.task_hash==request.task_hash==task.identity==record['task_hash']
+                    and payload.get('input_hash')==control_hash(location_packet(task,request))
+                    and payload['model_audit']['input_hash']==payload['input_hash']
+                    and payload['control_sequence_index']<final_gate['control_sequence_index'])
+        if record.get('evidence_sufficiency_protocol') is not None:
+            evidence_decision=final_gate.get('evidence_sufficiency') or {}
+            owner=next((row for row in rows if row['type']=='retrieval_sufficiency'
+                and row['id']==evidence_decision.get('observation_id')),None)
+            audit.check('pre_generation_sufficiency_bound',record['evidence_sufficiency_protocol']=='retrieval_evidence_sufficiency_v1'
+                and owner is not None and owner['payload']==evidence_decision and evidence_decision.get('status')=='completed'
+                and evidence_decision.get('audit_hash')==control_hash({k:v for k,v in evidence_decision.items() if k!='audit_hash'})
+                and (final_gate.get('source_admission') or {}).get('evidence_sufficiency_hash')==evidence_decision.get('audit_hash')
+                and not final_gate.get('admission_pending'))
+            if evidence_decision.get('protocol_version')=='retrieval_sufficiency_call_v2':
+                from app.retrieval_control_contracts import SourceAddressedAssessment
+                proof=SourceAddressedAssessment.model_validate(evidence_decision.get('source_addressed_assessment'))
+                audit.check('source_addressed_assessment_bound',
+                    proof.identity==evidence_decision.get('source_addressed_assessment_hash')
+                    ==(final_gate.get('source_admission') or {}).get('source_addressed_assessment_hash')
+                    and proof.feature_hash==final_gate['decision']['feature_hash']
+                    and proof.task_hash==record['task_hash']
+                    and proof.context_package_id==response.get('context_package_id')
+                    and proof.retrieval_trace_id==response.get('retrieval_trace_id')
+                    and proof.evidence_manifest_hash==evidence_decision['evidence_manifest_hash'])
+    except (KeyError,TypeError,ValueError):
+        audit.check('current_control_replay',False)
+    bindings={row['id']:row for row in current.get('source_bindings') or []}
+    citations=response.get('citations') or []
+    audit.check('source_binding_row_set',bool(bindings) and len(bindings)==len(citations)==summary.get('source_binding_count')
+        and set(bindings)=={item.get('source_binding_id') for item in citations})
+    answer_hash=hashlib.sha256(text.encode('utf-8')).hexdigest()
+    for citation in citations:
+        row=bindings.get(citation.get('source_binding_id'),{})
+        identity=(row.get('diagnostics_json') or {}).get('binding_identity') or {}
+        audit.check('current_source_binding_identity', row.get('binding_hash')==control_hash(identity)
+            and row.get('answer_hash')==answer_hash and row.get('answer_session_id')==answer_row.get('id')
+            and row.get('context_package_id')==response.get('context_package_id')
+            and row.get('unit_text')==text[row.get('answer_char_start',0):row.get('answer_char_end',0)]
+            and citation.get('chunk_id')==row.get('chunk_id') and citation.get('verification') is None
+            and (citation.get('source_binding') or {}).get('semantic_entailment_claimed') is False)
+        expected_span={**(row.get('source_span_json') or {}),'contract_version':'raw_chunk_source_span_v2','context_package_id':response.get('context_package_id'),
+            'retrieval_trace_id':response.get('retrieval_trace_id'),'verification_id':None,'source_binding_id':row.get('id')}
+        def nonnull(value):
+            if isinstance(value,dict):
+                return {key:nonnull(item) for key,item in value.items() if item is not None}
+            if isinstance(value,list):
+                return [nonnull(item) for item in value]
+            return value
+        audit.check('raw_source_span_matches_persisted_binding',nonnull(citation.get('source_span') or {})==nonnull(expected_span)
+            and identity.get('source_span')==row.get('source_span_json'))
+    for reward in current.get('rewards') or []:
+        observation=reward.get('observation') or {}
+        audit.check('pre_generation_reward_replay',reward.get('hash')==control_hash(observation)
+            and observation.get('phase')=='before_answer_generation' and observation.get('model_self_score_weight')==0)
+    recomputed=audit_retrieval_quality(retrieval_snapshot,gray_zone_audit=gray_zone_audit) if isinstance(retrieval_snapshot,Mapping) else {}
+    audit.check('retrieval_quality_passed',recomputed.get('pass') is True)
+    audit.metrics.update(source_binding_count=len(bindings),post_generation_review_count=0)
+    return audit.finish()
+
+
 def audit_agent_quality(
     response: Mapping[str, Any],
     *,
@@ -7558,6 +8111,13 @@ def audit_agent_quality(
     retrieval_quality: Mapping[str, Any] | None = None,
     persisted_agent_facts: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    model_audit = response.get("answer_model_audit") or response.get("model_audit") or {}
+    if (model_audit.get('retrieval_control') or {}).get('protocol_version') == 'retrieval_answer_v1':
+        return audit_retrieval_agent_quality(response,persisted_agent_facts=persisted_agent_facts,
+            retrieval_snapshot=retrieval_snapshot,gray_zone_audit=gray_zone_audit,typed_action_facts=typed_action_facts)
+    if (model_audit.get("answer_reflection") or {}).get("protocol_version") == "agent_answer_reflection_v1":
+        return audit_reflection_agent_quality(response, persisted_agent_facts=persisted_agent_facts,
+            retrieval_snapshot=retrieval_snapshot, gray_zone_audit=gray_zone_audit, typed_action_facts=typed_action_facts)
     audit = _Audit("agent")
     events = [
         agent_trace_event_replay_payload(event)

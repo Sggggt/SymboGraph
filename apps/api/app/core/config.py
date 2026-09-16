@@ -10,6 +10,8 @@ from uuid import UUID
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.runtime_config import read_runtime_settings_values, runtime_settings_path
+
 APP_DIR = Path(__file__).resolve().parents[2]
 WORKSPACE_ROOT = APP_DIR.parents[1]
 INVALID_KNOWLEDGE_BASE_DIR_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -33,7 +35,23 @@ QUERY_FACET_POSTERIOR_OBSERVATION_BUDGET_MAX = 1_024
 QUERY_FACET_POSTERIOR_ROUND_BUDGET_MAX = 2
 MODEL_API_PROTOCOL_ALLOWLIST = frozenset({"openai", "anthropic"})
 EMBEDDING_API_PROTOCOL_ALLOWLIST = frozenset({"openai"})
+RETRIEVAL_CONTROL_INT_SETTINGS = frozenset({
+    "retrieval_planning_timeout_seconds",
+    "retrieval_generation_timeout_seconds",
+    "retrieval_planning_max_tokens",
+    "retrieval_generation_max_tokens",
+    "retrieval_total_timeout_seconds",
+})
+RETRIEVAL_CONTROL_FLOAT_SETTINGS = frozenset()
+RETRIEVAL_CONTROL_SETTINGS = RETRIEVAL_CONTROL_INT_SETTINGS | RETRIEVAL_CONTROL_FLOAT_SETTINGS
 HOT_RELOAD_SETTINGS = {
+    *RETRIEVAL_CONTROL_SETTINGS,
+    "graph_compute_memory_mb",
+    "graph_compute_threads",
+    "graph_progress_interval_seconds",
+    "ingestion_memory_soft_limit_ratio",
+    "ingestion_memory_hard_limit_ratio",
+    "ingestion_memory_critical_limit_ratio",
     "chat_api_key",
     "chat_api_protocol",
     "chat_base_url",
@@ -55,10 +73,6 @@ HOT_RELOAD_SETTINGS = {
     "enable_model_fallback",
     "concept_i18n_enabled",
     "query_facet_bilingual_enabled",
-    "query_facet_posterior_enabled",
-    "query_facet_posterior_observation_budget",
-    "query_facet_posterior_round_budget",
-    "query_facet_posterior_convergence_epsilon",
     "enable_auto_tpe",
     "tpe_trial_budget",
     "tpe_startup_random_trials",
@@ -72,8 +86,18 @@ HOT_RELOAD_SETTINGS = {
     "operating_point_hard_gate_min_structure_recovery_rate",
     "operating_point_hard_gate_max_candidate_latency_p95_ms",
     "retrieval_result_top_k_default",
+    "retrieval_v1_dense_candidate_budget",
+    "retrieval_v1_rq_candidate_budget",
+    "retrieval_v1_bm25_candidate_budget",
+    "retrieval_v1_root_entry_budget",
+    "retrieval_v1_per_parent_entry_budget",
+    "retrieval_v1_layer_entry_budget",
+    "retrieval_v1_max_depth",
+    "retrieval_v1_restore_per_hit",
+    "lexical_index_max_documents",
+    "lexical_index_max_postings",
+    "lexical_index_max_characters",
     "agent_coarse_initial_budget",
-    "agent_coarse_total_budget",
     "agent_coarse_top_k",
     "agent_mid_per_coarse_budget",
     "agent_coarse_drilldown_mid_initial_budget",
@@ -85,8 +109,6 @@ HOT_RELOAD_SETTINGS = {
     "agent_max_depth_per_layer",
     "agent_max_labels_per_node",
     "agent_max_edge_reuse",
-    "agent_max_cycle_reward_per_path",
-    "agent_cycle_reward_distance_threshold",
     "agent_path_distance_green_threshold",
     "agent_path_distance_gray_threshold",
     "agent_path_distance_hard_threshold",
@@ -95,15 +117,14 @@ HOT_RELOAD_SETTINGS = {
     "traversal_observation_budget",
     "candidate_pool_dedupe_budget",
     "agent_structure_restore_per_chunk_budget",
-    "agent_structure_restore_budget",
     "context_path_summary_budget",
-    "agent_planning_round_budget",
-    "agent_max_typed_actions_per_round",
-    "agent_repair_round_budget",
-    "agent_verification_budget",
+    "agent_answer_unit_limit",
+    "agent_history_summary_max_chars",
 }
 
 REBUILD_REQUIRED_SETTINGS = {
+    "bm25_k1",
+    "bm25_b",
     "fixed_chunk_size_tokens",
     "fixed_chunk_overlap_tokens",
     "embedding_base_url",
@@ -158,6 +179,38 @@ RUNTIME_ENV_SETTINGS = (
     | REBUILD_REQUIRED_SETTINGS
     | SERVICE_RECREATE_REQUIRED_SETTINGS
 )
+
+# A key belongs to exactly one persisted root file. The name
+# ``RUNTIME_ENV_SETTINGS`` remains as a compatibility alias for the full
+# mutable lifecycle set while older recovery code is migrated.
+ENV_AUTHORITY_SETTINGS = frozenset(
+    {
+        "chat_api_key",
+        "chat_api_protocol",
+        "chat_base_url",
+        "chat_resolve_ip",
+        "chat_model",
+        "graph_api_key",
+        "graph_api_protocol",
+        "graph_base_url",
+        "graph_resolve_ip",
+        "graph_model",
+        "embedding_api_key",
+        "embedding_api_protocol",
+        "embedding_base_url",
+        "embedding_resolve_ip",
+        "embedding_model",
+        "embedding_dimensions",
+        "worker_concurrency",
+        "model_bridge_enabled",
+        "model_bridge_port",
+        "model_bridge_admin_token",
+        "enable_model_fallback",
+    }
+)
+RUNTIME_JSON_SETTINGS = frozenset(RUNTIME_ENV_SETTINGS - ENV_AUTHORITY_SETTINGS)
+if ENV_AUTHORITY_SETTINGS & RUNTIME_JSON_SETTINGS:
+    raise RuntimeError("runtime configuration authority sets overlap")
 
 
 def validate_path_distance_thresholds(
@@ -255,6 +308,12 @@ class Settings(BaseSettings):
     chat_json_max_tokens: int = Field(default=12000, ge=256, le=32768)
     agent_request_concurrency: int = Field(default=4, ge=1, le=128)
     source_io_concurrency: int = Field(default=4, ge=1, le=64)
+    graph_compute_memory_mb: int = Field(default=256, ge=32, le=2048)
+    graph_compute_threads: int = Field(default=2, ge=1, le=16)
+    graph_progress_interval_seconds: int = Field(default=5, ge=1, le=30)
+    ingestion_memory_soft_limit_ratio: float = Field(default=0.78, gt=0, lt=1)
+    ingestion_memory_hard_limit_ratio: float = Field(default=0.88, gt=0, lt=1)
+    ingestion_memory_critical_limit_ratio: float = Field(default=0.94, gt=0, le=1)
     agent_request_queue_limit: int = Field(default=8, ge=0, le=1000)
     agent_request_queue_timeout_seconds: int = Field(default=30, ge=1, le=3600)
     agent_request_lease_ttl_seconds: int = Field(default=300, ge=5, le=7200)
@@ -262,6 +321,19 @@ class Settings(BaseSettings):
     fixed_chunk_overlap_tokens: int = Field(default=80, ge=0, le=1024)
     context_package_token_budget: int = Field(default=2400, ge=256, le=20000)
     retrieval_result_top_k_default: int = Field(default=8, ge=1, le=50)
+    retrieval_v1_dense_candidate_budget: int = Field(default=64, ge=1, le=4096)
+    retrieval_v1_rq_candidate_budget: int = Field(default=64, ge=1, le=4096)
+    retrieval_v1_bm25_candidate_budget: int = Field(default=64, ge=1, le=4096)
+    retrieval_v1_root_entry_budget: int = Field(default=8, ge=1, le=256)
+    retrieval_v1_per_parent_entry_budget: int = Field(default=8, ge=1, le=256)
+    retrieval_v1_layer_entry_budget: int = Field(default=80, ge=1, le=1024)
+    retrieval_v1_max_depth: int = Field(default=3, ge=0, le=64)
+    retrieval_v1_restore_per_hit: int = Field(default=4, ge=0, le=64)
+    lexical_index_max_documents: int = Field(default=100000, ge=1, le=1000000)
+    lexical_index_max_postings: int = Field(default=4000000, ge=1, le=20000000)
+    lexical_index_max_characters: int = Field(default=32000000, ge=1, le=1000000000)
+    bm25_k1: float = Field(default=1.2, gt=0, le=10, allow_inf_nan=False)
+    bm25_b: float = Field(default=0.75, ge=0, le=1, allow_inf_nan=False)
     enable_model_fallback: bool = False
     concept_i18n_enabled: bool = False
     query_facet_bilingual_enabled: bool = False
@@ -370,6 +442,28 @@ class Settings(BaseSettings):
     agent_max_typed_actions_per_round: int = Field(default=8, ge=1, le=50)
     agent_repair_round_budget: int = Field(default=2, ge=0, le=10)
     agent_verification_budget: int = Field(default=8, ge=1, le=100)
+    agent_answer_unit_limit: int = Field(default=12, ge=1, le=32)
+    agent_reflection_round_budget: int = Field(default=2, ge=0, le=10)
+    agent_reflection_timeout_seconds: int = Field(default=90, ge=15, le=240)
+    retrieval_repair_round_limit: int = Field(default=1, ge=0, le=2)
+    retrieval_total_timeout_seconds: int = Field(default=360, ge=15, le=600)
+    retrieval_planning_timeout_seconds: int = Field(default=60, ge=5, le=120)
+    retrieval_repair_timeout_seconds: int = Field(default=60, ge=5, le=60)
+    retrieval_sufficiency_timeout_seconds: int = Field(default=60, ge=5, le=240)
+    retrieval_generation_timeout_seconds: int = Field(default=240, ge=10, le=240)
+    retrieval_planning_max_tokens: int = Field(default=8192, ge=256, le=8192)
+    retrieval_repair_max_tokens: int = Field(default=8192, ge=256, le=32768)
+    retrieval_sufficiency_max_tokens: int = Field(default=8192, ge=256, le=32768)
+    retrieval_generation_max_tokens: int = Field(default=32768, ge=256, le=32768)
+    retrieval_gate_coverage_threshold: float = Field(default=.35, gt=0, le=1, allow_inf_nan=False)
+    retrieval_reward_time_weight: float = Field(default=.05, ge=0, le=1, allow_inf_nan=False)
+    retrieval_reward_work_weight: float = Field(default=.01, ge=0, le=1, allow_inf_nan=False)
+    retrieval_reward_time_scale_seconds: float = Field(default=40, ge=1, le=600, allow_inf_nan=False)
+    retrieval_gate_path_threshold: float = Field(default=.10, gt=0, le=1, allow_inf_nan=False)
+    agent_history_summary_max_chars: int = Field(default=4000, ge=512, le=12000)
+    agent_reflection_path_threshold: float = Field(default=0.5, ge=0.0, le=1.0, allow_inf_nan=False)
+    agent_reflection_question_threshold: float = Field(default=0.8, ge=0.0, le=1.0, allow_inf_nan=False)
+    agent_reflection_context_threshold: float = Field(default=0.8, ge=0.0, le=1.0, allow_inf_nan=False)
 
     @field_validator("rq_kmeans_levels")
     @classmethod
@@ -385,6 +479,14 @@ class Settings(BaseSettings):
             self.agent_path_distance_gray_threshold,
             self.agent_path_distance_hard_threshold,
         )
+        if not (
+            self.ingestion_memory_soft_limit_ratio
+            < self.ingestion_memory_hard_limit_ratio
+            < self.ingestion_memory_critical_limit_ratio
+        ):
+            raise ValueError(
+                "ingestion memory watermarks must satisfy soft < hard < critical"
+            )
         return self
 
     @property
@@ -485,6 +587,21 @@ def _active_runtime_env_path() -> Path:
     return Path(configured) if configured else WORKSPACE_ROOT / ".env"
 
 
+def _active_runtime_settings_path() -> Path:
+    return runtime_settings_path(
+        workspace_root=WORKSPACE_ROOT,
+        env_path=_active_runtime_env_path(),
+    )
+
+
+def _read_runtime_settings_json() -> dict[str, object]:
+    return read_runtime_settings_values(
+        _active_runtime_settings_path(),
+        allowed_keys=RUNTIME_JSON_SETTINGS,
+        allow_missing=True,
+    )
+
+
 def _settings_file_cache_identity(path: Path) -> tuple[object, ...]:
     """Return a secret-free strong identity for one settings source."""
 
@@ -522,7 +639,11 @@ def _settings_cache_token() -> tuple[tuple[object, ...], ...]:
     if isinstance(configured_sources, (str, os.PathLike)):
         configured_sources = (configured_sources,)
     seen_paths: set[str] = set()
-    for raw_path in (_active_runtime_env_path(), *configured_sources):
+    for raw_path in (
+        _active_runtime_env_path(),
+        _active_runtime_settings_path(),
+        *configured_sources,
+    ):
         path = Path(raw_path)
         normalized_path = str(Path(os.path.abspath(path)))
         if normalized_path in seen_paths:
@@ -667,6 +788,9 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "enable_auto_tpe",
     }
     int_fields = {
+        "graph_compute_memory_mb",
+        "graph_compute_threads",
+        "graph_progress_interval_seconds",
         "model_bridge_port",
         "embedding_dimensions",
         "embedding_batch_size",
@@ -705,6 +829,17 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "tpe_candidate_pool_size",
         "operating_point_hard_gate_max_candidate_latency_p95_ms",
         "retrieval_result_top_k_default",
+        "retrieval_v1_dense_candidate_budget",
+        "retrieval_v1_rq_candidate_budget",
+        "retrieval_v1_bm25_candidate_budget",
+        "retrieval_v1_root_entry_budget",
+        "retrieval_v1_per_parent_entry_budget",
+        "retrieval_v1_layer_entry_budget",
+        "retrieval_v1_max_depth",
+        "retrieval_v1_restore_per_hit",
+        "lexical_index_max_documents",
+        "lexical_index_max_postings",
+        "lexical_index_max_characters",
         "agent_coarse_initial_budget",
         "agent_coarse_total_budget",
         "agent_coarse_top_k",
@@ -726,12 +861,21 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "agent_max_typed_actions_per_round",
         "agent_repair_round_budget",
         "agent_verification_budget",
+        "agent_answer_unit_limit",
+        "agent_reflection_round_budget",
+        "agent_reflection_timeout_seconds",
+        "agent_history_summary_max_chars",
         "gray_zone_observation_cadence",
         "traversal_observation_budget",
         "query_facet_posterior_observation_budget",
         "query_facet_posterior_round_budget",
     }
     float_fields: set[str] = {
+        "bm25_k1",
+        "bm25_b",
+        "agent_reflection_path_threshold",
+        "agent_reflection_question_threshold",
+        "agent_reflection_context_threshold",
         "mid_concept_candidate_keep_threshold",
         "rq_residual_tau",
         "rq_membership_temperature",
@@ -750,6 +894,9 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "agent_path_distance_gray_threshold",
         "agent_path_distance_hard_threshold",
         "query_facet_posterior_convergence_epsilon",
+        "ingestion_memory_soft_limit_ratio",
+        "ingestion_memory_hard_limit_ratio",
+        "ingestion_memory_critical_limit_ratio",
     }
     nullable_fields = {
         "chat_resolve_ip",
@@ -762,6 +909,9 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "CHAT_JSON_MAX_TOKENS": "chat_json_max_tokens",
         "AGENT_REQUEST_CONCURRENCY": "agent_request_concurrency",
         "SOURCE_IO_CONCURRENCY": "source_io_concurrency",
+        "GRAPH_COMPUTE_MEMORY_MB": "graph_compute_memory_mb",
+        "GRAPH_COMPUTE_THREADS": "graph_compute_threads",
+        "GRAPH_PROGRESS_INTERVAL_SECONDS": "graph_progress_interval_seconds",
         "AGENT_REQUEST_QUEUE_LIMIT": "agent_request_queue_limit",
         "AGENT_REQUEST_QUEUE_TIMEOUT_SECONDS": "agent_request_queue_timeout_seconds",
         "AGENT_REQUEST_LEASE_TTL_SECONDS": "agent_request_lease_ttl_seconds",
@@ -816,6 +966,19 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "OPERATING_POINT_HARD_GATE_MIN_STRUCTURE_RECOVERY_RATE": "operating_point_hard_gate_min_structure_recovery_rate",
         "OPERATING_POINT_HARD_GATE_MAX_CANDIDATE_LATENCY_P95_MS": "operating_point_hard_gate_max_candidate_latency_p95_ms",
         "RETRIEVAL_RESULT_TOP_K_DEFAULT": "retrieval_result_top_k_default",
+        "RETRIEVAL_V1_DENSE_CANDIDATE_BUDGET": "retrieval_v1_dense_candidate_budget",
+        "RETRIEVAL_V1_RQ_CANDIDATE_BUDGET": "retrieval_v1_rq_candidate_budget",
+        "RETRIEVAL_V1_BM25_CANDIDATE_BUDGET": "retrieval_v1_bm25_candidate_budget",
+        "RETRIEVAL_V1_ROOT_ENTRY_BUDGET": "retrieval_v1_root_entry_budget",
+        "RETRIEVAL_V1_PER_PARENT_ENTRY_BUDGET": "retrieval_v1_per_parent_entry_budget",
+        "RETRIEVAL_V1_LAYER_ENTRY_BUDGET": "retrieval_v1_layer_entry_budget",
+        "RETRIEVAL_V1_MAX_DEPTH": "retrieval_v1_max_depth",
+        "RETRIEVAL_V1_RESTORE_PER_HIT": "retrieval_v1_restore_per_hit",
+        "LEXICAL_INDEX_MAX_DOCUMENTS": "lexical_index_max_documents",
+        "LEXICAL_INDEX_MAX_POSTINGS": "lexical_index_max_postings",
+        "LEXICAL_INDEX_MAX_CHARACTERS": "lexical_index_max_characters",
+        "BM25_K1": "bm25_k1",
+        "BM25_B": "bm25_b",
         "AGENT_COARSE_INITIAL_BUDGET": "agent_coarse_initial_budget",
         "AGENT_COARSE_TOTAL_BUDGET": "agent_coarse_total_budget",
         "AGENT_COARSE_TOP_K": "agent_coarse_top_k",
@@ -845,6 +1008,13 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "AGENT_MAX_TYPED_ACTIONS_PER_ROUND": "agent_max_typed_actions_per_round",
         "AGENT_REPAIR_ROUND_BUDGET": "agent_repair_round_budget",
         "AGENT_VERIFICATION_BUDGET": "agent_verification_budget",
+        "AGENT_ANSWER_UNIT_LIMIT": "agent_answer_unit_limit",
+        "AGENT_REFLECTION_ROUND_BUDGET": "agent_reflection_round_budget",
+        "AGENT_REFLECTION_TIMEOUT_SECONDS": "agent_reflection_timeout_seconds",
+        "AGENT_HISTORY_SUMMARY_MAX_CHARS": "agent_history_summary_max_chars",
+        "AGENT_REFLECTION_PATH_THRESHOLD": "agent_reflection_path_threshold",
+        "AGENT_REFLECTION_QUESTION_THRESHOLD": "agent_reflection_question_threshold",
+        "AGENT_REFLECTION_CONTEXT_THRESHOLD": "agent_reflection_context_threshold",
     }
     for env_key, value in env_entries.items():
         if env_key in PROCESS_ONLY_ENV_KEYS:
@@ -856,7 +1026,11 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
             setattr(settings, attr, None)
             continue
         try:
-            if attr in bool_fields:
+            if attr in RETRIEVAL_CONTROL_INT_SETTINGS:
+                setattr(settings, attr, int(value))
+            elif attr in RETRIEVAL_CONTROL_FLOAT_SETTINGS:
+                setattr(settings, attr, float(value))
+            elif attr in bool_fields:
                 setattr(settings, attr, value.lower() in {"true", "1", "yes", "on"})
             elif attr in int_fields:
                 if value != "":
@@ -876,11 +1050,11 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
 
 
 def _build_settings() -> Settings:
-    # The root .env is the sole persisted authority, but lifecycle activation
-    # is represented by the current process environment.  Startup copies all
-    # runtime keys into the process; later broadcasts copy only the lifecycle-
-    # allowed subset.  Reading the file again here would make rebuild/service
-    # edits effective merely because the file identity changed.
+    # The two root files are the sole persisted authorities, but lifecycle
+    # activation is represented by the current process environment. Startup
+    # copies both authority sets into the process; later broadcasts copy only
+    # the lifecycle-allowed subset. Reading the files again here would make
+    # rebuild/service edits effective merely because their identities changed.
     env_entries = {
         key.upper(): value
         for key, value in os.environ.items()
@@ -1008,11 +1182,32 @@ def _clear_settings_cache() -> None:
     _SETTINGS_CACHE_TOKEN = None
 
 
+_SETTINGS_READ_SCOPE: ContextVar[Settings | None] = ContextVar("settings_read_scope", default=None)
+
+
+@contextmanager
+def runtime_settings_read_scope():
+    """Freeze one bounded compute phase, without granting shadow authority.
+
+    Leave the scope before a runtime refresh or trial boundary. The next
+    scope checks the root env's content identity again.
+    """
+    snapshot = get_settings()
+    token = _SETTINGS_READ_SCOPE.set(snapshot)
+    try:
+        yield snapshot
+    finally:
+        _SETTINGS_READ_SCOPE.reset(token)
+
+
 def get_settings() -> Settings:
     global _SETTINGS_CACHE, _SETTINGS_CACHE_TOKEN
     override = _SETTINGS_OVERRIDE.get()
     if override is not None:
         return override
+    snapshot = _SETTINGS_READ_SCOPE.get()
+    if snapshot is not None:
+        return snapshot
     token = _settings_cache_token()
     if _SETTINGS_CACHE is not None and _SETTINGS_CACHE_TOKEN == token:
         return _SETTINGS_CACHE

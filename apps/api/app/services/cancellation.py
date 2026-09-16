@@ -36,5 +36,9 @@ def is_cancel_requested(db: Session, batch_id: str | None) -> bool:
 
 
 def ensure_not_cancelled(db: Session, batch_id: str | None) -> None:
+    from app.services.build_performance import current_performance
+    performance = current_performance()
+    if performance:
+        performance.check()
     if is_cancel_requested(db, batch_id):
         raise IngestionCancelled("ingestion batch cancellation requested")

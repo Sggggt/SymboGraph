@@ -6,13 +6,15 @@ import json
 import math
 import re
 import tempfile
+from functools import lru_cache
 from contextlib import ExitStack
+from collections import ChainMap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import JSON, Text, cast, func, select
+from sqlalchemy.orm import Session, object_session
 
 from app.models import (
     Chunk,
@@ -74,6 +76,59 @@ _UUID_RE = re.compile(
     r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
 )
 _DROP = object()
+
+
+def _immutable_json(*args, **kwargs):
+    raise TypeError("Canonical JSON is immutable")
+
+
+class _CanonicalDict(dict):
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _immutable_json
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self,memo):
+        return self
+
+
+class _CanonicalList(list):
+    __setitem__ = __delitem__ = append = clear = extend = insert = pop = remove = reverse = sort = __iadd__ = __imul__ = _immutable_json
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self,memo):
+        return self
+
+
+class _FrozenInputDict(_CanonicalDict):
+    _graph_json_immutable = True
+
+
+class _FrozenInputList(_CanonicalList):
+    _graph_json_immutable = True
+
+
+class _FrozenReferences(_CanonicalDict):
+    pass
+
+
+def freeze_graph_input(value):
+    """Snapshot a trial-local shared card; its addresses stay unmodified."""
+    if value is None or type(value) in (str,int,float,bool):
+        return value
+    if type(value) is _FrozenInputDict or type(value) is _FrozenInputList:
+        return value
+    if isinstance(value,Mapping):
+        return _FrozenInputDict({key:freeze_graph_input(item) for key,item in value.items()})
+    if isinstance(value,(list,tuple)):
+        result=_FrozenInputList(freeze_graph_input(item) for item in value)
+        result._reference_free=all(item is None or type(item) in (float,int,bool) for item in result)
+        return result
+    return value
+
+
 _EPHEMERAL_KEYS = {
     "id",
     "created_at",
@@ -177,6 +232,7 @@ _DATABASE_ADDRESS_COLLECTION_SUFFIXES = (
 )
 
 
+@lru_cache(maxsize=4096)
 def _is_database_address_field(value: str | None) -> bool:
     key = str(value or "").strip().lower()
     if not key:
@@ -201,6 +257,35 @@ def _canonical_value(
     references: Mapping[str, str] | None = None,
     parent_key: str | None = None,
 ) -> Any:
+    # A second canonical pass is common in nested fact/set envelopes. These
+    # containers are recursively frozen, so no fact can change between passes.
+    # A new reference environment or unordered-list context still replays the
+    # original normalization instead of trusting an earlier projection.
+    value_type = type(value)
+    if value is None or value_type is bool or value_type is int:
+        return value
+    if value_type is str:
+        if not _is_database_address_field(parent_key):
+            return value
+        if references and value in references:
+            return references[value]
+        return _DROP if _UUID_RE.fullmatch(value) else value
+    if value_type is float:
+        if not math.isfinite(value):
+            raise ValueError("Canonical graph facts reject non-finite numbers")
+        return 0.0 if value == 0.0 else value
+    frozen_input = value_type is _FrozenInputDict or value_type is _FrozenInputList
+    if frozen_input:
+        context=(_is_database_address_field(parent_key),str(parent_key or "").lower() in _UNORDERED_LIST_KEYS)
+        memo_reference=references if references and not getattr(value,"_reference_free",False) else None
+        allow_memo=memo_reference is None or type(memo_reference) is _FrozenReferences
+        memo=getattr(value,"_canonical_memo",None)
+        if allow_memo and memo is not None and memo[0] is memo_reference and memo[1] == context:
+            return memo[2]
+    if (value_type is _CanonicalDict or value_type is _CanonicalList) and not references and not _is_database_address_field(parent_key) and (
+        value_type is _CanonicalDict or str(parent_key or "").lower() not in _UNORDERED_LIST_KEYS
+    ):
+        return value
     references = references or {}
     if value is None or isinstance(value, (str, bool, int)):
         if isinstance(value, str):
@@ -241,7 +326,9 @@ def _canonical_value(
             ):
                 continue
             normalized[key] = item
-        return normalized
+        result=_CanonicalDict(normalized)
+        if frozen_input and allow_memo: value._canonical_memo=(memo_reference,context,result)
+        return result
     if isinstance(value, (set, frozenset)):
         items = [
             item
@@ -255,7 +342,7 @@ def _canonical_value(
             )
             is not _DROP
         ]
-        return _sort_canonical(items)
+        return _CanonicalList(_sort_canonical(items))
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
         items = [
             item
@@ -270,8 +357,11 @@ def _canonical_value(
             is not _DROP
         ]
         if str(parent_key or "").lower() in _UNORDERED_LIST_KEYS:
-            return _sort_canonical(items)
-        return items
+            result=_CanonicalList(_sort_canonical(items))
+        else:
+            result=_CanonicalList(items)
+        if frozen_input and allow_memo: value._canonical_memo=(memo_reference,context,result)
+        return result
     raise TypeError(
         "Canonical graph facts accept only JSON primitives; "
         f"received {type(value).__name__}"
@@ -489,17 +579,23 @@ def _concept_state_stats_business_projection(
     }
 
 
+def _canonical_json_bytes(value: Any) -> bytes:
+    kind=type(value)
+    container=kind is _CanonicalDict or kind is _CanonicalList
+    cached=getattr(value,"_encoded_json",None) if container else None
+    if cached is not None:
+        return cached
+    result=json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(",",":"),allow_nan=False).encode("utf-8")
+    if container:
+        value._encoded_json=result
+    return result
+
+
 def _canonical_bytes(value: Any) -> bytes:
     normalized = _canonical_value(value)
     if normalized is _DROP:
         raise ValueError("Canonical graph root cannot be a database UUID")
-    return json.dumps(
-        normalized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
+    return _canonical_json_bytes(normalized)
 
 
 def _sort_canonical(values: Iterable[Any]) -> list[Any]:
@@ -507,16 +603,87 @@ def _sort_canonical(values: Iterable[Any]) -> list[Any]:
 
 
 def canonical_graph_hash(protocol_version: str, payload: Any) -> str:
-    envelope = {
-        "canonical_protocol_version": CANONICAL_GRAPH_JSON_PROTOCOL_VERSION,
-        "protocol_version": str(protocol_version),
-        "payload": payload,
-    }
-    return hashlib.sha256(_canonical_bytes(envelope)).hexdigest()
+    digest=hashlib.sha256()
+    digest.update(b'{"canonical_protocol_version":')
+    digest.update(_canonical_bytes(CANONICAL_GRAPH_JSON_PROTOCOL_VERSION))
+    digest.update(b',"payload":')
+    digest.update(_canonical_bytes(payload))
+    digest.update(b',"protocol_version":')
+    digest.update(_canonical_bytes(str(protocol_version)))
+    digest.update(b'}')
+    return digest.hexdigest()
 
 
 def canonical_fact_set_hash(protocol_version: str, facts: Iterable[Any]) -> str:
-    return canonical_graph_hash(protocol_version, _sort_canonical(list(facts)))
+    """Byte-identical canonical envelope with a bounded external merge sort.
+
+    Sort serialized canonical facts, not a second complete graph of Python
+    dictionaries. JSON escapes newlines, so each UTF-8 line is one exact fact.
+    """
+    from app.services.build_performance import tracked_temporary_directory,current_performance
+    with tracked_temporary_directory(prefix="graph-fact-sort-") as directory:
+        root = Path(directory)
+        paths: list[Path] = []
+        buffer: list[bytes] = []
+        buffered_bytes = 0
+
+        def spill() -> None:
+            nonlocal buffered_bytes
+            path = root / f"run-{len(paths)}"
+            with path.open("wb") as stream:
+                for value in sorted(buffer):
+                    stream.write(value + b"\n")
+            paths.append(path)
+            if current_performance(): current_performance().sample_temporary()
+            buffer.clear()
+            buffered_bytes = 0
+
+        for fact in facts:
+            from app.services.graph_build_workspace import checkpoint
+            checkpoint("canonical_hash")
+            encoded = _canonical_bytes(fact)
+            buffer.append(encoded)
+            buffered_bytes += len(encoded)
+            if buffered_bytes >= 8 * 1024**2:
+                spill()
+        if paths:
+            if buffer:
+                spill()
+            generation = 0
+            while len(paths) > 32:
+                next_paths = []
+                for offset in range(0, len(paths), 32):
+                    selected = paths[offset:offset + 32]
+                    target = root / f"merge-{generation}-{offset}"
+                    with ExitStack() as stack, target.open("wb") as writer:
+                        streams = [stack.enter_context(path.open("rb")) for path in selected]
+                        for line in heapq.merge(*streams):
+                            writer.write(line)
+                    if current_performance(): current_performance().sample_temporary()
+                    for path in selected:
+                        path.unlink()
+                    next_paths.append(target)
+                paths = next_paths
+                generation += 1
+        with ExitStack() as stack:
+            if paths:
+                streams = [stack.enter_context(path.open("rb")) for path in paths]
+                values = (line[:-1] for line in heapq.merge(*streams))
+            else:
+                values = iter(sorted(buffer))
+            digest = hashlib.sha256()
+            digest.update(b'{"canonical_protocol_version":')
+            digest.update(_canonical_bytes(CANONICAL_GRAPH_JSON_PROTOCOL_VERSION))
+            digest.update(b',"payload":[')
+            separator = b""
+            for value in values:
+                digest.update(separator)
+                digest.update(value)
+                separator = b","
+            digest.update(b'],"protocol_version":')
+            digest.update(_canonical_bytes(str(protocol_version)))
+            digest.update(b"}")
+            return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -790,11 +957,16 @@ def chunk_business_references(
     document_version_key_by_id: dict[str, str] = {}
     key_by_id: dict[str, str] = {}
     fact_by_id: dict[str, dict[str, Any]] = {}
+    document_facts: dict[tuple[str, str], tuple[dict[str, Any], str]] = {}
     for chunk in chunks:
         document = documents[str(chunk.document_id)]
         version = versions[str(chunk.document_version_id)]
-        document_fact = _document_business_fact(document, version)
-        document_key = canonical_graph_hash("document_business_key_v1", document_fact)
+        identity = str(document.id), str(version.id)
+        if identity not in document_facts:
+            source_fact = _document_business_fact(document, version)
+            document_facts[identity] = (source_fact, canonical_graph_hash("document_business_key_v1", source_fact))
+        source_fact, document_key = document_facts[identity]
+        document_fact = dict(source_fact)
         document_version_key_by_id[str(version.id)] = document_key
         raw_text_hash = hashlib.sha256((chunk.text or "").encode("utf-8")).hexdigest()
         fact = {
@@ -1057,61 +1229,51 @@ def build_structure_state_hash_card(
     )
 
 
+def _relation_edge_fact(edge, chunk_keys, references):
+    return {
+        "source": _reference_value(edge.source_chunk_id, chunk_keys),
+        "target": _reference_value(edge.target_chunk_id, chunk_keys),
+        "edge_type": str(edge.edge_type or ""),
+        "weight": float(edge.weight or 0.0),
+        "distance": float(edge.distance or 0.0),
+        "raw_strength": float(edge.raw_strength or 0.0),
+        "raw_strength_summary": _canonical_value(
+            edge.raw_strength_summary_json or {}, references=references
+        ),
+        "normalization_stats": _canonical_value(
+            edge.normalization_stats_json or {}, references=references
+        ),
+        "confidence": float(edge.confidence or 0.0),
+        "features": _canonical_value(
+            edge.features_json or {}, references=references
+        ),
+        "support": _canonical_value(
+            edge.support_json or {}, references=references
+        ),
+        "source_algorithm": str(edge.source_algorithm or ""),
+        "protocol_version": str(edge.protocol_version or ""),
+        "edge_distance_protocol_hash": str(
+            edge.edge_distance_protocol_hash or ""
+        ),
+        "source_language": str(edge.source_language or ""),
+        "target_language": str(edge.target_language or ""),
+        "is_cross_document": bool(edge.is_cross_document),
+        "is_cross_language": bool(edge.is_cross_language),
+        "bridge_quota_reason": str(edge.bridge_quota_reason or ""),
+        "is_bridge": bool(edge.is_bridge),
+        "diagnostics": _canonical_value(
+            edge.diagnostics_json or {}, references=references
+        ),
+    }
+
+
 def _relation_edge_maps(
     edges: Sequence[ChunkRelationEdge],
     chunk_keys: Mapping[str, str],
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
-    edge_key_by_id: dict[str, str] = {}
-    identity_by_id: dict[str, dict[str, Any]] = {}
-    for edge in edges:
-        identity = {
-            "source": _reference_value(edge.source_chunk_id, chunk_keys),
-            "target": _reference_value(edge.target_chunk_id, chunk_keys),
-            "edge_type": str(edge.edge_type or ""),
-        }
-        identity_by_id[str(edge.id)] = identity
-        edge_key_by_id[str(edge.id)] = canonical_graph_hash(
-            "chunk_relation_edge_business_key_v1", identity
-        )
-    references = {**chunk_keys, **edge_key_by_id}
-    facts = []
-    for edge in edges:
-        facts.append(
-            {
-                **identity_by_id[str(edge.id)],
-                "weight": float(edge.weight or 0.0),
-                "distance": float(edge.distance or 0.0),
-                "raw_strength": float(edge.raw_strength or 0.0),
-                "raw_strength_summary": _canonical_value(
-                    edge.raw_strength_summary_json or {}, references=references
-                ),
-                "normalization_stats": _canonical_value(
-                    edge.normalization_stats_json or {}, references=references
-                ),
-                "confidence": float(edge.confidence or 0.0),
-                "features": _canonical_value(
-                    edge.features_json or {}, references=references
-                ),
-                "support": _canonical_value(
-                    edge.support_json or {}, references=references
-                ),
-                "source_algorithm": str(edge.source_algorithm or ""),
-                "protocol_version": str(edge.protocol_version or ""),
-                "edge_distance_protocol_hash": str(
-                    edge.edge_distance_protocol_hash or ""
-                ),
-                "source_language": str(edge.source_language or ""),
-                "target_language": str(edge.target_language or ""),
-                "is_cross_document": bool(edge.is_cross_document),
-                "is_cross_language": bool(edge.is_cross_language),
-                "bridge_quota_reason": str(edge.bridge_quota_reason or ""),
-                "is_bridge": bool(edge.is_bridge),
-                "diagnostics": _canonical_value(
-                    edge.diagnostics_json or {}, references=references
-                ),
-            }
-        )
-    return edge_key_by_id, facts
+    keys = relation_edge_business_keys(edges, chunk_keys)
+    references = {**chunk_keys, **keys}
+    return keys, [_relation_edge_fact(edge, chunk_keys, references) for edge in edges]
 
 
 def relation_edge_business_keys(
@@ -1120,8 +1282,14 @@ def relation_edge_business_keys(
 ) -> dict[str, str]:
     """Return UUID-free keys for persisted bottom-edge address references."""
 
-    edge_keys, _facts = _relation_edge_maps(edges, chunk_keys)
-    return edge_keys
+    return {
+        str(edge.id): canonical_graph_hash("chunk_relation_edge_business_key_v1", {
+            "source": _reference_value(edge.source_chunk_id, chunk_keys),
+            "target": _reference_value(edge.target_chunk_id, chunk_keys),
+            "edge_type": str(edge.edge_type or ""),
+        })
+        for edge in edges
+    }
 
 
 def rq_membership_business_fact(
@@ -1133,7 +1301,14 @@ def rq_membership_business_fact(
 ) -> dict[str, Any]:
     """Canonical persisted RQ membership fact without row/address hashes."""
 
-    references = {**chunk_keys, **edge_keys, **prefix_keys}
+    from app.services.rq_numeric_storage import RQ_NUMERIC_STORAGE_PROTOCOL,validate_rq_vector_blob
+    diagnostics=membership.diagnostics_json or {}
+    if diagnostics.get("numeric_storage_protocol") is not None or any(isinstance(diagnostics.get(field),dict) for field in ("residual_vector","reconstructed_vector")):
+        if diagnostics.get("numeric_storage_protocol") != RQ_NUMERIC_STORAGE_PROTOCOL:
+            raise ValueError("Unsupported RQ numeric storage protocol")
+        for field in ("residual_vector","reconstructed_vector"):
+            validate_rq_vector_blob(diagnostics.get(field))
+    references = ChainMap(prefix_keys, edge_keys, chunk_keys)
     return {
         "rq_prefix_key": _reference_value(membership.rq_prefix_id, prefix_keys),
         "chunk": _reference_value(membership.chunk_id, chunk_keys),
@@ -1173,6 +1348,21 @@ def rq_membership_business_fact_hash(
     )
 
 
+def membership_fact_input_snapshot(row):
+    return tuple(getattr(row,name) for name in (
+        "rq_prefix_id","chunk_id","membership_score","membership_role","membership_reason",
+        "membership_entropy","rq_path","residual_norm","rank","support_chunk_edge_ids_json","diagnostics_json"))
+
+
+def prepare_membership_fact_for_insert(row, *, chunk_keys, prefix_keys, edge_keys):
+    fact=_canonical_value(rq_membership_business_fact(row,chunk_keys=chunk_keys,prefix_keys=prefix_keys,edge_keys=edge_keys))
+    row.diagnostics_json={**(row.diagnostics_json or {}),
+        "canonical_membership_fact_hash_protocol_version":RQ_MEMBERSHIP_BUSINESS_FACT_HASH_PROTOCOL_VERSION,
+        "canonical_membership_fact_hash":canonical_graph_hash(RQ_MEMBERSHIP_BUSINESS_FACT_HASH_PROTOCOL_VERSION,fact)}
+    freeze_constructed_row_json(row)
+    row._prepared_membership_fact=(membership_fact_input_snapshot(row),fact)
+
+
 def _rq_codebook_fact(
     relation_state: ChunkRelationGraphState,
     chunk_keys: Mapping[str, str],
@@ -1198,6 +1388,57 @@ def _rq_codebook_fact(
     return _canonical_value(raw, references=chunk_keys)
 
 
+def freeze_constructed_row_json(row) -> None:
+    for column in row.__table__.c:
+        if isinstance(column.type,JSON):
+            setattr(row,column.name,freeze_graph_input(getattr(row,column.name)))
+
+
+def _verified_constructed_rows(db, model, rows, predicate):
+    """Verify the complete persisted row set without transferring large JSON.
+
+    Only immutable objects still owned by the current writer Session qualify.
+    PostgreSQL compares the SHA-256 of each exact stored JSON transport value;
+    independent/cross-session callers keep the ordinary full database read.
+    """
+    session=getattr(db,"_session",db)
+    rows=list(rows)
+    columns=list(model.__table__.c)
+    json_columns=[column for column in columns if isinstance(column.type,JSON)]
+    scalar_columns=[column for column in columns if not isinstance(column.type,JSON)]
+    for row in rows:
+        if object_session(row) is not session or session.is_modified(row,include_collections=True):
+            raise RuntimeError("Constructed graph fact is foreign or dirty")
+        for column in json_columns:
+            value=getattr(row,column.name)
+            if isinstance(value,(dict,list)) and type(value) not in (_FrozenInputDict,_FrozenInputList):
+                raise RuntimeError("Constructed graph fact contains mutable JSON")
+    by_id={str(row.id):row for row in rows}
+    if len(by_id) != len(rows):
+        raise RuntimeError("Constructed graph fact contains duplicate rows")
+    postgres=db.get_bind().dialect.name == "postgresql"
+    json_expressions=[func.encode(func.sha256(func.convert_to(cast(column,Text),"UTF8")),"hex").label(column.name) if postgres else column for column in json_columns]
+    serializer=db.get_bind().dialect._json_serializer or json.dumps
+    observed=set()
+    for stored in db.execute(select(*scalar_columns,*json_expressions).where(predicate).execution_options(yield_per=128)):
+        card=stored._mapping
+        row=by_id.get(str(card["id"]))
+        if row is None:
+            raise RuntimeError("Constructed graph fact scope omits persisted rows")
+        observed.add(str(row.id))
+        if any(getattr(row,column.name) != card[column.name] for column in scalar_columns):
+            raise RuntimeError("Constructed graph fact scalar identity drifted")
+        for column in json_columns:
+            value=getattr(row,column.name)
+            from app.core.json_codec import database_json_digest
+            expected=database_json_digest(value, serializer) if postgres else value
+            if expected != card[column.name]:
+                raise RuntimeError("Constructed graph fact JSON identity drifted")
+    if observed != set(by_id):
+        raise RuntimeError("Constructed graph fact references missing persisted rows")
+    return rows
+
+
 def build_relation_state_hash_card(
     db: Session,
     relation_state: ChunkRelationGraphState,
@@ -1206,16 +1447,31 @@ def build_relation_state_hash_card(
     protocol_identities: Mapping[str, Any],
     vector_identity: Mapping[str, Any],
     chunk_references: ChunkBusinessReferences | None = None,
+    relation_edges_override: Sequence[ChunkRelationEdge] | None = None,
+    memberships_override: Sequence[RQPrefixMembership] | None = None,
+    membership_reference_environment: tuple | None = None,
 ) -> dict[str, Any]:
     refs = chunk_references or chunk_business_references(db, chunks)
-    edges = list(
-        db.scalars(
-            select(ChunkRelationEdge).where(
-                ChunkRelationEdge.graph_state_id == relation_state.id
-            )
-        ).all()
-    )
-    edge_key_by_id, edge_facts = _relation_edge_maps(edges, refs.key_by_id)
+    from app.services.relation_signal_storage import STATE_KEY,unpack_signal_pool,validate_signal_refs
+    signal_blob=(relation_state.diagnostics_json or {}).get(STATE_KEY)
+    signal_pool=unpack_signal_pool(signal_blob) if signal_blob is not None else {}
+    if not set(signal_pool)<=set(refs.key_by_id):
+        raise RuntimeError("Relation node signal pool contains out-of-scope chunks")
+    signal_pool_hash=(canonical_graph_hash("relation_node_signal_pool_business_v1",
+        _canonical_value(signal_pool,references=refs.key_by_id)) if signal_blob is not None else None)
+    edge_query = select(ChunkRelationEdge).where(ChunkRelationEdge.graph_state_id == relation_state.id)
+    edge_addresses = list(db.execute(select(ChunkRelationEdge.id, ChunkRelationEdge.source_chunk_id,
+        ChunkRelationEdge.target_chunk_id, ChunkRelationEdge.edge_type).where(ChunkRelationEdge.graph_state_id == relation_state.id)))
+    edge_key_by_id = relation_edge_business_keys(edge_addresses, refs.key_by_id)
+    edge_references = _FrozenReferences({**refs.key_by_id, **edge_key_by_id})
+    edge_rows=(_verified_constructed_rows(db,ChunkRelationEdge,relation_edges_override,
+        ChunkRelationEdge.graph_state_id == relation_state.id) if relation_edges_override is not None
+        else db.scalars(edge_query.execution_options(yield_per=64)))
+    def edge_facts():
+        for edge in edge_rows:
+            validate_signal_refs(edge.features_json or {},signal_pool,{edge.source_chunk_id,edge.target_chunk_id})
+            yield _relation_edge_fact(edge,refs.key_by_id,edge_references)
+    edge_facts_hash = canonical_fact_set_hash(RELATION_EDGE_FACT_HASH_PROTOCOL_VERSION,edge_facts())
     prefixes = list(
         db.scalars(
             select(RQPrefix).where(RQPrefix.graph_state_id == relation_state.id)
@@ -1260,31 +1516,38 @@ def build_relation_state_hash_card(
         }
         for prefix in prefixes
     ]
-    memberships = list(
-        db.scalars(
-            select(RQPrefixMembership)
+    membership_count = 0
+    constructed_memberships=(_verified_constructed_rows(db,RQPrefixMembership,memberships_override,
+        RQPrefixMembership.rq_prefix_id.in_(list(prefix_key_by_id))) if memberships_override is not None else None)
+    reuse_prepared_memberships=constructed_memberships is not None and membership_reference_environment == (refs.key_by_id,prefix_key_by_id,edge_key_by_id)
+    def membership_facts():
+        nonlocal membership_count
+        query = (select(RQPrefixMembership)
             .join(RQPrefix, RQPrefixMembership.rq_prefix_id == RQPrefix.id)
-            .where(RQPrefix.graph_state_id == relation_state.id)
-        ).all()
-    )
-    membership_facts: list[dict[str, Any]] = []
-    for membership in memberships:
-        fact = rq_membership_business_fact(
-            membership,
-            chunk_keys=refs.key_by_id,
-            prefix_keys=prefix_key_by_id,
-            edge_keys=edge_key_by_id,
-        )
-        membership_facts.append(fact)
-        membership.diagnostics_json = {
-            **(membership.diagnostics_json or {}),
-            "canonical_membership_fact_hash_protocol_version": (
-                RQ_MEMBERSHIP_BUSINESS_FACT_HASH_PROTOCOL_VERSION
-            ),
-            "canonical_membership_fact_hash": canonical_graph_hash(
-                RQ_MEMBERSHIP_BUSINESS_FACT_HASH_PROTOCOL_VERSION, fact
-            ),
-        }
+            .where(RQPrefix.graph_state_id == relation_state.id).execution_options(yield_per=128))
+        partitions=([constructed_memberships[offset:offset+128] for offset in range(0,len(constructed_memberships),128)]
+            if constructed_memberships is not None else db.scalars(query).partitions(128))
+        for partition in partitions:
+            for membership in partition:
+                membership_count += 1
+                prepared=getattr(membership,"_prepared_membership_fact",None) if reuse_prepared_memberships else None
+                if prepared is not None and prepared[0] == membership_fact_input_snapshot(membership):
+                    fact=prepared[1]
+                else:
+                    fact = rq_membership_business_fact(membership, chunk_keys=refs.key_by_id,
+                        prefix_keys=prefix_key_by_id, edge_keys=edge_key_by_id)
+                audit = {
+                    "canonical_membership_fact_hash_protocol_version": RQ_MEMBERSHIP_BUSINESS_FACT_HASH_PROTOCOL_VERSION,
+                    "canonical_membership_fact_hash": canonical_graph_hash(RQ_MEMBERSHIP_BUSINESS_FACT_HASH_PROTOCOL_VERSION, fact),
+                }
+                previous=membership.diagnostics_json or {}
+                if any(previous.get(key)!=value for key,value in audit.items()):
+                    if constructed_memberships is not None and previous.get("canonical_membership_fact_hash"):
+                        raise RuntimeError("Constructed RQ canonical membership identity drifted")
+                    membership.diagnostics_json = {**previous,**audit}
+                yield fact
+            db.flush()
+    membership_facts_hash = canonical_fact_set_hash("rq_membership_business_facts_v1", membership_facts())
 
     diagnostic_rows = list(
         db.scalars(
@@ -1351,13 +1614,7 @@ def build_relation_state_hash_card(
         for row in pair_rows
     ]
 
-    edge_facts_hash = canonical_fact_set_hash(
-        RELATION_EDGE_FACT_HASH_PROTOCOL_VERSION, edge_facts
-    )
     prefix_facts_hash = canonical_fact_set_hash("rq_prefix_business_facts_v1", prefix_facts)
-    membership_facts_hash = canonical_fact_set_hash(
-        "rq_membership_business_facts_v1", membership_facts
-    )
     diagnostic_facts_hash = canonical_fact_set_hash(
         "rq_prefix_diagnostic_business_facts_v1", diagnostic_facts
     )
@@ -1374,7 +1631,7 @@ def build_relation_state_hash_card(
             "diagnostic_facts_hash": diagnostic_facts_hash,
             "counts": {
                 "prefixes": len(prefixes),
-                "memberships": len(memberships),
+                "memberships": membership_count,
                 "diagnostics": len(diagnostic_rows),
             },
             "protocol_identities": _canonical_value(dict(protocol_identities)),
@@ -1431,6 +1688,7 @@ def build_relation_state_hash_card(
                 or ""
             ),
             "edge_facts_hash": edge_facts_hash,
+            **({"node_signal_facts_hash":signal_pool_hash} if signal_pool_hash is not None else {}),
             "edge_stats": _canonical_value(relation_state.stats_json or {}),
             "rq_state_hash": rq_state_card["state_hash"],
             "rq_pair_aggregate_hash": pair_state_card["state_hash"],
@@ -1444,14 +1702,15 @@ def build_relation_state_hash_card(
             "protocol_identities": _canonical_value(dict(protocol_identities)),
             "vector_identity": _canonical_value(dict(vector_identity)),
             "counts": {
-                "edges": len(edges),
+                "edges": len(edge_addresses),
                 "prefixes": len(prefixes),
-                "memberships": len(memberships),
+                "memberships": membership_count,
                 "rq_diagnostics": len(diagnostic_rows),
                 "rq_pair_diagnostics": len(pair_rows),
             },
             "component_hashes": {
                 "edge_facts": edge_facts_hash,
+                **({"node_signals":signal_pool_hash} if signal_pool_hash is not None else {}),
                 "rq": rq_state_card["state_hash"],
                 "rq_pair": pair_state_card["state_hash"],
                 "operating_point": operating_point_hash,
@@ -1513,14 +1772,14 @@ def build_mid_state_hash_card(
         list(relation_edges_override)
         if relation_edges_override is not None
         else list(
-            db.scalars(
-                select(ChunkRelationEdge).where(
+            db.execute(
+                select(ChunkRelationEdge.id, ChunkRelationEdge.source_chunk_id, ChunkRelationEdge.target_chunk_id, ChunkRelationEdge.edge_type).where(
                     ChunkRelationEdge.graph_state_id == relation_state.id
                 )
             ).all()
         )
     )
-    relation_edge_keys, _ = _relation_edge_maps(relation_edges, refs.key_by_id)
+    relation_edge_keys = relation_edge_business_keys(relation_edges, refs.key_by_id)
     prefixes = (
         list(prefixes_override)
         if prefixes_override is not None
@@ -1843,14 +2102,14 @@ def build_coarse_state_hash_card(
         list(relation_edges_override)
         if relation_edges_override is not None
         else list(
-            db.scalars(
-                select(ChunkRelationEdge).where(
+            db.execute(
+                select(ChunkRelationEdge.id, ChunkRelationEdge.source_chunk_id, ChunkRelationEdge.target_chunk_id, ChunkRelationEdge.edge_type).where(
                     ChunkRelationEdge.graph_state_id == relation_state.id
                 )
             ).all()
         )
     )
-    relation_edge_keys, _ = _relation_edge_maps(relation_edges, refs.key_by_id)
+    relation_edge_keys = relation_edge_business_keys(relation_edges, refs.key_by_id)
     prefixes = (
         list(prefixes_override)
         if prefixes_override is not None

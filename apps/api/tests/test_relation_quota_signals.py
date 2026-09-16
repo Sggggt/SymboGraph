@@ -196,7 +196,7 @@ def test_text_hash_integrity_distinguishes_match_mismatch_and_missing_and_propag
         for chunk in chunks
     }
 
-    assert RELATION_PROTOCOL_VERSION == "dense_only_chunk_relation_graph_v9"
+    assert RELATION_PROTOCOL_VERSION == "dense_only_chunk_relation_graph_v10"
     assert CHUNK_NODE_QUALITY_PROTOCOL_VERSION == "chunk_node_quality_intrinsic_v2"
     assert RELATION_QUOTA_PROTOCOL_VERSION == "dynamic_knn_reverse_quota_signals_v3"
     assert lifecycle_by_id[correct.id]["value"] == 1.0

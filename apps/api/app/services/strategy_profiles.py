@@ -144,11 +144,15 @@ GENERIC_REFLECTION_REVIEW_SYSTEM = (
 GENERIC_QUESTION_PERCEPTION_SYSTEM = (
     "You are a perception module for a {perception_domain}. "
     "Analyze the user's question and return ONLY a JSON object with these exact keys:\n"
-    "- intent: one of [definition, comparison, application, procedure, analysis, unknown]\n"
+    "- intent: one of [direct_answer, definition, comparison, application, procedure, analysis, formula_table_lookup, unknown]\n"
+    "- direct_answer_kind: one of [identity, model_identity, capabilities, evidence, usage, none]\n"
     "- entities: list of {entity_label} explicitly mentioned or implied in the question\n"
     "- sub_queries: list of simpler sub-questions if the original is complex/multi-hop; otherwise [original_question]\n"
     "- needs_graph: boolean, true if the question asks about observed connections, comparisons, dependencies, or derivations across indexed context\n"
-    "- suggested_strategy: one of [global_dense, local_graph, hybrid, community]\n"
+    "- suggested_strategy: one of [none, global_dense, local_graph, hybrid, community]\n"
+    "Use intent=direct_answer only for a request about this Agent's own identity, underlying model identity, capabilities, evidence policy, or usage. "
+    "Do not use it merely because those words appear in a knowledge-base question. For direct_answer, set the matching direct_answer_kind, "
+    "needs_graph=false, and suggested_strategy=none. For every other intent, set direct_answer_kind=none.\n"
     "  * global_dense: simple definition, formula, or single-fact lookup\n"
     "  * local_graph: question centers around specific grounded concepts and observed connections\n"
     "  * hybrid: multi-aspect or comparison questions\n"
@@ -316,7 +320,7 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "no_context_answer_zh": GENERIC_NO_CONTEXT_ZH,
         "query_rewrite_system": GENERIC_QUERY_REWRITE_SYSTEM,
         "json_response_fallback_system": GENERIC_JSON_RESPONSE_FALLBACK_SYSTEM,
-        "reflection_review_system": GENERIC_REFLECTION_REVIEW_SYSTEM,
+        "reflection_reviewer_system": "Review the complete answer for relevance to the current question, faithfulness to the full source text, and important omissions. Suggest only the single closed action required by the immutable system contract. Historical summaries are lower priority and are not evidence.",
         "question_perception_system": GENERIC_QUESTION_PERCEPTION_SYSTEM,
         "query_facet_extractor_system": GENERIC_QUERY_FACET_EXTRACTOR_SYSTEM,
         "query_facet_bilingual_suffix": GENERIC_QUERY_FACET_BILINGUAL_SUFFIX,
@@ -324,7 +328,6 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "agent_planner_system": GENERIC_AGENT_PLANNER_SYSTEM,
         "agent_planner_repair_suffix": GENERIC_AGENT_PLANNER_REPAIR_SUFFIX,
         "agent_evidence_evaluator_system": GENERIC_AGENT_EVIDENCE_EVALUATOR_SYSTEM,
-        "citation_entailment_judge_system": GENERIC_CITATION_ENTAILMENT_JUDGE_SYSTEM,
         "mid_concept_definition_system": GENERIC_MID_CONCEPT_DEFINITION_SYSTEM,
         "coarse_concept_definition_system": GENERIC_COARSE_CONCEPT_DEFINITION_SYSTEM,
         "concept_i18n_system": GENERIC_CONCEPT_I18N_SYSTEM,
@@ -356,7 +359,11 @@ DEFAULT_PROFILE: dict[str, Any] = {
 
 ACTIVE_PROFILE_KEYS = {"schema_version", "library_type", "ui_labels", "prompt_pack", "conversation_preferences"}
 ALLOWED_PROMPT_PACK_KEYS = frozenset(DEFAULT_PROFILE["prompt_pack"].keys())
-PROFILE_HOT_PROMPT_KEYS = ALLOWED_PROMPT_PACK_KEYS.difference(
+RETIRED_ANSWER_PROMPT_DEFAULTS = {
+    "reflection_review_system": GENERIC_REFLECTION_REVIEW_SYSTEM,
+    "citation_entailment_judge_system": GENERIC_CITATION_ENTAILMENT_JUDGE_SYSTEM,
+}
+PROFILE_HOT_PROMPT_KEYS = (ALLOWED_PROMPT_PACK_KEYS | RETIRED_ANSWER_PROMPT_DEFAULTS.keys()).difference(
     PROFILE_CONCEPT_PROMPT_KEYS
 )
 LEGACY_PROFILE_KEYS = {
@@ -412,9 +419,9 @@ def conversation_preference_prompt_guidance(
         "zh": "answer in Chinese",
     }[preferences["default_language"]]
     citation = {
-        "strict": "make verified citation support explicit for every material claim",
-        "compact": "keep citation wording compact while retaining verified support for every material claim",
-        "explain_failures": "state citation verification gaps explicitly and retain only verified claims",
+        "strict": "make the source support for factual answer units clear; the service binds original source spans",
+        "compact": "keep source explanations compact while preserving support for factual answer units",
+        "explain_failures": "state actual source gaps explicitly; transport and review failures are technical errors",
     }[preferences["citation_strictness"]]
     clarification = {
         "concise": "keep clarification requests concise",
@@ -451,11 +458,12 @@ def profile_lifecycle_diff(
 ) -> dict[str, Any]:
     """Classify effective Profile changes without treating prompts as authority."""
 
-    before_prompt = _effective_profile_mapping(before_profile_json, "prompt_pack")
-    after_prompt = _effective_profile_mapping(after_profile_json, "prompt_pack")
+    # Retired defaults are used only to replay historical lifecycle comparisons.
+    before_prompt = {**RETIRED_ANSWER_PROMPT_DEFAULTS, **_effective_profile_mapping(before_profile_json, "prompt_pack")}
+    after_prompt = {**RETIRED_ANSWER_PROMPT_DEFAULTS, **_effective_profile_mapping(after_profile_json, "prompt_pack")}
     changed_prompt_keys = sorted(
         key
-        for key in ALLOWED_PROMPT_PACK_KEYS
+        for key in ALLOWED_PROMPT_PACK_KEYS | RETIRED_ANSWER_PROMPT_DEFAULTS.keys()
         if before_prompt.get(key) != after_prompt.get(key)
     )
     concept_prompt_keys = sorted(
@@ -1499,6 +1507,60 @@ def reconcile_builtin_default_profile_startup() -> dict[str, Any]:
             "created": existing is None,
             "lifecycle_event_ids": [event.id for event in events],
         }
+
+
+def retire_legacy_answer_prompts(db: Session, *, execute: bool = False) -> dict[str, Any]:
+    """Versioned, idempotent retirement through the existing Profile outbox."""
+    statement = select(StrategyProfile).where(
+        StrategyProfile.is_active.is_(True), StrategyProfile.is_builtin.is_(False)
+    ).order_by(StrategyProfile.id.asc())
+    if execute:
+        statement = statement.with_for_update()
+    candidates = []
+    targets = []
+    for profile in db.scalars(statement):
+        raw = copy.deepcopy(profile.profile_json)
+        if not isinstance(raw, dict) or not isinstance(raw.get("prompt_pack"), dict):
+            raise ProfileIntegrityError("Retired prompt recovery requires a valid Profile object")
+        retired = sorted(set(raw["prompt_pack"]) & RETIRED_ANSWER_PROMPT_DEFAULTS.keys())
+        if not retired:
+            continue
+        _reject_sensitive_profile_keys(raw)
+        if not hmac.compare_digest(str(profile.profile_hash or ""), profile_hash(raw)):
+            raise ProfileIntegrityError("Retired prompt recovery rejected a Profile hash mismatch")
+        after = copy.deepcopy(raw)
+        for key in retired:
+            if not isinstance(after["prompt_pack"].pop(key), str):
+                raise ProfileIntegrityError("Retired prompt recovery requires text prompt fields")
+        normalized, _warnings = validate_profile_payload(after)
+        if normalized != after or profile.library_type != after.get("library_type"):
+            raise ProfileIntegrityError("Retired prompt recovery cannot repair unrelated Profile corruption")
+        targets.append({"profile_id": profile.id, "retired_keys": retired})
+        candidates.append((profile, raw, after))
+    result = {"protocol_version": "retire_answer_judge_prompts_v1", "execute": execute,
+              "targets": targets, "active_graph_mutated": False, "lifecycle_event_ids": []}
+    if not execute:
+        return result
+    events = []
+    for profile, before, after in candidates:
+        profile.profile_json, profile.profile_hash = after, profile_hash(after)
+        for kb in db.scalars(select(KnowledgeBase).where(KnowledgeBase.active_profile_id == profile.id).order_by(KnowledgeBase.id.asc()).with_for_update()):
+            event = _new_profile_lifecycle_event(db, knowledge_base_id=kb.id,
+                mutation="retire_answer_judge_prompts_v1", before_profile_id=profile.id, after_profile_id=profile.id,
+                before_profile_json=before, after_profile_json=after)
+            if event is not None:
+                events.append(event)
+    db.commit()
+    _dispatch_profile_lifecycle_events_or_raise(db, events)
+    result["lifecycle_event_ids"] = [event.id for event in events]
+    return result
+
+
+def reconcile_retired_answer_prompts_startup() -> dict[str, Any]:
+    from app.db import SessionLocal
+
+    with SessionLocal() as db:
+        return retire_legacy_answer_prompts(db, execute=True)
 
 
 def _dispatch_profile_lifecycle_events_or_raise(

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import AsyncIterator
+from contextlib import suppress
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from starlette.background import BackgroundTask
 
 from app.db import get_db
 from app.models import AgentRun, AgentTraceEvent
@@ -27,6 +29,7 @@ from app.schemas import (
 )
 from app.services.agent_graph import cancel_agent_run, run_agent, run_to_task_status, stream_agent_events
 from app.services.agent_admission import AgentAdmissionError, acquire_agent_request_slot
+from app.services.qa_performance import QAPerformance, qa_stage
 from app.services.agent_pe_audit import (
     AgentPEAuditIntegrityError,
     load_agent_pe_audit,
@@ -50,6 +53,7 @@ from app.services.ingestion import resolve_knowledge_base
 from app.services.retrieval import layered_context_search_chunks_with_audit, search_chunks_with_audit
 
 router = APIRouter()
+SSE_HEARTBEAT_SECONDS = 10.0
 ACTIVE_CONTEXT_GRAPH_ADMISSION_STATUS_CODE = 409
 ACTIVE_CONTEXT_GRAPH_REBUILD_FIX_COMMANDS = (
     "Run a full contextual-index and context-graph rebuild for this knowledge base.",
@@ -61,6 +65,42 @@ ACTIVE_CONTEXT_GRAPH_ADMISSION_RESPONSES = {
         "description": "The active contextual index or a dependent graph layer requires rebuild.",
     }
 }
+
+
+async def stream_sse_frames(
+    events: AsyncIterator[dict],
+    *,
+    heartbeat_seconds: float = SSE_HEARTBEAT_SECONDS,
+) -> AsyncIterator[str]:
+    """Frame one agent stream while keeping idle HTTP connections alive."""
+
+    interval = max(0.01, float(heartbeat_seconds))
+    iterator = events.__aiter__()
+    pending: asyncio.Task | None = None
+    try:
+        pending = asyncio.create_task(anext(iterator))
+        while True:
+            done, _pending = await asyncio.wait({pending}, timeout=interval)
+            if not done:
+                # SSE comments are transport-only. They do not enter the agent
+                # event contract, trace, Context Package, or model context.
+                yield ": keep-alive\n\n"
+                continue
+            try:
+                event = pending.result()
+            except StopAsyncIteration:
+                break
+            yield f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
+            pending = asyncio.create_task(anext(iterator))
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await pending
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            with suppress(asyncio.CancelledError, Exception):
+                await close()
 
 
 def agent_admission_http_exception(exc: AgentAdmissionError) -> HTTPException:
@@ -159,34 +199,14 @@ def gray_zone_trace_invariant_payload() -> dict:
     responses=ACTIVE_CONTEXT_GRAPH_ADMISSION_RESPONSES,
 )
 async def search(request: SearchRequest, db: Session = Depends(get_db)) -> dict:
-    knowledge_base = get_requested_knowledge_base(db, request.knowledge_base_id)
+    from app.services.intent_execution_agent import execute_intent_search
+
     try:
-        _session, conversation = load_conversation_state(
-            db,
-            knowledge_base_id=knowledge_base.id,
-            session_id=request.session_id,
-        )
-        effective_filters = merge_search_filters_with_conversation_constraints(
-            request.filters,
-            conversation.active_user_constraints,
-        )
-        results, model_audit = await search_chunks_with_audit(
-            db,
-            knowledge_base.id,
-            request.query,
-            effective_filters,
-            request.top_k,
-            retrieval_granularity=request.retrieval_granularity,
-            conversation_state_scope_hash=conversation.scope_hash,
-            conversation_state_audit=conversation.retrieval_audit(),
-            conversation_prompt_history=conversation.prompt_history,
-            conversation_prompt_history_audit=(
-                conversation.prompt_history_audit
-            ),
-        )
-        public_results = [
-            public_search_result_payload(item) for item in results
+        payload = await execute_intent_search(db, request)
+        payload["results"] = [
+            public_search_result_payload(item) for item in payload["results"]
         ]
+        return payload
     except ConversationStateNotFoundError as exc:
         db.rollback()
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -205,17 +225,6 @@ async def search(request: SearchRequest, db: Session = Depends(get_db)) -> dict:
             status_code=502,
             detail=search_model_dependency_failure_payload(exc),
         ) from exc
-    db.commit()
-    return {
-        "query": request.query,
-        "results": public_results,
-        "degraded_mode": is_degraded_mode(),
-        "model_audit": model_audit,
-        "retrieval_trace_id": model_audit.get("retrieval_trace_id"),
-        "context_package_id": model_audit.get("context_package_id"),
-        "retrieval_granularity": request.retrieval_granularity,
-        "conversation_state": conversation.public_payload(),
-    }
 
 
 @router.post(
@@ -224,61 +233,7 @@ async def search(request: SearchRequest, db: Session = Depends(get_db)) -> dict:
     responses=ACTIVE_CONTEXT_GRAPH_ADMISSION_RESPONSES,
 )
 async def graph_search(request: SearchRequest, db: Session = Depends(get_db)) -> dict:
-    knowledge_base = get_requested_knowledge_base(db, request.knowledge_base_id)
-    try:
-        _session, conversation = load_conversation_state(
-            db,
-            knowledge_base_id=knowledge_base.id,
-            session_id=request.session_id,
-        )
-        effective_filters = merge_search_filters_with_conversation_constraints(
-            request.filters,
-            conversation.active_user_constraints,
-        )
-        results, audit = await layered_context_search_chunks_with_audit(
-            db,
-            knowledge_base.id,
-            request.query,
-            effective_filters,
-            request.top_k,
-            route="layered_context_graph",
-            retrieval_granularity=request.retrieval_granularity,
-            conversation_state_scope_hash=conversation.scope_hash,
-            conversation_state_audit=conversation.retrieval_audit(),
-            conversation_prompt_history=conversation.prompt_history,
-            conversation_prompt_history_audit=(
-                conversation.prompt_history_audit
-            ),
-        )
-        public_results = [
-            public_search_result_payload(item) for item in results
-        ]
-    except ConversationStateNotFoundError as exc:
-        db.rollback()
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except (ConversationStateConflictError, ConversationStateIntegrityError) as exc:
-        db.rollback()
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ActiveContextGraphAdmissionError as exc:
-        db.rollback()
-        raise active_context_graph_admission_http_exception(exc) from exc
-    except GrayZoneTraceInvariantError as exc:
-        db.rollback()
-        raise HTTPException(status_code=409, detail=gray_zone_trace_invariant_payload()) from exc
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(status_code=502, detail={"code": "graph_search_failed", "message": public_exception_message(exc)}) from exc
-    db.commit()
-    return {
-        "query": request.query,
-        "results": public_results,
-        "degraded_mode": is_degraded_mode(),
-        "model_audit": audit,
-        "retrieval_trace_id": audit.get("retrieval_trace_id"),
-        "context_package_id": audit.get("context_package_id"),
-        "retrieval_granularity": request.retrieval_granularity,
-        "conversation_state": conversation.public_payload(),
-    }
+    return await search(request, db)
 
 
 @router.post(
@@ -289,8 +244,10 @@ async def graph_search(request: SearchRequest, db: Session = Depends(get_db)) ->
 async def qa(request: QARequest) -> dict:
     from app.db import SessionLocal
 
+    performance = QAPerformance()
     try:
-        admission = await acquire_agent_request_slot("qa")
+        with performance.activate(), qa_stage("admission_queue"):
+            admission = await acquire_agent_request_slot("qa")
         try:
             agent_request = AgentRequest(
                 question=request.question,
@@ -300,11 +257,9 @@ async def qa(request: QARequest) -> dict:
                 top_k=request.top_k,
                 history=request.history,
                 conversation_state_update=request.conversation_state_update,
-                retrieval_granularity=request.retrieval_granularity,
-                route="layered_context_graph",
                 stream_trace=False,
             )
-            with SessionLocal() as db:
+            with performance.activate(), SessionLocal() as db:
                 return await run_agent(db, agent_request, admission=admission)
         finally:
             await admission.release()
@@ -317,11 +272,15 @@ async def qa(request: QARequest) -> dict:
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
+        run_id = getattr(exc, "agent_run_id", None)
+        session_id = getattr(exc, "agent_session_id", None)
         raise HTTPException(
             status_code=502,
             detail={
                 "code": "agent_qa_failed",
                 "message": public_exception_message(exc),
+                "run_id": str(run_id) if run_id else None,
+                "session_id": str(session_id) if session_id else None,
             },
         ) from exc
 
@@ -333,18 +292,20 @@ async def qa(request: QARequest) -> dict:
 async def qa_stream(request: QARequest) -> StreamingResponse:
     from app.db import SessionLocal
 
+    performance = QAPerformance()
     try:
-        admission = await acquire_agent_request_slot("sse")
+        with performance.activate(), qa_stage("admission_queue"):
+            admission = await acquire_agent_request_slot("sse")
     except AgentAdmissionError as exc:
         raise agent_admission_http_exception(exc) from exc
     try:
         with SessionLocal() as db:
-            knowledge_base = get_requested_knowledge_base(db, request.knowledge_base_id)
-            try:
-                active_graph_admission_gate(db, knowledge_base.id)
-            except ActiveContextGraphAdmissionError as exc:
-                db.rollback()
-                raise
+            # Resolve only the knowledge-base identity before opening the SSE
+            # response. Unified Agent question perception must run before the
+            # retrieval-only graph admission gate so direct_answer can work
+            # even when no active graph exists. Retrieval requests still fail
+            # closed inside execute_agent_run and are emitted as SSE errors.
+            get_requested_knowledge_base(db, request.knowledge_base_id)
         admission.raise_if_lost()
     except AgentAdmissionError as exc:
         await admission.release()
@@ -364,25 +325,35 @@ async def qa_stream(request: QARequest) -> StreamingResponse:
             top_k=request.top_k,
             history=request.history,
             conversation_state_update=request.conversation_state_update,
-            retrieval_granularity=request.retrieval_granularity,
-            route="layered_context_graph",
             stream_trace=True,
         )
 
-        async def event_stream():
+        async def agent_event_objects():
             try:
-                async for event in stream_agent_events(agent_request, admission=admission):
-                    yield f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
+                async for event in stream_agent_events(agent_request, admission=admission, performance=performance):
+                    yield event
             except AgentAdmissionError as exc:
-                yield f"data: {json.dumps({'type': 'error', 'error': exc.message, 'detail': exc.payload()}, ensure_ascii=False)}\n\n"
+                yield {"type": "error", "error": exc.message, "detail": exc.payload()}
             except ActiveContextGraphAdmissionError:
                 detail = active_context_graph_admission_payload()
-                yield f"data: {json.dumps({'type': 'error', 'error': detail['message'], 'detail': detail}, ensure_ascii=False)}\n\n"
+                yield {"type": "error", "error": detail["message"], "detail": detail}
             except Exception as exc:
-                yield f"data: {json.dumps({'type': 'error', 'error': public_exception_message(exc)}, ensure_ascii=False)}\n\n"
+                yield {"type": "error", "error": public_exception_message(exc)}
+
+        async def event_stream():
+            async for frame in stream_sse_frames(agent_event_objects()):
+                yield frame
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(event_stream(), media_type="text/event-stream", background=BackgroundTask(admission.release))
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
     except BaseException:
         await admission.release()
         raise
@@ -396,10 +367,12 @@ async def qa_stream(request: QARequest) -> StreamingResponse:
 async def agent_call(request: AgentRequest) -> dict:
     from app.db import SessionLocal
 
+    performance = QAPerformance()
     try:
-        admission = await acquire_agent_request_slot("agent")
+        with performance.activate(), qa_stage("admission_queue"):
+            admission = await acquire_agent_request_slot("agent")
         try:
-            with SessionLocal() as db:
+            with performance.activate(), SessionLocal() as db:
                 return await run_agent(db, request, admission=admission)
         finally:
             await admission.release()

@@ -72,8 +72,8 @@ def test_runtime_payload_and_lifecycle_expose_traversal_observation_budget(monke
     monkeypatch.setattr(runtime_settings, "get_settings", lambda: settings)
     monkeypatch.setattr(
         runtime_settings,
-        "_env_entries",
-        lambda _path: {"TRAVERSAL_OBSERVATION_BUDGET": "7"},
+        "_runtime_settings_values",
+        lambda: {"traversal_observation_budget": 7},
     )
     monkeypatch.setattr(runtime_settings, "model_bridge_status_payload", lambda **_kwargs: {})
     monkeypatch.setattr(runtime_settings, "current_runtime_settings_version", lambda: "unit")

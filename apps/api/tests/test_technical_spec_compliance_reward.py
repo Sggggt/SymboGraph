@@ -234,6 +234,19 @@ def test_forged_or_contradictory_eligibility_is_a_corruption_blocker(
     }
     assert "policy_not_updated_from_reward" not in _codes(issues)
 
+    target_issues: list[dict[str, Any]] = []
+    target_summary = module._check_policy_reward_consumption(
+        db_session,
+        sample_knowledge_base.id,
+        target_issues,
+        target_protocol_active=True,
+    )
+    assert _codes(target_issues) == {
+        "historical_policy_reward_eligibility_or_binding_corrupt"
+    }
+    assert target_issues[0]["severity"] == "warning"
+    assert target_summary["corrupt_reward_count"] == 6
+
 
 def test_only_replay_valid_agent_reward_requires_policy_consumption(
     db_session,

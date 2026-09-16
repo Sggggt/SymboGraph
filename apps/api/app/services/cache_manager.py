@@ -23,7 +23,7 @@ ORDINARY_QUERY_REPLAY_POINTER_WRITE_SESSION_KEY = (
     "ordinary_query_replay_pointer_writes_v1"
 )
 ACTIVE_RETRIEVAL_CACHE_KEY_PROTOCOL_VERSION = (
-    "layered_retrieval_full_identity_key_v5"
+    "layered_retrieval_full_identity_key_v6"
 )
 AGENT_REPLAY_POINTER_KEY_PROTOCOL_VERSION = (
     "agent_provider_free_upstream_pointer_key_v1"
@@ -31,8 +31,13 @@ AGENT_REPLAY_POINTER_KEY_PROTOCOL_VERSION = (
 ORDINARY_QUERY_REPLAY_POINTER_KEY_PROTOCOL_VERSION = (
     "ordinary_query_provider_free_pointer_key_v1"
 )
+INTENT_RETRIEVAL_CACHE_KEY_PROTOCOL_VERSION = (
+    "intent_execution_retrieval_cache_key_v2"
+)
 STRICT_CACHED_JSON_MAX_BYTES = 2 * 1024 * 1024
 STRICT_CACHED_JSON_MAX_DEPTH = 128
+REDIS_INVALIDATION_BATCH_SIZE = 256
+REDIS_CONNECTION_POOL_MAX = 32
 SENSITIVE_CACHE_KEY_PROTOCOL_VERSION = (
     "recursive_sensitive_cache_key_rejection_v4"
 )
@@ -65,6 +70,7 @@ ACTIVE_RETRIEVAL_CACHE_COMPONENT_FIELDS = frozenset(
         "semantic_entry_query",
         "semantic_entry_query_hash",
         "filters",
+        "source_filter_protocol",
         "embedding_text_version",
         "local_hint_protocol_version",
         "contextual_index_hash",
@@ -123,6 +129,39 @@ ACTIVE_RETRIEVAL_CACHE_COMPONENT_FIELDS = frozenset(
         "repair_directive_protocol_version",
         "repair_directive_hash",
         "repair_action_type",
+    }
+)
+INTENT_RETRIEVAL_CACHE_COMPONENT_FIELDS = frozenset(
+    {
+        "cache_key_protocol_version",
+        "knowledge_base_id",
+        "conversation_identity_hash",
+        "conversation_scope_hash",
+        "question_hash",
+        "filters_hash",
+        "task_hash",
+        "intent_hash",
+        "strategy_hash",
+        "accepted_plan_hash",
+        "capability_hash",
+        "effective_budget_hash",
+        "entry_layer",
+        "semantic_query_hash",
+        "lexical_groups_hash",
+        "generate_lexical",
+        "hybrid",
+        "layer_weights_hash",
+        "graph_state_id",
+        "graph_identity",
+        "graph_snapshot_hash",
+        "source_manifest_hash",
+        "embedding_identity",
+        "lexical_identity",
+        "ranking_protocol_hash",
+        "traversal_protocol_hash",
+        "runtime_settings_hash",
+        "profile_hash",
+        "result_top_k",
     }
 )
 
@@ -342,12 +381,94 @@ def validate_active_retrieval_cache_components(
         != ACTIVE_RETRIEVAL_CACHE_KEY_PROTOCOL_VERSION
     ):
         raise ValueError("active retrieval cache key protocol mismatch")
+    if cache_components.get('source_filter_protocol') != 'active_source_filters_v2':
+        raise ValueError('active retrieval source filter protocol mismatch')
     if str(cache_components.get("knowledge_base_id") or "") != str(
         knowledge_base_id
     ):
         raise ValueError("active retrieval cache knowledge-base identity mismatch")
     # This is both a serializability gate and a ban on NaN/Infinity or
     # ``default=str`` coercion in an active identity.
+    serialized = json.dumps(
+        cache_components,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return json.loads(serialized)
+
+
+def validate_intent_retrieval_cache_components(
+    knowledge_base_id: str,
+    cache_components: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(cache_components, dict):
+        raise TypeError("intent retrieval cache components must be a JSON object")
+    validate_no_sensitive_cache_keys(
+        cache_components,
+        field="intent retrieval cache components",
+    )
+    actual_fields = frozenset(cache_components)
+    if actual_fields != INTENT_RETRIEVAL_CACHE_COMPONENT_FIELDS:
+        missing = sorted(INTENT_RETRIEVAL_CACHE_COMPONENT_FIELDS - actual_fields)
+        unexpected = sorted(actual_fields - INTENT_RETRIEVAL_CACHE_COMPONENT_FIELDS)
+        raise ValueError(
+            "intent retrieval cache requires the complete target identity; "
+            f"missing={missing!r}, unexpected={unexpected!r}"
+        )
+    if (
+        cache_components.get("cache_key_protocol_version")
+        != INTENT_RETRIEVAL_CACHE_KEY_PROTOCOL_VERSION
+    ):
+        raise ValueError("intent retrieval cache key protocol mismatch")
+    if str(cache_components.get("knowledge_base_id") or "") != str(
+        knowledge_base_id
+    ):
+        raise ValueError("intent retrieval cache knowledge-base identity mismatch")
+    for field in (
+        "conversation_scope_hash",
+        "conversation_identity_hash",
+        "question_hash",
+        "filters_hash",
+        "task_hash",
+        "intent_hash",
+        "strategy_hash",
+        "accepted_plan_hash",
+        "capability_hash",
+        "effective_budget_hash",
+        "semantic_query_hash",
+        "lexical_groups_hash",
+        "layer_weights_hash",
+        "graph_identity",
+        "graph_snapshot_hash",
+        "source_manifest_hash",
+        "ranking_protocol_hash",
+        "traversal_protocol_hash",
+        "runtime_settings_hash",
+        "profile_hash",
+    ):
+        digest = cache_components.get(field)
+        if (
+            not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            raise ValueError(f"intent retrieval cache {field} is not SHA-256")
+    lexical_identity = cache_components.get("lexical_identity")
+    if lexical_identity is not None and (
+        not isinstance(lexical_identity, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", lexical_identity)
+    ):
+        raise ValueError("intent retrieval cache lexical identity is invalid")
+    if cache_components.get("hybrid") is True and lexical_identity is None:
+        raise ValueError("hybrid intent retrieval cache requires lexical identity")
+    if cache_components.get("generate_lexical") is False and lexical_identity is not None:
+        raise ValueError("dense-only intent retrieval cache cannot bind lexical identity")
+    if cache_components.get("entry_layer") not in {"coarse", "mid", "chunk"}:
+        raise ValueError("intent retrieval cache entry layer is invalid")
+    result_top_k = cache_components.get("result_top_k")
+    if type(result_top_k) is not int or not 1 <= result_top_k <= 50:
+        raise ValueError("intent retrieval cache result top-k is invalid")
     serialized = json.dumps(
         cache_components,
         ensure_ascii=False,
@@ -504,7 +625,15 @@ class CacheManager:
         try:
             import redis as redis_lib
 
-            self._redis = redis_lib.from_url(self._settings.redis_url, decode_responses=False, socket_connect_timeout=2, socket_timeout=2)
+            self._redis = redis_lib.from_url(
+                self._settings.redis_url,
+                decode_responses=False,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+                health_check_interval=30,
+                max_connections=REDIS_CONNECTION_POOL_MAX,
+                retry_on_timeout=False,
+            )
             self._redis.ping()
         except Exception:
             self._redis = None
@@ -545,6 +674,18 @@ class CacheManager:
             self._key("agent_replay", knowledge_base_id, digest),
             digest,
         )
+
+    def _intent_retrieval_key(
+        self,
+        knowledge_base_id: str,
+        cache_components: dict[str, Any],
+    ) -> tuple[str, str]:
+        components = validate_intent_retrieval_cache_components(
+            knowledge_base_id,
+            cache_components,
+        )
+        digest = self._payload_hash(components)
+        return self._key("intent_retrieval", knowledge_base_id, digest), digest
 
     def _ordinary_query_replay_pointer_key(
         self,
@@ -699,6 +840,18 @@ class CacheManager:
         )
         return self._read_json_object(key, digest)
 
+    def read_intent_retrieval(
+        self,
+        knowledge_base_id: str,
+        *,
+        cache_components: dict[str, Any],
+    ) -> SearchCacheRead:
+        key, digest = self._intent_retrieval_key(
+            knowledge_base_id,
+            cache_components,
+        )
+        return self._read_json_object(key, digest)
+
     def read_ordinary_query_replay_pointer(
         self,
         knowledge_base_id: str,
@@ -770,6 +923,45 @@ class CacheManager:
             pointer_components,
         )
         self._set(key, payload, ttl)
+
+    def set_intent_retrieval(
+        self,
+        knowledge_base_id: str,
+        payload: dict[str, Any],
+        ttl: int = 300,
+        *,
+        cache_components: dict[str, Any],
+    ) -> None:
+        if not isinstance(payload, dict):
+            raise TypeError("intent retrieval cache payload must be a JSON object")
+        validate_no_sensitive_cache_keys(
+            payload,
+            field="intent retrieval cache payload",
+        )
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        key, _digest = self._intent_retrieval_key(
+            knowledge_base_id,
+            cache_components,
+        )
+        self._set(key, payload, ttl)
+
+    def delete_intent_retrieval(
+        self,
+        knowledge_base_id: str,
+        *,
+        cache_components: dict[str, Any],
+    ) -> bool:
+        key, _digest = self._intent_retrieval_key(
+            knowledge_base_id,
+            cache_components,
+        )
+        return self._delete_key(key)
 
     def delete_agent_replay_pointer(
         self,
@@ -876,9 +1068,24 @@ class CacheManager:
                     "Shared cache invalidation is unavailable; Redis is not connected"
                 )
             return False
+        def delete_batch(keys: list[Any]) -> None:
+            if not keys:
+                return
+            pipeline_factory = getattr(self._redis, "pipeline", None)
+            if callable(pipeline_factory):
+                pipeline = pipeline_factory(transaction=False)
+                pipeline.delete(*keys)
+                pipeline.execute()
+            else:
+                self._redis.delete(*keys)
         try:
+            batch: list[Any] = []
             for key in self._redis.scan_iter(match=f"kg:*:{knowledge_base_id}:*"):
-                self._redis.delete(key)
+                batch.append(key)
+                if len(batch) >= REDIS_INVALIDATION_BATCH_SIZE:
+                    delete_batch(batch)
+                    batch = []
+            delete_batch(batch)
         except Exception as exc:
             if strict:
                 raise CacheInvalidationError(

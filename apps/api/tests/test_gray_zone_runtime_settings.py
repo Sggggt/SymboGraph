@@ -15,10 +15,6 @@ def _active_settings(**overrides):
         "agent_path_distance_green_threshold": 0.45,
         "agent_path_distance_gray_threshold": 1.35,
         "agent_path_distance_hard_threshold": 2.4,
-        "query_facet_posterior_enabled": True,
-        "query_facet_posterior_observation_budget": 64,
-        "query_facet_posterior_round_budget": 2,
-        "query_facet_posterior_convergence_epsilon": 0.02,
         "model_bridge_enabled": False,
     }
     values.update(overrides)
@@ -208,111 +204,6 @@ def test_gray_zone_observation_cadence_hot_reload_contract(monkeypatch):
     assert settings_reader.cache_clear_calls == 1
     assert cache_clear_calls == [True]
     assert publish_calls == [["GRAY_ZONE_OBSERVATION_CADENCE"]]
-
-
-def test_query_facet_posterior_settings_are_hot_reloadable_and_gray_identity_isolated(
-    monkeypatch,
-):
-    from app.core.config import HOT_RELOAD_SETTINGS, Settings
-    from app.schemas import ModelSettingsUpdate
-    from app.services import cache_manager, context_graph, runtime_settings
-
-    fields = {
-        "query_facet_posterior_enabled",
-        "query_facet_posterior_observation_budget",
-        "query_facet_posterior_round_budget",
-        "query_facet_posterior_convergence_epsilon",
-    }
-    settings = Settings()
-    assert settings.query_facet_posterior_enabled is True
-    assert settings.query_facet_posterior_observation_budget == 64
-    assert settings.query_facet_posterior_round_budget == 2
-    assert settings.query_facet_posterior_convergence_epsilon == 0.02
-    assert fields.issubset(HOT_RELOAD_SETTINGS)
-    assert fields.issubset(
-        set(runtime_settings.runtime_lifecycle_payload()["hot_reloadable"])
-    )
-    for invalid in (
-        {"query_facet_posterior_observation_budget": 0},
-        {"query_facet_posterior_observation_budget": 1025},
-        {"query_facet_posterior_round_budget": 0},
-        {"query_facet_posterior_round_budget": 3},
-        {"query_facet_posterior_convergence_epsilon": -0.01},
-        {"query_facet_posterior_convergence_epsilon": 1.01},
-    ):
-        with pytest.raises(ValidationError):
-            ModelSettingsUpdate(**invalid)
-
-    base = context_graph.agent_operating_envelope(settings)
-    changed = {
-        **base,
-        "query_facet_posterior_observation_budget": 12,
-        "query_facet_posterior_round_budget": 1,
-        "query_facet_posterior_convergence_epsilon": 0.1,
-    }
-    assert (
-        context_graph.gray_zone_runtime_settings_hash(base)
-        == context_graph.gray_zone_runtime_settings_hash(changed)
-    )
-    assert (
-        context_graph.traversal_protocol_hash(base)
-        != context_graph.traversal_protocol_hash(changed)
-    )
-
-    settings_reader = _SettingsReader(_active_settings())
-    env_write_calls: list[dict] = []
-    env_apply_calls: list[dict] = []
-    cache_clear_calls: list[bool] = []
-    publish_calls: list[list[str]] = []
-    monkeypatch.setattr(runtime_settings, "get_settings", settings_reader)
-    monkeypatch.setattr(runtime_settings, "_env_entries", lambda _path: {})
-    monkeypatch.setattr(runtime_settings, "normalize_env_file", lambda: False)
-    monkeypatch.setattr(
-        runtime_settings,
-        "_update_env_file",
-        lambda updates: env_write_calls.append(dict(updates)),
-    )
-    monkeypatch.setattr(
-        runtime_settings,
-        "_apply_runtime_env",
-        lambda updates: env_apply_calls.append(dict(updates)),
-    )
-    monkeypatch.setattr(
-        runtime_settings,
-        "model_settings_payload",
-        lambda: {"status": "ok"},
-    )
-    monkeypatch.setattr(
-        cache_manager,
-        "clear_cache_manager",
-        lambda: cache_clear_calls.append(True),
-    )
-    monkeypatch.setattr(
-        runtime_settings,
-        "publish_runtime_settings_version",
-        lambda changed_keys, source="api": publish_calls.append(
-            list(changed_keys)
-        ),
-    )
-    patch = {
-        "query_facet_posterior_enabled": True,
-        "query_facet_posterior_observation_budget": 12,
-        "query_facet_posterior_round_budget": 1,
-        "query_facet_posterior_convergence_epsilon": 0.1,
-    }
-    assert runtime_settings.update_model_settings(patch) == {"status": "ok"}
-    assert env_write_calls == [patch]
-    assert env_apply_calls == [patch]
-    assert settings_reader.cache_clear_calls == 1
-    assert cache_clear_calls == [True]
-    assert publish_calls == [
-        [
-            "QUERY_FACET_POSTERIOR_ENABLED",
-            "QUERY_FACET_POSTERIOR_OBSERVATION_BUDGET",
-            "QUERY_FACET_POSTERIOR_ROUND_BUDGET",
-            "QUERY_FACET_POSTERIOR_CONVERGENCE_EPSILON",
-        ]
-    ]
 
 
 @pytest.mark.parametrize(

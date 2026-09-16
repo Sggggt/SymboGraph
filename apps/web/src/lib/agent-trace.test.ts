@@ -30,22 +30,9 @@ function traceEvent(node: AgentTraceEventPayload["node"]): AgentTraceEventPayloa
 }
 
 describe("agent trace helpers", () => {
-  it("uses four-layer P&E fallback steps", () => {
-    expect(contextGraphTraceFallbackSteps).toEqual([
-      "query_understanding",
-      "query_facet_extraction",
-      "agent_planner",
-      "typed_action_validation",
-      "entry_selection",
-      "layer_drilldown",
-      "frontier_traversal",
-      "chunk_recall",
-      "structure_context_restoration",
-      "context_package",
-      "grounded_answer",
-      "citation_verification",
-      "reward_event",
-    ]);
+  it("uses the retrieval controller for current requests", () => {
+    expect(contextGraphTraceFallbackSteps).toEqual(["retrieval_control"]);
+    expect(traceNodeLabel("retrieval_control")).toBe("检索与回答进度");
   });
 
   it("labels context graph nodes in Chinese", () => {
@@ -90,8 +77,15 @@ describe("agent trace helpers", () => {
     expect([...retrievalSummary, ...contextSummary]).toEqual(["粗入口: 2", "Stage 队列: 3", "Frontier pop: 5", "支配剪枝: 2", "RQ 路径: 1/2/3", "命中片段: 10", "恢复片段: 6", "证据包: pkg-1"]);
   });
 
-  it("renders retrieval granularity in Chinese", () => {
-    expect(traceAuditSummary(traceScores({ retrieval_granularity: "mid" }))).toContain("检索模式: 普通模式");
-    expect(traceAuditSummary(traceScores({ retrieval_granularity: "coarse" }))).toContain("检索模式: 摘要模式");
+  it("renders the model-selected target entry layer", () => {
+    const summary = traceAuditSummary({
+      contract_version: "agent_trace_scores_public_v1",
+      audit_kind: "intent_execution",
+      entry_layer: "coarse",
+      model_call_count: 1,
+      score_fields_used: [],
+    });
+    expect(summary).toContain("入口层: 粗概念");
+    expect(summary).toContain("模型调用: 1");
   });
 });

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable
 import http.client
 import ipaddress
 import json
@@ -19,6 +20,8 @@ from anthropic import AsyncAnthropic
 
 from app.core.concurrency import model_request_slot
 from app.core.config import get_settings
+from app.services.build_performance import measured, current_performance, measure
+from app.services.qa_performance import current_qa_performance, qa_stage, qa_timed
 from app.services.resource_guard import effective_embedding_batch_size, enforce_memory_budget
 from app.services.strategy_profiles import (
     DEFAULT_ANSWER_SYSTEM_PREFIX,
@@ -31,7 +34,6 @@ from app.services.strategy_profiles import (
     DEFAULT_NO_CONTEXT_ZH,
     DEFAULT_QUERY_REWRITE_SYSTEM,
     DEFAULT_QUESTION_PERCEPTION_SYSTEM,
-    DEFAULT_REFLECTION_REVIEW_SYSTEM,
     ANSWER_GROUNDING_ENVELOPE_PROTOCOL_VERSION,
     active_profile_json,
     compose_immutable_grounded_profile_prompt,
@@ -59,7 +61,7 @@ ANTHROPIC_GROUNDED_ANSWER_OUTPUT_BUDGET_PROTOCOL_VERSION = (
 )
 PROVIDER_PROMPT_CACHE_PROTOCOL_VERSION = "provider_system_prompt_cache_v1"
 ANTHROPIC_SYSTEM_PROMPT_CACHE_CONTROL = {"type": "ephemeral"}
-QUESTION_PERCEPTION_JSON_MAX_TOKENS = 1024
+QUESTION_PERCEPTION_JSON_MAX_TOKENS = 4096
 MAX_DOH_RESPONSE_BODY_BYTES = 256 * 1024
 MAX_DOH_ANSWER_RECORDS = 256
 DOH_REQUEST_TIMEOUT_SECONDS = 5.0
@@ -346,6 +348,7 @@ class EmbeddingProvider:
     async def embed_texts(self, texts: list[str], text_type: str = "document") -> list[list[float]]:
         return (await self.embed_texts_with_meta(texts, text_type=text_type)).vectors
 
+    @qa_timed("embedding", role="embedding")
     async def embed_texts_with_meta(self, texts: list[str], text_type: str = "document") -> "EmbeddingCallResult":
         # Keep protocol rejection outside the fallback try/except.  An unknown
         # embedding transport must never degrade into synthetic vectors.
@@ -391,16 +394,31 @@ class EmbeddingProvider:
 
     async def _openai_compatible_embeddings(self, texts: list[str], text_type: str = "document") -> list[list[float]]:
         self._require_supported_embedding_protocol()
-        vectors: list[list[float]] = []
-        start = 0
-        while start < len(texts):
-            batch_size = effective_embedding_batch_size(self.settings.embedding_batch_size)
-            enforce_memory_budget("embedding_batch")
-            batch = texts[start : start + batch_size]
-            vectors.extend(await self._openai_compatible_embeddings_batch(batch, text_type=text_type))
-            start += batch_size
-        return vectors
+        # At most concurrency tasks exist at once; preserve batch output order.
+        import asyncio
+        batch_size = effective_embedding_batch_size(self.settings.embedding_batch_size)
+        count = (len(texts) + batch_size - 1) // batch_size
+        results: list[list[list[float]] | None] = [None] * count
+        cursor = 0
+        async def worker():
+            nonlocal cursor
+            while cursor < count:
+                index = cursor
+                cursor += 1
+                enforce_memory_budget("embedding_batch")
+                start = index * batch_size
+                results[index] = await self._openai_compatible_embeddings_batch(texts[start:start+batch_size], text_type=text_type)
+        try:
+            async with asyncio.TaskGroup() as group:
+                for _ in range(min(count, max(1, self.settings.model_request_concurrency))):
+                    group.create_task(worker())
+        except ExceptionGroup as exc:
+            if len(exc.exceptions) == 1:
+                raise exc.exceptions[0] from None
+            raise
+        return [vector for result in results for vector in (result or [])]
 
+    @measured("embedding_request")
     async def _openai_compatible_embeddings_batch(self, texts: list[str], text_type: str = "document") -> list[list[float]]:
         payload: dict[str, Any] = {
             "model": self.embedding_model,
@@ -435,7 +453,11 @@ class EmbeddingProvider:
                 resolve_ip=self.settings.embedding_resolve_ip,
                 purpose="embedding",
             )
-        return [item["embedding"] for item in data["data"]]
+        result = [item["embedding"] for item in data["data"]]
+        performance = current_performance()
+        if performance:
+            performance.embedding_vector_count += len(result)
+        return result
 
     def _fake_embedding(self, text: str) -> list[float]:
         vector = []
@@ -592,6 +614,8 @@ class ChatProvider:
     ) -> None:
         if not isinstance(usage, dict):
             self.last_usage_audit = self._empty_usage_audit()
+            if current_performance():
+                current_performance().provider_cache_unknown_responses += 1
             return
         if protocol == "anthropic":
             input_tokens = self._usage_int(usage.get("input_tokens"))
@@ -645,6 +669,14 @@ class ChatProvider:
             ),
             "provider_response_persisted": False,
         }
+
+        performance = current_performance()
+        if performance:
+            if cache_read is None:
+                performance.provider_cache_unknown_responses += 1
+            else:
+                performance.provider_cache_observations += 1
+                performance.provider_cache_hits += int(cache_read > 0)
 
     def provider_call_audit(self) -> dict[str, Any]:
         return {
@@ -740,32 +772,30 @@ class ChatProvider:
                 fallback_reason=public_exception_message(exc),
             )
 
-    async def classify_json(
+    def _structured_json_payload(
         self,
+        *,
         system_prompt: str,
         user_prompt: str,
-        fallback: dict[str, Any] | None = None,
-        *,
-        max_tokens: int | None = None,
+        max_tokens: int | None,
     ) -> dict[str, Any]:
-        if not self.api_key:
-            if not self.settings.enable_model_fallback:
-                raise FallbackDisabledError(f"{self.api_key_env_name} is required because ENABLE_MODEL_FALLBACK is false")
-            if fallback is None:
-                raise FallbackDisabledError(f"{self.api_key_env_name} is required (no fallback provided)")
-            return fallback
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            "temperature": 0.0,
-            "response_format": {"type": "json_object"},
-        }
         if max_tokens is not None and (
             isinstance(max_tokens, bool)
             or not isinstance(max_tokens, int)
             or not 256 <= max_tokens <= 32_768
         ):
-            raise ValueError("Structured JSON max_tokens must be an integer in 256..32768")
+            raise ValueError(
+                "Structured JSON max_tokens must be an integer in 256..32768"
+            )
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
         if self.api_protocol == "anthropic":
             if self.purpose == "graph":
                 input_budget = int(
@@ -793,6 +823,27 @@ class ChatProvider:
                 int(getattr(self.settings, "chat_json_max_tokens", 12_000)),
                 max_tokens,
             )
+        return payload
+
+    async def classify_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        fallback: dict[str, Any] | None = None,
+        *,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        if not self.api_key:
+            if not self.settings.enable_model_fallback:
+                raise FallbackDisabledError(f"{self.api_key_env_name} is required because ENABLE_MODEL_FALLBACK is false")
+            if fallback is None:
+                raise FallbackDisabledError(f"{self.api_key_env_name} is required (no fallback provided)")
+            return fallback
+        payload = self._structured_json_payload(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=max_tokens,
+        )
         try:
             return await self._post_chat_json_with_response_format_fallback(payload)
         except Exception as exc:
@@ -801,6 +852,31 @@ class ChatProvider:
             if fallback is None:
                 raise
             return fallback
+
+    async def classify_json_streaming(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        max_tokens: int,
+        on_text_delta: Callable[[str], Awaitable[None]],
+    ) -> dict[str, Any]:
+        """Stream one structured response while retaining final closed parsing."""
+
+        if not self.api_key:
+            raise FallbackDisabledError(
+                f"{self.api_key_env_name} is required because live structured streaming has no fallback"
+            )
+        payload = self._structured_json_payload(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=max_tokens,
+        )
+        text = await self._post_chat_text_streaming(
+            payload,
+            on_text_delta=on_text_delta,
+        )
+        return self._parse_json_object(text)
 
     async def classify_json_bounded(
         self,
@@ -848,76 +924,32 @@ class ChatProvider:
                 raise
             return question
 
-    async def reflect_answer(self, question: str, answer: str, contexts: list[dict]) -> dict[str, Any]:
-        if not self.api_key:
-            if not self.settings.enable_model_fallback:
-                raise FallbackDisabledError(f"{self.api_key_env_name} is required because ENABLE_MODEL_FALLBACK is false")
-            return {"has_issue": False, "issue_type": "none", "suggestion": ""}
-        context_text = "\n\n".join(
-            f"[{i+1}] {ctx.get('document_title', '')}\n{ctx.get('content', '')[:600]}"
-            for i, ctx in enumerate(contexts)
-        )
-        profile = active_profile_json()
-        reflection_domain = profile_prompt(profile, "reflection_domain", "KnowledgeBase knowledge-base assistant")
-        citation_domain = profile_prompt(profile, "citation_domain", "KnowledgeBase excerpts")
-        system_prompt = profile_prompt_template(
-            profile,
-            "reflection_review_system",
-            DEFAULT_REFLECTION_REVIEW_SYSTEM,
-            {"reflection_domain": reflection_domain, "citation_domain": citation_domain},
-        )
-        user_prompt = (
-            f"Question: {question}\n\n"
-            f"Answer: {answer}\n\n"
-            f"{citation_domain}:\n{context_text}\n\n"
-            "Check: 1) Does the answer contain claims not found in the excerpts? 2) Is the question fully answered? 3) Are there contradictions between the answer and excerpts?"
-        )
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.0,
-            "response_format": {"type": "json_object"},
-            "max_tokens": min(
-                int(getattr(self.settings, "chat_json_max_tokens", 12_000)),
-                QUESTION_PERCEPTION_JSON_MAX_TOKENS,
-            ),
-        }
-        try:
-            result = await self._post_chat_json_with_response_format_fallback(payload)
-            return {
-                "has_issue": bool(result.get("has_issue")),
-                "issue_type": str(result.get("issue_type", "none")),
-                "suggestion": str(result.get("suggestion", "")),
-            }
-        except Exception:
-            if not self.settings.enable_model_fallback:
-                raise
-            return {"has_issue": False, "issue_type": "none", "suggestion": ""}
-
     async def perceive_question(self, question: str, history: list[dict] | None = None) -> dict[str, Any]:
         """Perceive user intent, extract entities, and decompose the question.
 
         Returns a dict with keys:
-        - intent: one of definition, comparison, application, procedure, analysis, unknown
+        - intent: one of direct_answer, definition, comparison, application,
+          procedure, analysis, formula_table_lookup, unknown
+        - direct_answer_kind: a closed system-capability subtype, or none
         - entities: list of source-grounded concepts found in the question
         - sub_queries: list of sub-questions if multi-hop
         - needs_graph: whether graph search is likely helpful
-        - suggested_strategy: one of global_dense, local_graph, hybrid, community
+        - suggested_strategy: one of none, global_dense, local_graph, hybrid,
+          community
         """
         if not self.api_key:
             if not self.settings.enable_model_fallback:
                 raise FallbackDisabledError(f"{self.api_key_env_name} is required because ENABLE_MODEL_FALLBACK is false")
             return {
                 "intent": "unknown",
+                "direct_answer_kind": "none",
                 "entities": [],
                 "sub_queries": [question],
                 "needs_graph": False,
                 "suggested_strategy": "hybrid",
             }
-        history_text = "\n".join(f"{item.get('role')}: {item.get('content')}" for item in (history or [])[-4:])
+        from app.services.agent_reflection import PROMPT_PRIORITY_RULES, history_summary_projection
+        history_text, _history_audit = history_summary_projection(history or [], max_characters=self.settings.agent_history_summary_max_chars)
         profile = active_profile_json()
         perception_domain = profile_prompt(profile, "perception_domain", "context-graph-grounded knowledge-base agent")
         entity_label = profile_prompt(profile, "entity_label", "source-grounded concepts")
@@ -927,35 +959,40 @@ class ChatProvider:
             DEFAULT_QUESTION_PERCEPTION_SYSTEM,
             {"perception_domain": perception_domain, "entity_label": entity_label},
         )
+        from app.services.agent_intent import (
+            QUESTION_PERCEPTION_IMMUTABLE_CONTRACT,
+        )
+
+        system_prompt = (
+            f"{system_prompt.strip()}\n\n"
+            f"{QUESTION_PERCEPTION_IMMUTABLE_CONTRACT}\n\n{PROMPT_PRIORITY_RULES}"
+        )
         user_prompt = (
-            f"History:\n{history_text}\n\nQuestion:\n{question}\n\n"
+            f"Current user question:\n{question}\n\nLowest-priority history summary (not evidence):\n{history_text}\n\n"
             "Analyze this question and output the JSON perception result."
         )
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.0,
-            "response_format": {"type": "json_object"},
-        }
         default_result = {
             "intent": "unknown",
+            "direct_answer_kind": "none",
             "entities": [],
             "sub_queries": [question],
             "needs_graph": False,
             "suggested_strategy": "hybrid",
         }
         try:
-            result = await self._post_chat_json_with_response_format_fallback(payload)
-            return {
-                "intent": str(result.get("intent", "unknown")).lower(),
-                "entities": list(result.get("entities", [])),
-                "sub_queries": list(result.get("sub_queries", [question])),
-                "needs_graph": bool(result.get("needs_graph", False)),
-                "suggested_strategy": str(result.get("suggested_strategy", "hybrid")).lower(),
-            }
+            result = await classify_json_with_budget(
+                self,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                fallback=default_result,
+                max_tokens=QUESTION_PERCEPTION_JSON_MAX_TOKENS,
+            )
+            from app.services.agent_intent import validate_question_perception_output
+
+            return validate_question_perception_output(
+                result,
+                question=question,
+            )
         except Exception:
             if not self.settings.enable_model_fallback:
                 raise
@@ -1011,6 +1048,7 @@ class ChatProvider:
                 rendered_profile_guidance,
                 component="answer",
             ),
+            "rendered_profile_guidance": rendered_profile_guidance,
             "target_language": target_language,
             "context_label": context_label,
             "coverage_label": coverage_label,
@@ -1095,6 +1133,8 @@ class ChatProvider:
             payload["thinking"] = {"type": "disabled"}
         return await self._post_chat_text(payload)
 
+    @measured("graph_request")
+    @qa_timed("model_call")
     async def _post_chat_text(self, payload: dict[str, Any]) -> str:
         if self.api_protocol == "anthropic":
             anthropic_payload = self._anthropic_messages_payload(payload)
@@ -1106,7 +1146,8 @@ class ChatProvider:
         )
         self._record_prompt_cache_prefix(system_prompt)
         if self.purpose == "chat":
-            _sync_model_bridge_for_model_io(self.settings)
+            with qa_stage("bridge_sync", role="chat"):
+                _sync_model_bridge_for_model_io(self.settings)
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -1122,6 +1163,42 @@ class ChatProvider:
         self._record_provider_usage(data.get("usage"), protocol="openai")
         return self._normalize_chat_content(data)
 
+    async def _post_chat_text_streaming(
+        self,
+        payload: dict[str, Any],
+        *,
+        on_text_delta: Callable[[str], Awaitable[None]],
+    ) -> str:
+        if self.api_protocol == "anthropic":
+            anthropic_payload = self._anthropic_messages_payload(payload)
+            return await self._post_anthropic_sdk_text_streaming(
+                anthropic_payload,
+                on_text_delta=on_text_delta,
+            )
+        system_prompt = "\n\n".join(
+            str(message.get("content") or "")
+            for message in list(payload.get("messages") or [])
+            if isinstance(message, dict) and message.get("role") == "system"
+        )
+        self._record_prompt_cache_prefix(system_prompt)
+        if self.purpose == "chat":
+            with qa_stage("bridge_sync", role="chat"):
+                _sync_model_bridge_for_model_io(self.settings)
+        text, usage = await stream_openai_compatible_chat_text(
+            f"{self.base_url.rstrip('/')}/chat/completions",
+            payload,
+            {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=float(self.settings.model_request_timeout_seconds),
+            resolve_ip=self.resolve_ip,
+            purpose=self.purpose,
+            on_text_delta=on_text_delta,
+        )
+        self._record_provider_usage(usage, protocol="openai")
+        return text
+
     async def _post_anthropic_sdk_text(
         self,
         payload: dict[str, Any],
@@ -1132,18 +1209,27 @@ class ChatProvider:
                 "Development Anthropic SDK transport cannot honor a pinned resolve IP"
             )
         if self.purpose == "chat":
-            _sync_model_bridge_for_model_io(self.settings)
+            with qa_stage("bridge_sync", role="chat"):
+                _sync_model_bridge_for_model_io(self.settings)
         response = None
         for attempt in range(1, MODEL_REQUEST_MAX_ATTEMPTS + 1):
             try:
-                async with model_request_slot():
-                    async with AsyncAnthropic(
-                        auth_token=str(self.api_key or ""),
-                        base_url=self.base_url.rstrip("/"),
-                        timeout=float(self.settings.model_request_timeout_seconds),
-                        max_retries=0,
-                    ) as client:
-                        response = await client.messages.create(**payload)
+                with measure(self.purpose + "_transport_attempt"):
+                    async with model_request_slot():
+                        with qa_stage("provider_roundtrip", role=self.purpose, attempt=attempt,
+                                      input_characters=len(json.dumps(payload, ensure_ascii=False)) if current_qa_performance() else None,
+                                      output_token_budget=payload.get("max_tokens")) as call_span:
+                            async with AsyncAnthropic(
+                                auth_token=str(self.api_key or ""),
+                                base_url=self.base_url.rstrip("/"),
+                                timeout=float(self.settings.model_request_timeout_seconds),
+                                max_retries=0,
+                            ) as client:
+                                response = await client.messages.create(**payload)
+                            if call_span is not None:
+                                usage = response.model_dump(mode="json").get("usage") or {}
+                                call_span.annotate(**{key: usage[key] for key in ("input_tokens", "output_tokens")
+                                                      if type(usage.get(key)) is int and usage[key] >= 0})
                 break
             except Exception as exc:
                 status_code = getattr(exc, "status_code", None)
@@ -1200,6 +1286,124 @@ class ChatProvider:
                 retryable=False,
             )
         return self._normalize_anthropic_content(response_payload)
+
+    async def _post_anthropic_sdk_text_streaming(
+        self,
+        payload: dict[str, Any],
+        *,
+        on_text_delta: Callable[[str], Awaitable[None]],
+    ) -> str:
+        normalized_resolve_ip = str(self.resolve_ip or "").strip().lower()
+        if normalized_resolve_ip not in {"", "none", "null", "__none__"}:
+            raise RuntimeError(
+                "Development Anthropic SDK streaming transport cannot honor a pinned resolve IP"
+            )
+        if self.purpose == "chat":
+            with qa_stage("bridge_sync", role="chat"):
+                _sync_model_bridge_for_model_io(self.settings)
+        response = None
+        parts: list[str] = []
+        emitted = False
+        for attempt in range(1, MODEL_REQUEST_MAX_ATTEMPTS + 1):
+            try:
+                with measure(self.purpose + "_transport_attempt"):
+                    async with model_request_slot():
+                        with qa_stage(
+                            "provider_roundtrip",
+                            role=self.purpose,
+                            attempt=attempt,
+                            input_characters=(
+                                len(json.dumps(payload, ensure_ascii=False))
+                                if current_qa_performance()
+                                else None
+                            ),
+                            output_token_budget=payload.get("max_tokens"),
+                        ) as call_span:
+                            async with AsyncAnthropic(
+                                auth_token=str(self.api_key or ""),
+                                base_url=self.base_url.rstrip("/"),
+                                timeout=float(self.settings.model_request_timeout_seconds),
+                                max_retries=0,
+                            ) as client:
+                                async with client.messages.stream(**payload) as stream:
+                                    async for text in stream.text_stream:
+                                        if text:
+                                            emitted = True
+                                            parts.append(text)
+                                            await on_text_delta(text)
+                                    response = await stream.get_final_message()
+                            if call_span is not None:
+                                usage = response.model_dump(mode="json").get("usage") or {}
+                                call_span.annotate(
+                                    **{
+                                        key: usage[key]
+                                        for key in ("input_tokens", "output_tokens")
+                                        if type(usage.get(key)) is int and usage[key] >= 0
+                                    }
+                                )
+                break
+            except Exception as exc:
+                status_code = getattr(exc, "status_code", None)
+                safe_status = (
+                    int(status_code)
+                    if type(status_code) is int and 100 <= status_code <= 599
+                    else None
+                )
+                retryable = bool(
+                    not emitted
+                    and _is_retryable_anthropic_sdk_error(
+                        exc,
+                        status_code=safe_status,
+                    )
+                )
+                external_error = ExternalServiceError(
+                    service="anthropic",
+                    phase="sdk_messages_stream",
+                    status_code=safe_status,
+                    error_code=type(exc).__name__.lower()[:80],
+                    retryable=retryable,
+                )
+                if not retryable or attempt >= MODEL_REQUEST_MAX_ATTEMPTS:
+                    raise external_error from None
+                retry_in = min(
+                    float(2 ** (attempt - 1)),
+                    MODEL_REQUEST_BACKOFF_CAP_SECONDS,
+                )
+                logger.warning(
+                    "Anthropic SDK stream retrying before the first delta",
+                    extra={
+                        "attempt": attempt,
+                        "max_attempts": MODEL_REQUEST_MAX_ATTEMPTS,
+                        "retry_in_seconds": retry_in,
+                        "error_type": type(exc).__name__[:80],
+                        "status_code": safe_status,
+                    },
+                )
+                await asyncio.sleep(retry_in)
+        if response is None:
+            raise RuntimeError("Anthropic SDK stream completed without a response")
+        response_payload = response.model_dump(mode="json")
+        self._record_provider_usage(
+            response_payload.get("usage"),
+            protocol="anthropic",
+        )
+        stop_reason = response_payload.get("stop_reason")
+        if stop_reason not in {"end_turn", "stop_sequence"}:
+            error_code = {
+                "max_tokens": "incomplete_max_tokens",
+                "refusal": "provider_refusal",
+            }.get(stop_reason, "invalid_stop_reason")
+            raise ExternalServiceError(
+                service="anthropic",
+                phase="sdk_messages_stream_completion",
+                error_code=error_code,
+                retryable=False,
+            )
+        normalized = self._normalize_anthropic_content(response_payload)
+        streamed = "".join(parts).strip()
+        if streamed != normalized:
+            raise RuntimeError("Anthropic streamed text differs from the final message")
+        return normalized
 
     async def _post_chat_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._parse_json_object(await self._post_chat_text(payload))
@@ -1511,9 +1715,135 @@ class ChatProvider:
     def _parse_json_object(self, text: str) -> dict[str, Any]:
         text = text.strip()
         raw_bytes = text.encode("utf-8")
+        repair_attempts: list[str] = []
+        fenced = re.fullmatch(
+            r"```(?:json)?[ \t]*\r?\n(?P<body>[\s\S]*?)\r?\n```",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if fenced is not None:
+            text = fenced.group("body").strip()
+            repair_attempts.append("single_json_code_fence")
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError as exc:
+            final_decode_error = exc
+            try:
+                parsed = json.loads(text, strict=False)
+            except json.JSONDecodeError as strict_exc:
+                final_decode_error = strict_exc
+                repair_attempts.append("unescaped_control_characters")
+                repaired: list[str] = []
+                in_string = False
+                escaped = False
+                index = 0
+                while index < len(text):
+                    character = text[index]
+                    if in_string:
+                        if escaped:
+                            repaired.append(character)
+                            escaped = False
+                        elif character == "\\":
+                            next_character = (
+                                text[index + 1] if index + 1 < len(text) else ""
+                            )
+                            if next_character not in '"\\/bfnrtu':
+                                # Preserve the model's literal backslash by
+                                # escaping it in JSON. This repairs syntax only;
+                                # the resulting string bytes remain explicit
+                                # input to the closed component schema.
+                                repaired.extend(("\\", "\\"))
+                                repair_attempts.append("invalid_json_escape")
+                            else:
+                                repaired.append(character)
+                                escaped = True
+                        elif character == '"':
+                            lookahead = index + 1
+                            while (
+                                lookahead < len(text)
+                                and text[lookahead].isspace()
+                            ):
+                                lookahead += 1
+                            next_structural = (
+                                text[lookahead] if lookahead < len(text) else ""
+                            )
+                            after_adjacent_quote = lookahead + 1
+                            while (
+                                after_adjacent_quote < len(text)
+                                and text[after_adjacent_quote].isspace()
+                            ):
+                                after_adjacent_quote += 1
+                            adjacent_inner_quote = (
+                                next_structural == '"'
+                                and lookahead == index + 1
+                                and (
+                                    after_adjacent_quote >= len(text)
+                                    or text[after_adjacent_quote] in ",}]"
+                                )
+                            )
+                            if adjacent_inner_quote or (
+                                next_structural
+                                and next_structural not in '\",:}]'
+                            ):
+                                repaired.extend(("\\", '"'))
+                                repair_attempts.append("unescaped_json_quote")
+                            else:
+                                repaired.append(character)
+                                in_string = False
+                        else:
+                            repaired.append(character)
+                        index += 1
+                        continue
+                    if character == '"':
+                        in_string = True
+                        repaired.append(character)
+                        index += 1
+                        continue
+                    if character == ",":
+                        lookahead = index + 1
+                        while lookahead < len(text) and text[lookahead].isspace():
+                            lookahead += 1
+                        if lookahead < len(text) and text[lookahead] in "]}":
+                            repair_attempts.append("trailing_comma")
+                            index += 1
+                            continue
+                    repaired.append(character)
+                    index += 1
+                candidate = "".join(repaired)
+                parsed = None
+                for _repair_round in range(8):
+                    try:
+                        parsed = json.loads(candidate, strict=False)
+                        break
+                    except json.JSONDecodeError as repair_exc:
+                        final_decode_error = repair_exc
+                        if repair_exc.msg != "Expecting ',' delimiter":
+                            break
+                        position = max(0, int(repair_exc.pos))
+                        left = position - 1
+                        while left >= 0 and candidate[left].isspace():
+                            left -= 1
+                        current = candidate[position] if position < len(candidate) else ""
+                        if (
+                            left < 0
+                            or candidate[left] not in '"}]0123456789eElL'
+                            or current not in '"{['
+                        ):
+                            break
+                        candidate = candidate[:position] + "," + candidate[position:]
+                        repair_attempts.append("missing_json_comma")
+            if parsed is not None:
+                if not isinstance(parsed, dict):
+                    shape_card = {
+                        "protocol_version": "provider_json_text_shape_v1",
+                        "error_code": "json_root_not_object",
+                        "field_path": "$",
+                        "utf8_bytes": len(raw_bytes),
+                        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                        "json_type": type(parsed).__name__,
+                    }
+                    raise ProviderJSONShapeError(shape_card)
+                return parsed
             shape_card = {
                 "protocol_version": "provider_json_text_shape_v1",
                 "error_code": "json_decode_error",
@@ -1523,7 +1853,18 @@ class ChatProvider:
                 "starts_with_object": text.startswith("{"),
                 "ends_with_object": text.endswith("}"),
                 "contains_code_fence": "```" in text,
-                "decode_error_position": max(0, int(exc.pos)),
+                "decode_error_position": max(0, int(final_decode_error.pos)),
+                "decode_error_kind": {
+                    "Expecting ',' delimiter": "missing_comma_or_unescaped_quote",
+                    "Expecting ':' delimiter": "missing_colon_or_unescaped_quote",
+                    "Expecting property name enclosed in double quotes": "invalid_object_key",
+                    "Invalid \\escape": "invalid_escape",
+                    "Invalid \\uXXXX escape": "invalid_unicode_escape",
+                    "Unterminated string starting at": "unterminated_string",
+                    "Expecting value": "missing_value",
+                    "Extra data": "extra_data",
+                }.get(str(final_decode_error.msg), "other_json_syntax"),
+                "deterministic_repairs_attempted": sorted(set(repair_attempts)),
             }
             raise ProviderJSONShapeError(shape_card) from None
         if not isinstance(parsed, dict):
@@ -1614,29 +1955,33 @@ async def post_openai_compatible_json(
     max_attempts = MODEL_REQUEST_MAX_ATTEMPTS
     for attempt in range(1, max_attempts + 1):
         try:
-            async with model_request_slot():
-                if not local_bridge_request:
-                    if not normalized_resolve_ip:
-                        normalized_resolve_ip = await asyncio.to_thread(
-                            _resolve_public_provider_ip,
-                            str(urlparse(validated_url).hostname or ""),
-                            int(urlparse(validated_url).port or 443),
-                            min(request_timeout, DOH_REQUEST_TIMEOUT_SECONDS),
+            with measure(purpose + "_transport_attempt"):
+                async with model_request_slot():
+                    with qa_stage("provider_roundtrip", role=purpose, attempt=attempt,
+                                  input_characters=len(json.dumps(payload, ensure_ascii=False)) if current_qa_performance() else None,
+                                  output_token_budget=payload.get("max_tokens")):
+                        if not local_bridge_request:
+                            if not normalized_resolve_ip:
+                                normalized_resolve_ip = await asyncio.to_thread(
+                                    _resolve_public_provider_ip,
+                                    str(urlparse(validated_url).hostname or ""),
+                                    int(urlparse(validated_url).port or 443),
+                                    min(request_timeout, DOH_REQUEST_TIMEOUT_SECONDS),
+                                )
+                            return await asyncio.to_thread(
+                                _post_json_with_pinned_resolve,
+                                validated_url,
+                                payload,
+                                direct_provider_headers,
+                                request_timeout,
+                                normalized_resolve_ip,
+                            )
+                        return await _post_json_to_local_bridge(
+                            validated_url,
+                            payload,
+                            direct_provider_headers,
+                            request_timeout,
                         )
-                    return await asyncio.to_thread(
-                        _post_json_with_pinned_resolve,
-                        validated_url,
-                        payload,
-                        direct_provider_headers,
-                        request_timeout,
-                        normalized_resolve_ip,
-                    )
-                return await _post_json_to_local_bridge(
-                    validated_url,
-                    payload,
-                    direct_provider_headers,
-                    request_timeout,
-                )
         except Exception as exc:
             last_error = exc
             retryable = _is_retryable_openai_error(exc)
@@ -2137,6 +2482,170 @@ async def _post_json_to_local_bridge(
                     phase="http_json",
                 )
             return data
+
+
+async def _stream_sse_from_local_bridge(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout: float,
+) -> AsyncIterator[str]:
+    request_payload = {**payload, "stream": True}
+    request_body = _validated_openai_request_body(request_payload)
+    restricted_headers = _restricted_openai_headers(headers)
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        trust_env=False,
+        follow_redirects=False,
+    ) as client:
+        async with client.stream(
+            "POST",
+            url,
+            content=request_body,
+            headers={
+                **restricted_headers,
+                "Accept": "text/event-stream",
+                "Accept-Encoding": "identity",
+            },
+        ) as response:
+            if 300 <= response.status_code < 400:
+                raise ExternalServiceError(
+                    service="model_bridge",
+                    phase="local_bridge_stream_redirect",
+                    status_code=502,
+                    error_code="upstream_redirect_rejected",
+                    retryable=False,
+                )
+            if response.status_code >= 400:
+                body = await response.aread()
+                error_code = "upstream_stream_http_error"
+                try:
+                    payload_error = _validated_json_response_body(
+                        body,
+                        content_type=response.headers.get("Content-Type", ""),
+                        content_encoding=response.headers.get("Content-Encoding", ""),
+                    )
+                    error_code = _provider_error_code(
+                        json.dumps(payload_error, ensure_ascii=False)
+                    )
+                except Exception:
+                    pass
+                raise ExternalServiceError(
+                    service="model_bridge",
+                    phase="local_bridge_stream_http",
+                    status_code=response.status_code,
+                    error_code=error_code,
+                    retryable=response.status_code == 429 or response.status_code >= 500,
+                )
+            content_type = str(response.headers.get("Content-Type") or "")
+            if content_type.split(";", 1)[0].strip().casefold() != "text/event-stream":
+                raise RuntimeError("Model bridge streaming response was not event-stream")
+            if str(response.headers.get("Content-Encoding") or "").strip().casefold() not in {
+                "",
+                "identity",
+            }:
+                raise RuntimeError("Model bridge streaming content encoding was unsupported")
+            total = 0
+            data_lines: list[str] = []
+            async for line in response.aiter_lines():
+                total += len(line.encode("utf-8")) + 1
+                if total > MAX_OPENAI_RESPONSE_BODY_BYTES:
+                    raise RuntimeError("Model bridge stream exceeded the hard byte bound")
+                if not line:
+                    if data_lines:
+                        yield "\n".join(data_lines)
+                        data_lines = []
+                    continue
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip())
+            if data_lines:
+                yield "\n".join(data_lines)
+
+
+async def stream_openai_compatible_chat_text(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    *,
+    timeout: float,
+    resolve_ip: str | None,
+    purpose: Literal["chat", "graph"],
+    on_text_delta: Callable[[str], Awaitable[None]],
+) -> tuple[str, dict[str, Any] | None]:
+    if purpose not in {"chat", "graph"}:
+        raise ValueError("OpenAI-compatible streaming purpose is invalid")
+    from app.services import runtime_settings
+
+    settings = get_settings()
+    parsed_url = urlparse(url)
+    local_bridge = bool(
+        settings.model_bridge_enabled
+        and purpose == "chat"
+        and parsed_url.scheme == "http"
+        and parsed_url.path == "/chat/completions"
+        and runtime_settings._bridge_target_is_self(url, settings)
+    )
+    if not local_bridge:
+        raise RuntimeError(
+            "OpenAI-compatible live streaming requires the verified local model bridge"
+        )
+    del resolve_ip
+    parts: list[str] = []
+    usage: dict[str, Any] | None = None
+    finish_reason: str | None = None
+    emitted = False
+    candidate = {**payload, "stream": True}
+    async with model_request_slot():
+        with qa_stage(
+            "provider_roundtrip",
+            role=purpose,
+            input_characters=(
+                len(json.dumps(candidate, ensure_ascii=False))
+                if current_qa_performance()
+                else None
+            ),
+            output_token_budget=candidate.get("max_tokens"),
+        ):
+            async for data_line in _stream_sse_from_local_bridge(
+                url,
+                candidate,
+                headers,
+                timeout,
+            ):
+                if data_line == "[DONE]":
+                    break
+                event = _strict_json_loads(data_line)
+                if not isinstance(event, dict):
+                    raise RuntimeError("OpenAI-compatible stream event must be an object")
+                event_usage = event.get("usage")
+                if isinstance(event_usage, dict):
+                    usage = event_usage
+                choices = event.get("choices")
+                if not isinstance(choices, list):
+                    continue
+                for choice in choices:
+                    if not isinstance(choice, dict):
+                        continue
+                    reason = choice.get("finish_reason")
+                    if isinstance(reason, str):
+                        finish_reason = reason
+                    delta = choice.get("delta")
+                    text = delta.get("content") if isinstance(delta, dict) else None
+                    if isinstance(text, str) and text:
+                        emitted = True
+                        parts.append(text)
+                        await on_text_delta(text)
+    if finish_reason == "length":
+        raise ExternalServiceError(
+            service="openai_compatible",
+            phase="chat_stream_completion",
+            error_code="incomplete_max_tokens",
+            retryable=False,
+        )
+    text = "".join(parts).strip()
+    if not emitted or not text:
+        raise RuntimeError("OpenAI-compatible stream returned no text")
+    return text, usage
 
 
 def _resolve_public_provider_ip(

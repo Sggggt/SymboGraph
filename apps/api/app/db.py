@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import get_settings
+from app.core.json_codec import database_json_dumps, database_json_loads
 
 
 class Base(DeclarativeBase):
@@ -63,6 +64,8 @@ def build_engine():
         "future": True,
         "echo": False,
         "connect_args": connect_args,
+        "json_serializer": database_json_dumps,
+        "json_deserializer": database_json_loads,
     }
     if database_url.startswith("postgresql"):
         engine_kwargs.update(

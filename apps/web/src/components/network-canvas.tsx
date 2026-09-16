@@ -167,7 +167,7 @@ export function buildBaseOption(graph: GraphResponse): EChartsOption {
         },
         draggable: true,
         label: {
-          show: true,
+          show: graph.nodes.length <= 24,
           color: "#dff7ff",
           fontSize: 11,
           distance: 6,
@@ -203,24 +203,32 @@ export function buildBaseOption(graph: GraphResponse): EChartsOption {
           label: { opacity: 1 },
         },
         edgeLabel: { show: false },
-        data: graph.nodes.map((node) => ({
-          ...node,
-          name: node.name ?? node.label ?? "名称缺失",
-          category: node.category ?? node.type ?? "chunk",
-          draggable: true,
-          fixed: false,
-          symbolSize: symbolSizeForNode(node),
-          itemStyle: {
-            color: colorForNode(node),
-            borderWidth: (node.category ?? node.type) === "mid_concept" || (node.category ?? node.type) === "coarse_concept" ? 1.4 : 0.8,
-            borderColor: "rgba(255,255,255,0.16)",
-            shadowBlur: (node.category ?? node.type) === "mid_concept" || (node.category ?? node.type) === "coarse_concept" ? 13 : 7,
-            shadowColor: "rgba(99, 203, 255, 0.08)",
-          },
-          label: {
-            color: "#dff7ff",
-          },
-        })),
+        data: graph.nodes.map((node) => {
+          const category = node.category ?? node.type ?? "chunk";
+          const showLabel = graph.nodes.length <= 24 || category === "coarse_concept";
+          return {
+            ...node,
+            name: node.name ?? node.label ?? "名称缺失",
+            category,
+            draggable: true,
+            fixed: false,
+            symbolSize: symbolSizeForNode(node),
+            itemStyle: {
+              color: colorForNode(node),
+              borderWidth: category === "mid_concept" || category === "coarse_concept" ? 1.4 : 0.8,
+              borderColor: "rgba(255,255,255,0.16)",
+              shadowBlur: category === "mid_concept" || category === "coarse_concept" ? 13 : 7,
+              shadowColor: "rgba(99, 203, 255, 0.08)",
+            },
+            label: {
+              show: showLabel,
+              color: "#dff7ff",
+            },
+            emphasis: {
+              label: { show: true, color: "#ffffff" },
+            },
+          };
+        }),
         links: graph.edges.map((edge) => {
           const category = edge.category ?? edge.type ?? "";
           const isRqEdge = category.startsWith("rq_");

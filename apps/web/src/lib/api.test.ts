@@ -97,41 +97,6 @@ describe("api client", () => {
     );
   });
 
-  it("reads the canonical PostgreSQL P&E audit endpoint without caching", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      jsonResponse({
-        contract_version: "agent_pe_audit_public_v1",
-        run_id: "run-1",
-        knowledge_base_id: "kb-1",
-        run_status: "completed",
-        counts: { plans: 0, actions: 0, observations: 0 },
-        ordering: {
-          plans: "plan_index ASC, created_at ASC, id ASC",
-          actions:
-            "plan_index ASC NULLS LAST, action_index ASC, created_at ASC, id ASC",
-          observations: "created_at ASC, id ASC",
-        },
-        plans: [],
-        actions: [],
-        observations: [],
-        provider_raw_response_exposed: false,
-        credentials_exposed: false,
-      }),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    const { fetchAgentPEAudit } = await import("./api");
-
-    await fetchAgentPEAudit("run-1");
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      "http://api.test/api/agent/runs/run-1/pe-audit",
-      expect.objectContaining({
-        cache: "no-store",
-        headers: { "X-API-Key": "test-key" },
-      }),
-    );
-  });
-
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
@@ -153,30 +118,6 @@ describe("api client", () => {
     );
   });
 
-  it("routes search requests through graph-enhanced retrieval", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      jsonResponse({
-        query: "markov blanket",
-        results: [],
-        degraded_mode: false,
-        model_audit: { retrieval_pipeline: "layered_context_graph" },
-      }),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    const { searchKnowledge } = await import("./api");
-
-    await searchKnowledge({ knowledge_base_id: "kb-1", query: "markov blanket", top_k: 8, filters: {}, retrieval_granularity: "coarse" });
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      "http://api.test/api/search/graph-enhanced",
-      expect.objectContaining({
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-API-Key": "test-key" },
-        body: JSON.stringify({ knowledge_base_id: "kb-1", query: "markov blanket", top_k: 8, filters: {}, retrieval_granularity: "coarse" }),
-      }),
-    );
-  });
-
   it("passes production runtime setting fields", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ provider: "multi_protocol" }));
     vi.stubGlobal("fetch", fetchMock);
@@ -192,10 +133,9 @@ describe("api client", () => {
       upload_max_bytes: 104857600,
       concept_i18n_enabled: true,
       query_facet_bilingual_enabled: true,
-      query_facet_posterior_enabled: true,
-      query_facet_posterior_observation_budget: 64,
-      query_facet_posterior_round_budget: 2,
-      query_facet_posterior_convergence_epsilon: 0.02,
+      ingestion_memory_soft_limit_ratio: 0.78,
+      ingestion_memory_hard_limit_ratio: 0.88,
+      ingestion_memory_critical_limit_ratio: 0.94,
       embedding_batch_size: 10,
       fixed_chunk_size_tokens: 512,
       fixed_chunk_overlap_tokens: 80,
@@ -218,7 +158,6 @@ describe("api client", () => {
       cross_language_min_cosine: 0.65,
       retrieval_result_top_k_default: 8,
       agent_coarse_initial_budget: 8,
-      agent_coarse_total_budget: 8,
       agent_coarse_top_k: 5,
       agent_mid_per_coarse_budget: 6,
       agent_coarse_drilldown_mid_initial_budget: 10,
@@ -231,18 +170,12 @@ describe("api client", () => {
       agent_max_depth_per_layer: 3,
       agent_max_labels_per_node: 3,
       agent_max_edge_reuse: 2,
-      agent_max_cycle_reward_per_path: 0.18,
-      agent_cycle_reward_distance_threshold: 1.2,
       agent_path_distance_green_threshold: 0.45,
       agent_path_distance_gray_threshold: 1.35,
       agent_path_distance_hard_threshold: 2.4,
       agent_structure_restore_per_chunk_budget: 4,
-      agent_structure_restore_budget: 16,
       context_path_summary_budget: 32,
-      agent_planning_round_budget: 2,
-      agent_max_typed_actions_per_round: 8,
-      agent_repair_round_budget: 2,
-      agent_verification_budget: 8,
+      agent_answer_unit_limit: 8,
       enable_auto_tpe: false,
       tpe_trial_budget: 6,
       tpe_startup_random_trials: 3,
@@ -267,10 +200,6 @@ describe("api client", () => {
       upload_max_bytes: 104857600,
       concept_i18n_enabled: true,
       query_facet_bilingual_enabled: true,
-      query_facet_posterior_enabled: true,
-      query_facet_posterior_observation_budget: 64,
-      query_facet_posterior_round_budget: 2,
-      query_facet_posterior_convergence_epsilon: 0.02,
       embedding_batch_size: 10,
       fixed_chunk_size_tokens: 512,
       fixed_chunk_overlap_tokens: 80,
@@ -293,7 +222,6 @@ describe("api client", () => {
       cross_language_min_cosine: 0.65,
       retrieval_result_top_k_default: 8,
       agent_coarse_initial_budget: 8,
-      agent_coarse_total_budget: 8,
       agent_coarse_top_k: 5,
       agent_mid_per_coarse_budget: 6,
       agent_coarse_drilldown_mid_initial_budget: 10,
@@ -306,18 +234,12 @@ describe("api client", () => {
       agent_max_depth_per_layer: 3,
       agent_max_labels_per_node: 3,
       agent_max_edge_reuse: 2,
-      agent_max_cycle_reward_per_path: 0.18,
-      agent_cycle_reward_distance_threshold: 1.2,
       agent_path_distance_green_threshold: 0.45,
       agent_path_distance_gray_threshold: 1.35,
       agent_path_distance_hard_threshold: 2.4,
       agent_structure_restore_per_chunk_budget: 4,
-      agent_structure_restore_budget: 16,
       context_path_summary_budget: 32,
-      agent_planning_round_budget: 2,
-      agent_max_typed_actions_per_round: 8,
-      agent_repair_round_budget: 2,
-      agent_verification_budget: 8,
+      agent_answer_unit_limit: 8,
       enable_auto_tpe: false,
       tpe_trial_budget: 6,
       tpe_startup_random_trials: 3,
@@ -343,24 +265,6 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "http://api.test/api/knowledge-bases/kb-1/graph-operating-point/auto-tpe/latest",
       expect.objectContaining({ cache: "no-store", headers: { "X-API-Key": "test-key" } }),
-    );
-  });
-
-  it("requests context graph status refresh", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ batch_id: null, state: "context_graph_active", mode: "four_layer_context_graph", affected_documents: 1 }));
-    vi.stubGlobal("fetch", fetchMock);
-    const { rebuildGraph } = await import("./api");
-
-    await rebuildGraph("knowledge-base-1");
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      "http://api.test/api/maintenance/rebuild-graph?knowledge_base_id=knowledge-base-1",
-      expect.objectContaining({
-        method: "POST",
-        body: JSON.stringify({
-          dry_run: false,
-        }),
-      }),
     );
   });
 
@@ -498,33 +402,19 @@ describe("api client", () => {
     );
   });
 
-  it("requires graph_type on graph requests and confirms destructive rebuilds", async () => {
+  it("requires graph_type on graph requests", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse({ graph_type: "chunk-relation", schema_version: "context_graph_v1", nodes: [], edges: [], counts: {}, sampled_counts: {}, node_counts: {}, edge_counts: {}, freshness: { is_stale: false } }))
-      .mockResolvedValueOnce(jsonResponse({ batch_id: null, state: "context_graph_active", mode: "four_layer_context_graph" }))
-      .mockResolvedValueOnce(jsonResponse({ batch_id: null, state: "context_graph_active", mode: "four_layer_context_graph", dry_run: true, affected_documents: 3 }));
+      .mockResolvedValueOnce(jsonResponse({ graph_type: "chunk-relation", schema_version: "context_graph_v1", nodes: [], edges: [], counts: {}, sampled_counts: {}, node_counts: {}, edge_counts: {}, freshness: { is_stale: false } }));
     vi.stubGlobal("fetch", fetchMock);
-    const { fetchGraph, rebuildGraph } = await import("./api");
+    const { fetchGraph } = await import("./api");
 
     await fetchGraph("knowledge-base-1", "chunk-relation");
-    await rebuildGraph("knowledge-base-1");
-    await rebuildGraph("knowledge-base-1", true);
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       "http://api.test/api/knowledge_bases/current/graph?knowledge_base_id=knowledge-base-1&graph_type=chunk-relation&view=overview&limit=100",
       expect.objectContaining({ cache: "no-store", headers: { "X-API-Key": "test-key" } }),
-    );
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
-      "http://api.test/api/maintenance/rebuild-graph?knowledge_base_id=knowledge-base-1",
-      expect.objectContaining({ method: "POST", body: JSON.stringify({ dry_run: false }) }),
-    );
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      3,
-      "http://api.test/api/maintenance/rebuild-graph?knowledge_base_id=knowledge-base-1",
-      expect.objectContaining({ method: "POST", body: JSON.stringify({ dry_run: true }) }),
     );
   });
 
@@ -545,9 +435,11 @@ describe("api client", () => {
     const body = new ReadableStream({
       start(controller) {
         const encoder = new TextEncoder();
-        controller.enqueue(encoder.encode('data: {"type":"meta","run_id":"run-1","session_id":"session-1","retrieval_granularity":"coarse"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"meta","run_id":"run-1","session_id":"session-1","entry_layer":"coarse"}\n\n'));
+        controller.enqueue(encoder.encode(": keep-alive\n\n"));
         controller.enqueue(encoder.encode('data: {"token":"hello"}\n\n'));
-        controller.enqueue(encoder.encode('data: {"type":"final","response":{"run_id":"run-1","session_id":"session-1","answer":"done","citations":[],"used_chunks":[],"route":"retrieve_sources","trace":[],"degraded_mode":false,"retrieval_granularity":"coarse","retrieval_trace_id":"trace-1","context_package_id":"package-1"}}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"answer_replace","answer":"hello corrected"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"final","response":{"run_id":"run-1","session_id":"session-1","answer":"done","citations":[],"used_chunks":[],"route":"intent_execution_retrieval_v1","trace":[],"degraded_mode":false,"entry_layer":"coarse","terminal_outcome":"completed","retrieval_trace_id":"trace-1","context_package_id":"package-1"}}\n\n'));
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         controller.close();
       },
@@ -556,14 +448,16 @@ describe("api client", () => {
     vi.stubGlobal("fetch", fetchMock);
     const { streamAnswer } = await import("./api");
     const tokens: string[] = [];
+    const replacements: string[] = [];
     const meta: unknown[] = [];
     const finalResponses: unknown[] = [];
     const controller = new AbortController();
 
     await streamAnswer(
-      { question: "hello", top_k: 3, retrieval_granularity: "coarse" },
+      { question: "hello", top_k: 3 },
       {
         onToken: (value) => tokens.push(value),
+        onAnswerReplace: (value) => replacements.push(value),
         onCitations: () => undefined,
         onMeta: (value) => meta.push(value),
         onFinal: (value) => finalResponses.push(value),
@@ -575,13 +469,14 @@ describe("api client", () => {
       "http://api.test/api/qa/stream",
       expect.objectContaining({
         signal: controller.signal,
-        body: JSON.stringify({ question: "hello", top_k: 3, retrieval_granularity: "coarse" }),
+        body: JSON.stringify({ question: "hello", top_k: 3 }),
       }),
     );
     expect(tokens).toEqual(["hello"]);
+    expect(replacements).toEqual(["hello corrected"]);
     expect(finalResponses).toContainEqual(expect.objectContaining({ retrieval_trace_id: "trace-1", context_package_id: "package-1" }));
-    expect(meta).toContainEqual({ run_id: "run-1", session_id: "session-1", route: undefined, retrieval_granularity: "coarse" });
-    expect(meta).toContainEqual({ degraded_mode: false, run_id: "run-1", session_id: "session-1", route: "retrieve_sources", retrieval_granularity: "coarse" });
+    expect(meta).toContainEqual({ run_id: "run-1", session_id: "session-1", route: undefined, direct_answer_mode: undefined, entry_layer: "coarse", terminal_outcome: undefined });
+    expect(meta).toContainEqual({ degraded_mode: false, run_id: "run-1", session_id: "session-1", route: "intent_execution_retrieval_v1", direct_answer_mode: undefined, entry_layer: "coarse", terminal_outcome: "completed" });
   });
 
   it("parses profile assistant SSE chunks", async () => {
@@ -634,6 +529,83 @@ describe("api client", () => {
     expect(finalStates).toEqual([{ session_id: "profile-session", messages: [], latest_profile_json: profileJson, latest_profile_hash: "hash-1", warnings: ["check"] }]);
   });
 
+  it("delivers final metadata before final and releases an open stream without waiting for teardown", async () => {
+    const cancel = vi.fn(() => new Promise<void>(() => undefined));
+    const final = {
+      run_id: "unit-test-run", session_id: "unit-test-session", answer: "完成",
+      citations: [], trace: [], route: "layered_context_graph", degraded_mode: false,
+    };
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode([
+          `data: ${JSON.stringify({ type: "final", response: final })}`,
+          'data: {"type":"meta","run_id":"late-run"}',
+          'data: {"token":"late-token"}',
+        ].join("\n\n") + "\n\n"));
+      },
+      cancel,
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(body)));
+    const { streamAnswer } = await import("./api");
+    const order: string[] = [];
+    const onToken = vi.fn();
+
+    await streamAnswer({ question: "示例问题" }, {
+      onToken, onCitations: vi.fn(),
+      onMeta: (meta) => { order.push(`meta:${meta.run_id}`); },
+      onFinal: (response) => { order.push(`final:${response.answer}`); },
+    });
+
+    expect(order).toEqual(["meta:unit-test-run", "final:完成"]);
+    expect(onToken).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(body.locked).toBe(false);
+  });
+
+  it.each([
+    ['data: {"type":"error","error":"unit-test-error"}\n\n', "unit-test-error"],
+    ["data: [DONE]\n\n", null],
+  ])("stops reading after a terminal control frame: %s", async (frame, error) => {
+    const cancel = vi.fn();
+    const body = new ReadableStream({
+      start(controller) { controller.enqueue(new TextEncoder().encode(frame)); },
+      cancel,
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(body)));
+    const { streamAnswer } = await import("./api");
+    const onError = vi.fn();
+
+    await streamAnswer({ question: "示例问题" }, { onToken: vi.fn(), onCitations: vi.fn(), onError });
+
+    if (error) expect(onError).toHaveBeenCalledExactlyOnceWith(error);
+    else expect(onError).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(body.locked).toBe(false);
+  });
+
+  it("recovers a final frame at EOF across UTF-8 and CRLF chunk boundaries", async () => {
+    const bytes = new TextEncoder().encode(
+      ': heartbeat\r\ndata: {"token":"示例"}\r\n\r\n'
+      + 'data: {"type":"final","response":{"run_id":"unit-test-run","session_id":"unit-test-session","answer":"完成","citations":[],"trace":[]}}',
+    );
+    const body = new ReadableStream({
+      start(controller) {
+        for (const byte of bytes) controller.enqueue(new Uint8Array([byte]));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(body)));
+    const { streamAnswer } = await import("./api");
+    const onToken = vi.fn();
+    const onFinal = vi.fn();
+
+    await streamAnswer({ question: "示例问题" }, { onToken, onCitations: vi.fn(), onFinal });
+
+    expect(onToken).toHaveBeenCalledExactlyOnceWith("示例");
+    expect(onFinal).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ answer: "完成" }));
+    expect(body.locked).toBe(false);
+  });
+
   it("passes structured stream errors to handlers before rejecting", async () => {
     const body = {
       detail: {
@@ -683,6 +655,6 @@ describe("api client", () => {
     );
 
     expect(tokens).toEqual(["still works"]);
-    expect(warn).toHaveBeenCalledWith("忽略无法解析的 SSE 数据行", expect.objectContaining({ line: "not-json" }));
+    expect(warn).toHaveBeenCalledExactlyOnceWith("忽略无法解析的 SSE 数据行");
   });
 });

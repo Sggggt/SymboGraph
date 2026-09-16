@@ -13,7 +13,9 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.models import (
     AgentPlan,
     AgentRun,
+    AgentTraceEvent,
     AnswerSession,
+    AnswerSourceBinding,
     CitationVerification,
     ContextPackage,
     QASession,
@@ -32,6 +34,7 @@ CONVERSATION_STATE_PROTOCOL_VERSION = "conversation_state_v1"
 CONVERSATION_STATE_SCOPE_PROTOCOL_VERSION = "conversation_state_scope_v1"
 CONVERSATION_HISTORY_MERGE_PROTOCOL_VERSION = "server_history_overlap_merge_v1"
 CONVERSATION_REFERENCE_PROTOCOL_VERSION = "answer_context_citation_reference_v1"
+CONVERSATION_SOURCE_REFERENCE_PROTOCOL_VERSION = "answer_context_source_reference_v2"
 CONVERSATION_PROMPT_HISTORY_PROTOCOL_VERSION = "conversation_prompt_projection_v1"
 CONVERSATION_STATE_UNINITIALIZED_HASH = (
     "959a95f2683e19efd10a1296ed82dac31d14c77a74caac4f5e0c12cfd062bd5e"
@@ -297,7 +300,13 @@ def canonical_task_state(value: Any) -> dict[str, Any]:
     status = payload.get("status", "active")
     if not isinstance(status, str):
         raise ConversationStateIntegrityError("task_state status must be text")
-    if status not in {"active", "waiting_user", "completed", "cancelled"}:
+    if status not in {
+        "active",
+        "waiting_user",
+        "completed",
+        "cancelled",
+        "failed",
+    }:
         raise ConversationStateIntegrityError("task_state status is unsupported")
     objective = payload.get("objective")
     current_step = payload.get("current_step")
@@ -357,6 +366,7 @@ def canonical_transcript(value: Any) -> list[dict[str, Any]]:
             "content",
             "run_id",
             "route",
+            "direct_answer_mode",
             "retrieval_trace_id",
             "citations",
             "source",
@@ -402,6 +412,17 @@ def canonical_transcript(value: Any) -> list[dict[str, Any]]:
                     f"transcript[{index}].route must be text"
                 )
             canonical["route"] = str(item["route"])
+        if item.get("direct_answer_mode") is not None:
+            if item["direct_answer_mode"] not in {
+                "system_capability",
+                "verified_context_reuse",
+            }:
+                raise ConversationStateIntegrityError(
+                    f"transcript[{index}].direct_answer_mode is unsupported"
+                )
+            canonical["direct_answer_mode"] = str(
+                item["direct_answer_mode"]
+            )
         if item.get("retrieval_trace_id") is not None:
             if not isinstance(item["retrieval_trace_id"], str):
                 raise ConversationStateIntegrityError(
@@ -432,9 +453,13 @@ def canonical_transcript(value: Any) -> list[dict[str, Any]]:
         raise ConversationStateIntegrityError(
             "persisted transcript must start with a user message"
         )
-    if messages and messages[-1]["role"] != "assistant":
+    if (
+        messages
+        and messages[-1]["role"] == "user"
+        and not messages[-1].get("run_id")
+    ):
         raise ConversationStateIntegrityError(
-            "persisted transcript must contain completed user/assistant turns"
+            "pending persisted user message must include its run_id"
         )
     return messages
 
@@ -461,11 +486,14 @@ def canonical_history_references(value: Any) -> list[dict[str, Any]]:
             "retrieval_trace_id",
             "citation_verification_ids",
         }
+        source_reference = item.get("protocol_version") == CONVERSATION_SOURCE_REFERENCE_PROTOCOL_VERSION
+        if source_reference:
+            allowed_fields.add("source_binding_ids")
         if set(item) - allowed_fields:
             raise ConversationStateIntegrityError(
                 f"history reference {index} contains unsupported fields"
             )
-        if item.get("protocol_version") != CONVERSATION_REFERENCE_PROTOCOL_VERSION:
+        if item.get("protocol_version") not in {CONVERSATION_REFERENCE_PROTOCOL_VERSION, CONVERSATION_SOURCE_REFERENCE_PROTOCOL_VERSION}:
             raise ConversationStateIntegrityError(
                 f"history reference {index} uses an unsupported protocol"
             )
@@ -478,7 +506,10 @@ def canonical_history_references(value: Any) -> list[dict[str, Any]]:
             raise ConversationStateIntegrityError(
                 "history references must use contiguous stored order"
             )
-        raw_citation_ids = item.get("citation_verification_ids", [])
+        id_field = "source_binding_ids" if source_reference else "citation_verification_ids"
+        if source_reference and item.get("citation_verification_ids", []):
+            raise ConversationStateIntegrityError("source reference cannot contain legacy verification ids")
+        raw_citation_ids = item.get(id_field, [])
         if not isinstance(raw_citation_ids, list) or any(
             not isinstance(citation_id, str)
             for citation_id in raw_citation_ids
@@ -508,7 +539,7 @@ def canonical_history_references(value: Any) -> list[dict[str, Any]]:
         )
         references.append(
             {
-                "protocol_version": CONVERSATION_REFERENCE_PROTOCOL_VERSION,
+                "protocol_version": item["protocol_version"],
                 "turn_index": index,
                 "run_id": canonical_uuid(
                     item.get("run_id"),
@@ -526,7 +557,8 @@ def canonical_history_references(value: Any) -> list[dict[str, Any]]:
                     item.get("retrieval_trace_id"),
                     field_name=f"history_references[{index}].retrieval_trace_id",
                 ),
-                "citation_verification_ids": citation_ids,
+                "citation_verification_ids": [] if source_reference else citation_ids,
+                **({"source_binding_ids": citation_ids} if source_reference else {}),
             }
         )
     return references
@@ -652,11 +684,14 @@ def _validate_reference_provenance(
     session: QASession,
     references: list[dict[str, Any]],
     transcript: list[dict[str, Any]],
+    *,
+    validation_phase: str = "persisted_state",
 ) -> None:
     seen_answer_ids: set[str] = set()
+    completed_message_count = len(transcript) - (len(transcript) % 2)
     transcript_pairs = [
         (transcript[index], transcript[index + 1])
-        for index in range(0, len(transcript), 2)
+        for index in range(0, completed_message_count, 2)
         if index + 1 < len(transcript)
     ]
     for reference in references:
@@ -712,18 +747,65 @@ def _validate_reference_provenance(
                 "answer, context package, and retrieval trace provenance diverged"
             )
         trace_scope = str(trace.conversation_state_scope_hash or "")
-        answer_scope = str((answer.model_json or {}).get("conversation_state_scope_hash") or "")
+        answer_scope = str(
+            (answer.model_json or {}).get("conversation_state_scope_hash")
+            or (answer.diagnostics_json or {}).get(
+                "conversation_state_scope_hash"
+            )
+            or ""
+        )
         package_scope = str(
             (package.diagnostics_json or {}).get("conversation_state_scope_hash")
             or ""
         )
         if (
+            not answer_scope
+            and answer.prompt_protocol_version == "single_grounded_answer_v3"
+            and len(trace_scope) == 64
+        ):
+            # JSON ORM state can be expired by the source-binding flush. Read
+            # the just-flushed PostgreSQL value directly before rejecting the
+            # same-transaction conversation reference.
+            persisted_model_json = db.execute(
+                select(AnswerSession.model_json).where(
+                    AnswerSession.id == answer.id
+                )
+            ).scalar_one()
+            persisted_scope = str(
+                (persisted_model_json or {}).get(
+                    "conversation_state_scope_hash"
+                )
+                or ""
+            )
+            if persisted_scope == trace_scope:
+                answer_scope = persisted_scope
+        if (
             len(trace_scope) != 64
             or answer_scope != trace_scope
             or package_scope != trace_scope
         ):
+            mismatch = []
+            if len(trace_scope) != 64:
+                mismatch.append("trace_scope_invalid")
+            if answer_scope != trace_scope:
+                mismatch.append(
+                    "answer_scope_missing"
+                    if not answer_scope
+                    else "answer_scope_mismatch"
+                )
+            if package_scope != trace_scope:
+                mismatch.append("package_scope_mismatch")
             raise ConversationStateIntegrityError(
-                "answer and context package conversation scopes do not match the retrieval trace"
+                "answer and context package conversation scopes do not match the retrieval trace: "
+                + ",".join(mismatch)
+                + f";turn_index={reference.get('turn_index')}"
+                + f";validation_phase={validation_phase}"
+                + ";answer_protocol="
+                + str(answer.prompt_protocol_version or "missing")
+                + ";model_keys="
+                + ",".join(sorted((answer.model_json or {}).keys()))
+                + ";diagnostic_keys="
+                + ",".join(sorted((answer.diagnostics_json or {}).keys()))
             )
         expected_citation_ids = sorted(
             {
@@ -731,10 +813,25 @@ def _validate_reference_provenance(
                 for value in (answer.citation_ids_json or [])
             }
         )
-        if reference["citation_verification_ids"] != expected_citation_ids:
+        source_reference = reference["protocol_version"] == CONVERSATION_SOURCE_REFERENCE_PROTOCOL_VERSION
+        id_field = "source_binding_ids" if source_reference else "citation_verification_ids"
+        if reference.get(id_field, []) != expected_citation_ids:
             raise ConversationStateIntegrityError(
                 "conversation citation references do not match the answer session"
             )
+        if source_reference:
+            from app.services.retrieval_answer_record import replay_answer_bindings
+            rows = list(db.scalars(select(AnswerSourceBinding).where(AnswerSourceBinding.answer_session_id == answer.id)))
+            if sorted(row.id for row in rows) != expected_citation_ids:
+                raise ConversationStateIntegrityError("source binding references do not match persisted rows")
+            try:
+                replayed = replay_answer_bindings(db, answer=answer, package=package)
+                supplied = [Citation.model_validate(item).model_dump(mode="json") for item in assistant_message.get("citations", [])]
+            except ValueError as exc:
+                raise ConversationStateIntegrityError("source binding replay failed") from exc
+            if replayed != supplied:
+                raise ConversationStateIntegrityError("conversation source bindings differ from persisted answer")
+            continue
         for citation_id in expected_citation_ids:
             verification = db.get(CitationVerification, citation_id)
             if verification is None:
@@ -757,6 +854,7 @@ def verify_session_state(
     session: QASession,
     *,
     validate_references: bool = True,
+    validation_phase: str = "persisted_state",
 ) -> tuple[
     list[dict[str, Any]],
     dict[str, Any],
@@ -802,7 +900,13 @@ def verify_session_state(
             "persisted conversation state hash does not match canonical state"
         )
     if validate_references:
-        _validate_reference_provenance(db, session, references, transcript)
+        _validate_reference_provenance(
+            db,
+            session,
+            references,
+            transcript,
+            validation_phase=validation_phase,
+        )
     return transcript, constraints, task_state, references, expected_hash
 
 
@@ -927,9 +1031,11 @@ def bounded_prompt_history(
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     selected_pairs_reversed: list[list[dict[str, str]]] = []
     token_count = 0
+    completed_message_count = len(transcript) - (len(transcript) % 2)
+    completed_transcript = transcript[:completed_message_count]
     transcript_pairs = [
         (transcript[index], transcript[index + 1])
-        for index in range(0, len(transcript), 2)
+        for index in range(0, completed_message_count, 2)
     ]
     for user_item, assistant_item in reversed(transcript_pairs):
         selected_message_count = len(selected_pairs_reversed) * 2
@@ -984,15 +1090,19 @@ def bounded_prompt_history(
         "stored_turn_count": len(transcript),
         "selected_turn_count": len(selected),
         "stored_completed_turn_count": len(transcript_pairs),
+        "pending_user_message_count": len(transcript) % 2,
         "selected_completed_turn_count": len(selected) // 2,
         "omitted_turn_count": len(transcript) - len(selected),
         "selected_token_count": token_count,
         "turn_limit": PROMPT_HISTORY_MAX_TURNS,
         "token_limit": PROMPT_HISTORY_MAX_TOKENS,
-        "transcript_truncated": len(selected) < len(transcript)
+        "transcript_truncated": len(selected) < completed_message_count
+        or len(transcript) != completed_message_count
         or any(
             selected[index]["content"]
-            != transcript[len(transcript) - len(selected) + index]["content"]
+            != completed_transcript[
+                len(completed_transcript) - len(selected) + index
+            ]["content"]
             for index in range(len(selected))
         ),
         "persisted_transcript_retained_in_full": True,
@@ -1101,7 +1211,9 @@ def prepare_session_for_turn(
     if locked is None:
         raise ConversationStateNotFoundError("conversation session not found")
     transcript, constraints, task_state, references, _state_hash = (
-        verify_session_state(db, locked, validate_references=True)
+        # Historical source replay is an authorization gate for reuse, not a
+        # prerequisite for viewing or continuing an otherwise intact session.
+        verify_session_state(db, locked, validate_references=False)
     )
     client_history = _history_messages(history)
     merged_transcript, merge_audit = _merge_client_history(
@@ -1116,12 +1228,12 @@ def prepare_session_for_turn(
             task_state = canonical_task_state(
                 state_update.task_state.model_dump()
             )
-    if not task_state.get("objective"):
+    if state_update is None or state_update.task_state is None or not state_update.task_state.objective:
         task_state = {
             **task_state,
             "objective": question.strip(),
         }
-    if task_state.get("status") in {"completed", "cancelled"}:
+    if task_state.get("status") in {"completed", "cancelled", "failed"}:
         task_state = {**task_state, "status": "active"}
     task_state = {**task_state, "current_step": "answering"}
     locked.transcript = merged_transcript
@@ -1155,6 +1267,95 @@ def prepare_session_for_turn(
             "prompt_history_audit": prompt_audit,
         }
     )
+
+
+def mark_session_task_terminal_for_run(
+    db: Session,
+    *,
+    session_id: str | None,
+    run_id: str,
+    status: str,
+) -> bool:
+    """Persist a failed/cancelled task state when this is the session's latest run."""
+
+    if session_id is None:
+        return False
+    if status not in {"failed", "cancelled"}:
+        raise ValueError("conversation terminal task status must be failed or cancelled")
+    session = db.scalar(
+        select(QASession).where(QASession.id == session_id).with_for_update()
+    )
+    if session is None:
+        return False
+    latest_run = db.scalar(
+        select(AgentRun)
+        .where(AgentRun.session_id == session_id)
+        .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+        .limit(1)
+    )
+    if latest_run is None or str(latest_run.id) != str(run_id):
+        return False
+    transcript = canonical_transcript(session.transcript)
+    canonical_run_id = canonical_uuid(run_id, field_name="run_id")
+    terminal_answer = (
+        "本轮问答已取消。"
+        if status == "cancelled"
+        else "本轮问答未能完成，请重新提问。"
+    )
+    run_messages = [
+        item for item in transcript if item.get("run_id") == canonical_run_id
+    ]
+    if not run_messages:
+        if transcript and transcript[-1]["role"] != "assistant":
+            raise ConversationStateConflictError(
+                "cannot recover a terminal turn after another pending user message"
+            )
+        pending = {
+            "role": "user",
+            "content": str(latest_run.question).strip(),
+            "run_id": canonical_run_id,
+        }
+        transcript.append(pending)
+        run_messages = [pending]
+    if (
+        len(run_messages) == 1
+        and run_messages[0]["role"] == "user"
+        and transcript[-1] is run_messages[0]
+    ):
+        transcript.append(
+            {
+                "role": "assistant",
+                "content": terminal_answer,
+                "run_id": canonical_run_id,
+                **({"route": latest_run.route} if latest_run.route else {}),
+            }
+        )
+    elif not (
+        len(run_messages) == 2
+        and run_messages[0]["role"] == "user"
+        and run_messages[1]["role"] == "assistant"
+    ):
+        raise ConversationStateConflictError(
+            "terminal run does not map to one persisted conversation turn"
+        )
+    transcript = canonical_transcript(transcript)
+    task_state = {
+        **canonical_task_state(session.task_state_json),
+        "status": status,
+        "current_step": status,
+    }
+    session.transcript = transcript
+    session.task_state_json = task_state
+    session.last_question = str(latest_run.question).strip()
+    session.last_answer = terminal_answer
+    session.conversation_state_revision = int(
+        session.conversation_state_revision or 0
+    ) + 1
+    session.conversation_state_hash = conversation_state_hash_for_session(session)
+    flag_modified(session, "transcript")
+    flag_modified(session, "task_state_json")
+    db.flush()
+    return True
 
 
 def merge_search_filters_with_conversation_constraints(
@@ -1215,6 +1416,78 @@ def merge_search_filters_with_conversation_constraints(
     return SearchFilters.model_validate(request_payload)
 
 
+def append_pending_user_turn(
+    db: Session,
+    *,
+    session_id: str,
+    question: str,
+    run_id: str,
+) -> ConversationStateSnapshot:
+    """Persist the accepted user message before retrieval or model work starts."""
+
+    session = db.scalar(
+        select(QASession).where(QASession.id == session_id).with_for_update()
+    )
+    if session is None:
+        raise ConversationStateNotFoundError("conversation session not found")
+    transcript, constraints, task_state, references, _state_hash = (
+        verify_session_state(db, session, validate_references=False)
+    )
+    canonical_run_id = canonical_uuid(run_id, field_name="run_id")
+    normalized_question = question.strip()
+    matching = [
+        item for item in transcript if item.get("run_id") == canonical_run_id
+    ]
+    if matching:
+        if (
+            len(matching) == 1
+            and matching[0]["role"] == "user"
+            and matching[0]["content"] == normalized_question
+            and transcript[-1] is matching[0]
+        ):
+            return _snapshot_from_verified(
+                session,
+                transcript=transcript,
+                constraints=constraints,
+                task_state=task_state,
+                references=references,
+                state_hash=session.conversation_state_hash,
+            )
+        raise ConversationStateConflictError(
+            "run_id already has a non-pending conversation turn"
+        )
+    if transcript and transcript[-1]["role"] != "assistant":
+        raise ConversationStateConflictError(
+            "previous conversation run has not reached a persisted terminal turn"
+        )
+    transcript = canonical_transcript(
+        [
+            *transcript,
+            {
+                "role": "user",
+                "content": normalized_question,
+                "run_id": canonical_run_id,
+            },
+        ]
+    )
+    session.transcript = transcript
+    session.last_question = normalized_question
+    session.conversation_state_revision = int(
+        session.conversation_state_revision or 0
+    ) + 1
+    session.conversation_state_hash = conversation_state_hash_for_session(session)
+    flag_modified(session, "transcript")
+    db.flush()
+    return _snapshot_from_verified(
+        session,
+        transcript=transcript,
+        constraints=constraints,
+        task_state=task_state,
+        references=references,
+        state_hash=session.conversation_state_hash,
+    )
+
+
 def append_completed_turn(
     db: Session,
     *,
@@ -1226,6 +1499,9 @@ def append_completed_turn(
     answer_session_id: str | None = None,
     retrieval_trace_id: str | None = None,
     task_status: str = "active",
+    route: str | None = None,
+    direct_answer_mode: str | None = None,
+    commit: bool = True,
 ) -> ConversationStateSnapshot:
     session = db.scalar(
         select(QASession).where(QASession.id == session_id).with_for_update()
@@ -1233,7 +1509,12 @@ def append_completed_turn(
     if session is None:
         raise ConversationStateNotFoundError("conversation session not found")
     transcript, constraints, task_state, references, _state_hash = (
-        verify_session_state(db, session, validate_references=True)
+        verify_session_state(
+            db,
+            session,
+            validate_references=False,
+            validation_phase="pre_append",
+        )
     )
     canonical_run_id = canonical_uuid(run_id, field_name="run_id")
     answer_row: AnswerSession | None = None
@@ -1272,31 +1553,81 @@ def append_completed_turn(
             for citation in citations
         ],
     }
+    if route is not None:
+        assistant_message["route"] = str(route)
+    if direct_answer_mode is not None:
+        assistant_message["direct_answer_mode"] = str(
+            direct_answer_mode
+        )
     if canonical_retrieval_trace_id is not None:
         assistant_message["retrieval_trace_id"] = canonical_retrieval_trace_id
-    transcript.extend(
-        [
-            {
-                "role": "user",
-                "content": question.strip(),
-                "run_id": canonical_run_id,
-            },
-            assistant_message,
-        ]
-    )
+    run_messages = [
+        item for item in transcript if item.get("run_id") == canonical_run_id
+    ]
+    if run_messages:
+        if (
+            len(run_messages) != 1
+            or run_messages[0]["role"] != "user"
+            or run_messages[0]["content"] != question.strip()
+            or transcript[-1] is not run_messages[0]
+        ):
+            raise ConversationStateConflictError(
+                "completed run does not match one pending user turn"
+            )
+        transcript.append(assistant_message)
+    else:
+        # Historical/internal callers may not have created a pending turn.
+        transcript.extend(
+            [
+                {
+                    "role": "user",
+                    "content": question.strip(),
+                    "run_id": canonical_run_id,
+                },
+                assistant_message,
+            ]
+        )
     transcript = canonical_transcript(transcript)
-    if answer_row is not None:
+    if answer_row is not None and (
+        answer_row.context_package_id is not None
+        or answer_row.retrieval_trace_id is not None
+    ):
+        if (
+            answer_row.context_package_id is None
+            or answer_row.retrieval_trace_id is None
+        ):
+            raise ConversationStateIntegrityError(
+                "answer evidence reference is only partially populated"
+            )
+        source_reference = (
+            (answer_row.diagnostics_json or {}).get("answer_reflection", {}).get("protocol_version") == "agent_answer_reflection_v1"
+            or (answer_row.diagnostics_json or {}).get("retrieval_control", {}).get("protocol_version") == "retrieval_answer_v1"
+            or (answer_row.diagnostics_json or {}).get("source_integrity_admission", {}).get("protocol_version") == "source_integrity_admission_v1"
+        )
         reference = {
-            "protocol_version": CONVERSATION_REFERENCE_PROTOCOL_VERSION,
+            "protocol_version": CONVERSATION_SOURCE_REFERENCE_PROTOCOL_VERSION if source_reference else CONVERSATION_REFERENCE_PROTOCOL_VERSION,
             "turn_index": len(references),
             "run_id": canonical_run_id,
             "answer_session_id": answer_row.id,
             "context_package_id": answer_row.context_package_id,
             "retrieval_trace_id": answer_row.retrieval_trace_id,
-            "citation_verification_ids": answer_row.citation_ids_json or [],
+            "citation_verification_ids": [] if source_reference else answer_row.citation_ids_json or [],
+            **({"source_binding_ids": answer_row.citation_ids_json or []} if source_reference else {}),
         }
         references = canonical_history_references([*references, reference])
-        _validate_reference_provenance(db, session, references, transcript)
+        # Validate the new evidence binding before it joins history. Older
+        # bindings remain visible but are replayed independently before reuse.
+        _validate_reference_provenance(
+            db,
+            session,
+            references[-1:],
+            transcript,
+            validation_phase="pending_append",
+        )
+    elif answer_row is not None and citations:
+        raise ConversationStateIntegrityError(
+            "answer without a context package cannot persist citations"
+        )
     task_steps = {
         "active": "awaiting_user",
         "waiting_user": "clarification_required",
@@ -1326,9 +1657,17 @@ def append_completed_turn(
     flag_modified(session, "active_user_constraints_json")
     flag_modified(session, "task_state_json")
     flag_modified(session, "history_references_json")
-    db.commit()
-    db.refresh(session)
-    verified = verify_session_state(db, session, validate_references=True)
+    if commit:
+        db.commit()
+        db.refresh(session)
+    else:
+        db.flush()
+    verified = verify_session_state(
+        db,
+        session,
+        validate_references=False,
+        validation_phase="post_append_flush",
+    )
     return _snapshot_from_verified(
         session,
         transcript=verified[0],
@@ -1370,6 +1709,47 @@ def session_transcript_public_payload(
                 public_item["citation_replay_reason"] = None
         public_transcript.append(public_item)
     transcript = public_transcript
+    recent_trace_run_ids = [
+        item["run_id"]
+        for item in transcript
+        if item["role"] == "assistant" and item.get("run_id") is not None
+    ][-8:]
+    traces_by_run: dict[str, list[dict[str, Any]]] = {}
+    if recent_trace_run_ids:
+        trace_rows = db.scalars(
+            select(AgentTraceEvent)
+            .where(AgentTraceEvent.run_id.in_(recent_trace_run_ids))
+            .order_by(AgentTraceEvent.run_id.asc(), AgentTraceEvent.sequence_index.asc())
+        ).all()
+        for event in trace_rows:
+            traces_by_run.setdefault(event.run_id, []).append(
+                {
+                    "id": event.id,
+                    "run_id": event.run_id,
+                    "sequence_index": event.sequence_index,
+                    "node": event.node,
+                    "status": event.status,
+                    "input_summary": event.input_summary,
+                    "output_summary": event.output_summary,
+                    "document_ids": event.document_ids or [],
+                    "scores": event.scores or {},
+                    "duration_ms": event.duration_ms,
+                    "error": event.error_message,
+                    "created_at": event.created_at,
+                }
+            )
+        transcript = [
+            {
+                **item,
+                **(
+                    {"trace": traces_by_run.get(item["run_id"], [])}
+                    if item["role"] == "assistant"
+                    and item.get("run_id") in traces_by_run
+                    else {}
+                ),
+            }
+            for item in transcript
+        ]
     missing_run_ids = {
         item["run_id"]
         for item in transcript
@@ -1412,12 +1792,14 @@ def session_transcript_public_payload(
 def session_summary_payload(
     db: Session,
     session: QASession,
+    *,
+    validate_references: bool = True,
 ) -> dict[str, Any]:
     _session, snapshot = load_conversation_state(
         db,
         knowledge_base_id=session.knowledge_base_id,
         session_id=session.id,
-        validate_references=True,
+        validate_references=validate_references,
     )
     return {
         "id": session.id,

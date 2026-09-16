@@ -1,6 +1,5 @@
 param(
   [string]$ApiBuildTag = "course-kg-api:local",
-  [string]$WebBuildTag = "course-kg-web:local",
   # Must match start-app.ps1 so image rebuilds address the existing local stack.
   [string]$ComposeProjectName = "knowledgegraph-dev-20260820",
   [switch]$NoCache,
@@ -60,16 +59,13 @@ if ($ComposeProjectName -cnotmatch '^[a-z0-9][a-z0-9_-]*$') {
   throw "Unsupported ComposeProjectName='$ComposeProjectName'. Use lowercase letters, digits, underscores or hyphens."
 }
 Assert-BuildableImageTag -Name "ApiBuildTag" -Value $ApiBuildTag
-Assert-BuildableImageTag -Name "WebBuildTag" -Value $WebBuildTag
 
 # Shell environment has higher Compose interpolation precedence than --env-file.
 # This intentionally prevents a locked runtime API_IMAGE=name@sha256:... in .env
 # from becoming the output tag of a local build.
 $env:API_IMAGE = $ApiBuildTag
-$env:WEB_IMAGE = $WebBuildTag
 
 Write-Host "API build tag: $ApiBuildTag"
-Write-Host "Web build tag: $WebBuildTag"
 
 Invoke-Compose -Arguments @(
   "compose",
@@ -81,14 +77,14 @@ $buildArgs = @("compose", "-f", $InfraComposeFile, "build")
 if ($NoCache) {
   $buildArgs += "--no-cache"
 }
-# worker uses the exact API image/tag and does not need a duplicate build.
-$buildArgs += @("api", "web")
+# Worker and beat reuse the exact API image/tag.
+$buildArgs += @("api")
 
-Write-Host "Rebuilding application images (api, web; worker reuses api)..." -ForegroundColor Cyan
+Write-Host "Rebuilding backend image (API, worker and beat)..." -ForegroundColor Cyan
 Invoke-Compose -Arguments $buildArgs
 
 if (-not $DryRun) {
-  foreach ($requiredImage in @($ApiBuildTag, $WebBuildTag)) {
+  foreach ($requiredImage in @($ApiBuildTag)) {
     & docker image inspect $requiredImage *> $null
     if ($LASTEXITCODE -ne 0) {
       throw "Build completed without the expected image tag '$requiredImage'."

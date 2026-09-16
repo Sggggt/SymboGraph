@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+import math
 from typing import Any
 
 
@@ -92,6 +93,7 @@ _SAFE_TOKEN_OPERATIONAL_SEGMENTS = frozenset(
         "read",
         "remaining",
         "request",
+        "retrieval",
         "selected",
         "size",
         "span",
@@ -290,6 +292,14 @@ def _safe_sensitive_observability_value(key: str, value: Any) -> bool:
     """Allow only typed, content-free forms of otherwise sensitive metrics."""
 
     segments = semantic_key_segments(key)
+    if segments == ("first", "token", "ms"):
+        return value is None or (type(value) in {int, float} and math.isfinite(value) and value >= 0)
+    if segments in {
+        ("retrieval", "planning", "max", "token"),
+        ("retrieval", "repair", "max", "token"),
+        ("retrieval", "generation", "max", "token"),
+    }:
+        return value is None or (type(value) is int and 256 <= value <= 32768)
     if segments == ("provider", "response", "persisted"):
         return value is False
     if segments == ("cacheable", "system", "prompt", "sha256"):

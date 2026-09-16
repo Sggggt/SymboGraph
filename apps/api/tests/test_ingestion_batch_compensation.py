@@ -1154,8 +1154,24 @@ async def test_multi_file_partial_failure_uses_each_exact_before_state(
         graph_db.flush()
         return state
 
+    async def minimal_lexical(knowledge_base_id, **_kwargs):
+        assert knowledge_base_id == sample_knowledge_base.id
+        return {
+            "status": "completed",
+            "index_state_id": "unit-test-lexical-state",
+            "index_identity": "8" * 64,
+            "job_id": "unit-test-lexical-job",
+            "document_count": 1,
+            "posting_count": 1,
+        }
+
     monkeypatch.setattr(ingestion, "ingest_file", one_success_one_failure)
     monkeypatch.setattr(ingestion, "rebuild_context_graph", minimal_graph)
+    monkeypatch.setattr(
+        ingestion,
+        "rebuild_lexical_index_for_knowledge_base",
+        minimal_lexical,
+    )
     result = await ingestion.run_uploaded_files_ingestion(
         batch.id,
         [str(first), str(second)],

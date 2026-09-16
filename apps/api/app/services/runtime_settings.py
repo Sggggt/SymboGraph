@@ -28,13 +28,16 @@ from app.core.config import (
     EDGE_PROJECTION_PROTOCOL_ALLOWLIST,
     EDGE_TYPE_CALIBRATION_PROTOCOL_ALLOWLIST,
     EMBEDDING_API_PROTOCOL_ALLOWLIST,
+    ENV_AUTHORITY_SETTINGS,
     GRAY_ZONE_OBSERVATION_CADENCE_MAX,
     GRAY_ZONE_RULE_PROTOCOL_ALLOWLIST,
     HOT_RELOAD_SETTINGS,
     MODEL_API_PROTOCOL_ALLOWLIST,
     PROCESS_ONLY_ENV_KEYS,
     REBUILD_REQUIRED_SETTINGS,
+    RETRIEVAL_CONTROL_SETTINGS,
     RQ_MEMBERSHIP_PROTOCOL_ALLOWLIST,
+    RUNTIME_JSON_SETTINGS,
     RUNTIME_ENV_SETTINGS,
     SERVICE_RECREATE_REQUIRED_SETTINGS,
     Settings,
@@ -46,12 +49,22 @@ from app.core.config import (
     validate_path_distance_thresholds,
 )
 from app.services.error_sanitizer import public_exception_message, sanitize_error_message
+from app.core.runtime_config import (
+    atomic_replace_runtime_settings,
+    read_runtime_settings_values,
+    runtime_settings_bytes,
+    runtime_settings_file_identity,
+    runtime_settings_path,
+)
 
 
 ENV_PATH = Path(
     os.environ.get("RUNTIME_ENV_FILE") or (WORKSPACE_ROOT / ".env")
 )
 ENV_EXAMPLE_PATH = Path(ENV_PATH).with_name(".env.example")
+SETTINGS_PATH = runtime_settings_path(workspace_root=WORKSPACE_ROOT, env_path=ENV_PATH)
+SETTINGS_EXAMPLE_PATH = SETTINGS_PATH.with_name("settings.example.json")
+_INITIAL_ENV_PATH = ENV_PATH
 RUNTIME_SETTINGS_AUDIT_PROTOCOL_VERSION = "runtime_settings_audit_v1"
 RUNTIME_ENV_FILE_LOCK_PROTOCOL_VERSION = "runtime_env_file_lock_v1"
 RUNTIME_ENV_FILE_IDENTITY_PROTOCOL_VERSION = "runtime_env_file_identity_v1"
@@ -74,6 +87,10 @@ KNOWN_UNSAFE_BRIDGE_ADMIN_TOKENS = frozenset(
     }
 )
 DEPRECATED_ENV_KEYS: set[str] = {
+    "AGENT_REPAIR_ROUND_BUDGET",
+    "AGENT_VERIFICATION_BUDGET",
+    "RQ_KMEANS_LEVELS",
+    "WEB_IMAGE",
     "CHUNK_TOKEN_BUDGET",
     "SEMANTIC_CHUNKING_ENABLED",
     "SEMANTIC_CHUNKING_MIN_LENGTH",
@@ -118,6 +135,31 @@ DEPRECATED_ENV_KEYS: set[str] = {
     "RERANKER_DEVICE",
     "HF_HUB_OFFLINE",
     "OPENAI_API_KEY",
+    "RETRIEVAL_REPAIR_ROUND_LIMIT",
+    "RETRIEVAL_REPAIR_TIMEOUT_SECONDS",
+    "RETRIEVAL_SUFFICIENCY_TIMEOUT_SECONDS",
+    "RETRIEVAL_REPAIR_MAX_TOKENS",
+    "RETRIEVAL_SUFFICIENCY_MAX_TOKENS",
+    "RETRIEVAL_GATE_COVERAGE_THRESHOLD",
+    "RETRIEVAL_GATE_PATH_THRESHOLD",
+    "RETRIEVAL_REWARD_TIME_WEIGHT",
+    "RETRIEVAL_REWARD_WORK_WEIGHT",
+    "RETRIEVAL_REWARD_TIME_SCALE_SECONDS",
+    "QUERY_FACET_POSTERIOR_ENABLED",
+    "QUERY_FACET_POSTERIOR_OBSERVATION_BUDGET",
+    "QUERY_FACET_POSTERIOR_ROUND_BUDGET",
+    "QUERY_FACET_POSTERIOR_CONVERGENCE_EPSILON",
+    "AGENT_COARSE_TOTAL_BUDGET",
+    "AGENT_MAX_CYCLE_REWARD_PER_PATH",
+    "AGENT_CYCLE_REWARD_DISTANCE_THRESHOLD",
+    "AGENT_STRUCTURE_RESTORE_BUDGET",
+    "AGENT_PLANNING_ROUND_BUDGET",
+    "AGENT_MAX_TYPED_ACTIONS_PER_ROUND",
+    "AGENT_REFLECTION_ROUND_BUDGET",
+    "AGENT_REFLECTION_TIMEOUT_SECONDS",
+    "AGENT_REFLECTION_PATH_THRESHOLD",
+    "AGENT_REFLECTION_QUESTION_THRESHOLD",
+    "AGENT_REFLECTION_CONTEXT_THRESHOLD",
 }
 _LAST_RUNTIME_SETTINGS_VERSION: str | None = None
 _RUNTIME_ENV_PROCESS_APPLIED_VALUES: dict[str, str | None] = {}
@@ -131,38 +173,95 @@ SECRET_CLEAR_CONTROL_KEYS = {
 }
 
 
+def _runtime_settings_values() -> dict[str, Any]:
+    if runtime_settings_override_active():
+        return {}
+    return read_runtime_settings_values(
+        _active_settings_path(),
+        allowed_keys=RUNTIME_JSON_SETTINGS,
+        allow_missing=True,
+    )
+
+
+def _active_settings_path() -> Path:
+    # Unit tests and explicit recovery tools commonly replace ENV_PATH with a
+    # temporary root. Keep the paired settings file in that same root unless
+    # they also replace SETTINGS_PATH explicitly.
+    if ENV_PATH != _INITIAL_ENV_PATH and SETTINGS_PATH.parent != ENV_PATH.parent:
+        return ENV_PATH.with_name("settings.json")
+    return SETTINGS_PATH
+
+
+def runtime_configuration_identity() -> dict[str, Any]:
+    env_identity = runtime_env_file_identity(ENV_PATH)
+    settings_identity = runtime_settings_file_identity(_active_settings_path())
+    encoded = json.dumps(
+        {
+            "protocol_version": "runtime_configuration_pair_identity_v1",
+            "env_identity_hash": env_identity.get("identity_hash"),
+            "settings_sha256": settings_identity.get("sha256"),
+            "settings_exists": settings_identity.get("exists"),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "protocol_version": "runtime_configuration_pair_identity_v1",
+        "identity_hash": hashlib.sha256(encoded).hexdigest(),
+        "env": env_identity,
+        "settings": settings_identity,
+    }
+
+
 def read_env_int(key: str, default: int = 0) -> int:
     """直接从 .env 文件读取整数值（热加载，绕过 os.environ 缓存）。"""
     if runtime_settings_override_active():
         return default
-    value = _env_entries(ENV_PATH).get(key.upper())
+    setting_key = key.casefold()
+    value = (
+        _runtime_settings_values().get(setting_key)
+        if setting_key in RUNTIME_JSON_SETTINGS
+        else _env_entries(ENV_PATH).get(key.upper())
+    )
     if value is None:
         return default
     try:
         return int(value)
-    except ValueError:
+    except (TypeError, ValueError):
         return default
 
 
 def read_env_float(key: str, default: float = 0.0) -> float:
     if runtime_settings_override_active():
         return default
-    value = _env_entries(ENV_PATH).get(key.upper())
+    setting_key = key.casefold()
+    value = (
+        _runtime_settings_values().get(setting_key)
+        if setting_key in RUNTIME_JSON_SETTINGS
+        else _env_entries(ENV_PATH).get(key.upper())
+    )
     if value is None:
         return default
     try:
         return float(value)
-    except ValueError:
+    except (TypeError, ValueError):
         return default
 
 
 def read_env_bool(key: str, default: bool = False) -> bool:
     if runtime_settings_override_active():
         return default
-    value = _env_entries(ENV_PATH).get(key.upper())
+    setting_key = key.casefold()
+    value = (
+        _runtime_settings_values().get(setting_key)
+        if setting_key in RUNTIME_JSON_SETTINGS
+        else _env_entries(ENV_PATH).get(key.upper())
+    )
     if value is None:
         return default
-    return value.strip().lower() in {"true", "1", "yes", "on"}
+    if type(value) is bool:
+        return value
+    return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
 
 def runtime_lifecycle_payload() -> dict:
@@ -221,6 +320,7 @@ def model_settings_payload(
         else None
     )
     payload = {
+        **{name: getattr(settings, name) for name in RETRIEVAL_CONTROL_SETTINGS},
         "provider": "multi_protocol",
         "chat_api_protocol": settings.chat_api_protocol,
         "graph_api_protocol": settings.graph_api_protocol,
@@ -241,6 +341,9 @@ def model_settings_payload(
         "embedding_batch_size": read_env_int("EMBEDDING_BATCH_SIZE", settings.embedding_batch_size),
         "worker_concurrency": settings.worker_concurrency,
         "model_request_concurrency": settings.model_request_concurrency,
+        "graph_compute_memory_mb": settings.graph_compute_memory_mb,
+        "graph_compute_threads": settings.graph_compute_threads,
+        "graph_progress_interval_seconds": settings.graph_progress_interval_seconds,
         "model_request_timeout_seconds": settings.model_request_timeout_seconds,
         "chat_json_max_tokens": settings.chat_json_max_tokens,
         "agent_request_concurrency": read_env_int("AGENT_REQUEST_CONCURRENCY", settings.agent_request_concurrency),
@@ -315,11 +418,23 @@ def model_settings_payload(
             "OPERATING_POINT_HARD_GATE_MAX_CANDIDATE_LATENCY_P95_MS", settings.operating_point_hard_gate_max_candidate_latency_p95_ms
         ),
         "retrieval_result_top_k_default": read_env_int("RETRIEVAL_RESULT_TOP_K_DEFAULT", settings.retrieval_result_top_k_default),
+        "retrieval_v1_dense_candidate_budget": read_env_int("RETRIEVAL_V1_DENSE_CANDIDATE_BUDGET", settings.retrieval_v1_dense_candidate_budget),
+        "retrieval_v1_rq_candidate_budget": read_env_int("RETRIEVAL_V1_RQ_CANDIDATE_BUDGET", settings.retrieval_v1_rq_candidate_budget),
+        "retrieval_v1_bm25_candidate_budget": read_env_int("RETRIEVAL_V1_BM25_CANDIDATE_BUDGET", settings.retrieval_v1_bm25_candidate_budget),
+        "retrieval_v1_root_entry_budget": read_env_int("RETRIEVAL_V1_ROOT_ENTRY_BUDGET", settings.retrieval_v1_root_entry_budget),
+        "retrieval_v1_per_parent_entry_budget": read_env_int("RETRIEVAL_V1_PER_PARENT_ENTRY_BUDGET", settings.retrieval_v1_per_parent_entry_budget),
+        "retrieval_v1_layer_entry_budget": read_env_int("RETRIEVAL_V1_LAYER_ENTRY_BUDGET", settings.retrieval_v1_layer_entry_budget),
+        "retrieval_v1_max_depth": read_env_int("RETRIEVAL_V1_MAX_DEPTH", settings.retrieval_v1_max_depth),
+        "retrieval_v1_restore_per_hit": read_env_int("RETRIEVAL_V1_RESTORE_PER_HIT", settings.retrieval_v1_restore_per_hit),
+        "lexical_index_max_documents": read_env_int("LEXICAL_INDEX_MAX_DOCUMENTS", settings.lexical_index_max_documents),
+        "lexical_index_max_postings": read_env_int("LEXICAL_INDEX_MAX_POSTINGS", settings.lexical_index_max_postings),
+        "lexical_index_max_characters": read_env_int("LEXICAL_INDEX_MAX_CHARACTERS", settings.lexical_index_max_characters),
+        "bm25_k1": read_env_float("BM25_K1", settings.bm25_k1),
+        "bm25_b": read_env_float("BM25_B", settings.bm25_b),
         "agent_coarse_initial_budget": read_env_int(
             "AGENT_COARSE_INITIAL_BUDGET",
             read_env_int("AGENT_COARSE_TOTAL_BUDGET", settings.agent_coarse_initial_budget or settings.agent_coarse_total_budget),
         ),
-        "agent_coarse_total_budget": read_env_int("AGENT_COARSE_TOTAL_BUDGET", settings.agent_coarse_total_budget),
         "agent_coarse_top_k": read_env_int(
             "AGENT_COARSE_TOP_K",
             settings.agent_coarse_top_k or settings.agent_coarse_initial_budget or settings.agent_coarse_total_budget,
@@ -337,8 +452,6 @@ def model_settings_payload(
         "agent_max_depth_per_layer": read_env_int("AGENT_MAX_DEPTH_PER_LAYER", settings.agent_max_depth_per_layer),
         "agent_max_labels_per_node": read_env_int("AGENT_MAX_LABELS_PER_NODE", settings.agent_max_labels_per_node),
         "agent_max_edge_reuse": read_env_int("AGENT_MAX_EDGE_REUSE", settings.agent_max_edge_reuse),
-        "agent_max_cycle_reward_per_path": read_env_float("AGENT_MAX_CYCLE_REWARD_PER_PATH", settings.agent_max_cycle_reward_per_path),
-        "agent_cycle_reward_distance_threshold": read_env_float("AGENT_CYCLE_REWARD_DISTANCE_THRESHOLD", settings.agent_cycle_reward_distance_threshold),
         "agent_path_distance_green_threshold": read_env_float("AGENT_PATH_DISTANCE_GREEN_THRESHOLD", settings.agent_path_distance_green_threshold),
         "agent_path_distance_gray_threshold": read_env_float("AGENT_PATH_DISTANCE_GRAY_THRESHOLD", settings.agent_path_distance_gray_threshold),
         "agent_path_distance_hard_threshold": read_env_float("AGENT_PATH_DISTANCE_HARD_THRESHOLD", settings.agent_path_distance_hard_threshold),
@@ -356,30 +469,14 @@ def model_settings_payload(
             "AGENT_STRUCTURE_RESTORE_PER_CHUNK_BUDGET",
             settings.agent_structure_restore_per_chunk_budget or settings.agent_structure_restore_budget,
         ),
-        "agent_structure_restore_budget": read_env_int("AGENT_STRUCTURE_RESTORE_BUDGET", settings.agent_structure_restore_budget),
         "context_path_summary_budget": read_env_int("CONTEXT_PATH_SUMMARY_BUDGET", settings.context_path_summary_budget),
-        "agent_planning_round_budget": read_env_int("AGENT_PLANNING_ROUND_BUDGET", settings.agent_planning_round_budget),
-        "agent_max_typed_actions_per_round": read_env_int("AGENT_MAX_TYPED_ACTIONS_PER_ROUND", settings.agent_max_typed_actions_per_round),
-        "agent_repair_round_budget": read_env_int("AGENT_REPAIR_ROUND_BUDGET", settings.agent_repair_round_budget),
-        "agent_verification_budget": read_env_int("AGENT_VERIFICATION_BUDGET", settings.agent_verification_budget),
+        "agent_answer_unit_limit": read_env_int("AGENT_ANSWER_UNIT_LIMIT", settings.agent_answer_unit_limit),
+        "agent_history_summary_max_chars": read_env_int("AGENT_HISTORY_SUMMARY_MAX_CHARS", settings.agent_history_summary_max_chars),
         "concept_i18n_enabled": read_env_bool("CONCEPT_I18N_ENABLED", settings.concept_i18n_enabled),
         "query_facet_bilingual_enabled": read_env_bool("QUERY_FACET_BILINGUAL_ENABLED", settings.query_facet_bilingual_enabled),
-        "query_facet_posterior_enabled": read_env_bool(
-            "QUERY_FACET_POSTERIOR_ENABLED",
-            settings.query_facet_posterior_enabled,
-        ),
-        "query_facet_posterior_observation_budget": read_env_int(
-            "QUERY_FACET_POSTERIOR_OBSERVATION_BUDGET",
-            settings.query_facet_posterior_observation_budget,
-        ),
-        "query_facet_posterior_round_budget": read_env_int(
-            "QUERY_FACET_POSTERIOR_ROUND_BUDGET",
-            settings.query_facet_posterior_round_budget,
-        ),
-        "query_facet_posterior_convergence_epsilon": read_env_float(
-            "QUERY_FACET_POSTERIOR_CONVERGENCE_EPSILON",
-            settings.query_facet_posterior_convergence_epsilon,
-        ),
+        "ingestion_memory_soft_limit_ratio": settings.ingestion_memory_soft_limit_ratio,
+        "ingestion_memory_hard_limit_ratio": settings.ingestion_memory_hard_limit_ratio,
+        "ingestion_memory_critical_limit_ratio": settings.ingestion_memory_critical_limit_ratio,
         "enable_model_fallback": settings.enable_model_fallback,
         "enable_database_fallback": settings.enable_database_fallback,
         "has_chat_api_key": bool(settings.chat_api_key),
@@ -1556,6 +1653,17 @@ def _update_env_file(
     path: Path | str | None = None,
 ) -> None:
     target = _runtime_env_target_path(path or ENV_PATH)
+    json_updates = {
+        str(key).casefold(): value
+        for key, value in updates.items()
+        if str(key).casefold() in RUNTIME_JSON_SETTINGS
+    }
+    env_updates = {
+        key: value
+        for key, value in updates.items()
+        if str(key).casefold() not in RUNTIME_JSON_SETTINGS
+    }
+    settings_target = _active_settings_path()
     lock_context = (
         nullcontext()
         if lock_already_held
@@ -1564,9 +1672,35 @@ def _update_env_file(
     with lock_context:
         _identity, content = _read_runtime_env_snapshot(target)
         _cleanup_runtime_env_temporary_files(target)
-        publish_bytes = _runtime_env_bytes_with_updates(content, updates)
-        if publish_bytes != content:
-            _atomic_replace_runtime_env_bytes(publish_bytes, path=target)
+        settings_before = (
+            settings_target.read_bytes() if settings_target.exists() else None
+        )
+        settings_values = read_runtime_settings_values(
+            settings_target,
+            allowed_keys=RUNTIME_JSON_SETTINGS,
+            allow_missing=True,
+        )
+        for key, value in json_updates.items():
+            if value is None:
+                settings_values.pop(key, None)
+            else:
+                settings_values[key] = value
+        settings_after = runtime_settings_bytes(
+            settings_values,
+            allowed_keys=RUNTIME_JSON_SETTINGS,
+        )
+        publish_bytes = _runtime_env_bytes_with_updates(content, env_updates)
+        if settings_after != settings_before:
+            atomic_replace_runtime_settings(settings_target, settings_after)
+        try:
+            if publish_bytes != content:
+                _atomic_replace_runtime_env_bytes(publish_bytes, path=target)
+        except BaseException:
+            if settings_before is None:
+                settings_target.unlink(missing_ok=True)
+            else:
+                atomic_replace_runtime_settings(settings_target, settings_before)
+            raise
 
 
 def _apply_runtime_env(updates: dict[str, str | int | float | bool | None]) -> None:
@@ -1625,6 +1759,7 @@ def _apply_runtime_env_file_to_process_environment(
     allowed_setting_keys: set[str] | frozenset[str] | None = None,
 ) -> None:
     entries = _env_entries(ENV_PATH)
+    settings_values = _runtime_settings_values()
     # Only settings governed by the runtime-settings lifecycle may be
     # reverse-applied to the current process.  Deployment/bootstrap settings
     # such as DATA_ROOT, DATABASE_URL and REDIS_URL may be present in the
@@ -1638,6 +1773,7 @@ def _apply_runtime_env_file_to_process_environment(
     for key in PROCESS_ONLY_ENV_KEYS:
         _RUNTIME_ENV_PROCESS_APPLIED_VALUES.pop(key, None)
     for key in controlled_keys:
+        setting_key = key.casefold()
         current_value = os.environ.get(key)
         if (
             key in _RUNTIME_ENV_PROCESS_APPLIED_VALUES
@@ -1648,7 +1784,14 @@ def _apply_runtime_env_file_to_process_environment(
             # processes still consume the shared file at their own refresh
             # boundary.
             continue
-        if key in entries:
+        if setting_key in RUNTIME_JSON_SETTINGS and setting_key in settings_values:
+            value = settings_values[setting_key]
+            applied_value = (
+                "true" if value is True else "false" if value is False else str(value)
+            )
+            os.environ[key] = applied_value
+            _RUNTIME_ENV_PROCESS_APPLIED_VALUES[key] = applied_value
+        elif key in entries:
             applied_value = _deserialize_runtime_env_value(entries[key])
             os.environ[key] = applied_value
             _RUNTIME_ENV_PROCESS_APPLIED_VALUES[key] = applied_value
@@ -2373,12 +2516,8 @@ def publish_runtime_settings_version(
     *,
     idempotency_key: str | None = None,
 ) -> dict:
-    managed_env_identity = runtime_env_file_identity(ENV_PATH)
-    managed_env_identity_hash = (
-        str(managed_env_identity.get("identity_hash"))
-        if managed_env_identity.get("exists")
-        else None
-    )
+    managed_env_identity = runtime_configuration_identity()
+    managed_env_identity_hash = str(managed_env_identity["identity_hash"])
     normalized_changed_keys = sorted(set(changed_keys))
     stored_source = str(source or "api")
     if idempotency_key is not None:
@@ -2631,20 +2770,21 @@ def _env_entries(path: Path) -> dict[str, str]:
 
 
 def _settings_from_root_env(base: Settings | None = None) -> Settings:
-    """Validate the sole root env as the value shown by the Settings API.
+    """Validate both non-overlapping root authorities for the Settings API.
 
     The current process model remains the lifecycle baseline: hot values may
     already match the file, rebuild values may be waiting for promotion and
-    service values may be waiting for recreation.  No second value snapshot is
-    read from PostgreSQL or another file.
+    service values may be waiting for recreation. No value snapshot is read
+    from PostgreSQL.
     """
 
     model = (base or get_settings()).model_dump(mode="python")
     entries = _env_entries(ENV_PATH)
-    for setting_key in sorted(RUNTIME_ENV_SETTINGS):
+    for setting_key in sorted(ENV_AUTHORITY_SETTINGS):
         env_key = setting_key.upper()
         if env_key in entries:
             model[setting_key] = _deserialize_runtime_env_value(entries[env_key])
+    model.update(_runtime_settings_values())
     return Settings.model_validate(model)
 
 
@@ -3254,30 +3394,57 @@ def _restore_runtime_env_bytes_exact(
 
 
 def env_sync_status() -> dict:
-    """Check the schema of the sole repository-root runtime ``.env``."""
+    """Check both root authorities without returning configuration values."""
     actual_keys, bom_keys = _env_keys(ENV_PATH)
     example_keys, _ = _env_keys(ENV_EXAMPLE_PATH)
     declared_managed_keys = {
         key.upper()
-        for key in RUNTIME_ENV_SETTINGS
+        for key in ENV_AUTHORITY_SETTINGS
     }
     expected_managed_keys = example_keys.intersection(declared_managed_keys)
-    allowed_persisted_keys = example_keys - DEPRECATED_ENV_KEYS
+    allowed_persisted_keys = (
+        example_keys - DEPRECATED_ENV_KEYS - {key.upper() for key in RUNTIME_JSON_SETTINGS}
+    )
     deprecated_keys = sorted(actual_keys & DEPRECATED_ENV_KEYS)
     active_actual_keys = actual_keys - DEPRECATED_ENV_KEYS
     missing_keys = sorted(expected_managed_keys - active_actual_keys)
-    extra_keys = sorted(active_actual_keys - allowed_persisted_keys)
-    managed_schema_synced = bool(ENV_PATH.exists()) and not (
-        bom_keys or missing_keys or extra_keys
+    overlap_keys = sorted(active_actual_keys & {key.upper() for key in RUNTIME_JSON_SETTINGS})
+    extra_keys = sorted(active_actual_keys - allowed_persisted_keys - set(overlap_keys))
+    env_schema_synced = bool(ENV_PATH.exists()) and not (
+        bom_keys or missing_keys or extra_keys or overlap_keys
     )
+    settings_path = _active_settings_path()
+    settings_missing_keys: list[str] = []
+    settings_extra_keys: list[str] = []
+    settings_error_type: str | None = None
+    try:
+        settings_values = read_runtime_settings_values(
+            settings_path,
+            allowed_keys=RUNTIME_JSON_SETTINGS,
+            allow_missing=False,
+        )
+        settings_missing_keys = sorted(RUNTIME_JSON_SETTINGS - set(settings_values))
+    except Exception as exc:
+        settings_values = {}
+        settings_error_type = type(exc).__name__
+    settings_schema_synced = bool(settings_path.exists()) and not (
+        settings_missing_keys or settings_extra_keys or settings_error_type
+    )
+    managed_schema_synced = env_schema_synced and settings_schema_synced
     return {
         "synced": managed_schema_synced,
-        "settings_file_present": ENV_PATH.exists(),
-        "settings_file_schema_synced": managed_schema_synced,
+        "settings_file_present": settings_path.exists(),
+        "settings_file_schema_synced": settings_schema_synced,
+        "env_file_present": ENV_PATH.exists(),
+        "env_file_schema_synced": env_schema_synced,
         "missing_keys": missing_keys,
         "extra_keys": extra_keys,
+        "overlap_keys": overlap_keys,
         "deprecated_keys": deprecated_keys,
         "bom_keys": sorted(set(bom_keys)),
+        "runtime_settings_missing_keys": settings_missing_keys,
+        "runtime_settings_extra_keys": settings_extra_keys,
+        "runtime_settings_error_type": settings_error_type,
     }
 
 
@@ -3484,7 +3651,7 @@ def _root_env_updates(
     request: Mapping[str, Any],
 ) -> dict[str, str | int | float | bool | None]:
     updates: dict[str, str | int | float | bool | None] = {}
-    for key in sorted(set(request).intersection(RUNTIME_ENV_SETTINGS)):
+    for key in sorted(set(request).intersection(ENV_AUTHORITY_SETTINGS)):
         if key in SECRET_RUNTIME_SETTING_KEYS or key.upper() in PROCESS_ONLY_ENV_KEYS:
             continue
         value = getattr(prospective, key)
@@ -3527,7 +3694,7 @@ def _runtime_settings_audit_response_fields(
     *,
     configured_payload: Mapping[str, Any],
 ) -> dict[str, Any]:
-    identity = runtime_env_file_identity(ENV_PATH)
+    identity = runtime_configuration_identity()
     statuses: dict[str, str] = {}
     if row is not None and row.env_identity_hash == identity.get("identity_hash"):
         statuses = {
@@ -3600,7 +3767,7 @@ def pending_rebuild_setting_keys() -> set[str]:
             row = _latest_runtime_settings_audit(session)
             if row is None:
                 return set()
-            identity = runtime_env_file_identity(ENV_PATH)
+            identity = runtime_configuration_identity()
             if row.env_identity_hash != identity.get("identity_hash"):
                 return set()
             return {
@@ -3622,7 +3789,7 @@ def mark_runtime_settings_rebuild_applied(
     row = _latest_runtime_settings_audit(db, for_update=True)
     if row is None:
         return
-    identity = runtime_env_file_identity(ENV_PATH)
+    identity = runtime_configuration_identity()
     if row.env_identity_hash != identity.get("identity_hash"):
         return
     statuses = dict(row.field_status_json or {})
@@ -3639,13 +3806,13 @@ def mark_runtime_settings_rebuild_applied(
     row.last_error_type = None
 
 
-def save_model_settings_to_root_env(
+def save_model_settings_to_root_configuration(
     db: Session,
     payload: Mapping[str, Any],
     *,
     source: str = "api",
 ) -> dict[str, Any]:
-    """Write only the root ``.env`` and apply changes by lifecycle class."""
+    """Write each model/runtime field to its sole root authority file."""
 
     from app.models import RuntimeSettingsAudit
 
@@ -3680,7 +3847,28 @@ def save_model_settings_to_root_env(
         prospective.agent_path_distance_hard_threshold,
     )
     _validate_provider_targets(prospective, requested_keys)
-    updates = _root_env_updates(prospective=prospective, request=request)
+    requested_env_updates = _root_env_updates(
+        prospective=prospective,
+        request=request,
+    )
+    updates = {
+        key: value
+        for key, value in requested_env_updates.items()
+        if key in ENV_AUTHORITY_SETTINGS
+    }
+    settings_path = _active_settings_path()
+    settings_before_values = _runtime_settings_values()
+    settings_updates = {
+        key: getattr(prospective, key)
+        for key in sorted(requested_keys.intersection(RUNTIME_JSON_SETTINGS))
+    }
+    settings_after_values = {**settings_before_values, **settings_updates}
+    settings_publish_bytes = runtime_settings_bytes(
+        settings_after_values,
+        allowed_keys=RUNTIME_JSON_SETTINGS,
+    )
+    settings_identity_before = runtime_settings_file_identity(settings_path)
+    configuration_identity_before = runtime_configuration_identity()
     current_entries = _env_entries(ENV_PATH)
     changed_keys = [
         key
@@ -3727,15 +3915,41 @@ def save_model_settings_to_root_env(
         else:
             future_entries[env_key] = _serialize_env_value(value)
     hot_changed = sorted(set(changed_keys).intersection(HOT_RELOAD_SETTINGS))
-    hot_updates = {key: updates[key] for key in hot_changed if key in updates}
+    hot_updates = {
+        key: (
+            updates[key]
+            if key in updates
+            else getattr(prospective, key)
+        )
+        for key in hot_changed
+    }
     process_before: dict[str, tuple[bool, str | None]] = {}
     applied_values_before = dict(_RUNTIME_ENV_PROCESS_APPLIED_VALUES)
     bridge_preflight: dict[str, Any] | None = None
+
+    env_sync = env_sync_status()
+    if (
+        env_sync["overlap_keys"]
+        or env_sync["runtime_settings_missing_keys"]
+        or env_sync["runtime_settings_error_type"]
+    ):
+        raise ValueError("runtime_configuration_authority_mismatch")
 
     with runtime_env_file_lock(path=ENV_PATH):
         before_identity, before_bytes = _read_runtime_env_snapshot(ENV_PATH)
         if before_bytes is None:
             raise RuntimeError("Repository-root .env is missing")
+        settings_before_bytes = (
+            settings_path.read_bytes() if settings_path.exists() else None
+        )
+        if (
+            before_identity.get("identity_hash")
+            != configuration_identity_before["env"].get("identity_hash")
+            or runtime_settings_file_identity(settings_path) != settings_identity_before
+        ):
+            raise RuntimeEnvFileConflict(
+                "Repository-root configuration changed after request validation"
+            )
         if active_settings.model_bridge_enabled and set(changed_keys).intersection(bridge_keys):
             bridge_preflight = preflight_model_bridge_reload(
                 settings=active_settings,
@@ -3746,6 +3960,8 @@ def save_model_settings_to_root_env(
             for key in hot_changed
         }
         publish_bytes = _runtime_env_bytes_with_updates(before_bytes, updates)
+        if settings_publish_bytes != settings_before_bytes:
+            atomic_replace_runtime_settings(settings_path, settings_publish_bytes)
         if publish_bytes != before_bytes:
             _atomic_replace_runtime_env_bytes(publish_bytes, path=ENV_PATH)
         try:
@@ -3762,6 +3978,10 @@ def save_model_settings_to_root_env(
                     raise RuntimeError("model bridge reload did not commit")
         except Exception:
             _atomic_replace_runtime_env_bytes(before_bytes, path=ENV_PATH)
+            if settings_before_bytes is not None:
+                atomic_replace_runtime_settings(settings_path, settings_before_bytes)
+            else:
+                settings_path.unlink(missing_ok=True)
             for key, (existed, value) in process_before.items():
                 if existed:
                     os.environ[key] = str(value or "")
@@ -3785,16 +4005,18 @@ def save_model_settings_to_root_env(
                     },
                 )
             raise ValueError(
-                "Runtime Settings update failed; repository-root .env and current process were restored"
+                "Runtime Settings update failed; repository-root configuration and current process were restored"
             ) from None
 
-    after_identity = runtime_env_file_identity(ENV_PATH)
+    after_identity = runtime_configuration_identity()
     latest = _latest_runtime_settings_audit(db, for_update=True)
     statuses = {
         str(key): str(value)
         for key, value in (
             dict(latest.field_status_json or {}).items() if latest is not None
-            and latest.env_identity_hash == before_identity.get("identity_hash") else []
+            and latest.env_identity_hash
+            == configuration_identity_before["identity_hash"]
+            else []
         )
         if value in {
             "written_pending_rebuild",
@@ -3850,6 +4072,13 @@ def save_model_settings_to_root_env(
             db.rollback()
             with runtime_env_file_lock(path=ENV_PATH):
                 _atomic_replace_runtime_env_bytes(before_bytes, path=ENV_PATH)
+                if settings_before_bytes is not None:
+                    atomic_replace_runtime_settings(
+                        settings_path,
+                        settings_before_bytes,
+                    )
+                else:
+                    settings_path.unlink(missing_ok=True)
             for key, (existed, value) in process_before.items():
                 if existed:
                     os.environ[key] = str(value or "")
@@ -4126,6 +4355,9 @@ def update_model_settings(payload: dict) -> dict:
         "chat_json_max_tokens": "chat_json_max_tokens",
         "agent_request_concurrency": "agent_request_concurrency",
         "source_io_concurrency": "source_io_concurrency",
+        "graph_compute_memory_mb": "graph_compute_memory_mb",
+        "graph_compute_threads": "graph_compute_threads",
+        "graph_progress_interval_seconds": "graph_progress_interval_seconds",
         "agent_request_queue_limit": "agent_request_queue_limit",
         "agent_request_queue_timeout_seconds": "agent_request_queue_timeout_seconds",
         "agent_request_lease_ttl_seconds": "agent_request_lease_ttl_seconds",
@@ -4180,6 +4412,19 @@ def update_model_settings(payload: dict) -> dict:
         "operating_point_hard_gate_min_structure_recovery_rate": "operating_point_hard_gate_min_structure_recovery_rate",
         "operating_point_hard_gate_max_candidate_latency_p95_ms": "operating_point_hard_gate_max_candidate_latency_p95_ms",
         "retrieval_result_top_k_default": "retrieval_result_top_k_default",
+        "retrieval_v1_dense_candidate_budget": "retrieval_v1_dense_candidate_budget",
+        "retrieval_v1_rq_candidate_budget": "retrieval_v1_rq_candidate_budget",
+        "retrieval_v1_bm25_candidate_budget": "retrieval_v1_bm25_candidate_budget",
+        "retrieval_v1_root_entry_budget": "retrieval_v1_root_entry_budget",
+        "retrieval_v1_per_parent_entry_budget": "retrieval_v1_per_parent_entry_budget",
+        "retrieval_v1_layer_entry_budget": "retrieval_v1_layer_entry_budget",
+        "retrieval_v1_max_depth": "retrieval_v1_max_depth",
+        "retrieval_v1_restore_per_hit": "retrieval_v1_restore_per_hit",
+        "lexical_index_max_documents": "lexical_index_max_documents",
+        "lexical_index_max_postings": "lexical_index_max_postings",
+        "lexical_index_max_characters": "lexical_index_max_characters",
+        "bm25_k1": "bm25_k1",
+        "bm25_b": "bm25_b",
         "agent_coarse_initial_budget": "agent_coarse_initial_budget",
         "agent_coarse_total_budget": "agent_coarse_total_budget",
         "agent_coarse_top_k": "agent_coarse_top_k",
@@ -4207,8 +4452,13 @@ def update_model_settings(payload: dict) -> dict:
         "context_path_summary_budget": "context_path_summary_budget",
         "agent_planning_round_budget": "agent_planning_round_budget",
         "agent_max_typed_actions_per_round": "agent_max_typed_actions_per_round",
-        "agent_repair_round_budget": "agent_repair_round_budget",
-        "agent_verification_budget": "agent_verification_budget",
+        "agent_answer_unit_limit": "agent_answer_unit_limit",
+        "agent_reflection_round_budget": "agent_reflection_round_budget",
+        "agent_reflection_timeout_seconds": "agent_reflection_timeout_seconds",
+        "agent_history_summary_max_chars": "agent_history_summary_max_chars",
+        "agent_reflection_path_threshold": "agent_reflection_path_threshold",
+        "agent_reflection_question_threshold": "agent_reflection_question_threshold",
+        "agent_reflection_context_threshold": "agent_reflection_context_threshold",
     }
     nullable_setting_keys: set[str] = set()
     for key, env_key in key_map.items():
@@ -4526,8 +4776,8 @@ def update_model_settings(payload: dict) -> dict:
     return result
 
 
-def initialize_runtime_env_from_root_file() -> dict[str, Any]:
-    """Read and apply the repository-root runtime authority without writing it.
+def initialize_runtime_configuration_from_root_files() -> dict[str, Any]:
+    """Read and apply both repository-root authorities without writing them.
 
     Importing this module is intentionally side-effect free.  API, worker and
     beat entry points call this function after their earliest platform safety
@@ -4541,11 +4791,21 @@ def initialize_runtime_env_from_root_file() -> dict[str, Any]:
         raise RuntimeError(
             "Repository-root .env is missing; restore it before starting API or workers"
         )
+    settings_path = _active_settings_path()
+    settings_identity = runtime_settings_file_identity(settings_path)
+    if not settings_identity.get("exists"):
+        raise RuntimeError(
+            "Repository-root settings.json is missing; restore it before starting API or workers"
+        )
+    _runtime_settings_values()
     _apply_runtime_env_file_to_process_environment()
     get_settings.cache_clear()
+    combined = runtime_configuration_identity()
     return {
         "initialized": True,
-        "reason": "root_runtime_env_applied",
+        "reason": "root_runtime_configuration_applied",
         "bootstrap": None,
-        "identity_hash": identity["identity_hash"],
+        "identity_hash": combined["identity_hash"],
+        "env_identity_hash": identity["identity_hash"],
+        "settings_identity_hash": settings_identity["sha256"],
     }

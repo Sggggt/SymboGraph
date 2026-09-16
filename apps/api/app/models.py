@@ -979,7 +979,7 @@ class GraphRetrievalStep(Base):
     action: Mapped[str] = mapped_column(String(96), index=True)
     action_type: Mapped[str | None] = mapped_column(String(96), nullable=True, index=True)
     parent_layer: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    parent_node_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    parent_node_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     input_json: Mapped[dict] = mapped_column(JSON, default=dict)
     output_json: Mapped[dict] = mapped_column(JSON, default=dict)
     score_json: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -1021,6 +1021,57 @@ class ContextPackage(Base):
     citation_spans_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
     diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ContextPackageSourceRetention(Base):
+    """A retained span keeps its real upstream evidence scope and deletion guards."""
+    __tablename__ = "context_package_source_retentions"
+    __table_args__ = (
+        UniqueConstraint("target_context_package_id", "chunk_id", name="uq_context_source_retention_chunk"),
+        ForeignKeyConstraint(["chunk_id", "knowledge_base_id"], ["chunks.id", "chunks.knowledge_base_id"],
+            ondelete="CASCADE", name="fk_context_source_retention_chunk_scope"),
+        CheckConstraint("target_context_package_id <> source_context_package_id", name="ck_context_source_retention_not_self"),
+        CheckConstraint("protocol_version = 'reflection_bound_source_retention_v1'", name="ck_context_source_retention_protocol"),
+        CheckConstraint("length(source_item_hash) = 64 AND length(retention_hash) = 64", name="ck_context_source_retention_hashes"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    target_context_package_id: Mapped[str] = mapped_column(ForeignKey("context_packages.id", ondelete="CASCADE"), index=True)
+    source_context_package_id: Mapped[str] = mapped_column(ForeignKey("context_packages.id", deferrable=True, initially="DEFERRED"), index=True)
+    source_retrieval_trace_id: Mapped[str] = mapped_column(ForeignKey("retrieval_traces.id", deferrable=True, initially="DEFERRED"), index=True)
+    chunk_id: Mapped[str] = mapped_column(String(36), index=True)
+    protocol_version: Mapped[str] = mapped_column(String(64), default="reflection_bound_source_retention_v1")
+    source_item_hash: Mapped[str] = mapped_column(String(64))
+    retention_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ContextPackageSourceExpansion(Base):
+    """A new raw span is supported by a verified original source and structure path."""
+    __tablename__ = "context_package_source_expansions"
+    __table_args__ = (
+        UniqueConstraint("target_context_package_id", "chunk_id", name="uq_context_source_expansion_chunk"),
+        ForeignKeyConstraint(["chunk_id", "knowledge_base_id"], ["chunks.id", "chunks.knowledge_base_id"],
+            ondelete="CASCADE", name="fk_context_expansion_chunk_scope"),
+        ForeignKeyConstraint(["anchor_chunk_id", "knowledge_base_id"], ["chunks.id", "chunks.knowledge_base_id"],
+            deferrable=True, initially="DEFERRED", name="fk_context_expansion_anchor_scope"),
+        CheckConstraint("target_context_package_id <> source_context_package_id", name="ck_context_expansion_not_self"),
+        CheckConstraint("protocol_version = 'reflection_source_structure_expansion_v1'", name="ck_context_expansion_protocol"),
+        CheckConstraint("length(anchor_item_hash) = 64 AND length(target_item_hash) = 64 AND length(witness_hash) = 64", name="ck_context_expansion_hashes"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    target_context_package_id: Mapped[str] = mapped_column(ForeignKey("context_packages.id", ondelete="CASCADE"), index=True)
+    source_context_package_id: Mapped[str] = mapped_column(ForeignKey("context_packages.id", deferrable=True, initially="DEFERRED"), index=True)
+    source_retrieval_trace_id: Mapped[str] = mapped_column(ForeignKey("retrieval_traces.id", deferrable=True, initially="DEFERRED"), index=True)
+    anchor_chunk_id: Mapped[str] = mapped_column(String(36), index=True)
+    chunk_id: Mapped[str] = mapped_column(String(36), index=True)
+    protocol_version: Mapped[str] = mapped_column(String(64), default="reflection_source_structure_expansion_v1")
+    anchor_item_hash: Mapped[str] = mapped_column(String(64))
+    target_item_hash: Mapped[str] = mapped_column(String(64))
+    witness_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    witness_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class QASession(TimestampMixin, Base):
@@ -1097,6 +1148,47 @@ class CitationVerification(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
+class AnswerSourceBinding(Base):
+    """Deterministic unit-to-source address; never a semantic entailment verdict."""
+
+    __tablename__ = "answer_source_bindings"
+    __table_args__ = (
+        CheckConstraint("protocol_version != 'answer_source_binding_v2' OR retrieval_gate_observation_id IS NOT NULL",
+                        name="ck_answer_binding_v2_gate_required"),
+        UniqueConstraint("answer_session_id", "unit_id", "chunk_id", name="uq_answer_source_binding_unit_chunk"),
+        UniqueConstraint("binding_hash", name="uq_answer_source_binding_hash"),
+        ForeignKeyConstraint(
+            ["chunk_id", "knowledge_base_id"], ["chunks.id", "chunks.knowledge_base_id"],
+            ondelete="CASCADE", name="fk_answer_source_binding_chunk_scope",
+        ),
+        CheckConstraint("unit_index >= 0 AND unit_index < 32", name="ck_answer_source_binding_unit_index"),
+        CheckConstraint("answer_char_start >= 0 AND answer_char_end > answer_char_start", name="ck_answer_source_binding_answer_span"),
+        CheckConstraint("length(unit_id) = 64 AND length(answer_hash) = 64 AND length(binding_hash) = 64", name="ck_answer_source_binding_hash_lengths"),
+        CheckConstraint("protocol_version IN ('answer_source_binding_v1','answer_source_binding_v2')", name="ck_answer_source_binding_protocol"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    answer_session_id: Mapped[str] = mapped_column(ForeignKey("answer_sessions.id", ondelete="CASCADE"), index=True)
+    context_package_id: Mapped[str] = mapped_column(ForeignKey("context_packages.id", ondelete="CASCADE"), index=True)
+    retrieval_trace_id: Mapped[str] = mapped_column(ForeignKey("retrieval_traces.id", ondelete="CASCADE"), index=True)
+    chunk_id: Mapped[str] = mapped_column(String(36), index=True)
+    unit_id: Mapped[str] = mapped_column(String(64), index=True)
+    unit_index: Mapped[int] = mapped_column(Integer)
+    unit_text: Mapped[str] = mapped_column(Text)
+    answer_char_start: Mapped[int] = mapped_column(Integer)
+    answer_char_end: Mapped[int] = mapped_column(Integer)
+    answer_hash: Mapped[str] = mapped_column(String(64), index=True)
+    protocol_version: Mapped[str] = mapped_column(String(64), default="answer_source_binding_v1")
+    retrieval_gate_observation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agent_observations.id", name="fk_answer_binding_retrieval_gate", ondelete="RESTRICT"),
+        nullable=True, index=True)
+    source_span_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    binding_hash: Mapped[str] = mapped_column(String(64))
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 class PolicyState(Base):
     __tablename__ = "policy_states"
 
@@ -1111,6 +1203,31 @@ class PolicyState(Base):
     reward_summary_json: Mapped[dict] = mapped_column(JSON, default=dict)
     state_hash: Mapped[str] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class RetrievalLexicalPolicy(Base):
+    __tablename__ = "retrieval_lexical_policies"
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), primary_key=True)
+    protocol_version: Mapped[str] = mapped_column(String(64), default="retrieval_lexical_policy_v1")
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    operation_counts_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    state_hash: Mapped[str] = mapped_column(String(64))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class RetrievalLexicalReward(Base):
+    __tablename__ = "retrieval_lexical_rewards"
+    __table_args__ = (UniqueConstraint("run_id", "attempt_index", name="uq_retrieval_reward_attempt"),
+                     CheckConstraint("attempt_index >= 0 AND attempt_index <= 2", name="ck_retrieval_reward_attempt"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    context_package_id: Mapped[str] = mapped_column(ForeignKey("context_packages.id", ondelete="RESTRICT"), index=True)
+    attempt_index: Mapped[int] = mapped_column(Integer)
+    protocol_version: Mapped[str] = mapped_column(String(64), default="retrieval_lexical_reward_v1")
+    observation_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    observation_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class RewardEvent(Base):
@@ -2024,6 +2141,7 @@ class StorageMaintenanceIntent(Base):
 
     __tablename__ = "storage_maintenance_intents"
     __table_args__ = (
+        Index('ix_storage_maintenance_intents_kb_status', 'knowledge_base_id', 'status'),
         CheckConstraint(
             "status IN ('intent_committed','external_deleting','external_applied',"
             "'facts_deleted','cache_invalidation_pending','completed','manual_review')",
@@ -2159,3 +2277,116 @@ class AgentObservation(Base):
     verdict: Mapped[str] = mapped_column(String(32), default="observed", index=True)
     diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class LexicalIndexState(Base):
+    __tablename__ = "lexical_index_states"
+    __table_args__ = (
+        UniqueConstraint("id", "knowledge_base_id", name="uq_lexical_index_state_owner"),
+        CheckConstraint("state IN ('candidate','active','stale','failed')", name="ck_lexical_index_state"),
+        CheckConstraint("document_count >= 0 AND total_length >= 0 AND posting_count >= 0 AND term_count >= 0", name="ck_lexical_index_counts"),
+        Index("uq_lexical_index_active_kb", "knowledge_base_id", unique=True,
+              postgresql_where=text("state = 'active'"), sqlite_where=text("state = 'active'")),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    predecessor_id: Mapped[str | None] = mapped_column(ForeignKey("lexical_index_states.id", ondelete="RESTRICT"), nullable=True)
+    protocol_version: Mapped[str] = mapped_column(String(64))
+    tokenizer_protocol: Mapped[str] = mapped_column(String(64))
+    tokenizer_hash: Mapped[str] = mapped_column(String(64))
+    scoring_protocol: Mapped[str] = mapped_column(String(64))
+    scoring_hash: Mapped[str] = mapped_column(String(64), index=True)
+    bm25_k1: Mapped[float] = mapped_column(Float)
+    bm25_b: Mapped[float] = mapped_column(Float)
+    source_scope_hash: Mapped[str] = mapped_column(String(64), index=True)
+    statistics_hash: Mapped[str] = mapped_column(String(64))
+    postings_hash: Mapped[str] = mapped_column(String(64))
+    state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    document_count: Mapped[int] = mapped_column(Integer, default=0)
+    total_length: Mapped[int] = mapped_column(Integer, default=0)
+    term_count: Mapped[int] = mapped_column(Integer, default=0)
+    posting_count: Mapped[int] = mapped_column(Integer, default=0)
+    state: Mapped[str] = mapped_column(String(16), default="candidate", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class LexicalDocument(Base):
+    __tablename__ = "lexical_documents"
+    __table_args__ = (
+        ForeignKeyConstraint(["index_state_id", "knowledge_base_id"],
+            ["lexical_index_states.id", "lexical_index_states.knowledge_base_id"],
+            name="fk_lexical_document_index_owner", ondelete="CASCADE"),
+        ForeignKeyConstraint(["chunk_id", "knowledge_base_id"], ["chunks.id", "chunks.knowledge_base_id"],
+            name="fk_lexical_document_chunk_owner", ondelete="CASCADE"),
+        CheckConstraint("token_length >= 0 AND char_start >= 0 AND char_end >= char_start", name="ck_lexical_document_shape"),
+    )
+    index_state_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    chunk_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    knowledge_base_id: Mapped[str] = mapped_column(String(36), index=True)
+    document_version_id: Mapped[str] = mapped_column(ForeignKey("document_versions.id", ondelete="CASCADE"))
+    char_start: Mapped[int] = mapped_column(Integer)
+    char_end: Mapped[int] = mapped_column(Integer)
+    raw_text_hash: Mapped[str] = mapped_column(String(64))
+    token_length: Mapped[int] = mapped_column(Integer)
+
+
+class LexicalTermRecord(Base):
+    __tablename__ = "lexical_terms"
+    __table_args__ = (CheckConstraint("document_frequency > 0", name="ck_lexical_term_df"),)
+    index_state_id: Mapped[str] = mapped_column(ForeignKey("lexical_index_states.id", ondelete="CASCADE"), primary_key=True)
+    term_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    term: Mapped[str] = mapped_column(Text)
+    document_frequency: Mapped[int] = mapped_column(Integer)
+
+
+class LexicalPosting(Base):
+    __tablename__ = "lexical_postings"
+    __table_args__ = (
+        ForeignKeyConstraint(["index_state_id", "chunk_id"], ["lexical_documents.index_state_id", "lexical_documents.chunk_id"],
+            name="fk_lexical_posting_document", ondelete="CASCADE"),
+        ForeignKeyConstraint(["index_state_id", "term_key"], ["lexical_terms.index_state_id", "lexical_terms.term_key"],
+            name="fk_lexical_posting_term", ondelete="CASCADE"),
+        CheckConstraint("term_frequency > 0", name="ck_lexical_posting_tf"),
+        Index("ix_lexical_posting_document", "index_state_id", "chunk_id"),
+    )
+    index_state_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    term_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    chunk_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    term_frequency: Mapped[int] = mapped_column(Integer)
+    positions_json: Mapped[list] = mapped_column(JSON)
+
+
+class LexicalIndexJob(Base):
+    __tablename__ = "lexical_index_jobs"
+    __table_args__ = (
+        ForeignKeyConstraint(["target_state_id", "knowledge_base_id"],
+            ["lexical_index_states.id", "lexical_index_states.knowledge_base_id"],
+            name="fk_lexical_job_target_owner", ondelete="CASCADE"),
+        CheckConstraint("status IN ('prepared','building','ready_to_publish','published','completed','failed','cancel_requested','cancelled')",
+            name="ck_lexical_job_status"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True)
+    target_state_id: Mapped[str] = mapped_column(String(36), unique=True)
+    predecessor_state_id: Mapped[str | None] = mapped_column(
+        ForeignKey("lexical_index_states.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    ingestion_batch_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ingestion_batches.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source_scope_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(24), default="prepared", index=True)
+    publish_intent: Mapped[bool] = mapped_column(Boolean, default=False)
+    completed_documents: Mapped[int] = mapped_column(Integer, default=0)
+    completed_postings: Mapped[int] = mapped_column(Integer, default=0)
+    cache_invalidation_pending: Mapped[bool] = mapped_column(Boolean, default=False)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    diagnostics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

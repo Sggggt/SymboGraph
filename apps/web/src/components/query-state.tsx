@@ -1,20 +1,18 @@
-import { AlertCircle } from "lucide-react";
+import { AlertCircle, LoaderCircle } from "lucide-react";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Skeleton } from "@/components/ui/skeleton";
 
 export function LoadingBlock({ rows = 3 }: { rows?: number }) {
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>正在加载</CardTitle>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-3">
-        {Array.from({ length: rows }).map((_, index) => (
-          <Skeleton key={index} className="h-12 w-full rounded-lg" />
-        ))}
-      </CardContent>
-    </Card>
+    <div
+      role="status"
+      aria-live="polite"
+      data-loading-rows={rows}
+      className="flex min-h-44 w-full items-center justify-center gap-3 text-sm text-white/58"
+    >
+      <LoaderCircle className="size-6 animate-spin text-cyan-100" />
+      <span>正在加载...</span>
+    </div>
   );
 }
 

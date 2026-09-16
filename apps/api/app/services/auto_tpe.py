@@ -5,6 +5,9 @@ import json
 import math
 import random
 import time
+from app.services.graph_build_workspace import current_workspace, NUMERIC_PROTOCOL
+from app.services.build_performance import measured
+from app.core.config import runtime_settings_read_scope
 from collections import Counter, defaultdict, deque
 from datetime import datetime
 from pathlib import Path
@@ -247,6 +250,8 @@ def _protocol_hash() -> str:
     return stable_hash(
         {
             "auto_tpe_protocol": AUTO_TPE_PROTOCOL,
+            "numeric_protocol": NUMERIC_PROTOCOL,
+            "shared_preparation_timing_protocol": "tpe_conservative_shared_prepare_v1",
             "candidate_adjacency_hash_protocol": TPE_CANDIDATE_ADJACENCY_HASH_PROTOCOL,
             "tpe_search_space_hash": tpe_search_space_hash(),
             "relation_protocol": RELATION_PROTOCOL_VERSION,
@@ -1151,6 +1156,7 @@ def _bounded_reachable_ids(
     return reached
 
 
+@measured("rq_shared_prepare")
 def _candidate_rq_prefix_inputs(
     chunks: list[Chunk],
     vectors: dict[str, list[float]],
@@ -1510,6 +1516,27 @@ def _valid_verified_support_span(
 
 
 def _structure_positive_context(
+    db: Session,
+    chunks: list[Chunk],
+    probes: list[Chunk],
+    *,
+    chunk_business_keys: dict[str, str] | None = None,
+) -> tuple[dict[str, dict[str, set[str]]], set[str], dict[str, Any]]:
+    workspace = current_workspace()
+    def prepare():
+        return _structure_positive_context_uncached(db, chunks, probes, chunk_business_keys=chunk_business_keys)
+    if workspace is None or workspace.matrix is None:
+        return prepare()
+    from copy import deepcopy
+    key = "tpe_structure_positives:" + stable_hash({
+        "chunks": sorted(str(chunk.id) for chunk in chunks),
+        "probes": sorted(str(chunk.id) for chunk in probes),
+        "business_keys": chunk_business_keys,
+    })
+    return deepcopy(workspace.cached(key, prepare))
+
+
+def _structure_positive_context_uncached(
     db: Session,
     chunks: list[Chunk],
     probes: list[Chunk],
@@ -3000,6 +3027,7 @@ def _latency_budget_excess_penalty(
     return card
 
 
+@runtime_settings_read_scope()
 def evaluate_candidate_trial(
     db: Session,
     chunks: list[Chunk],
@@ -3835,6 +3863,7 @@ def _stop_tpe_after_runtime_disable(
     }
 
 
+@measured("tpe_trials")
 def select_auto_tpe_operating_point(
     db: Session,
     knowledge_base_id: str,
@@ -3966,8 +3995,6 @@ def select_auto_tpe_operating_point(
         run_id=run.id,
         chunk_version=chunk_version,
         trial_budget=run.trial_budget,
-        embedding_model=run.embedding_model,
-        chat_model=run.chat_model,
     )
 
     candidate_rq_started_at = time.perf_counter()
@@ -3989,6 +4016,10 @@ def select_auto_tpe_operating_point(
         ),
         "precomputed_once_per_run": True,
     }
+    workspace = current_workspace()
+    shared_prepare_ms = (workspace.prepare_seconds * 1000.0 if workspace else 0.0) + float(candidate_rq_diagnostics["precompute_latency_ms"])
+    candidate_rq_diagnostics["shared_prepare_ms"] = shared_prepare_ms
+    candidate_rq_diagnostics["numeric_protocol"] = NUMERIC_PROTOCOL
     run.diagnostics_json = {
         **dict(run.diagnostics_json or {}),
         "tpe_quality_proxy_protocol_version": TPE_QUALITY_PROXY_PROTOCOL_VERSION,
@@ -4184,7 +4215,7 @@ def select_auto_tpe_operating_point(
                     language_identity_diagnostics.get("scope_hash") or ""
                 ),
             )
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            elapsed_ms = (time.perf_counter() - started) * 1000.0 + shared_prepare_ms
             trial.diagnostics_json = {
                 **(trial.diagnostics_json or {}),
                 "relation_quota_signal_scope_hash": quota_signal_diagnostics.get("signal_scope_hash"),
@@ -4202,6 +4233,7 @@ def select_auto_tpe_operating_point(
                     **(trial.diagnostics_json or {}),
                     "elapsed_ms": round(elapsed_ms, 3),
                     "candidate_count": len(candidates),
+                    "nomination_count": diagnostics.get("candidate_intent_count"),
                     "trial_timeout_seconds": float(
                         trial_gate_profile["tpe_trial_timeout_seconds"]
                     ),
@@ -4224,7 +4256,7 @@ def select_auto_tpe_operating_point(
                         production_canonical_business_keys
                     ),
                 )
-                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                elapsed_ms = (time.perf_counter() - started) * 1000.0 + shared_prepare_ms
                 trial.candidate_adjacency_hash = candidate_hash
                 trial.probe_set_hash = probe_hash
                 trial.hard_gate_json = hard_gate
@@ -4249,10 +4281,13 @@ def select_auto_tpe_operating_point(
                 else:
                     terminal_status = "blocked" if failure_code else "completed"
                     trial.failure_code = failure_code
+                    if workspace and terminal_status == "completed" and (workspace.best_candidate is None or score > workspace.best_candidate[0]):
+                        workspace.best_candidate = (score, trial.theta_hash, candidates, diagnostics, candidate_hash)
                 trial.diagnostics_json = {
                     **(trial.diagnostics_json or {}),
                     "elapsed_ms": round(elapsed_ms, 3),
                     "candidate_count": len(candidates),
+                    "nomination_count": diagnostics.get("candidate_intent_count"),
                     "trial_timeout_seconds": float(
                         trial_gate_profile["tpe_trial_timeout_seconds"]
                     ),
@@ -4603,7 +4638,7 @@ def summarize_auto_tpe_trial(trial: AutoTpeTrial) -> dict[str, Any]:
         "objective_score": trial.objective_score,
         "hard_gate": trial.hard_gate_json or {},
         "objective_components": trial.objective_components_json or {},
-        "failure_code": trial.failure_code,
+                "failure_code": trial.failure_code,
         "diagnostics": trial.diagnostics_json or {},
         "started_at": trial.started_at,
         "finished_at": trial.finished_at,

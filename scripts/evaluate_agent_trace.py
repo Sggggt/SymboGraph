@@ -30,10 +30,40 @@ REQUIRED_TRACE_NODES = {
     "layered_retrieval",
     "structure_context_restoration",
     "context_package",
-    "grounded_answer",
-    "citation_verification",
+    "answer_generation",
+    "reflection_gate",
+    "answer_source_binding",
     "reward_event",
 }
+
+
+def replay_identity_complete(identity: dict[str, Any], response: dict[str, Any]) -> bool:
+    """Require the actual persisted identities for the answer's frozen protocol."""
+    model = response.get("answer_model_audit") or response.get("model_audit") or {}
+    review = model.get("answer_reflection") or {}
+    reflection = review.get("protocol_version") == "agent_answer_reflection_v1"
+    current = (model.get('retrieval_control') or {}).get('protocol_version') == 'retrieval_answer_v1'
+    direct_reuse = response.get("route") == "direct_answer" and (reflection or current)
+    insufficient = review.get("outcome") in {"clarify_user", "insufficient_evidence"} if reflection else (
+        model.get("insufficient_evidence") is True or model.get("grounding_outcome") == "insufficient_evidence"
+    )
+    required = {"retrieval_trace", "context_package", "answer_session"}
+    if not direct_reuse and not current:
+        required.update({"initial_retrieval_trace", "initial_context_package", "reward_event"})
+    bindings = identity.get("bindings") or {}
+    source_ids = identity.get("source_binding_ids" if reflection or current else "citation_verification_ids") or []
+    pe = identity.get("pe") or {}
+    return (
+        all(bool((bindings.get(name) or {}).get("id")) for name in required)
+        and bool(identity.get("agent_trace_event_ids"))
+        and all(identity["agent_trace_event_ids"])
+        and (bool(source_ids) or insufficient)
+        and all(source_ids)
+        and len(set(source_ids)) == len(source_ids)
+        and (direct_reuse or bool(pe.get("plan_ids")))
+        and (direct_reuse and current or bool(pe.get("action_ids"))) and bool(pe.get("observation_ids"))
+        and bool(identity.get("persisted_agent_snapshot_hash"))
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -338,6 +368,8 @@ def persisted_agent_quality_snapshot(
             if reward is not None and reward.answer_session_id
             else None
         )
+        if answer_session is None and (run.metadata_json or {}).get("answer_session_id"):
+            answer_session = db.get(AnswerSession, run.metadata_json["answer_session_id"])
         retrieval_trace = (
             db.get(
                 RetrievalTrace,
@@ -522,6 +554,25 @@ def persisted_agent_quality_snapshot(
                 },
             },
         }
+        if answer_session is not None and (answer_session.diagnostics_json or {}).get("answer_reflection"):
+            from app.models import AnswerSourceBinding
+            snapshot["reflection"] = {
+                "answer_audit": dict(answer_session.diagnostics_json),
+                "source_bindings": [{column.name: getattr(row, column.name) for column in AnswerSourceBinding.__table__.columns if column.name != "created_at"}
+                    for row in db.scalars(select(AnswerSourceBinding).where(AnswerSourceBinding.answer_session_id == answer_session.id))],
+            }
+        if answer_session is not None and (answer_session.diagnostics_json or {}).get('retrieval_control'):
+            from app.models import AnswerSourceBinding,AgentObservation,RetrievalLexicalReward
+            snapshot['retrieval_control'] = {
+                'answer_audit':dict(answer_session.diagnostics_json),
+                'state':dict(run.metadata_json.get('retrieval_control') or {}),
+                'source_bindings':[{column.name:getattr(row,column.name) for column in AnswerSourceBinding.__table__.columns if column.name!='created_at'}
+                    for row in db.scalars(select(AnswerSourceBinding).where(AnswerSourceBinding.answer_session_id==answer_session.id))],
+                'observations':[{'id':row.id,'run_id':row.run_id,'action_id':row.action_id,'type':row.observation_type,
+                    'verdict':row.verdict,'payload':row.observation_json} for row in db.scalars(select(AgentObservation).where(AgentObservation.run_id==run.id))],
+                'rewards':[{'observation':row.observation_json,'hash':row.observation_hash}
+                    for row in db.scalars(select(RetrievalLexicalReward).where(RetrievalLexicalReward.run_id==run.id))],
+            }
         snapshot["snapshot_hash"] = persisted_agent_snapshot_hash(
             snapshot
         )
@@ -590,117 +641,133 @@ def persisted_agent_response_bundle(
                 "persisted Agent answer/trace/package bindings are inconsistent"
             )
 
-        verification_rows = list(
-            db.scalars(
-                select(CitationVerification)
-                .where(
-                    CitationVerification.answer_session_id
-                    == answer_session_id
-                )
-                .order_by(
-                    CitationVerification.created_at.asc(),
-                    CitationVerification.id.asc(),
-                )
-            ).all()
-        )
-        verification_by_id = {
-            str(verification.id): verification
-            for verification in verification_rows
-        }
-        citation_verification_ids = list(
-            answer_session.citation_ids_json or []
-        )
-        if (
-            len(citation_verification_ids)
-            != len(set(citation_verification_ids))
-            or set(citation_verification_ids) != set(verification_by_id)
-        ):
-            raise RuntimeError(
-                "AnswerSession citation ids do not cover the complete persisted "
-                "CitationVerification set"
+        source_binding_ids = []
+        review = (answer_session.diagnostics_json or {}).get("answer_reflection") or {}
+        if (answer_session.diagnostics_json or {}).get('retrieval_control'):
+            from app.services.retrieval_answer_record import replay_answer_bindings
+            citations = replay_answer_bindings(db,answer=answer_session,package=context_package)
+            source_binding_ids = list(answer_session.citation_ids_json)
+            citation_verification_ids = []
+        elif review.get("protocol_version") == "agent_answer_reflection_v1":
+            from app.models import AnswerSourceBinding
+            from app.services.answer_sources import source_binding_citations
+            source_rows = list(db.scalars(select(AnswerSourceBinding).where(AnswerSourceBinding.answer_session_id == answer_session.id)))
+            citations = source_binding_citations(answer_session=answer_session, package=context_package,
+                rows=source_rows, reflection_audit_hash=review["audit_hash"])
+            source_binding_ids = [row.id for row in source_rows]
+            citation_verification_ids = []
+        else:
+            verification_rows = list(
+                db.scalars(
+                    select(CitationVerification)
+                    .where(
+                        CitationVerification.answer_session_id
+                        == answer_session_id
+                    )
+                    .order_by(
+                        CitationVerification.created_at.asc(),
+                        CitationVerification.id.asc(),
+                    )
+                ).all()
             )
-        ordered_verifications = [
-            verification_by_id[verification_id]
-            for verification_id in citation_verification_ids
-        ]
-        package_chunks = list(
-            (context_package.package_json or {}).get("chunks") or []
-        )
-        package_chunks_by_id = {
-            str(chunk.get("chunk_id") or ""): dict(chunk)
-            for chunk in package_chunks
-            if isinstance(chunk, dict) and chunk.get("chunk_id")
-        }
-        citations: list[dict[str, Any]] = []
-        for citation_index, verification in enumerate(
-            ordered_verifications,
-            start=1,
-        ):
+            verification_by_id = {
+                str(verification.id): verification
+                for verification in verification_rows
+            }
+            citation_verification_ids = list(
+                answer_session.citation_ids_json or []
+            )
             if (
-                str(verification.verdict or "") != "supported"
-                or not verification.chunk_id
+                len(citation_verification_ids)
+                != len(set(citation_verification_ids))
+                or set(citation_verification_ids) != set(verification_by_id)
             ):
-                continue
-            chunk_id = str(verification.chunk_id)
-            chunk = package_chunks_by_id.get(chunk_id)
-            if chunk is None:
                 raise RuntimeError(
-                    "supported CitationVerification references a chunk outside "
-                    "the persisted ContextPackage"
+                    "AnswerSession citation ids do not cover the complete persisted "
+                    "CitationVerification set"
                 )
-            diagnostics = dict(verification.diagnostics_json or {})
-            source_span = dict(verification.source_span_json or {})
-            source_span["verification_id"] = str(verification.id)
-            section_path = source_span.get("section_path") or chunk.get(
-                "section_path"
+            ordered_verifications = [
+                verification_by_id[verification_id]
+                for verification_id in citation_verification_ids
+            ]
+            package_chunks = list(
+                (context_package.package_json or {}).get("chunks") or []
             )
-            citations.append(
-                {
-                    "citation_index": citation_index,
-                    "claim_id": diagnostics.get("claim_id"),
-                    "claim_index": diagnostics.get("claim_index"),
-                    "claim_text": verification.claim_text,
-                    "answer_hash": diagnostics.get("answer_hash"),
-                    "chunk_id": chunk_id,
-                    "document_id": chunk.get("document_id"),
-                    "document_version_id": chunk.get("document_version_id")
-                    or source_span.get("document_version_id"),
-                    "document_title": chunk.get("document_title") or "",
-                    "source_path": chunk.get("source_path") or "",
-                    "logical_source_path": chunk.get("logical_source_path")
-                    or source_span.get("logical_source_path")
-                    or "",
-                    "partition": None,
-                    "section": chunk.get("section_path"),
-                    "page_number": (
-                        (chunk.get("page_range") or [None])[0]
-                    ),
-                    "page_range": source_span.get("page_range")
-                    or chunk.get("page_range"),
-                    "char_span": source_span.get("char_span")
-                    or chunk.get("char_span"),
-                    "section_path": (
-                        list(section_path)
-                        if isinstance(section_path, list)
-                        else [str(section_path)]
-                        if section_path
-                        else []
-                    ),
-                    "bbox": source_span.get("bbox")
-                    or chunk.get("bbox")
-                    or None,
-                    "snippet": str(chunk.get("content") or "")[:240],
-                    "source_span": source_span,
-                    "context_package_id": context_package_id,
-                    "retrieval_trace_id": retrieval_trace_id,
-                    "answer_session_id": answer_session_id,
-                    "citation_verification_id": str(verification.id),
-                    "verification": citation_verification_public_payload(
-                        verification,
-                        source_span=source_span,
-                    ),
-                }
-            )
+            package_chunks_by_id = {
+                str(chunk.get("chunk_id") or ""): dict(chunk)
+                for chunk in package_chunks
+                if isinstance(chunk, dict) and chunk.get("chunk_id")
+            }
+            citations: list[dict[str, Any]] = []
+            for citation_index, verification in enumerate(
+                ordered_verifications,
+                start=1,
+            ):
+                if (
+                    str(verification.verdict or "") != "supported"
+                    or not verification.chunk_id
+                ):
+                    continue
+                chunk_id = str(verification.chunk_id)
+                chunk = package_chunks_by_id.get(chunk_id)
+                if chunk is None:
+                    raise RuntimeError(
+                        "supported CitationVerification references a chunk outside "
+                        "the persisted ContextPackage"
+                    )
+                diagnostics = dict(verification.diagnostics_json or {})
+                source_span = dict(verification.source_span_json or {})
+                source_span["verification_id"] = str(verification.id)
+                section_path = source_span.get("section_path") or chunk.get(
+                    "section_path"
+                )
+                citations.append(
+                    {
+                        "citation_index": citation_index,
+                        "claim_id": diagnostics.get("claim_id"),
+                        "claim_index": diagnostics.get("claim_index"),
+                        "claim_text": verification.claim_text,
+                        "answer_hash": diagnostics.get("answer_hash"),
+                        "chunk_id": chunk_id,
+                        "document_id": chunk.get("document_id"),
+                        "document_version_id": chunk.get("document_version_id")
+                        or source_span.get("document_version_id"),
+                        "document_title": chunk.get("document_title") or "",
+                        "source_path": chunk.get("source_path") or "",
+                        "logical_source_path": chunk.get("logical_source_path")
+                        or source_span.get("logical_source_path")
+                        or "",
+                        "partition": None,
+                        "section": chunk.get("section_path"),
+                        "page_number": (
+                            (chunk.get("page_range") or [None])[0]
+                        ),
+                        "page_range": source_span.get("page_range")
+                        or chunk.get("page_range"),
+                        "char_span": source_span.get("char_span")
+                        or chunk.get("char_span"),
+                        "section_path": (
+                            list(section_path)
+                            if isinstance(section_path, list)
+                            else [str(section_path)]
+                            if section_path
+                            else []
+                        ),
+                        "bbox": source_span.get("bbox")
+                        or chunk.get("bbox")
+                        or None,
+                        "snippet": str(chunk.get("content") or "")[:240],
+                        "source_span": source_span,
+                        "context_package_id": context_package_id,
+                        "retrieval_trace_id": retrieval_trace_id,
+                        "answer_session_id": answer_session_id,
+                        "citation_verification_id": str(verification.id),
+                        "verification": citation_verification_public_payload(
+                            verification,
+                            source_span=source_span,
+                        ),
+                    }
+                )
 
         pe_audit = load_agent_pe_audit(db, run_id).model_dump(mode="json")
         if (
@@ -740,6 +807,7 @@ def persisted_agent_response_bundle(
                 for event in persisted_agent_facts.get("trace_events") or []
             ],
             "citation_verification_ids": citation_verification_ids,
+            "source_binding_ids": source_binding_ids,
             "context_package": {
                 "id": context_package_id,
                 "knowledge_base_id": str(
@@ -897,33 +965,7 @@ def main() -> None:
                 or grounding_outcome == "insufficient_evidence"
             )
             citation_count = len(response.get("citations") or [])
-            required_binding_names = {
-                "initial_retrieval_trace",
-                "initial_context_package",
-                "retrieval_trace",
-                "context_package",
-                "answer_session",
-                "reward_event",
-            }
-            bindings = dict(identity.get("bindings") or {})
-            identity_complete = (
-                required_binding_names.issubset(bindings)
-                and all(
-                    bool((bindings.get(name) or {}).get("id"))
-                    for name in required_binding_names
-                )
-                and bool(identity.get("agent_trace_event_ids"))
-                and all(identity.get("agent_trace_event_ids") or [])
-                and all(identity.get("citation_verification_ids") or [])
-                and (
-                    bool(identity.get("citation_verification_ids"))
-                    or insufficient_evidence
-                )
-                and bool((identity.get("pe") or {}).get("plan_ids"))
-                and bool((identity.get("pe") or {}).get("action_ids"))
-                and bool((identity.get("pe") or {}).get("observation_ids"))
-                and bool(identity.get("persisted_agent_snapshot_hash"))
-            )
+            identity_complete = replay_identity_complete(identity, response)
             replay_rows.append(
                 {
                     "run_id": run_id,
@@ -1171,6 +1213,8 @@ def main() -> None:
                 "trace_nodes": sorted(nodes),
                 "missing_trace_nodes": sorted(REQUIRED_TRACE_NODES - nodes),
                 "citation_verification_pass_rate": model_audit.get("citation_verification_pass_rate"),
+                "source_binding_pass_rate": model_audit.get("source_binding_pass_rate"),
+                "old_citation_judge_calls": (model_audit.get("answer_reflection") or {}).get("citation_judge_model_call_count"),
                 "degraded_mode": bool(response.get("degraded_mode")),
                 "gray_zone_trace_audit": row_gray_audit,
                 "retrieval_quality_gate": retrieval_quality,
@@ -1187,7 +1231,8 @@ def main() -> None:
         "context_packages_returned": all(row["context_package_id"] and row["retrieval_trace_id"] for row in rows),
         "citations_returned": all(row["citation_count"] > 0 for row in rows),
         "required_trace_nodes_present": all(not row["missing_trace_nodes"] for row in rows),
-        "citation_verification_positive": all((row["citation_verification_pass_rate"] or 0) > 0 for row in rows),
+        "source_binding_positive": all(row["source_binding_pass_rate"] == 1.0 for row in rows),
+        "old_citation_judge_not_called": all(row["old_citation_judge_calls"] == 0 for row in rows),
         "not_degraded": not any(row["degraded_mode"] for row in rows),
         "gray_zone_trace_audit": bool(gray_zone_trace_audit["pass"])
         and all(bool(row["gray_zone_trace_audit"].get("pass")) for row in rows),

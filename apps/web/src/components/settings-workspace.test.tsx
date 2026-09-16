@@ -16,6 +16,7 @@ import {
   ParameterName,
   RQ_KMEANS_PROTOCOL_DEPTH,
   RUNTIME_ENV_AUTHORITY_NOTE,
+  RuntimeSettingsNavigation,
   RqProtocolDepthField,
   SETTINGS_PARAMETER_HELP,
   SourceIoConcurrencyField,
@@ -33,9 +34,25 @@ const MODEL_SETTINGS_UPDATE_HAS_EMBEDDING_PROTOCOL: AssertTrue<
 > = true;
 
 describe("settings parameter help", () => {
-  it("explains the single root env and three lifecycle boundaries", () => {
-    expect(RUNTIME_ENV_AUTHORITY_NOTE).toContain("仓库根 .env 是唯一配置来源");
-    expect(RUNTIME_ENV_AUTHORITY_NOTE).toContain("所有参数立即写入该文件");
+  it("uses an embedded category navigation to switch settings pages", () => {
+    const onChange = vi.fn();
+    render(
+      <RuntimeSettingsNavigation
+        activePage="connections"
+        onChange={onChange}
+      />,
+    );
+
+    expect(screen.getByRole("navigation", { name: "运行设置分类" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /模型连接/ }).getAttribute("aria-current")).toBe("page");
+    fireEvent.click(screen.getByRole("button", { name: /检索入口/ }));
+    expect(onChange).toHaveBeenCalledWith("retrieval");
+  });
+
+  it("explains the two non-overlapping root files and three lifecycle boundaries", () => {
+    expect(RUNTIME_ENV_AUTHORITY_NOTE).toContain("根 .env 管理秘密");
+    expect(RUNTIME_ENV_AUTHORITY_NOTE).toContain("根 settings.json 管理非秘密");
+    expect(RUNTIME_ENV_AUTHORITY_NOTE).toContain("每个键只属于一个文件");
     expect(RUNTIME_ENV_AUTHORITY_NOTE).toContain("服务参数在重启后生效");
   });
 
@@ -109,6 +126,10 @@ describe("settings parameter help", () => {
       agent_request_lease_ttl_seconds: "300",
       upload_max_bytes: "104857600",
       concept_i18n_enabled: true,
+      query_facet_bilingual_enabled: true,
+      ingestion_memory_soft_limit_ratio: "0.78",
+      ingestion_memory_hard_limit_ratio: "0.88",
+      ingestion_memory_critical_limit_ratio: "0.94",
       chat_api_key: "",
       clear_chat_api_key: false,
       graph_api_key: "",
@@ -116,6 +137,19 @@ describe("settings parameter help", () => {
       embedding_api_key: "",
       clear_embedding_api_key: false,
       model_bridge_enabled: true,
+      context_package_token_budget: "2400",
+      retrieval_result_top_k_default: "8",
+      retrieval_v1_dense_candidate_budget: "64",
+      retrieval_v1_rq_candidate_budget: "64",
+      retrieval_v1_bm25_candidate_budget: "64",
+      retrieval_v1_root_entry_budget: "8",
+      retrieval_v1_per_parent_entry_budget: "8",
+      retrieval_v1_layer_entry_budget: "80",
+      retrieval_v1_max_depth: "3",
+      retrieval_v1_restore_per_hit: "4",
+      lexical_index_max_documents: "100000",
+      lexical_index_max_postings: "4000000",
+      lexical_index_max_characters: "32000000",
     });
 
     expect(payload).toMatchObject({
@@ -167,6 +201,10 @@ describe("settings parameter help", () => {
       agent_request_lease_ttl_seconds: "300",
       upload_max_bytes: "104857600",
       concept_i18n_enabled: false,
+      query_facet_bilingual_enabled: true,
+      ingestion_memory_soft_limit_ratio: "0.78",
+      ingestion_memory_hard_limit_ratio: "0.88",
+      ingestion_memory_critical_limit_ratio: "0.94",
       fixed_chunk_size_tokens: "640",
       fixed_chunk_overlap_tokens: "96",
       chat_api_key: "",
@@ -203,6 +241,21 @@ describe("settings parameter help", () => {
       cross_language_out_quota_min: "0",
       cross_language_out_quota_max: "2",
       cross_language_min_cosine: "0.68",
+      context_package_token_budget: "2400",
+      retrieval_result_top_k_default: "8",
+      retrieval_v1_dense_candidate_budget: "64",
+      retrieval_v1_rq_candidate_budget: "64",
+      retrieval_v1_bm25_candidate_budget: "64",
+      retrieval_v1_root_entry_budget: "8",
+      retrieval_v1_per_parent_entry_budget: "8",
+      retrieval_v1_layer_entry_budget: "80",
+      retrieval_v1_max_depth: "3",
+      retrieval_v1_restore_per_hit: "4",
+      lexical_index_max_documents: "100000",
+      lexical_index_max_postings: "4000000",
+      lexical_index_max_characters: "32000000",
+      bm25_k1: "1.2",
+      bm25_b: "0.75",
     });
 
     expect(payload).toMatchObject({
@@ -297,22 +350,23 @@ describe("settings parameter help", () => {
     expect(SETTINGS_PARAMETER_HELP["RQ membership 协议"]).toContain("LLM");
   });
 
-  it("keeps active runtime and graph parameters documented without legacy BM25 wording", () => {
-    for (const label of ["模型请求并发", "源文件 I/O 并发", "Agent 请求并发", "Agent 等待队列上限", "Agent 排队超时秒数", "Agent 租约 TTL 秒数", "单文件上传上限（字节）", "中粗层双语派生", "片段 Top K", "跨文档桥最小配额", "引用验证预算", "工作进程并发"]) {
+  it("documents the target runtime, graph, and versioned BM25 controls", () => {
+    for (const label of ["模型请求并发", "源文件 I/O 并发", "Agent 请求并发", "Agent 等待队列上限", "Agent 排队超时秒数", "Agent 租约 TTL 秒数", "单文件上传上限（字节）", "中粗层双语派生", "Dense 候选预算", "RQ 候选预算", "BM25 候选预算", "根入口预算", "逐父节点预算", "单层总预算", "最大遍历深度", "每命中恢复预算", "BM25 k1", "BM25 b", "跨文档桥最小配额", "工作进程并发"]) {
       expect(SETTINGS_PARAMETER_HELP[label]).toBeTruthy();
     }
 
     expect(UPLOAD_MAX_BYTES_LIMITS).toEqual({ defaultValue: 104_857_600, min: 1, max: 10_737_418_240 });
-    expect(SETTINGS_PARAMETER_HELP["LLM 双语查询面"]).toBeTruthy();
-    expect(Object.values(SETTINGS_PARAMETER_HELP).join("\n")).not.toContain("BM25");
+    const help = Object.values(SETTINGS_PARAMETER_HELP).join("\n");
+    expect(help).not.toContain("普通模式");
+    expect(help).not.toContain("摘要模式");
+    expect(help).not.toContain("Cycle reward");
   });
 
-  it("documents gray-zone decisions as deterministic and model-free", () => {
-    expect(SETTINGS_PARAMETER_HELP["路径 green 阈值"]).toContain("LLM 不参与");
-    expect(SETTINGS_PARAMETER_HELP["路径 gray 阈值"]).toContain("deterministic local rule");
-    expect(SETTINGS_PARAMETER_HELP["路径 gray 阈值"]).toContain("模型调用数必须为 0");
-    expect(SETTINGS_PARAMETER_HELP["路径 gray 阈值"]).not.toContain("LLM evaluator");
-    expect(SETTINGS_PARAMETER_HELP["路径 hard 阈值"]).toContain("不能绕过或覆盖");
+  it("documents deterministic bounded traversal and independent channels", () => {
+    expect(SETTINGS_PARAMETER_HELP["最大遍历深度"]).toContain("非负累计距离");
+    expect(SETTINGS_PARAMETER_HELP["最大遍历深度"]).toContain("循环只用于剪枝");
+    expect(SETTINGS_PARAMETER_HELP["BM25 候选预算"]).toContain("纯向量策略不依赖");
+    expect(SETTINGS_PARAMETER_HELP["逐父节点预算"]).toContain("每个父节点");
   });
 
   it("renders and updates the hot-reloadable upload byte limit", () => {

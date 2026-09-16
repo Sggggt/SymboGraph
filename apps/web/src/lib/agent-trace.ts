@@ -1,22 +1,11 @@
 import type { AgentTraceEventPayload, AgentTraceNode, AgentTraceScores } from "@course-kg/shared";
 
 export const contextGraphTraceFallbackSteps: AgentTraceNode[] = [
-  "query_understanding",
-  "query_facet_extraction",
-  "agent_planner",
-  "typed_action_validation",
-  "entry_selection",
-  "layer_drilldown",
-  "frontier_traversal",
-  "chunk_recall",
-  "structure_context_restoration",
-  "context_package",
-  "grounded_answer",
-  "citation_verification",
-  "reward_event",
+  "retrieval_control",
 ];
 
 const traceNodeLabels: Record<AgentTraceNode, string> = {
+  retrieval_control: "检索与回答进度",
   query_understanding: "查询意图",
   query_facet_extraction: "查询 facets",
   agent_planner: "智能体规划",
@@ -33,12 +22,26 @@ const traceNodeLabels: Record<AgentTraceNode, string> = {
   layered_retrieval: "分层检索",
   context_package: "证据包",
   grounded_answer: "有支撑回答",
+  answer_generation: "生成回答并自评",
+  reflection_gate: "判断是否需要反思",
+  answer_reflection: "检查回答",
+  reflection_backtrack: "补充证据或改写回答",
+  reflection_action_validation: "检查后续动作",
+  answer_source_binding: "核对原文来源",
   citation_verification: "引用验证",
   repair_executed: "修复执行",
   reward_event: "奖励观测",
+  direct_answer_route_gate: "直接回答路由",
+  direct_answer_reuse_evaluator: "历史证据复用评估",
+  direct_answer_fallback: "直接回答回退",
+  direct_answer: "直接回答",
   cancelled: "已取消",
   agent_admission: "Agent 准入",
   error: "错误",
+  intent_planning: "理解任务并冻结计划",
+  intent_execution_retrieval: "执行分层检索",
+  source_integrity_admission: "核对来源完整性",
+  verified_context_reuse: "复用已验证证据",
 };
 
 export const traceGroupLabels = {
@@ -48,6 +51,8 @@ export const traceGroupLabels = {
   restoration: "结构恢复",
   package: "证据包",
   verification: "引用验证",
+  reflection: "回答反思",
+  source_binding: "原文来源",
   repair: "修复",
   reward: "奖励观测",
   answer: "回答生成",
@@ -64,10 +69,16 @@ export function traceNodeLabel(node: string): string {
 }
 
 export function traceGroupForNode(node: string): TraceGroupKey {
-  if (node === "query_understanding" || node === "query_facet_extraction" || node === "agent_planner" || node === "typed_action_validation" || node === "replan_no_progress" || node === "entry_selection") {
+  if (["reflection_gate", "answer_reflection", "reflection_backtrack", "reflection_action_validation"].includes(node)) {
+    return "reflection";
+  }
+  if (node === "answer_source_binding") {
+    return "source_binding";
+  }
+  if (node === "query_understanding" || node === "query_facet_extraction" || node === "agent_planner" || node === "typed_action_validation" || node === "replan_no_progress" || node === "entry_selection" || node === "direct_answer_route_gate" || node === "direct_answer_reuse_evaluator" || node === "direct_answer_fallback" || node === "intent_planning") {
     return "entry";
   }
-  if (node === "layer_drilldown" || node === "layered_retrieval") {
+  if (node === "layer_drilldown" || node === "layered_retrieval" || node === "intent_execution_retrieval") {
     return "drilldown";
   }
   if (node === "frontier_traversal" || node === "chunk_recall" || node === "retrievers") {
@@ -79,7 +90,7 @@ export function traceGroupForNode(node: string): TraceGroupKey {
   if (node === "context_package") {
     return "package";
   }
-  if (node === "citation_verification") {
+  if (node === "citation_verification" || node === "source_integrity_admission") {
     return "verification";
   }
   if (node === "repair_executed") {
@@ -88,14 +99,14 @@ export function traceGroupForNode(node: string): TraceGroupKey {
   if (node === "reward_event") {
     return "reward";
   }
-  if (node === "grounded_answer") {
+  if (node === "grounded_answer" || node === "answer_generation" || node === "direct_answer") {
     return "answer";
   }
   return "other";
 }
 
 export function groupTraceEvents(trace: AgentTraceEventPayload[]): Array<{ key: TraceGroupKey; label: string; events: AgentTraceEventPayload[] }> {
-  const order: TraceGroupKey[] = ["entry", "drilldown", "frontier", "restoration", "package", "answer", "verification", "repair", "reward", "other"];
+  const order: TraceGroupKey[] = ["entry", "drilldown", "frontier", "restoration", "package", "answer", "reflection", "source_binding", "verification", "repair", "reward", "other"];
   const grouped = new Map<TraceGroupKey, AgentTraceEventPayload[]>();
   for (const event of trace) {
     const key = traceGroupForNode(event.node);
@@ -123,7 +134,11 @@ export function traceNodeVariant(node: string): "success" | "info" | "warning" |
     node === "chunk_recall" ||
     node === "structure_context_restoration" ||
     node === "layered_retrieval" ||
-    node === "context_package"
+    node === "context_package" ||
+    node === "intent_planning" ||
+    node === "intent_execution_retrieval" ||
+    node === "source_integrity_admission" ||
+    node === "verified_context_reuse"
   ) {
     return "info";
   }
@@ -134,6 +149,9 @@ function formatAuditValue(key: string, value: unknown): string {
   if (key === "retrieval_granularity") {
     if (value === "mid") return "普通模式";
     if (value === "coarse") return "摘要模式";
+  }
+  if (key === "entry_layer") {
+    return value === "coarse" ? "粗概念" : value === "mid" ? "中概念" : value === "chunk" ? "原文片段" : String(value);
   }
   return Array.isArray(value) ? value.join("/") : String(value);
 }
@@ -219,6 +237,13 @@ export function traceAuditSummary(scores: AgentTraceScores | undefined): string[
       entries = [
         ["context_package_id", "证据包", scores.context_package_id],
         ["token_count", "Token", scores.token_count],
+      ];
+      break;
+    case "intent_execution":
+      entries = [
+        ["entry_layer", "入口层", scores.entry_layer],
+        ["accepted_plan_hash", "计划", scores.accepted_plan_hash],
+        ["model_call_count", "模型调用", scores.model_call_count],
       ];
       break;
     case "citation_verification":

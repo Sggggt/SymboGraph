@@ -29,6 +29,7 @@ from app.services.graph_protocols import (
     retrieval_node_contribution_facts,
     retrieval_path_contribution_id,
 )
+from app.reflection_contracts import AnswerReflectionSummary, ReflectionDecision, ReflectionGate, is_direct_reflection_action
 
 
 JobState = Literal[
@@ -68,6 +69,7 @@ AgentRoute = Literal[
     "formula_table_lookup",
     "cross_document_synthesis",
 ]
+DirectAnswerMode = Literal["system_capability", "verified_context_reuse"]
 RetrievalGranularity = Literal["mid", "coarse"]
 CONVERSATION_CLIENT_HISTORY_MAX_TURNS = 32
 CONVERSATION_CLIENT_HISTORY_MAX_TOKENS = 8_192
@@ -138,6 +140,16 @@ class SearchFilters(APIModel):
     page_range: tuple[int | None, int | None] | None = None
     content_kinds: list[str] = Field(default_factory=list)
     chunk_version: int | None = None
+
+    @model_validator(mode='after')
+    def valid_source_range(self):
+        if self.chunk_version is not None and self.chunk_version < 1:
+            raise ValueError('chunk_version must be positive')
+        if self.page_range:
+            start,end=self.page_range
+            if any(value is not None and value < 1 for value in self.page_range) or (start is not None and end is not None and start > end):
+                raise ValueError('page_range must be positive and ordered')
+        return self
 
 
 class UploadReplacementLockReleaseAudit(APIModel):
@@ -244,7 +256,7 @@ class SourceSnapshotVerification(ClosedContractModel):
 
 
 class CitationSourceSpan(ClosedContractModel):
-    contract_version: Literal["raw_chunk_source_span_v1"] = "raw_chunk_source_span_v1"
+    contract_version: Literal["raw_chunk_source_span_v1", "raw_chunk_source_span_v3"] = "raw_chunk_source_span_v1"
     document_version_id: str
     chunk_id: str
     source_path: str
@@ -298,6 +310,71 @@ class VerifiedCitationSourceSpan(CitationSourceSpan):
     context_package_id: str = Field(min_length=1)
     retrieval_trace_id: str = Field(min_length=1)
     verification_id: str = Field(min_length=1)
+
+
+class BoundCitationSourceSpan(CitationSourceSpan):
+    """Raw address bound structurally under the answer reflection protocol."""
+
+    contract_version: Literal["raw_chunk_source_span_v2"] = "raw_chunk_source_span_v2"
+    context_package_id: str = Field(min_length=1)
+    retrieval_trace_id: str = Field(min_length=1)
+    verification_id: None = None
+    source_binding_id: str = Field(min_length=1)
+
+
+class AnswerSourceBindingAudit(ClosedContractModel):
+    contract_version: Literal[
+        "answer_source_binding_public_v1",
+        "answer_source_binding_public_v2",
+        "answer_source_binding_public_v3",
+    ] = "answer_source_binding_public_v1"
+    protocol_version: Literal["answer_source_binding_v1", "answer_source_binding_v2"] = "answer_source_binding_v1"
+    status: Literal["source_bound"]
+    source_binding_id: str = Field(min_length=1)
+    unit_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    unit_index: int = Field(ge=0, lt=32)
+    answer_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    binding_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reflection_audit_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    retrieval_gate_audit_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    retrieval_gate_observation_id: str | None = None
+    source_integrity_admission_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    source_integrity_admission_observation_id: str | None = None
+    provenance_status: Literal["valid"]
+    structure_context_status: Literal["valid"]
+    transactional_replay: Literal[True]
+    semantic_entailment_claimed: Literal[False]
+
+    @model_validator(mode="after")
+    def source_authority_protocol(self):
+        if self.protocol_version == "answer_source_binding_v1":
+            if (self.contract_version != "answer_source_binding_public_v1" or not self.reflection_audit_hash
+                or self.retrieval_gate_audit_hash is not None or self.retrieval_gate_observation_id is not None
+                or self.source_integrity_admission_hash is not None
+                or self.source_integrity_admission_observation_id is not None):
+                raise ValueError("legacy_source_binding_authority_invalid")
+        elif self.contract_version == "answer_source_binding_public_v2":
+            if (
+                self.reflection_audit_hash is not None
+                or not self.retrieval_gate_audit_hash
+                or not self.retrieval_gate_observation_id
+                or self.source_integrity_admission_hash is not None
+                or self.source_integrity_admission_observation_id is not None
+            ):
+                raise ValueError("retrieval_source_binding_authority_invalid")
+        elif (
+            self.contract_version != "answer_source_binding_public_v3"
+            or self.reflection_audit_hash is not None
+            or self.retrieval_gate_audit_hash is not None
+            or self.retrieval_gate_observation_id is not None
+            or not self.source_integrity_admission_hash
+            or not self.source_integrity_admission_observation_id
+        ):
+            raise ValueError("source_integrity_binding_authority_invalid")
+        return self
 
 
 class CitationVerificationDiagnostics(ClosedContractModel):
@@ -469,7 +546,7 @@ class CitationVerificationAudit(ClosedContractModel):
 
 
 class Citation(ClosedContractModel):
-    contract_version: Literal["citation_public_v1"] = "citation_public_v1"
+    contract_version: Literal["citation_public_v1", "citation_public_v2"] = "citation_public_v1"
     chunk_id: str = Field(min_length=1)
     citation_index: int = Field(ge=1)
     claim_id: str | None = Field(min_length=64, max_length=64)
@@ -492,15 +569,42 @@ class Citation(ClosedContractModel):
     section_path: list[str]
     text: str | None = None
     snippet: str | None = None
-    source_span: VerifiedCitationSourceSpan
+    source_span: VerifiedCitationSourceSpan | BoundCitationSourceSpan
     retrieval_trace_id: str = Field(min_length=1)
     answer_session_id: str = Field(min_length=1)
-    citation_verification_id: str = Field(min_length=1)
-    verification: CitationVerificationAudit
+    citation_verification_id: str | None = Field(min_length=1)
+    verification: CitationVerificationAudit | None
+    source_binding_id: str | None = Field(default=None, min_length=1)
+    source_binding: AnswerSourceBindingAudit | None = None
+    unit_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    unit_index: int | None = Field(default=None, ge=0, lt=32)
+    unit_text: str | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_versioned_binding(self, handler):
+        payload = handler(self)
+        if self.contract_version == "citation_public_v1":
+            for key in ("source_binding_id", "source_binding", "unit_id", "unit_index", "unit_text"):
+                payload.pop(key, None)
+        return payload
 
     @model_validator(mode="after")
     def validate_public_bindings(self) -> "Citation":
         span = self.source_span
+        new_binding = self.contract_version == "citation_public_v2"
+        if new_binding:
+            if not isinstance(span, BoundCitationSourceSpan) or self.source_binding is None:
+                raise ValueError("new citation requires its deterministic source binding")
+            if self.verification is not None or self.citation_verification_id is not None:
+                raise ValueError("new source binding cannot masquerade as semantic verification")
+            if any(value is not None for value in (self.claim_id, self.claim_index, self.claim_text)):
+                raise ValueError("new citation uses structured units, not legacy split claims")
+        elif (
+            not isinstance(span, VerifiedCitationSourceSpan) or self.verification is None
+            or self.citation_verification_id is None or self.source_binding is not None
+            or any(value is not None for value in (self.source_binding_id, self.unit_id, self.unit_index, self.unit_text))
+        ):
+            raise ValueError("legacy citation requires its original verification contract")
         identity_pairs = (
             ("chunk_id", self.chunk_id, span.chunk_id),
             (
@@ -551,6 +655,19 @@ class Citation(ClosedContractModel):
             )
         if self.bbox is not None and self.bbox != span.bbox:
             raise ValueError("citation bbox does not match the raw source span")
+
+        if new_binding:
+            binding = self.source_binding
+            if (
+                self.source_binding_id != span.source_binding_id
+                or self.source_binding_id != binding.source_binding_id
+                or self.unit_id != binding.unit_id or self.unit_index != binding.unit_index
+                or self.answer_hash != binding.answer_hash or not str(self.unit_text or "").strip()
+                or not normalized_path(span.section_path) or not normalized_path(span.structure_path)
+                or not span.structure_node_ids
+            ):
+                raise ValueError("citation unit/source binding does not match its persisted address")
+            return self
 
         diagnostics = self.verification.diagnostics
         if self.claim_id != diagnostics.claim_id:
@@ -630,12 +747,13 @@ class SearchCitation(ClosedContractModel):
 
 
 class SearchRequest(APIModel):
+    model_config = ConfigDict(from_attributes=True, extra="forbid")
+
     query: str = Field(min_length=1, max_length=12_000)
     knowledge_base_id: str | None = None
     session_id: str | None = Field(default=None, max_length=36)
     filters: SearchFilters = Field(default_factory=SearchFilters)
     top_k: int | None = Field(default=None, ge=1, le=50)
-    retrieval_granularity: RetrievalGranularity = "mid"
 
 
 class ActiveContextGraphAdmissionIssue(APIModel):
@@ -706,7 +824,8 @@ def public_search_result_payload(value: object) -> dict[str, Any]:
 
 class RetrievalCacheAudit(ClosedContractModel):
     protocol_version: Literal[
-        "layered_retrieval_postgresql_strict_replay_v1"
+        "layered_retrieval_postgresql_strict_replay_v1",
+        "intent_execution_retrieval_cache_v1",
     ]
     status: Literal["hit", "miss", "poison", "unavailable"]
     cache_hit: bool
@@ -725,7 +844,7 @@ class RetrievalCacheAudit(ClosedContractModel):
     provider_perception_model_call_count: Literal[0] | None = None
     query_embedding_model_call_count: Literal[0] | None = None
     traversal_execution_count: Literal[0] | None = None
-    retrieval_fact_insert_count: Literal[0] | None = None
+    retrieval_fact_insert_count: Literal[0, 1] | None = None
     gray_zone_input_modified: Literal[False]
     gray_zone_model_call_count: Literal[0]
     context_package_reused: bool | None = None
@@ -755,7 +874,7 @@ class OrdinaryQueryReplayPointerAudit(ClosedContractModel):
 
 class OrdinaryQueryPerceptionAudit(ClosedContractModel):
     protocol_version: Literal[
-        "bounded_query_perception_and_facet_proposal_v1"
+        "bounded_query_perception_and_facet_proposal_v2"
     ]
     provider_protocol_hash: str = Field(min_length=64, max_length=64)
     model_call_budget: Literal[2]
@@ -816,13 +935,14 @@ class ModelAudit(ClosedContractModel):
         default=None, min_length=64, max_length=64
     )
     semantic_entry_query_protocol_version: Literal[
-        "validated_query_facet_semantic_entry_v1"
+        "validated_query_facet_semantic_entry_v1", "validated_query_facet_semantic_entry_v2", "validated_query_facet_semantic_entry_v3"
     ] | None = None
     semantic_entry_query_hash: str | None = Field(
         default=None, min_length=64, max_length=64
     )
     semantic_entry_query_selection_source: Literal[
         "validated_required_facet",
+        "validated_required_domain_composite",
         "raw_query",
     ] | None = None
     semantic_entry_query_is_evidence: Literal[False] | None = None
@@ -858,20 +978,45 @@ class ModelAudit(ClosedContractModel):
     repair_global_top_k_modified: Literal[False] | None = None
     repair_gray_zone_model_call_count: Literal[0] | None = None
     retrieval_cache: RetrievalCacheAudit | None = None
+    intent_retrieval_cache: RetrievalCacheAudit | None = None
     query_perception_audit: OrdinaryQueryPerceptionAudit | None = None
     query_embedding_execution: QueryEmbeddingExecutionAudit | None = None
 
 
 class SearchResponse(PublicResponseModel):
-    contract_version: Literal["search_public_v1"] = "search_public_v1"
+    contract_version: Literal["search_public_v2"] = "search_public_v2"
     query: str
     results: list[SearchResult]
     degraded_mode: bool = False
     model_audit: ModelAudit = Field(default_factory=ModelAudit)
     retrieval_trace_id: str | None = None
     context_package_id: str | None = None
-    retrieval_granularity: RetrievalGranularity = "mid"
+    run_id: str | None = None
+    entry_layer: Literal["coarse", "mid", "chunk"] | None = None
+    intent: dict[str, Any] | None = None
+    execution_strategy: dict[str, Any] | None = None
+    terminal_outcome: Literal[
+        "completed",
+        "partial_answer",
+        "insufficient_evidence",
+        "scope_ambiguous",
+        "representation_incomplete",
+        "context_budget_exhausted",
+        "strategy_invalid",
+        "entry_unavailable",
+        "index_unavailable",
+        "technical_failure",
+        "cancelled",
+    ] | None = None
+    accepted_plan_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     conversation_state: "ConversationStatePayload | None" = None
+
+    @model_validator(mode="after")
+    def validate_unique_result_chunks(self) -> "SearchResponse":
+        chunk_ids = [item.chunk_id for item in self.results]
+        if len(chunk_ids) != len(set(chunk_ids)):
+            raise ValueError("search results must contain unique chunk_id values")
+        return self
 
 
 class ChatMessage(APIModel):
@@ -923,6 +1068,7 @@ class ConversationTaskState(APIModel):
         "waiting_user",
         "completed",
         "cancelled",
+        "failed",
     ] = "active"
     objective: str | None = Field(default=None, max_length=2_000)
     current_step: str | None = Field(default=None, max_length=1_000)
@@ -946,13 +1092,14 @@ class ConversationStateUpdate(APIModel):
 class ConversationHistoryReference(APIModel):
     model_config = ConfigDict(from_attributes=True, extra="forbid")
 
-    protocol_version: Literal["answer_context_citation_reference_v1"]
+    protocol_version: Literal["answer_context_citation_reference_v1", "answer_context_source_reference_v2"]
     turn_index: int = Field(ge=0)
     run_id: str
     answer_session_id: str
     context_package_id: str
     retrieval_trace_id: str
     citation_verification_ids: list[str] = Field(default_factory=list)
+    source_binding_ids: list[str] = Field(default_factory=list)
 
 
 class ConversationStatePayload(APIModel):
@@ -1019,7 +1166,6 @@ class QARequest(APIModel):
         max_length=CONVERSATION_CLIENT_HISTORY_MAX_TURNS,
     )
     conversation_state_update: ConversationStateUpdate | None = None
-    retrieval_granularity: RetrievalGranularity = "mid"
 
     @field_validator("question")
     @classmethod
@@ -1052,6 +1198,7 @@ class ExpectedEvidenceAudit(ClosedContractModel):
     target_layer: str | None = None
     fallback_allowed: bool | None = None
     required_verification_stage: str | None = None
+    required_review_stage: str | None = None
     protocol_version: str | None = None
     executor_mechanism: str | None = None
     failure_card_hashes: list[str] = Field(default_factory=list)
@@ -1339,10 +1486,36 @@ class ProviderCallAudit(ClosedContractModel):
     provider_response_persisted: Literal[False]
 
 
+from app.retrieval_control_contracts import RetrievalAnswerSummary
+from app.services.qa_performance import QAPerformanceSummary
+
+
 class AnswerModelAudit(ModelAudit):
     contract_version: Literal["answer_model_audit_public_v1"] = (
         "answer_model_audit_public_v1"
     )
+    protocol_version: str | None = None
+    accepted_plan_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    planning_model_call_count: int | None = Field(default=None, ge=0)
+    generation_model_call_count: int | None = Field(default=None, ge=0)
+    post_generation_model_call_count: int | None = Field(default=None, ge=0)
+    source_admission_model_call_count: int | None = Field(default=None, ge=0)
+    terminal_outcome: Literal[
+        "completed",
+        "partial_answer",
+        "insufficient_evidence",
+        "scope_ambiguous",
+        "representation_incomplete",
+        "context_budget_exhausted",
+        "strategy_invalid",
+        "entry_unavailable",
+        "index_unavailable",
+        "technical_failure",
+        "cancelled",
+    ] | None = None
+    capability_card_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    generation: dict[str, Any] | None = None
+    source_binding_count: int | None = Field(default=None, ge=0)
     model: str | None = None
     external_called: bool | None = None
     fallback_reason: str | None = None
@@ -1353,6 +1526,7 @@ class AnswerModelAudit(ModelAudit):
     typed_action_control_hash: str | None = None
     evidence_evaluator: EvidenceEvaluatorVerdictAudit | None = None
     context_package_evidence_gate_passed: bool | None = None
+    preliminary_evidence_uncertain: bool | None = None
     answer_model_called: bool | None = None
     answer_claim_limit: int | None = Field(default=None, ge=1, le=100)
     output_token_budget: int | None = Field(default=None, ge=1, le=32_768)
@@ -1375,19 +1549,44 @@ class AnswerModelAudit(ModelAudit):
     insufficient_evidence: bool = False
     grounding_outcome: str | None = None
     returned_citation_count: int | None = Field(default=None, ge=0)
+    answer_reflection: AnswerReflectionSummary | None = None
+    retrieval_control: RetrievalAnswerSummary | None = None
+    qa_performance: QAPerformanceSummary | None = None
+    source_binding_pass_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    direct_answer_mode: DirectAnswerMode | None = None
+    direct_answer_protocol_version: str | None = None
+    policy_update_eligible: bool | None = None
+    tool_call_count: int | None = Field(default=None, ge=0)
 
 
 class QAResponse(PublicResponseModel):
-    contract_version: Literal["qa_public_v1"] = "qa_public_v1"
+    contract_version: Literal["qa_public_v2"] = "qa_public_v2"
     answer: str
     citations: list[Citation] = Field(default_factory=list)
     session_id: str | None = None
     run_id: str | None = None
     context_package_id: str | None = None
     retrieval_trace_id: str | None = None
-    retrieval_granularity: RetrievalGranularity = "mid"
+    answer_session_id: str | None = None
+    entry_layer: Literal["coarse", "mid", "chunk"] | None = None
+    intent: dict[str, Any] | None = None
+    execution_strategy: dict[str, Any] | None = None
+    terminal_outcome: Literal[
+        "completed",
+        "partial_answer",
+        "insufficient_evidence",
+        "scope_ambiguous",
+        "representation_incomplete",
+        "context_budget_exhausted",
+        "strategy_invalid",
+        "entry_unavailable",
+        "index_unavailable",
+        "technical_failure",
+        "cancelled",
+    ] | None = None
     used_chunks: list["ContextItem"] = Field(default_factory=list)
     route: AgentRoute | str | None = None
+    direct_answer_mode: DirectAnswerMode | None = None
     trace: list["AgentTraceEventPayload"] = Field(default_factory=list)
     degraded_mode: bool = False
     model_audit: AnswerModelAudit = Field(default_factory=AnswerModelAudit)
@@ -1408,8 +1607,6 @@ class AgentRequest(APIModel):
         max_length=CONVERSATION_CLIENT_HISTORY_MAX_TURNS,
     )
     conversation_state_update: ConversationStateUpdate | None = None
-    retrieval_granularity: RetrievalGranularity = "mid"
-    route: AgentRoute = "layered_context_graph"
     stream_trace: bool = False
 
     @field_validator("question")
@@ -1440,6 +1637,14 @@ class AgentQueryIntentConversationAudit(ClosedContractModel):
 
 class AgentQueryIntentAudit(ClosedContractModel):
     intent: str
+    direct_answer_kind: Literal[
+        "identity",
+        "model_identity",
+        "capabilities",
+        "evidence",
+        "usage",
+        "none",
+    ]
     entities: list[str] = Field(default_factory=list)
     sub_queries: list[str] = Field(default_factory=list)
     needs_graph: bool
@@ -1459,6 +1664,7 @@ class AgentActionValidationResult(ClosedContractModel):
     bridge_protection_checked: bool | None = None
     required_restore_modes: list[str] = Field(default_factory=list)
     required_verification_stage: str | None = None
+    required_review_stage: str | None = None
     inserted_required_action: bool | None = None
 
 
@@ -1523,6 +1729,7 @@ class AgentStopConditionRequestAudit(ClosedContractModel):
     all_required_facets_covered: bool | None = None
     independent_support_paths_at_least: int | None = Field(default=None, ge=0)
     citation_verification_passes: bool | None = None
+    answer_review_passes: bool | None = None
     frontier_empty: bool | None = None
     all_claims_supported: bool | None = None
     no_semantic_progress: bool | None = None
@@ -1534,6 +1741,7 @@ class AgentStopConditionResultAudit(ClosedContractModel):
     all_required_facets_covered: bool | None = None
     independent_support_paths_at_least: bool | None = None
     citation_verification_passes: bool | None = None
+    answer_review_passes: bool | None = None
     frontier_empty: bool | None = None
     all_claims_supported: bool | None = None
     no_semantic_progress: bool | None = None
@@ -1583,6 +1791,7 @@ class AgentTraceScoresBase(ClosedContractModel):
 
 class QueryUnderstandingTraceScores(AgentTraceScoresBase):
     audit_kind: Literal["query_understanding"]
+    protocol_version: str | None = None
     top_k: int | None = Field(default=None, ge=0)
     query_intent: AgentQueryIntentAudit | None = None
     retrieval_granularity: RetrievalGranularity | None = None
@@ -1707,10 +1916,63 @@ class RewardTraceScores(AgentTraceScoresBase):
     agent_operating_envelope_hash: str | None = None
 
 
+class AnswerReflectionTraceScores(AgentTraceScoresBase):
+    audit_kind: Literal["answer_reflection"]
+    stage: str
+    gate: ReflectionGate | None = None
+    decision: ReflectionDecision | None = None
+    action: str | None = None
+    error_code: str | None = None
+    executed_action_count: int | None = Field(default=None, ge=0)
+    unit_count: int | None = Field(default=None, ge=0, le=32)
+    source_binding_count: int | None = Field(default=None, ge=0, le=256)
+    reflection_rounds_used: int | None = Field(default=None, ge=0, le=10)
+    reflection_audit_hash: str | None = None
+    summary: AnswerReflectionSummary | None = None
+
+
+class DirectAnswerTraceScores(AgentTraceScoresBase):
+    audit_kind: Literal["direct_answer"]
+    protocol_version: str | None = None
+    response_mode: DirectAnswerMode | None = None
+    reason_code: str | None = None
+    reason: str | None = None
+    error_type: str | None = None
+    verdict: str | None = None
+    decision_hash: str | None = None
+    capability_card_hash: str | None = None
+    input_hash: str | None = None
+    output_hash: str | None = None
+    model_call_count: int | None = Field(default=None, ge=0)
+    tool_call_count: int | None = Field(default=None, ge=0)
+    tool_call_count_before_fallback: int | None = Field(default=None, ge=0)
+    policy_update_eligible: bool | None = None
+    answer_session_id: str | None = None
+    answer_hash: str | None = None
+    citation_count: int | None = Field(default=None, ge=0)
+    citation_pass_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    claim_pass_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    returned_citation_count: int | None = Field(default=None, ge=0)
+
+
 class StatusTraceScores(AgentTraceScoresBase):
     audit_kind: Literal["status"]
     cancel_requested: bool | None = None
     admission_failure: bool | None = None
+
+
+class IntentExecutionTraceScores(AgentTraceScoresBase):
+    audit_kind: Literal["intent_execution"]
+    protocol_version: str | None = None
+    accepted_plan_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    capability_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    strategy_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    source_integrity_admission_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    entry_layer: Literal["coarse", "mid", "chunk"] | None = None
+    model_call_count: int | None = Field(default=None, ge=0)
+    score_fields_used: list[str] = Field(default_factory=list)
+    fallback_before_retrieval: bool | None = None
+    retrieval_audit: dict[str, Any] | None = None
 
 
 AgentTraceScores = Annotated[
@@ -1729,10 +1991,26 @@ AgentTraceScores = Annotated[
     | GroundedAnswerTraceScores
     | RepairTraceScores
     | CitationVerificationTraceScores
+    | AnswerReflectionTraceScores
     | RewardTraceScores
-    | StatusTraceScores,
+    | DirectAnswerTraceScores
+    | StatusTraceScores
+    | IntentExecutionTraceScores,
     Field(discriminator="audit_kind"),
 ]
+
+
+class RetrievalControlTraceScores(AgentTraceScoresBase):
+    audit_kind: Literal["retrieval_control"]
+    stage: str
+    outcome: str | None = None
+    repairs_used: int | None = Field(default=None, ge=0, le=2)
+    source_count: int | None = Field(default=None, ge=0)
+    missing_facet_count: int | None = Field(default=None, ge=0)
+    model_call_count: int | None = Field(default=None, ge=0)
+
+
+ExtendedAgentTraceScores = Annotated[AgentTraceScores | RetrievalControlTraceScores, Field(discriminator="audit_kind")]
 
 
 class AgentTraceEventPayload(ClosedContractModel):
@@ -1744,6 +2022,7 @@ class AgentTraceEventPayload(ClosedContractModel):
     run_id: str
     sequence_index: int = Field(strict=True, ge=0)
     node: Literal[
+        "retrieval_control",
         "query_understanding",
         "query_facet_extraction",
         "agent_planner",
@@ -1760,18 +2039,32 @@ class AgentTraceEventPayload(ClosedContractModel):
         "structure_context_restoration",
         "context_package",
         "grounded_answer",
+        "answer_generation",
+        "reflection_gate",
+        "answer_reflection",
+        "reflection_backtrack",
+        "reflection_action_validation",
+        "answer_source_binding",
         "citation_verification",
         "repair_executed",
         "reward_event",
+        "direct_answer_route_gate",
+        "direct_answer_reuse_evaluator",
+        "direct_answer_fallback",
+        "direct_answer",
         "cancelled",
         "agent_admission",
         "error",
+        "intent_planning",
+        "intent_execution_retrieval",
+        "source_integrity_admission",
+        "verified_context_reuse",
     ]
     status: str
     input_summary: str = ""
     output_summary: str = ""
     document_ids: list[str] = Field(default_factory=list)
-    scores: AgentTraceScores
+    scores: ExtendedAgentTraceScores
     duration_ms: int = 0
     error: str | None = None
     created_at: datetime | None = None
@@ -1785,6 +2078,7 @@ class AgentTraceEventPayload(ClosedContractModel):
         node = str(payload.get("node") or "")
         scores = dict(payload.get("scores") or {})
         kind_by_node = {
+            "retrieval_control": "retrieval_control",
             "query_understanding": "query_understanding",
             "query_facet_extraction": "query_facets",
             "agent_planner": "planner",
@@ -1801,12 +2095,26 @@ class AgentTraceEventPayload(ClosedContractModel):
             "structure_context_restoration": "context_restoration",
             "context_package": "context_package",
             "grounded_answer": "grounded_answer",
+            "answer_generation": "answer_reflection",
+            "reflection_gate": "answer_reflection",
+            "answer_reflection": "answer_reflection",
+            "reflection_backtrack": "answer_reflection",
+            "reflection_action_validation": "answer_reflection",
+            "answer_source_binding": "answer_reflection",
             "repair_executed": "repair",
             "citation_verification": "citation_verification",
             "reward_event": "reward",
+            "direct_answer_route_gate": "direct_answer",
+            "direct_answer_reuse_evaluator": "direct_answer",
+            "direct_answer_fallback": "direct_answer",
+            "direct_answer": "direct_answer",
             "cancelled": "status",
             "agent_admission": "status",
             "error": "status",
+            "intent_planning": "intent_execution",
+            "intent_execution_retrieval": "intent_execution",
+            "source_integrity_admission": "intent_execution",
+            "verified_context_reuse": "intent_execution",
         }
         audit_kind = kind_by_node.get(node)
         if audit_kind is None:
@@ -1852,6 +2160,9 @@ class AgentTraceEventPayload(ClosedContractModel):
                     "completed evidence_gate trace requires a sufficient evaluator "
                     "verdict and a passed context-package gate"
                 )
+        elif self.status == "review_required":
+            if audit.preliminary_evidence_uncertain is not True or audit.context_package_evidence_gate_passed is not True:
+                raise ValueError("provisional evidence gate requires explicit full-context reflection")
         elif self.status == "blocked" and (
             audit.context_package_evidence_gate_passed is not False
             or (
@@ -1878,7 +2189,9 @@ class TaskStatusResponse(PublicResponseModel):
     current_node: str | None = None
     retry_count: int | None = None
     route: str | None = None
-    retrieval_granularity: RetrievalGranularity = "mid"
+    direct_answer_mode: DirectAnswerMode | None = None
+    entry_layer: Literal["coarse", "mid", "chunk"] | None = None
+    terminal_outcome: str | None = None
     answer: str | None = None
     error: str | None = None
     created_at: datetime | None = None
@@ -1901,12 +2214,21 @@ AgentPEActionType = Literal[
     "restore_context_package",
     "build_context_package",
     "verify_citations",
+    "review_answer",
     "repair_missing_citation",
     "repair_concept_gap",
     "repair_bridge_gap",
     "repair_structure_context",
+    "accept",
+    "revise_answer",
+    "restore_context",
+    "replan_retrieval",
+    "clarify_user",
+    "insufficient_evidence",
 ]
 AgentPEObservationType = Literal[
+    'retrieval_state_transition', 'retrieval_gate', 'retrieval_scope_targets', 'retrieval_sufficiency', 'retrieval_scope_resolution',
+    'retrieval_packing_repair', 'retrieval_generation_packing', 'retrieval_repair_request', 'retrieval_lexical_patch',
     "plan_validation_failed",
     "executor_contract_blocked",
     "entry_selection",
@@ -1922,6 +2244,8 @@ AgentPEObservationType = Literal[
     "citation_verification",
     "typed_repair_round",
     "claim_level_final_grounded_gate",
+    "answer_reflection",
+    "answer_reflection_final",
 ]
 
 
@@ -2067,6 +2391,7 @@ class AgentPEPlanAuditRow(ClosedContractModel):
     validation: AgentPEJsonPayload
     planner_model_metadata: AgentPEJsonPayload
     status: Literal[
+        'executed',
         "validated",
         "invalid",
         "validator_replan_requested",
@@ -2090,8 +2415,8 @@ class AgentPEActionAuditRow(ClosedContractModel):
     order_index: int = Field(strict=True, ge=0)
     id: str
     run_id: str
-    plan_id: str
-    plan_index: int = Field(strict=True, ge=0)
+    plan_id: str | None
+    plan_index: int | None = Field(strict=True, ge=0)
     parent_action_id: str | None = None
     action_index: int = Field(strict=True, ge=0)
     action_type: AgentPEActionType
@@ -2102,6 +2427,7 @@ class AgentPEActionAuditRow(ClosedContractModel):
     stop_condition: AgentPEJsonPayload
     validator: AgentPEActionValidatorAudit
     status: Literal[
+        'executing', 'failed', 'cancelled',
         "accepted",
         "completed",
         "rejected",
@@ -2126,12 +2452,13 @@ class AgentPEObservationAuditRow(ClosedContractModel):
     order_index: int = Field(strict=True, ge=0)
     id: str
     run_id: str
-    plan_id: str
-    plan_index: int = Field(strict=True, ge=0)
+    plan_id: str | None
+    plan_index: int | None = Field(strict=True, ge=0)
     action_id: str | None = None
     action_index: int | None = Field(default=None, ge=0)
     parent_action_id: str | None = None
     observation_type: AgentPEObservationType
+    run_control_protocol: Literal['retrieval_fsm_v1'] | None = None
     protocol_version: str | None = None
     input_hash: str | None = None
     output_hash: str | None = None
@@ -2196,7 +2523,8 @@ class AgentPEAuditResponse(ClosedContractModel):
         if self.actions != sorted(
             self.actions,
             key=lambda row: (
-                row.plan_index,
+                row.plan_index is None,
+                row.plan_index if row.plan_index is not None else 0,
                 row.action_index,
                 instant(row.created_at),
                 row.id,
@@ -2237,6 +2565,17 @@ class AgentPEAuditResponse(ClosedContractModel):
                 )
 
         action_by_id = {action.id: action for action in self.actions}
+        def direct_review(action: AgentPEActionAuditRow) -> bool:
+            return (
+                action.plan_index is None
+                and action.validator.valid is True
+                and is_direct_reflection_action(
+                    action.action_type,
+                    action.plan_id,
+                    json.loads(action.validator.payload.canonical_json),
+                )
+            )
+
         expected_action_ids = [
             action.id
             for plan in self.plans
@@ -2249,6 +2588,12 @@ class AgentPEAuditResponse(ClosedContractModel):
                 key=lambda row: row.action_index,
             )
         ]
+        expected_action_ids.extend(
+            action.id for action in sorted(
+                (action for action in self.actions if direct_review(action)),
+                key=lambda row: row.action_index,
+            )
+        )
         if expected_action_ids != [action.id for action in self.actions]:
             raise ValueError(
                 "P&E public actions violate canonical plan/action scope"
@@ -2262,8 +2607,8 @@ class AgentPEAuditResponse(ClosedContractModel):
             )
             if (
                 action.run_id != self.run_id
-                or plan is None
-                or action.plan_index != plan.plan_index
+                or (plan is None and not direct_review(action))
+                or (plan is not None and action.plan_index != plan.plan_index)
                 or action.observation_count != len(action.observation_ids)
                 or (
                     action.parent_action_id is not None
@@ -2277,11 +2622,11 @@ class AgentPEAuditResponse(ClosedContractModel):
                 raise ValueError(
                     "P&E public action scope or observation count conflicts"
                 )
-        for plan in self.plans:
+        for scope_id in [*(plan.id for plan in self.plans), None]:
             action_indexes = [
                 action.action_index
                 for action in self.actions
-                if action.plan_id == plan.id
+                if action.plan_id == scope_id
             ]
             if action_indexes != list(range(len(action_indexes))):
                 raise ValueError(
@@ -2290,6 +2635,13 @@ class AgentPEAuditResponse(ClosedContractModel):
 
         for observation in self.observations:
             plan = plan_by_id.get(observation.plan_id)
+            from app.retrieval_control_contracts import RUN_OBSERVATION_PROTOCOLS
+            run_control = (observation.run_control_protocol == 'retrieval_fsm_v1'
+                and observation.protocol_version in RUN_OBSERVATION_PROTOCOLS.get(observation.observation_type, ())
+                and observation.action_id is None and observation.action_index is None and observation.parent_action_id is None
+                and observation.plan_id is None and observation.plan_index is None)
+            if observation.run_control_protocol is not None and not run_control:
+                raise ValueError('P&E run control observation ownership conflicts')
             action = (
                 action_by_id.get(observation.action_id)
                 if observation.action_id is not None
@@ -2297,8 +2649,16 @@ class AgentPEAuditResponse(ClosedContractModel):
             )
             if (
                 observation.run_id != self.run_id
-                or plan is None
-                or observation.plan_index != plan.plan_index
+                or (
+                    plan is None
+                    and not run_control and not (
+                        observation.plan_id is None
+                        and observation.plan_index is None
+                        and action is not None
+                        and direct_review(action)
+                    )
+                )
+                or (plan is not None and observation.plan_index != plan.plan_index)
                 or (
                     observation.action_id is not None
                     and (
@@ -2621,6 +2981,7 @@ class SessionMessage(ClosedContractModel):
     content: str = Field(min_length=1)
     run_id: str | None = None
     route: str | None = None
+    direct_answer_mode: DirectAnswerMode | None = None
     retrieval_trace_id: str | None = None
     citations: list[Citation] = Field(default_factory=list)
     citation_replay_status: Literal["not_present", "valid", "unavailable"] = (
@@ -2629,6 +2990,7 @@ class SessionMessage(ClosedContractModel):
     citation_replay_reason: Literal[
         "persisted_citation_contract_mismatch"
     ] | None = None
+    trace: list["AgentTraceEventPayload"] = Field(default_factory=list)
     source: Literal["client_history"] | None = None
 
 
@@ -5899,9 +6261,18 @@ class QueryFacetDiagnostics(ClosedContractModel):
     ] | None = None
     llm_schema_rejection: QueryFacetSchemaRejection | None = None
     query_perception_audit: OrdinaryQueryPerceptionAudit | None = None
+    lexical_strategy_protocol_version: Literal["retrieval_lexical_strategy_v1"] | None = None
+    lexical_strategy_hash: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    fixed_task_hash: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    lexical_only_aliases: bool = False
 
     @model_validator(mode="after")
     def validate_schema_repair_diagnostics(self) -> "QueryFacetDiagnostics":
+        identities = (self.lexical_strategy_protocol_version, self.lexical_strategy_hash, self.fixed_task_hash)
+        if self.lexical_only_aliases != all(value is not None for value in identities) or (
+            not self.lexical_only_aliases and any(value is not None for value in identities)
+        ):
+            raise ValueError("lexical strategy diagnostics require a complete fixed-task identity")
         if self.output_contract_protocol_version is None:
             if (
                 self.sampling_model_call_count is not None
@@ -6125,8 +6496,10 @@ class RetrievalAgentOperatingEnvelope(ClosedContractModel):
     context_path_summary_budget: int = Field(ge=1)
     planning_round_budget: int = Field(ge=1)
     max_typed_actions_per_round: int = Field(ge=1)
-    repair_round_budget: int = Field(ge=0)
-    verification_budget: int = Field(ge=0)
+    repair_round_budget: int | None = Field(default=None, ge=0)
+    verification_budget: int | None = Field(default=None, ge=0)
+    answer_unit_limit: int | None = Field(default=None, ge=1, le=32)
+    reflection_round_budget: int | None = Field(default=None, ge=0, le=10)
     allowed_relation_types: list[
         Literal[
             "dense_semantic",
@@ -6142,6 +6515,10 @@ class RetrievalAgentOperatingEnvelope(ClosedContractModel):
     def validate_provider_free_executor_envelope(
         self,
     ) -> "RetrievalAgentOperatingEnvelope":
+        legacy_budget = self.verification_budget is not None or self.repair_round_budget is not None
+        review_budget = self.answer_unit_limit is not None or self.reflection_round_budget is not None
+        if legacy_budget == review_budget or (legacy_budget and (self.verification_budget is None or self.repair_round_budget is None)) or (review_budget and (self.answer_unit_limit is None or self.reflection_round_budget is None)):
+            raise ValueError("frozen envelope must contain exactly one complete answer protocol budget")
         if not (
             self.path_distance_green_threshold
             <= self.path_distance_gray_threshold
@@ -6180,6 +6557,14 @@ class RetrievalAgentOperatingEnvelope(ClosedContractModel):
                 "query facet posterior envelope fields must be all present or all absent"
             )
         return self
+
+    @model_serializer(mode="wrap")
+    def serialize_answer_budget_version(self, handler):
+        payload = handler(self)
+        for key in ("repair_round_budget", "verification_budget", "answer_unit_limit", "reflection_round_budget"):
+            if payload.get(key) is None:
+                payload.pop(key, None)
+        return payload
 
 
 class RetrievalTraceDiagnostics(ClosedContractModel):
@@ -6533,11 +6918,21 @@ class ContextStructureOCRLayoutItemAudit(ClosedContractModel):
     bbox: CitationBoundingBox
 
 
+class PDFTableGeometryAudit(ClosedContractModel):
+    protocol_version: Literal["pdf_ruled_table_geometry_v1"]
+    detector_version: str
+    row_band_count: int = Field(ge=2)
+    column_count: int = Field(ge=2)
+    region: CitationBoundingBox
+    source_block_indices: list[int] = Field(min_length=1)
+
+
 class ContextStructureNativeMetadataAudit(ClosedContractModel):
     native_structure: bool | None = None
     parent_ref: str | None = None
     parser_source: str | None = None
     native_geometry: bool | None = None
+    table_geometry: PDFTableGeometryAudit | None = None
     layout_protocol_version: str | None = None
     flow_block_protocol_version: str | None = None
     block_start_protocol_version: str | None = None
@@ -6579,6 +6974,7 @@ class ContextStructureNativeMetadataAudit(ClosedContractModel):
 
 
 class ContextStructureLayoutAudit(ClosedContractModel):
+    has_formula: bool | None = None
     coordinate_system: str | None = None
     structure_id: str | None = None
     layout_id: str | None = None
@@ -6604,6 +7000,7 @@ class ContextStructureLayoutAudit(ClosedContractModel):
     page_size: list[float] | tuple[float, float] | None = None
     native_layout_block_count: int | None = Field(default=None, ge=0)
     pdf_image_count: int | None = Field(default=None, ge=0)
+    ocr_image_errors: list[str] = Field(default_factory=list)
     ocr_applied: bool | None = None
     ocr_page_count: int | None = Field(default=None, ge=0)
     ocr_reason: str | None = None
@@ -6681,7 +7078,7 @@ class ContextPackageChunk(ClosedContractModel):
     structure_closure: ContextStructureClosure
     why_selected: ContextSelectionReason
     dedupe_key: str
-    role: Literal["hit", "bridge", "graph_path", "restored_context"]
+    role: Literal["hit", "bridge", "graph_path", "restored_context", "source_scope", "source_scope_context", "preserved_source"]
     context_package_id: str
 
     @model_validator(mode="after")
@@ -6776,7 +7173,7 @@ class ContextMetadata(ClosedContractModel):
     structure_closure: ContextStructureClosure
     why_selected: ContextSelectionReason
     dedupe_key: str
-    role: Literal["hit", "bridge", "graph_path", "restored_context"]
+    role: Literal["hit", "bridge", "graph_path", "restored_context", "source_scope", "source_scope_context", "preserved_source"]
     content_clipped: bool
     content_token_count: int = Field(ge=0)
     original_token_count: int = Field(ge=0)
@@ -6932,6 +7329,8 @@ class ContextRestoreCounts(ClosedContractModel):
     graph_path_chunks: int = Field(ge=0)
     parent_structure_nodes: int = Field(ge=0)
     per_hit_chunk_budget: int = Field(ge=0)
+    required_scope_chunks: int = Field(default=0, ge=0)
+    source_scope_context_chunks: int = Field(default=0, ge=0)
 
 
 class ContextTokenBudgetAudit(ClosedContractModel):
@@ -6941,12 +7340,32 @@ class ContextTokenBudgetAudit(ClosedContractModel):
     clipped_chunk_ids: list[str] = Field(default_factory=list)
     skipped_chunk_ids: list[str] = Field(default_factory=list)
     packing_protocol: str
+    candidate_chunk_ids: list[str] = Field(default_factory=list, max_length=4096)
+    selection_token_budget: int | None = Field(default=None, gt=0)
 
 
 class ContextSnapshotIntegrityAudit(ClosedContractModel):
     protocol_version: str
     verified_document_version_count: int = Field(ge=0)
     fail_closed: Literal[True]
+
+
+class ContextSourceRetentionAudit(ClosedContractModel):
+    protocol_version: Literal["reflection_bound_source_retention_v1"]
+    base_context_package_id: str
+    base_retrieval_trace_id: str
+    source_context_package_id: str
+    retrieval_executed: Literal[False]
+    gray_zone_model_call_count: Literal[0]
+    retained_chunk_ids: list[str]
+    preserved_chunk_ids: list[str]
+
+
+class ContextSourceExpansionAudit(ClosedContractModel):
+    protocol_version: Literal["reflection_source_structure_expansion_v1"]
+    expanded_chunk_ids: list[str]
+    graph_hits_added: Literal[0]
+    gray_zone_model_call_count: Literal[0]
 
 
 class ContextPackageDiagnostics(ClosedContractModel):
@@ -6966,6 +7385,8 @@ class ContextPackageDiagnostics(ClosedContractModel):
     restore_counts: ContextRestoreCounts
     token_budget_audit: ContextTokenBudgetAudit
     snapshot_integrity: ContextSnapshotIntegrityAudit
+    source_retention: ContextSourceRetentionAudit | None = None
+    source_expansion: ContextSourceExpansionAudit | None = None
 
 
 CONTEXT_PACKAGE_PUBLIC_HASH_FIELDS = (
@@ -7187,6 +7608,24 @@ class ContextPackageResponse(ClosedContractModel):
                 "context package why_selected keys must exactly match "
                 "the packaged chunks"
             )
+        preserved_ids = {chunk.chunk_id for chunk in self.package.chunks if chunk.role == "preserved_source"}
+        expansion = self.diagnostics.source_expansion
+        if expansion is not None and (len(expansion.expanded_chunk_ids) != len(set(expansion.expanded_chunk_ids))
+            or not set(expansion.expanded_chunk_ids).issubset(self.restored_chunk_ids)):
+            raise ValueError("source expansions must be unique restored context chunks")
+        retention = self.diagnostics.source_retention
+        if preserved_ids and retention is None:
+            raise ValueError("preserved sources require explicit origin retention diagnostics")
+        if retention is not None and (
+            set(retention.preserved_chunk_ids) != preserved_ids
+            or not preserved_ids.issubset(retention.retained_chunk_ids)
+            or not set(retention.retained_chunk_ids).issubset(packaged_chunk_ids)
+            or len(retention.retained_chunk_ids) != len(set(retention.retained_chunk_ids))
+            or len(retention.preserved_chunk_ids) != len(preserved_ids)
+            or self.id in {retention.base_context_package_id, retention.source_context_package_id}
+            or preserved_ids.intersection(self.hit_chunk_ids + self.restored_chunk_ids + self.bridge_chunk_ids)
+        ):
+            raise ValueError("retained source ownership or role scope is inconsistent")
         expected_dedupe_keys = [
             chunk.dedupe_key for chunk in self.package.chunks
         ]
@@ -7464,6 +7903,46 @@ class RetrievalTraceStepsResponse(ClosedContractModel):
         return self
 
 
+class IntentExecutionRetrievalTraceStepsResponse(ClosedContractModel):
+    contract_version: Literal["intent_execution_retrieval_trace_public_v1"] = (
+        "intent_execution_retrieval_trace_public_v1"
+    )
+    trace_id: str
+    context_package_id: str | None = None
+    query: str | None = None
+    retrieval_mode: Literal["intent_execution_retrieval_v1"]
+    entry_layer: Literal["coarse", "mid", "chunk"]
+    conversation_state_scope_hash: str = Field(min_length=64, max_length=64)
+    concept_path: list[dict[str, Any]] = Field(default_factory=list)
+    result_chunk_ids: list[str] = Field(default_factory=list)
+    query_facets: dict[str, Any] = Field(default_factory=dict)
+    entry_nodes: list[dict[str, Any]] = Field(default_factory=list)
+    frontier: list[dict[str, Any]] = Field(default_factory=list)
+    stage_queues: dict[str, Any] = Field(default_factory=dict)
+    candidate_pools: dict[str, Any] = Field(default_factory=dict)
+    topk_selection: dict[str, Any] = Field(default_factory=dict)
+    path_labels: list[dict[str, Any]] = Field(default_factory=list)
+    convergence: dict[str, Any] = Field(default_factory=dict)
+    trace_diagnostics: dict[str, Any] = Field(default_factory=dict)
+    gray_zone_protocol: Literal["deterministic_support_progress_v2"]
+    gray_zone_decision_authority: Literal["executor_local_deterministic_only"]
+    gray_zone_model_call_count: Literal[0]
+    gray_zone_path_decisions: list[dict[str, Any]] = Field(default_factory=list)
+    path_distance_threshold_hits: list[dict[str, Any]] = Field(default_factory=list)
+    retrieval_cache: RetrievalCacheAudit | None = None
+    steps: list[dict[str, Any]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_target_trace(self):
+        if (
+            self.convergence.get("model_call_count") != 0
+            or self.convergence.get("gray_zone_model_call_count") != 0
+            or self.convergence.get("cycle_reward") != 0
+        ):
+            raise ValueError("intent execution trace contains forbidden online control")
+        return self
+
+
 class ModelBridgeOperationStatus(ClosedContractModel):
     attempted: bool | None = None
     ok: bool | None = None
@@ -7522,6 +8001,11 @@ class RuntimeSettingsLifecycle(ClosedContractModel):
 
 
 class ModelSettingsResponse(PublicResponseModel):
+    retrieval_total_timeout_seconds: int | None = Field(default=None, ge=15, le=600)
+    retrieval_planning_timeout_seconds: int | None = Field(default=None, ge=5, le=120)
+    retrieval_generation_timeout_seconds: int | None = Field(default=None, ge=10, le=240)
+    retrieval_planning_max_tokens: int | None = Field(default=None, ge=256, le=8192)
+    retrieval_generation_max_tokens: int | None = Field(default=None, ge=256, le=32768)
     provider: str | None = None
     chat_api_protocol: Literal["openai", "anthropic"] = "openai"
     graph_api_protocol: Literal["openai", "anthropic"] = "openai"
@@ -7545,6 +8029,9 @@ class ModelSettingsResponse(PublicResponseModel):
     model_request_timeout_seconds: int | None = None
     chat_json_max_tokens: int | None = Field(default=None, ge=256, le=32768)
     agent_request_concurrency: int | None = None
+    graph_compute_memory_mb: int | None = Field(default=None, ge=32, le=2048)
+    graph_compute_threads: int | None = Field(default=None, ge=1, le=16)
+    graph_progress_interval_seconds: int | None = Field(default=None, ge=1, le=30)
     source_io_concurrency: int | None = Field(
         default=None,
         strict=True,
@@ -7557,23 +8044,9 @@ class ModelSettingsResponse(PublicResponseModel):
     upload_max_bytes: int | None = None
     concept_i18n_enabled: bool | None = None
     query_facet_bilingual_enabled: bool | None = None
-    query_facet_posterior_enabled: bool | None = None
-    query_facet_posterior_observation_budget: int | None = Field(
-        default=None,
-        ge=1,
-        le=QUERY_FACET_POSTERIOR_OBSERVATION_BUDGET_MAX,
-    )
-    query_facet_posterior_round_budget: int | None = Field(
-        default=None,
-        ge=1,
-        le=QUERY_FACET_POSTERIOR_ROUND_BUDGET_MAX,
-    )
-    query_facet_posterior_convergence_epsilon: float | None = Field(
-        default=None,
-        ge=0.0,
-        le=1.0,
-        allow_inf_nan=False,
-    )
+    ingestion_memory_soft_limit_ratio: float | None = None
+    ingestion_memory_hard_limit_ratio: float | None = None
+    ingestion_memory_critical_limit_ratio: float | None = None
     fixed_chunk_size_tokens: int | None = None
     fixed_chunk_overlap_tokens: int | None = None
     context_package_token_budget: int | None = None
@@ -7626,8 +8099,20 @@ class ModelSettingsResponse(PublicResponseModel):
     operating_point_hard_gate_min_structure_recovery_rate: float | None = None
     operating_point_hard_gate_max_candidate_latency_p95_ms: int | None = None
     retrieval_result_top_k_default: int | None = None
+    retrieval_v1_dense_candidate_budget: int | None = None
+    retrieval_v1_rq_candidate_budget: int | None = None
+    retrieval_v1_bm25_candidate_budget: int | None = None
+    retrieval_v1_root_entry_budget: int | None = None
+    retrieval_v1_per_parent_entry_budget: int | None = None
+    retrieval_v1_layer_entry_budget: int | None = None
+    retrieval_v1_max_depth: int | None = None
+    retrieval_v1_restore_per_hit: int | None = None
+    lexical_index_max_documents: int | None = None
+    lexical_index_max_postings: int | None = None
+    lexical_index_max_characters: int | None = None
+    bm25_k1: float | None = None
+    bm25_b: float | None = None
     agent_coarse_initial_budget: int | None = None
-    agent_coarse_total_budget: int | None = None
     agent_coarse_top_k: int | None = None
     agent_mid_per_coarse_budget: int | None = None
     agent_coarse_drilldown_mid_initial_budget: int | None = None
@@ -7640,8 +8125,6 @@ class ModelSettingsResponse(PublicResponseModel):
     agent_max_depth_per_layer: int | None = None
     agent_max_labels_per_node: int | None = None
     agent_max_edge_reuse: int | None = None
-    agent_max_cycle_reward_per_path: float | None = None
-    agent_cycle_reward_distance_threshold: float | None = None
     agent_path_distance_green_threshold: float | None = None
     agent_path_distance_gray_threshold: float | None = None
     agent_path_distance_hard_threshold: float | None = None
@@ -7649,12 +8132,9 @@ class ModelSettingsResponse(PublicResponseModel):
     gray_zone_observation_cadence: int = Field(ge=1, le=16)
     traversal_observation_budget: int = Field(ge=1, le=20_000)
     agent_structure_restore_per_chunk_budget: int | None = None
-    agent_structure_restore_budget: int | None = None
     context_path_summary_budget: int | None = None
-    agent_planning_round_budget: int | None = None
-    agent_max_typed_actions_per_round: int | None = None
-    agent_repair_round_budget: int | None = None
-    agent_verification_budget: int | None = None
+    agent_answer_unit_limit: int | None = Field(default=None, strict=True, ge=1, le=32)
+    agent_history_summary_max_chars: int | None = Field(default=None, strict=True, ge=512, le=12000)
     enable_model_fallback: bool | None = None
     enable_database_fallback: bool | None = None
     has_chat_api_key: bool | None = None
@@ -7687,6 +8167,18 @@ class ModelSettingsResponse(PublicResponseModel):
 
 
 class ModelSettingsUpdate(APIModel):
+    retrieval_total_timeout_seconds: int | None = Field(default=None, strict=True, ge=15, le=600)
+    retrieval_planning_timeout_seconds: int | None = Field(default=None, strict=True, ge=5, le=120)
+    retrieval_generation_timeout_seconds: int | None = Field(default=None, strict=True, ge=10, le=240)
+    retrieval_planning_max_tokens: int | None = Field(default=None, strict=True, ge=256, le=8192)
+    retrieval_generation_max_tokens: int | None = Field(default=None, strict=True, ge=256, le=32768)
+    @model_validator(mode="before")
+    @classmethod
+    def reject_retired_answer_verification_settings(cls, values):
+        if isinstance(values, dict) and {"agent_repair_round_budget", "agent_verification_budget"}.intersection(values):
+            raise ValueError("引用判官预算已退役，请使用回答单元上限和反思轮次设置")
+        return values
+
     model_config = ConfigDict(extra="forbid")
 
     chat_api_key: str | None = None
@@ -7715,6 +8207,9 @@ class ModelSettingsUpdate(APIModel):
     model_request_timeout_seconds: int | None = None
     chat_json_max_tokens: int | None = Field(default=None, ge=256, le=32768)
     agent_request_concurrency: int | None = Field(default=None, ge=1, le=128)
+    graph_compute_memory_mb: int | None = Field(default=None, ge=32, le=2048)
+    graph_compute_threads: int | None = Field(default=None, ge=1, le=16)
+    graph_progress_interval_seconds: int | None = Field(default=None, ge=1, le=30)
     source_io_concurrency: int | None = Field(
         default=None,
         strict=True,
@@ -7727,26 +8222,9 @@ class ModelSettingsUpdate(APIModel):
     upload_max_bytes: int | None = Field(default=None, ge=1, le=10 * 1024 * 1024 * 1024)
     concept_i18n_enabled: bool | None = None
     query_facet_bilingual_enabled: bool | None = None
-    query_facet_posterior_enabled: bool | None = None
-    query_facet_posterior_observation_budget: int | None = Field(
-        default=None,
-        strict=True,
-        ge=1,
-        le=QUERY_FACET_POSTERIOR_OBSERVATION_BUDGET_MAX,
-    )
-    query_facet_posterior_round_budget: int | None = Field(
-        default=None,
-        strict=True,
-        ge=1,
-        le=QUERY_FACET_POSTERIOR_ROUND_BUDGET_MAX,
-    )
-    query_facet_posterior_convergence_epsilon: float | None = Field(
-        default=None,
-        strict=True,
-        ge=0.0,
-        le=1.0,
-        allow_inf_nan=False,
-    )
+    ingestion_memory_soft_limit_ratio: float | None = Field(default=None, gt=0, lt=1)
+    ingestion_memory_hard_limit_ratio: float | None = Field(default=None, gt=0, lt=1)
+    ingestion_memory_critical_limit_ratio: float | None = Field(default=None, gt=0, le=1)
     fixed_chunk_size_tokens: int | None = None
     fixed_chunk_overlap_tokens: int | None = None
     context_package_token_budget: int | None = None
@@ -7807,8 +8285,20 @@ class ModelSettingsUpdate(APIModel):
     operating_point_hard_gate_min_structure_recovery_rate: float | None = None
     operating_point_hard_gate_max_candidate_latency_p95_ms: int | None = None
     retrieval_result_top_k_default: int | None = Field(default=None, ge=1, le=50)
+    retrieval_v1_dense_candidate_budget: int | None = Field(default=None, ge=1, le=4096)
+    retrieval_v1_rq_candidate_budget: int | None = Field(default=None, ge=1, le=4096)
+    retrieval_v1_bm25_candidate_budget: int | None = Field(default=None, ge=1, le=4096)
+    retrieval_v1_root_entry_budget: int | None = Field(default=None, ge=1, le=256)
+    retrieval_v1_per_parent_entry_budget: int | None = Field(default=None, ge=1, le=256)
+    retrieval_v1_layer_entry_budget: int | None = Field(default=None, ge=1, le=1024)
+    retrieval_v1_max_depth: int | None = Field(default=None, ge=0, le=64)
+    retrieval_v1_restore_per_hit: int | None = Field(default=None, ge=0, le=64)
+    lexical_index_max_documents: int | None = Field(default=None, ge=1, le=1000000)
+    lexical_index_max_postings: int | None = Field(default=None, ge=1, le=20000000)
+    lexical_index_max_characters: int | None = Field(default=None, ge=1, le=1000000000)
+    bm25_k1: float | None = Field(default=None, gt=0, le=10, allow_inf_nan=False)
+    bm25_b: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     agent_coarse_initial_budget: int | None = None
-    agent_coarse_total_budget: int | None = None
     agent_coarse_top_k: int | None = None
     agent_mid_per_coarse_budget: int | None = None
     agent_coarse_drilldown_mid_initial_budget: int | None = None
@@ -7821,8 +8311,6 @@ class ModelSettingsUpdate(APIModel):
     agent_max_depth_per_layer: int | None = None
     agent_max_labels_per_node: int | None = None
     agent_max_edge_reuse: int | None = None
-    agent_max_cycle_reward_per_path: float | None = None
-    agent_cycle_reward_distance_threshold: float | None = None
     agent_path_distance_green_threshold: float | None = Field(default=None, ge=0.0, le=20.0)
     agent_path_distance_gray_threshold: float | None = Field(default=None, ge=0.0, le=20.0)
     agent_path_distance_hard_threshold: float | None = Field(default=None, ge=0.0, le=40.0)
@@ -7830,12 +8318,9 @@ class ModelSettingsUpdate(APIModel):
     gray_zone_observation_cadence: int | None = Field(default=None, strict=True, ge=1, le=16)
     traversal_observation_budget: int | None = Field(default=None, strict=True, ge=1, le=20_000)
     agent_structure_restore_per_chunk_budget: int | None = None
-    agent_structure_restore_budget: int | None = None
     context_path_summary_budget: int | None = None
-    agent_planning_round_budget: int | None = None
-    agent_max_typed_actions_per_round: int | None = None
-    agent_repair_round_budget: int | None = None
-    agent_verification_budget: int | None = None
+    agent_answer_unit_limit: int | None = Field(default=None, strict=True, ge=1, le=32)
+    agent_history_summary_max_chars: int | None = Field(default=None, strict=True, ge=512, le=12000)
 
     @field_validator(
         "edge_distance_protocol",
@@ -7923,10 +8408,16 @@ class RuntimeEnvSyncStatus(ClosedContractModel):
     synced: bool
     settings_file_present: bool = False
     settings_file_schema_synced: bool = False
+    env_file_present: bool = False
+    env_file_schema_synced: bool = False
     missing_keys: list[str] = Field(default_factory=list)
     extra_keys: list[str] = Field(default_factory=list)
+    overlap_keys: list[str] = Field(default_factory=list)
     deprecated_keys: list[str] = Field(default_factory=list)
     bom_keys: list[str] = Field(default_factory=list)
+    runtime_settings_missing_keys: list[str] = Field(default_factory=list)
+    runtime_settings_extra_keys: list[str] = Field(default_factory=list)
+    runtime_settings_error_type: str | None = None
 
 
 class RuntimeInfrastructureStatus(ClosedContractModel):

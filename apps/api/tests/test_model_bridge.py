@@ -582,6 +582,80 @@ def test_model_bridge_rejects_cross_protocol_auth_before_body_or_upstream(
         thread.join(timeout=5)
 
 
+def test_model_bridge_forwards_chat_stream_as_event_stream(monkeypatch):
+    module = load_model_bridge_module()
+    module.BridgeState.configure(
+        module.build_config(
+            chat_api_protocol="anthropic",
+            chat_target_base_url="https://provider.example.test",
+            chat_resolve_ip="1.1.1.1",
+            embedding_target_base_url="https://embedding.example.test/v1",
+            embedding_resolve_ip="2.2.2.2",
+            timeout=30,
+        ),
+        "unit-admin-token",
+    )
+    forwarded = []
+
+    def fake_stream(self, target_url, body, *, route, timeout, resolve_ip):
+        forwarded.append(
+            {
+                "target_url": target_url,
+                "payload": json.loads(body),
+                "route": route,
+                "timeout": timeout,
+                "resolve_ip": resolve_ip,
+            }
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(
+            b'event: content_block_delta\ndata: {"delta":{"type":"text_delta","text":"unit"}}\n\n'
+        )
+
+    monkeypatch.setattr(
+        module.ModelBridgeHandler,
+        "_forward_stream_with_urllib",
+        fake_stream,
+    )
+    server = module.ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        module.ModelBridgeHandler,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{server.server_address[1]}/v1/messages",
+        data=json.dumps(
+            {
+                "model": "unit-test-model",
+                "max_tokens": 256,
+                "messages": [{"role": "user", "content": "unit"}],
+                "stream": True,
+            }
+        ).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": "Bearer unit-only-secret",
+            "Anthropic-Version": module.ANTHROPIC_VERSION,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.status == 200
+            assert response.headers.get_content_type() == "text/event-stream"
+            assert b'"text":"unit"' in response.read()
+        assert len(forwarded) == 1
+        assert forwarded[0]["payload"]["stream"] is True
+        assert forwarded[0]["route"] == "chat_anthropic"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 @pytest.mark.parametrize(
     ("protocol", "chat_base", "embedding_base"),
     [

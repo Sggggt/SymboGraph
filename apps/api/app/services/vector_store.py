@@ -14,6 +14,7 @@ from threading import Lock
 from typing import Any, Callable, TypeVar
 
 import httpx
+import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from qdrant_client.http import models as rest
@@ -308,6 +309,44 @@ def canonical_embedding_vector(vector: Any, *, source: str) -> list[float]:
 
     if not isinstance(vector, list) or not vector:
         raise ValueError(f"{source} must be a non-empty vector list")
+    # JSON vectors contain native Python numbers. Bulk struct conversion has
+    # exactly the same binary32 rounding/endianness as the scalar protocol,
+    # without an ABC lookup and two struct calls for each coordinate.
+    if all(type(value) in (float, int) for value in vector):
+        try:
+            packed = struct.pack(f">{len(vector)}f", *vector)
+        except (OverflowError, struct.error):
+            pass  # Recover the original indexed diagnostic below.
+        else:
+            if len(vector) >= 64:
+                values = np.frombuffer(packed, dtype='>f4').astype(np.float64)
+                if np.isfinite(values).all():
+                    # Products of two binary32 values fit exactly in binary64.
+                    # einsum avoids BLAS threads; only the reduction may round.
+                    squared_norm = float(np.einsum('i,i->', values, values, optimize=False))
+                    threshold = MIN_EMBEDDING_VECTOR_NORM ** 2
+                    relative_error = 8 * len(values) * np.finfo(np.float64).eps
+                    if (relative_error >= .25 or abs(squared_norm - threshold)
+                            <= relative_error * max(squared_norm, threshold)):
+                        valid_norm = math.sqrt(math.fsum(value * value for value in values.tolist())) > MIN_EMBEDDING_VECTOR_NORM
+                    else:
+                        valid_norm = squared_norm > threshold
+                    if not valid_norm:
+                        raise ValueError(f"{source} must have norm greater than {MIN_EMBEDDING_VECTOR_NORM}")
+                    values[values == 0] = 0.0
+                    return values.tolist()
+                return _canonical_embedding_vector_scalar(vector, source=source)
+            binary32 = struct.unpack(f">{len(vector)}f", packed)
+            if all(math.isfinite(value) for value in binary32):
+                normalized = [0.0 if value == 0.0 else value for value in binary32]
+                if math.sqrt(math.fsum(value * value for value in normalized)) <= MIN_EMBEDDING_VECTOR_NORM:
+                    raise ValueError(f"{source} must have norm greater than {MIN_EMBEDDING_VECTOR_NORM}")
+                return normalized
+    return _canonical_embedding_vector_scalar(vector, source=source)
+
+
+def _canonical_embedding_vector_scalar(vector: list, *, source: str) -> list[float]:
+    """Indexed validation for uncommon numeric types and malformed vectors."""
     normalized: list[float] = []
     for index, value in enumerate(vector):
         if isinstance(value, bool) or not isinstance(value, Real):

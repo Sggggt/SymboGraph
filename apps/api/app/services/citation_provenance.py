@@ -293,6 +293,7 @@ def audit_citation_provenance(
     citations: list[dict[str, Any]],
     contexts: list[dict[str, Any]],
     for_update: bool = False,
+    _retention_ancestors: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Validate every citation against current persisted provenance.
 
@@ -304,6 +305,12 @@ def audit_citation_provenance(
     commit on PostgreSQL.
     """
 
+    from app.services.reflection_sources import MAX_SOURCE_ANCESTORS, audit_retained_sources
+    from app.services.agent_reflection import ReflectionContractError
+    from app.services.storage import raise_if_source_io_cancelled
+    raise_if_source_io_cancelled()
+    if package.id in _retention_ancestors or len(_retention_ancestors) >= MAX_SOURCE_ANCESTORS:
+        raise ReflectionContractError("reflection_retention_ancestry_invalid")
     if for_update:
         db.flush()
     persisted_package = _load(
@@ -406,11 +413,6 @@ def audit_citation_provenance(
     trace_result_ids = {
         str(value) for value in ((trace.result_chunk_ids_json if trace else None) or [])
     }
-    _append(
-        global_reasons,
-        "context_package_hit_trace_scope_mismatch",
-        hit_ids != trace_result_ids,
-    )
     expected_graph_path_ids = list(
         dict.fromkeys(
             str(edge_id)
@@ -442,9 +444,23 @@ def audit_citation_provenance(
         step_path_labels != list((trace.path_labels_json if trace else None) or []),
     )
     snapshot_verifier = SnapshotIntegrityVerifier()
+    from app.services.context_packing import PACKING_PROTOCOL, audit_context_packing
+    packing_v3 = (package_row.diagnostics_json or {}).get("token_budget_audit", {}).get("packing_protocol") == PACKING_PROTOCOL
+    restoration_anchor_ids = trace_result_ids if packing_v3 else hit_ids
+    retention_citations = [*citations, *({"chunk_id": item["chunk_id"]} for item in (package_row.package_json or {}).get("chunks", []))] if packing_v3 else citations
+    retained_supports, retention_reasons = audit_retained_sources(
+        db, package=package_row, citations=retention_citations, for_update=for_update, ancestors=_retention_ancestors)
+    global_reasons.extend(retention_reasons)
+    global_reasons.extend(audit_context_packing(db, package=package_row, trace=trace, for_update=for_update,
+        retained_chunk_ids={cid for cid, proof in retained_supports.items() if proof.get("valid")}))
+    from app.services.reflection_expansion import audit_source_expansions
+    expansion_supports, expansion_reasons = audit_source_expansions(db, package=package_row,
+        for_update=for_update, ancestors=_retention_ancestors)
+    global_reasons.extend(expansion_reasons)
     audits: list[dict[str, Any]] = []
 
     for citation_index, citation in enumerate(citations, start=1):
+        raise_if_source_io_cancelled()
         reasons = list(global_reasons)
         if not isinstance(citation, dict):
             citation = {}
@@ -454,6 +470,10 @@ def audit_citation_provenance(
             source_span = {}
             _append(reasons, "citation_source_span_not_object")
         chunk_id = str(citation.get("chunk_id") or "")
+        retained_support = retained_supports.get(chunk_id)
+        expansion_support = expansion_supports.get(chunk_id)
+        _append(reasons, "source_expansion_provenance_invalid", expansion_support is not None and expansion_support.get("valid") is not True)
+        _append(reasons, "retained_source_provenance_invalid", retained_support is not None and retained_support.get("valid") is not True)
         _append(reasons, "citation_chunk_id_missing", not chunk_id)
         _append(
             reasons,
@@ -653,6 +673,7 @@ def audit_citation_provenance(
                     context_package_id=package_row.id,
                     retrieval_trace_id=package_row.retrieval_trace_id,
                     snapshot_verifier=snapshot_verifier,
+                    replay_source_span=package_item.get("source_span") or {},
                 )
             except ChunkSourceProvenanceError:
                 _append(reasons, "citation_source_snapshot_provenance_invalid")
@@ -840,7 +861,7 @@ def audit_citation_provenance(
                         or not _active_bridge_proof(
                             db,
                             knowledge_base_id=knowledge_base_id,
-                            hit_chunk_ids=hit_ids,
+                            hit_chunk_ids=restoration_anchor_ids,
                             bridge_chunk_id=bridge_chunk_id,
                             for_update=for_update,
                         ),
@@ -969,7 +990,7 @@ def audit_citation_provenance(
                     not _active_bridge_proof(
                         db,
                         knowledge_base_id=knowledge_base_id,
-                        hit_chunk_ids=hit_ids,
+                        hit_chunk_ids=restoration_anchor_ids,
                         bridge_chunk_id=chunk_id,
                         for_update=for_update,
                     ),
@@ -1004,13 +1025,84 @@ def audit_citation_provenance(
                 _append(
                     reasons,
                     "citation_neighbor_support_missing",
-                    not _neighbor_proof(
+                    not (expansion_support is not None and expansion_support.get("valid") is True) and not _neighbor_proof(
                         db,
-                        hit_chunk_ids=hit_ids,
+                        hit_chunk_ids=restoration_anchor_ids,
                         restored_chunk_id=chunk_id,
                         for_update=for_update,
                     ),
                 )
+            elif role == "source_scope":
+                scope_execution = dict(
+                    (trace.diagnostics_json or {}).get("source_scope_execution")
+                    or {}
+                ) if trace is not None else {}
+                target_plan = dict(scope_execution.get("target_plan") or {})
+                _append(
+                    reasons,
+                    "citation_role_scope_overlap",
+                    chunk_id in hit_ids or chunk_id in bridge_ids,
+                )
+                _append(
+                    reasons,
+                    "citation_source_scope_membership_missing",
+                    chunk_id not in restored_ids,
+                )
+                _append(
+                    reasons,
+                    "citation_source_scope_support_missing",
+                    scope_execution.get("protocol_version")
+                    != "intent_source_scope_execution_v1"
+                    or chunk_id
+                    not in {
+                        str(item)
+                        for item in target_plan.get("target_chunk_ids") or []
+                    },
+                )
+            elif role == "source_scope_context":
+                scope_execution = dict(
+                    (trace.diagnostics_json or {}).get("source_scope_execution")
+                    or {}
+                ) if trace is not None else {}
+                context_audit = dict(
+                    (package.diagnostics_json or {}).get("source_scope_context")
+                    or {}
+                )
+                expected_context_hash = stable_hash(
+                    {
+                        key: value
+                        for key, value in context_audit.items()
+                        if key != "audit_hash"
+                    }
+                )
+                _append(
+                    reasons,
+                    "citation_role_scope_overlap",
+                    chunk_id in hit_ids or chunk_id in bridge_ids,
+                )
+                _append(
+                    reasons,
+                    "citation_source_scope_context_membership_missing",
+                    chunk_id not in restored_ids,
+                )
+                _append(
+                    reasons,
+                    "citation_source_scope_context_support_missing",
+                    context_audit.get("protocol_version")
+                    != "source_scope_chunk_adjacency_v1"
+                    or context_audit.get("validated") is not True
+                    or context_audit.get("source_scope_execution_hash")
+                    != scope_execution.get("audit_hash")
+                    or context_audit.get("audit_hash") != expected_context_hash
+                    or chunk_id
+                    not in {
+                        str(item)
+                        for item in context_audit.get("context_chunk_ids") or []
+                    },
+                )
+            elif role == "preserved_source":
+                _append(reasons, "retained_source_reference_missing", retained_support is None)
+                _append(reasons, "citation_role_scope_overlap", chunk_id in hit_ids or chunk_id in restored_ids or chunk_id in bridge_ids)
             else:
                 _append(reasons, "context_package_role_invalid")
 
@@ -1155,6 +1247,8 @@ def audit_citation_provenance(
             "package_binding_hash": package_binding_hash,
             "trace_binding_hash": trace_binding_hash,
             "reasons": reasons,
+            **({"retained_source_support": retained_support} if retained_support is not None else {}),
+            **({"source_expansion_support": expansion_support} if expansion_support is not None else {}),
         }
         audits.append(
             {

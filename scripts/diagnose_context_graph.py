@@ -14,9 +14,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    from sqlalchemy import func, inspect, select
+def read_rq_membership_quality_rows(db, graph_state_id):
+    """The exact existing quality-checker input, without unused vector JSON."""
+    if graph_state_id is None:
+        return []
+    from sqlalchemy import select
+    from app.models import RQPrefix,RQPrefixMembership
+    fields=('id','rq_prefix_id','chunk_id','membership_score','membership_role',
+            'membership_entropy','residual_norm','rank','rq_path')
+    statement=select(*[getattr(RQPrefixMembership,name) for name in fields],
+        RQPrefixMembership.diagnostics_json['membership_role_evaluation'].label('role_evaluation'))
+    statement=statement.join(RQPrefix,RQPrefixMembership.rq_prefix_id==RQPrefix.id).where(
+        RQPrefix.graph_state_id==graph_state_id).order_by(RQPrefixMembership.id)
+    return [{**dict(row),'rq_path':row['rq_path'] or [],'role_evaluation':row['role_evaluation'] or {}}
+            for row in db.execute(statement).mappings()]
+
+
+def main(args=None, *, emit_report: bool = True):
+    args = parse_args() if args is None else args
+    from sqlalchemy import func, inspect, select, text
 
     from app.models import (
         Chunk,
@@ -30,15 +46,16 @@ def main() -> None:
         RQPrefix,
         RQPrefixMembership,
     )
-    from app.services.context_graph import context_graph_stats, graph_layer_payload
+    from app.services.context_graph import graph_layers_payload
     from app.services.graph_state_hashes import chunk_business_references
 
     with session_scope() as db:
+        if db.get_bind().dialect.name=='postgresql':
+            db.execute(text('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY'))
         knowledge_base = resolve_knowledge_base(db, knowledge_base_id=args.knowledge_base_id, knowledge_base_name=args.knowledge_base_name)
-        layers = {}
-        for layer in ("chunk-structure", "chunk-relation", "mid-concepts", "coarse-concepts"):
-            layers[layer] = graph_layer_payload(db, knowledge_base.id, layer, limit=50)
-        stats = context_graph_stats(db, knowledge_base.id)
+        snapshot=graph_layers_payload(db,knowledge_base.id,
+            ('chunk-structure','chunk-relation','mid-concepts','coarse-concepts'),limit=50)
+        layers,stats=snapshot['layers'],snapshot['stats']
         relation_state = db.scalar(
             select(ChunkRelationGraphState)
             .where(ChunkRelationGraphState.knowledge_base_id == knowledge_base.id, ChunkRelationGraphState.state == "active")
@@ -123,17 +140,7 @@ def main() -> None:
             if relation_state_id
             else []
         )
-        memberships = (
-            list(
-                db.scalars(
-                    select(RQPrefixMembership)
-                    .join(RQPrefix, RQPrefixMembership.rq_prefix_id == RQPrefix.id)
-                    .where(RQPrefix.graph_state_id == relation_state_id)
-                ).all()
-            )
-            if relation_state_id
-            else []
-        )
+        memberships = read_rq_membership_quality_rows(db,relation_state_id)
         active_state_ids = stats.get("active_state_ids") or {}
         mid_state_id = active_state_ids.get("mid_concept_state_id")
         coarse_state_id = active_state_ids.get("coarse_concept_state_id")
@@ -316,26 +323,7 @@ def main() -> None:
                     else {}
                 )
                 or {},
-                "rq_memberships": [
-                    {
-                        "id": membership.id,
-                        "rq_prefix_id": membership.rq_prefix_id,
-                        "chunk_id": membership.chunk_id,
-                        "membership_score": membership.membership_score,
-                        "membership_role": membership.membership_role,
-                        "membership_entropy": membership.membership_entropy,
-                        "residual_norm": membership.residual_norm,
-                        "rank": membership.rank,
-                        "rq_path": membership.rq_path or [],
-                        "role_evaluation": (
-                            (membership.diagnostics_json or {}).get(
-                                "membership_role_evaluation"
-                            )
-                            or {}
-                        ),
-                    }
-                    for membership in memberships
-                ],
+                "rq_memberships": memberships,
                 "rq_membership_diagnostics": (
                     (relation_state.diagnostics_json or {}).get("rq_membership")
                     if relation_state
@@ -388,6 +376,8 @@ def main() -> None:
             "quality_gate": graph_quality,
             "layers": layers,
         }
+        if not emit_report:
+            return payload
         report = write_report("diagnose_context_graph", payload)
         print(json.dumps({"output": str(report), "pass": payload["pass"], "knowledge_base_id": knowledge_base.id, "stats": payload["stats"], "checks": checks}, ensure_ascii=False, default=str))
         if not payload["pass"]:

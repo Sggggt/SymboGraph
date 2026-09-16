@@ -7,6 +7,15 @@ from types import SimpleNamespace
 import pytest
 
 
+def historical_agent_request(**kwargs):
+    from app.schemas import AgentRequest
+
+    granularity = kwargs.pop("retrieval_granularity", "mid")
+    value = AgentRequest(**kwargs)
+    object.__setattr__(value, "retrieval_granularity", granularity)
+    return value
+
+
 def _typed_action(action_type: str, **overrides):
     action = {
         "action_type": action_type,
@@ -18,6 +27,51 @@ def _typed_action(action_type: str, **overrides):
     }
     action.update(overrides)
     return action
+
+
+@pytest.mark.parametrize("granularity", ["mid", "coarse"])
+def test_chunk_expansion_target_does_not_rewrite_global_entry(granularity):
+    from app.services import agent_graph
+    envelope = agent_graph.agent_operating_envelope()
+    action = _typed_action("recall_chunks", expected_evidence={"start_layer": "chunk", "target_layer": "chunk"})
+    _accepted, rejected = agent_graph.validate_typed_actions([action], envelope,
+        require_required_actions=False, retrieval_granularity=granularity)
+    assert not rejected["valid"]
+    assert any(row["reason"] == "retrieval_granularity_rewrite_forbidden" for row in rejected["rejected"])
+    action["expected_evidence"]["start_layer"] = granularity
+    accepted, valid = agent_graph.validate_typed_actions([action], envelope,
+        require_required_actions=False, retrieval_granularity=granularity)
+    assert valid["valid"] and accepted[0]["expected_evidence"]["target_layer"] == "chunk"
+
+
+@pytest.mark.asyncio
+async def test_planner_target_contract_matches_real_node_types(db_session, populated_context_graph):
+    from sqlalchemy import select
+    from app.models import MidConcept
+    from app.services import agent_graph
+    kb = populated_context_graph["knowledge_base"]
+    chunk = populated_context_graph["chunks"][0]
+    mid = db_session.scalar(select(MidConcept).where(MidConcept.knowledge_base_id == kb.id))
+    card = agent_graph.planner_target_contracts("mid")
+    assert "activate_coarse_concepts" not in card
+    assert card["drill_down_layer"]["allowed_target_id_layers"] == ["mid"]
+    assert card["drill_down_layer"]["target_ids_mean"] == "parent_nodes_to_expand"
+    assert "chunk" in card["recall_chunks"]["allowed_target_id_layers"]
+    for action_type, target, expected in (("drill_down_layer", chunk.id, False),
+        ("drill_down_layer", mid.id, True), ("recall_chunks", chunk.id, True)):
+        _actions, validation = agent_graph.validate_typed_actions([
+            _typed_action(action_type, target_ids=[target], expected_evidence={"target_layer": "chunk"})],
+            agent_graph.agent_operating_envelope(), db=db_session, knowledge_base_id=kb.id,
+            require_required_actions=False, retrieval_granularity="mid")
+        assert validation["valid"] is expected
+
+
+def test_early_replay_identity_includes_planner_input_contract(monkeypatch, db_session, sample_knowledge_base):
+    from app.services import agent_graph
+    before = agent_graph._agent_query_provider_protocol_hash(db_session, sample_knowledge_base.id)
+    monkeypatch.setattr(agent_graph, "AGENT_PLANNER_NESTED_OBJECT_CONTRACT_VERSION", "unit-test-changed-contract")
+    after = agent_graph._agent_query_provider_protocol_hash(db_session, sample_knowledge_base.id)
+    assert before != after
 
 
 def _bounded_observation_search_result(convergence: dict) -> SimpleNamespace:
@@ -221,7 +275,7 @@ def test_bounded_graph_observation_includes_bounded_raw_span_summaries():
     assert observation["convergence"]["gray_zone_model_call_count"] == 0
 
 
-def test_retrieval_granularity_agent_run_context_records_resolved_result_top_k(monkeypatch, db_session, sample_knowledge_base):
+def test_agent_run_context_records_resolved_result_top_k_without_public_mode(monkeypatch, db_session, sample_knowledge_base):
     from app.schemas import AgentRequest
     from app.services import agent_graph
 
@@ -233,13 +287,13 @@ def test_retrieval_granularity_agent_run_context_records_resolved_result_top_k(m
     )
     _session, explicit_run = agent_graph.create_agent_run_context(
         db_session,
-        AgentRequest(knowledge_base_id=sample_knowledge_base.id, question="explicit top k", top_k=4, retrieval_granularity="coarse"),
+        AgentRequest(knowledge_base_id=sample_knowledge_base.id, question="explicit top k", top_k=4),
     )
 
     assert default_run.metadata_json["top_k"] == 9
-    assert default_run.metadata_json["retrieval_granularity"] == "mid"
     assert explicit_run.metadata_json["top_k"] == 4
-    assert explicit_run.metadata_json["retrieval_granularity"] == "coarse"
+    assert "retrieval_granularity" not in default_run.metadata_json
+    assert "retrieval_granularity" not in explicit_run.metadata_json
 
 
 @pytest.mark.parametrize(
@@ -407,14 +461,19 @@ async def test_planner_prompt_closes_nested_action_object_types_on_replan(
         "output_size_contract"
     ]["prefer_empty_nested_objects"]
     assert contract["target_id_contract"].startswith("Use []")
+    assert contract["target_contracts_by_action"] == agent_graph.planner_target_contracts("mid")
+    assert "activate_coarse_concepts" not in prompts[0]["allowed_action_types"]
     assert contract["retrieval_granularity_contract"] == {
         "locked_value": "mid",
         "rewrite_allowed": False,
-        "mid_forbids_coarse_start_layer": True,
+        "start_layer_allowed_values_on_every_action": ["mid"],
+        "start_layer_means_global_entry": True,
+        "downstream_chunk_layer_field": "target_layer",
+        "chunk_expansion_changes_entry": False,
     }
-    assert contract["verify_citations_contract"] == {
-        "required_verification_stage_if_present": (
-            "structure_plus_llm_entailment"
+    assert contract["review_answer_contract"] == {
+        "required_review_stage_if_present": (
+            "source_binding_and_optional_reflection"
         )
     }
     assert contract["allowed_budget_keys_by_action"]["recall_chunks"] == [
@@ -492,6 +551,7 @@ async def test_planner_transport_failure_does_not_trigger_schema_repair(
         ):
             self.calls += 1
             assert max_tokens == agent_graph.AGENT_PLANNER_JSON_MAX_TOKENS
+            assert max_tokens == 12000
             raise ExternalServiceError(
                 service="model_provider",
                 phase="sdk_messages_completion",
@@ -521,14 +581,14 @@ def test_typed_action_validator_accepts_active_rq_and_structure_names():
     accepted, diagnostics = agent_graph.validate_typed_actions(
         [
             _typed_action("route_rq_addresses"),
-            _typed_action("repair_structure_context"),
+            _typed_action("restore_context_package"),
         ],
         agent_graph.agent_operating_envelope(),
     )
 
     accepted_types = {item["action_type"] for item in accepted}
     assert "route_rq_addresses" in accepted_types
-    assert "repair_structure_context" in accepted_types
+    assert "restore_context_package" in accepted_types
     assert not any(item.get("reason") == "unsupported_action_type" for item in diagnostics["rejected"])
     assert diagnostics["valid"] is False
     assert diagnostics["inserted_required_actions"]
@@ -563,7 +623,7 @@ def test_typed_action_validator_rejects_duplicate_action_in_same_plan_round():
 
     envelope = agent_graph.agent_operating_envelope()
     actions = agent_graph.fallback_typed_actions("ordinary query", envelope)
-    actions.append(_typed_action("verify_citations"))
+    actions.append(_typed_action("review_answer"))
     _accepted, diagnostics = agent_graph.validate_typed_actions(actions, envelope)
 
     assert diagnostics["valid"] is False
@@ -629,8 +689,8 @@ def test_typed_action_validator_normalized_output_is_replayable_under_same_schem
     assert first_diagnostics["valid"] is True
     assert replayed_diagnostics["valid"] is True
     assert replayed_actions == first_actions
-    verify_action = next(action for action in replayed_actions if action["action_type"] == "verify_citations")
-    assert verify_action["expected_evidence"]["required_verification_stage"] == "structure_plus_llm_entailment"
+    verify_action = next(action for action in replayed_actions if action["action_type"] == "review_answer")
+    assert verify_action["expected_evidence"]["required_review_stage"] == "source_binding_and_optional_reflection"
 
 
 def test_typed_action_validator_replays_multiple_retired_targets_from_frozen_layers():
@@ -710,6 +770,11 @@ def test_early_v3_typed_action_schema_enforces_its_hash_bound_required_phase_set
         if action["action_type"] != "build_context_package"
     ]
 
+    for action in early_actions:
+        if action["action_type"] == "review_answer":
+            action["action_type"] = "verify_citations"
+            action["budget_request"] = {}
+
     accepted, replayed = agent_graph.validate_typed_actions(
         early_actions,
         envelope,
@@ -742,7 +807,7 @@ def test_early_v3_typed_action_schema_enforces_its_hash_bound_required_phase_set
         },
         replayed,
     )
-    assert forged["typed_action_schema_protocol_version"] == "typed_action_schema_v4"
+    assert forged["typed_action_schema_protocol_version"] == agent_graph.TYPED_ACTION_SCHEMA_PROTOCOL_VERSION
 
 
 @pytest.mark.asyncio
@@ -2520,7 +2585,7 @@ def test_cancel_agent_run_marks_running_run_cancelled_and_records_trace(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_retrieval_granularity_stream_agent_events_cancels_task_when_stream_closes(
+async def test_stream_agent_events_keeps_owner_running_when_observer_closes(
     monkeypatch, db_session, sample_knowledge_base, local_agent_admission
 ):
     from app.models import AgentRun
@@ -2529,12 +2594,17 @@ async def test_retrieval_granularity_stream_agent_events_cancels_task_when_strea
 
     started = asyncio.Event()
     cancelled = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
 
     async def fake_execute_agent_run_and_close(db, request, session, run):
         try:
             agent_graph.set_run_state(db, run, "running", current_node="test_wait")
             started.set()
-            await asyncio.sleep(30)
+            await release.wait()
+            agent_graph.set_run_state(db, run, "completed", answer="done")
+            completed.set()
+            return {"answer": "done"}
         except asyncio.CancelledError:
             cancelled.set()
             raise
@@ -2546,22 +2616,35 @@ async def test_retrieval_granularity_stream_agent_events_cancels_task_when_strea
         AgentRequest(
             knowledge_base_id=sample_knowledge_base.id,
             question="cancel the stream",
-            retrieval_granularity="coarse",
             stream_trace=True,
         )
     )
 
     meta = await stream.__anext__()
-    assert meta["retrieval_granularity"] == "coarse"
+    assert "retrieval_granularity" not in meta
     await asyncio.wait_for(started.wait(), timeout=1)
     await stream.aclose()
-    await asyncio.wait_for(cancelled.wait(), timeout=1)
+    await asyncio.sleep(0)
+    assert cancelled.is_set() is False
+    assert meta["run_id"] in agent_graph._ACTIVE_AGENT_TASKS
+
+    release.set()
+    await asyncio.wait_for(completed.wait(), timeout=1)
+    for _ in range(100):
+        if meta["run_id"] not in agent_graph._ACTIVE_AGENT_TASKS:
+            break
+        await asyncio.sleep(0.01)
 
     db_session.expire_all()
     run = db_session.get(AgentRun, meta["run_id"])
     assert run is not None
-    assert run.status == "cancelled"
-    assert run.error_message == agent_graph.CANCELLED_BY_USER
+    assert run.status == "completed"
+    assert run.error_message is None
+    from app.models import QASession
+
+    session = db_session.get(QASession, run.session_id)
+    assert session is not None
+    assert cancelled.is_set() is False
     assert await local_agent_admission.snapshot() == {"active": 0, "queued": 0}
 
 
@@ -2593,7 +2676,8 @@ async def test_stream_agent_events_does_not_repeat_trace_in_terminal_frame(
                 "degraded_mode": False,
                 "context_package_id": None,
                 "retrieval_trace_id": None,
-                "retrieval_granularity": request.retrieval_granularity,
+                "entry_layer": "chunk",
+                "terminal_outcome": "completed",
                 "model_audit": {},
                 "answer_model_audit": {},
                 "conversation_state": None,
@@ -2623,7 +2707,72 @@ async def test_stream_agent_events_does_not_repeat_trace_in_terminal_frame(
 
 
 @pytest.mark.asyncio
-async def test_agent_answers_from_context_package_and_records_audit(
+async def test_stream_agent_events_forwards_live_provider_deltas_before_final(
+    monkeypatch,
+    sample_knowledge_base,
+    local_agent_admission,
+):
+    from app.schemas import AgentRequest
+    from app.services import agent_graph
+    from app.services.answer_stream import publish_answer_stream_update
+
+    async def fake_execute_agent_run_and_close(db, request, session, run):
+        try:
+            for delta in ("word ", "by ", "word"):
+                assert await publish_answer_stream_update("delta", delta) is True
+                await asyncio.sleep(0)
+            agent_graph.set_run_state(db, run, "completed", answer="word by word")
+            return {
+                "run_id": run.id,
+                "session_id": session.id,
+                "answer": "word by word",
+                "citations": [],
+                "used_chunks": [],
+                "route": "intent_execution_retrieval_v1",
+                "trace": [],
+                "degraded_mode": False,
+                "context_package_id": None,
+                "retrieval_trace_id": None,
+                "entry_layer": "chunk",
+                "terminal_outcome": "completed",
+                "model_audit": {},
+                "answer_model_audit": {},
+                "conversation_state": None,
+            }
+        finally:
+            db.close()
+
+    monkeypatch.setattr(
+        agent_graph,
+        "_execute_agent_run_and_close",
+        fake_execute_agent_run_and_close,
+    )
+    events = [
+        event
+        async for event in agent_graph.stream_agent_events(
+            AgentRequest(
+                knowledge_base_id=sample_knowledge_base.id,
+                question="stream provider deltas",
+                stream_trace=True,
+            )
+        )
+    ]
+
+    assert [event["token"] for event in events if event["type"] == "token"] == [
+        "word ",
+        "by ",
+        "word",
+    ]
+    assert not [event for event in events if event["type"] == "answer_replace"]
+    assert next(event for event in events if event["type"] == "final")[
+        "response"
+    ]["answer"] == "word by word"
+    assert await local_agent_admission.snapshot() == {"active": 0, "queued": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('historical_answer_executor')
+async def test_historical_agent_answers_from_context_package_and_records_audit(
     db_session,
     populated_context_graph,
 ):
@@ -2637,101 +2786,48 @@ async def test_agent_answers_from_context_package_and_records_audit(
     kb = populated_context_graph["knowledge_base"]
     response = await agent_graph.run_agent(
         db_session,
-        AgentRequest(
-            knowledge_base_id=kb.id,
-            question="Explain Bayesian network factorization.",
+            historical_agent_request(
+                knowledge_base_id=kb.id,
+                question="Explain Bayesian network factorization.",
             filters=SearchFilters(),
             top_k=4,
         ),
     )
     QAResponse.model_validate(response)
-    # The claim-level grounded gate may keep the provider's grounded answer or
-    # return only its verified subset after repair.  The public/persisted
-    # evidence assertions below are authoritative; a mock wording prefix is not.
+    from app.models import AnswerSourceBinding, AgentRun
+    from app.services.reflection_reward import replay_reflection_reward
+    from app.services.policy import validate_persisted_policy_state
+    from app.services.conversation_state import load_conversation_state
     assert response["answer"].strip()
-    grounded_audit = response["model_audit"]
-    grounded_gate = grounded_audit["claim_grounded_gate"]
-    assert grounded_audit["grounding_outcome"] == "grounded_answer"
-    assert grounded_gate["all_claims_supported"] is True
-    assert grounded_gate["unsupported_claim_count"] == 0
-    assert grounded_gate["require_persistence_replay"] is True
-    assert grounded_gate["answer_hash"] == agent_graph.exact_answer_hash(
-        response["answer"]
-    )
-    assert response["citations"]
-    assert response["trace"]
-    trace_nodes = [item["node"] for item in response["trace"]]
-    assert "agent_planner" in trace_nodes
-    assert "typed_action_validation" in trace_nodes
-    assert "citation_verification" in trace_nodes
-    assert "reward_event" in trace_nodes
-    assert "evidence_gate" in trace_nodes
-    layered_retrieval_event = next(
-        item
-        for item in response["trace"]
-        if item["node"] == "layered_retrieval"
-    )
-    assert (
-        "query_perception_audit"
-        not in layered_retrieval_event["scores"]
-    )
-    evidence_gate_event = next(
-        item for item in response["trace"] if item["node"] == "evidence_gate"
-    )
-    assert evidence_gate_event["status"] == "completed"
-    assert evidence_gate_event["scores"][
-        "context_package_evidence_gate_passed"
-    ] is True
-    assert evidence_gate_event["scores"]["answer_model_called"] is False
-    assert evidence_gate_event["scores"]["evidence_evaluator"][
-        "verdict"
-    ] == "sufficient"
-    assert response["context_package_id"]
-    assert response["retrieval_trace_id"]
-    assert response["retrieval_granularity"] == "mid"
-    assert response["model_audit"]["context_package_id"] == response["context_package_id"]
-    assert response["model_audit"]["retrieval_trace_id"] == response["retrieval_trace_id"]
-    assert response["model_audit"]["retrieval_granularity"] == "mid"
-    assert response["model_audit"]["evidence_evaluator"]["verdict"] == "sufficient"
-    assert response["model_audit"]["planning_rounds_used"] == 1
-    assert response["model_audit"]["answer_model_called"] is True
-    assert len(response["model_audit"]["typed_action_control_hash"]) == 64
-    assert response["model_audit"]["citation_verification_pass_rate"] == 1.0
-    assert response["answer_model_audit"]["context_package_id"]
-    assert response["answer_model_audit"]["answer_session_id"]
-    assert response["answer_model_audit"]["answer_claim_limit"] == 6
-    assert response["citations"][0]["verification"]["verdict"] == "supported"
-    assert db_session.scalar(select(func.count(AnswerSession.id)).where(AnswerSession.knowledge_base_id == kb.id)) == 1
-    assert db_session.scalar(select(func.count(CitationVerification.id)).where(CitationVerification.knowledge_base_id == kb.id)) >= 1
-    assert db_session.scalar(select(func.count(RewardEvent.id)).where(RewardEvent.knowledge_base_id == kb.id)) == 1
-    assert db_session.scalar(select(func.count(AgentPlan.id)).where(AgentPlan.knowledge_base_id == kb.id)) == 1
-    assert db_session.scalar(select(func.count(AgentAction.id)).join(AgentPlan, AgentAction.plan_id == AgentPlan.id).where(AgentPlan.knowledge_base_id == kb.id)) >= 3
-    assert db_session.scalar(select(func.count(AgentObservation.id))) >= 3
-    latest_policy = db_session.scalar(select(PolicyState).where(PolicyState.knowledge_base_id == kb.id).order_by(PolicyState.created_at.desc()))
-    assert latest_policy is not None
-    assert (latest_policy.reward_summary_json or {}).get("last_reward_event_id")
-    retrieval_trace = db_session.get(
-        RetrievalTrace, response["retrieval_trace_id"]
-    )
-    reward_event = db_session.scalar(
-        select(RewardEvent).where(RewardEvent.knowledge_base_id == kb.id)
-    )
-    assert retrieval_trace is not None
-    assert reward_event is not None
-    assert retrieval_trace.diagnostics_json[
-        "gray_zone_runtime_settings_identity_protocol_version"
-    ] == "gray_zone_runtime_settings_identity_v1"
-    assert retrieval_trace.diagnostics_json[
-        "gray_zone_runtime_settings_hash"
-    ] != retrieval_trace.runtime_settings_hash
-    replay = build_policy_reward_replay(db_session, reward_event)
-    assert replay["reward_fact"]["policy_inputs"][
-        "runtime_settings_hash"
-    ] == retrieval_trace.runtime_settings_hash
+    audit = response["answer_model_audit"]["answer_reflection"]
+    assert audit["outcome"] in {"accepted_without_reflection", "accepted_after_reflection"}
+    assert audit["citation_judge_model_call_count"] == 0
+    assert audit["source_binding_pass_rate"] == 1.0
+    assert response["citations"] and all(c["contract_version"] == "citation_public_v2" for c in response["citations"])
+    assert all(c["verification"] is None and c["source_binding"]["semantic_entailment_claimed"] is False for c in response["citations"])
+    nodes = [event["node"] for event in response["trace"]]
+    assert "agent_planner" in nodes and "reflection_gate" in nodes and "answer_source_binding" in nodes
+    assert "citation_verification" not in nodes and "repair_executed" not in nodes
+    assert db_session.scalar(select(func.count(CitationVerification.id)).where(CitationVerification.knowledge_base_id == kb.id)) == 0
+    assert db_session.scalar(select(func.count(AnswerSourceBinding.id)).where(AnswerSourceBinding.knowledge_base_id == kb.id)) >= 1
+    answer = db_session.scalar(select(AnswerSession).where(AnswerSession.knowledge_base_id == kb.id))
+    run = db_session.get(AgentRun, response["run_id"])
+    assert answer.answer == response["answer"] == run.final_answer
+    assert run.status == "completed" and run.current_node is None
+    _session, state = load_conversation_state(db_session, knowledge_base_id=kb.id, session_id=response["session_id"])
+    assert state.history_references[-1]["protocol_version"] == "answer_context_source_reference_v2"
+    assert state.history_references[-1]["source_binding_ids"]
+    reward = db_session.scalar(select(RewardEvent).where(RewardEvent.answer_session_id == answer.id))
+    assert replay_reflection_reward(db_session, reward) == reward.reward_json
+    assert reward.reward_json["self_assessment_reward_weight"] == 0.0
+    assert reward.policy_state_id is not None
+    policy = db_session.get(PolicyState, reward.policy_state_id)
+    validate_persisted_policy_state(db_session, policy, knowledge_base_id=kb.id)
 
 
 @pytest.mark.asyncio
-async def test_evidence_evaluator_replan_changes_retrieval_budget_and_persists_round_state(
+@pytest.mark.usefixtures('historical_answer_executor')
+async def test_historical_evidence_evaluator_replan_changes_retrieval_budget_and_persists_round_state(
     monkeypatch,
     db_session,
     populated_context_graph,
@@ -2780,7 +2876,7 @@ async def test_evidence_evaluator_replan_changes_retrieval_budget_and_persists_r
     kb = populated_context_graph["knowledge_base"]
     response = await agent_graph.run_agent(
         db_session,
-        AgentRequest(
+        historical_agent_request(
             knowledge_base_id=kb.id,
             question="Explain Bayesian network factorization.",
             filters=SearchFilters(),
@@ -2809,7 +2905,8 @@ async def test_evidence_evaluator_replan_changes_retrieval_budget_and_persists_r
 
 
 @pytest.mark.asyncio
-async def test_insufficient_corpus_is_not_terminal_until_planning_rounds_are_exhausted(
+@pytest.mark.usefixtures('historical_answer_executor')
+async def test_historical_insufficient_corpus_is_not_terminal_until_planning_rounds_are_exhausted(
     monkeypatch,
     db_session,
     populated_context_graph,
@@ -2874,7 +2971,7 @@ async def test_insufficient_corpus_is_not_terminal_until_planning_rounds_are_exh
     kb = populated_context_graph["knowledge_base"]
     response = await agent_graph.run_agent(
         db_session,
-        AgentRequest(
+        historical_agent_request(
             knowledge_base_id=kb.id,
             question="Explain Bayesian network factorization.",
             filters=SearchFilters(),
@@ -2920,7 +3017,8 @@ async def test_insufficient_corpus_is_not_terminal_until_planning_rounds_are_exh
 
 
 @pytest.mark.asyncio
-async def test_validator_rejection_consumes_plan_round_then_replans_before_executor(
+@pytest.mark.usefixtures('historical_answer_executor')
+async def test_historical_validator_rejection_consumes_plan_round_then_replans_before_executor(
     monkeypatch,
     db_session,
     populated_context_graph,
@@ -2980,11 +3078,12 @@ async def test_validator_rejection_consumes_plan_round_then_replans_before_execu
     plans = list(db_session.scalars(select(AgentPlan).where(AgentPlan.run_id == response["run_id"]).order_by(AgentPlan.plan_index)).all())
     assert [plan.status for plan in plans] == ["validator_replan_requested", "evidence_sufficient"]
     assert primary_search_calls == 1
-    assert repair_search_calls <= agent_graph.agent_operating_envelope()["repair_round_budget"]
+    assert repair_search_calls <= agent_graph.agent_operating_envelope()["reflection_round_budget"]
 
 
 @pytest.mark.asyncio
-async def test_action_stop_condition_does_not_override_evaluator_replan(
+@pytest.mark.usefixtures('historical_answer_executor')
+async def test_historical_action_stop_condition_does_not_override_evaluator_replan(
     monkeypatch,
     db_session,
     populated_context_graph,
@@ -3037,8 +3136,10 @@ async def test_action_stop_condition_does_not_override_evaluator_replan(
     assert [plan.status for plan in plans] == ["replan_requested", "no_progress"]
     assert plans[-1].diagnostics_json["replan_progress"]["no_progress"] is True
     assert all(plan.diagnostics_json["evidence_evaluator"]["verdict"] == "need_mid_expansion" for plan in plans)
-    assert response["context_package_id"] is None
-    assert response["model_audit"]["answer_model_called"] is False
+    assert response["context_package_id"] is not None
+    assert response["model_audit"]["answer_model_called"] is True
+    assert response["model_audit"]["preliminary_evidence_uncertain"] is True
+    assert response["model_audit"]["answer_reflection"]["reflection_model_call_count"] >= 1
 
 
 def test_replan_progress_signature_ignores_trace_ids_but_detects_new_spans():
@@ -3172,1065 +3273,24 @@ async def test_direct_definition_evaluator_contract_accepts_citable_span(
 
 
 @pytest.mark.asyncio
-async def test_final_need_expansion_verdict_blocks_answer_model_and_requests_clarification(
-    monkeypatch,
-    db_session,
-    populated_context_graph,
-):
-    from sqlalchemy import func, select
-
-    from app.models import AgentAction, AgentPlan, AgentRun, AnswerSession, QASession
-    from app.schemas import AgentRequest, SearchFilters
+@pytest.mark.usefixtures('historical_answer_executor')
+async def test_historical_bounded_evaluator_uncertainty_reaches_full_context_reflection(monkeypatch, db_session, populated_context_graph):
+    from app.models import AgentRun
+    from app.schemas import AgentRequest, AgentResponse, SearchFilters
     from app.services import agent_graph
-
     envelope = {**agent_graph.agent_operating_envelope(), "planning_round_budget": 1}
-
-    async def fallback_plan(question, history, query_intent, active_envelope, retrieval_granularity="mid", **kwargs):
-        actions = agent_graph.fallback_typed_actions(question, active_envelope)
-        return actions, {"typed_actions": actions}
-
-    async def needs_expansion(**kwargs):
-        return {
-            "protocol_version": agent_graph.EVIDENCE_EVALUATOR_PROTOCOL_VERSION,
-            "verdict": "need_mid_expansion",
-            "reason": "one planning round is insufficient",
-            "target_ids": [],
-            "expected_evidence": {
-                "required_facets": ["factorization", "conditional independence"],
-            },
-            "schema_repair_attempted": False,
-            "decision_hash": "final-need-mid",
-        }
-
-    async def forbidden_answer_model_call(*args, **kwargs):
-        raise AssertionError("answer model must not run after the evidence gate blocks")
-
+    async def uncertain(**kwargs):
+        return {"protocol_version": agent_graph.EVIDENCE_EVALUATOR_PROTOCOL_VERSION, "verdict": "need_chunk_expansion",
+                "reason": "bounded summary may omit a necessary detail", "target_ids": [], "expected_evidence": {},
+                "schema_repair_attempted": False, "decision_hash": "a" * 64}
     monkeypatch.setattr(agent_graph, "agent_operating_envelope", lambda: envelope)
-    monkeypatch.setattr(agent_graph, "propose_agent_plan", fallback_plan)
-    monkeypatch.setattr(agent_graph, "evaluate_graph_evidence", needs_expansion)
-    monkeypatch.setattr(agent_graph.ChatProvider, "answer_question_with_meta", forbidden_answer_model_call)
-
-    kb = populated_context_graph["knowledge_base"]
-    response = await agent_graph.run_agent(
-        db_session,
-        AgentRequest(
-            knowledge_base_id=kb.id,
-            question="Explain Bayesian network factorization.",
-            filters=SearchFilters(),
-            top_k=4,
-        ),
-    )
-
-    run = db_session.get(AgentRun, response["run_id"])
-    plan = db_session.scalar(select(AgentPlan).where(AgentPlan.run_id == response["run_id"]))
-    actions = list(db_session.scalars(select(AgentAction).where(AgentAction.run_id == response["run_id"])).all())
-    assert run is not None and run.status == "needs_clarification"
-    assert plan is not None and plan.status == "planning_budget_exhausted"
-    assert response["context_package_id"] is None
-    assert response["citations"] == []
-    assert response["model_audit"]["answer_model_called"] is False
-    assert response["retrieval_trace_id"] == plan.retrieval_trace_id
-    session = db_session.get(QASession, response["session_id"])
-    assert session is not None
-    assert session.transcript[-1]["retrieval_trace_id"] == plan.retrieval_trace_id
-    from app.schemas import QAResponse
-
-    parsed = QAResponse.model_validate(response)
-    assert parsed.model_audit.evidence_evaluator is not None
-    assert parsed.model_audit.evidence_evaluator.expected_evidence.required_facets == [
-        "factorization",
-        "conditional independence",
-    ]
-    assert all(
-        action.status == "deferred"
-        for action in actions
-        if action.action_type in {"restore_context_package", "build_context_package", "verify_citations"}
-    )
-    assert db_session.scalar(
-        select(func.count(AnswerSession.id)).where(AnswerSession.knowledge_base_id == kb.id)
-    ) == 0
-
-
-@pytest.mark.asyncio
-async def test_agent_repair_loop_keeps_locked_retrieval_granularity(monkeypatch, db_session, populated_context_graph):
-    from datetime import datetime, timedelta
-
-    from sqlalchemy import select
-
-    from app.models import AgentAction, RewardEvent
-    from app.schemas import AgentRequest, SearchFilters
-    from app.services import agent_graph
-
-    kb = populated_context_graph["knowledge_base"]
-    captured_granularities: list[str] = []
-    real_layered_search = agent_graph.layered_search
-    real_record_answer_audit = agent_graph.record_answer_audit
-
-    async def capture_layered_search(*args, **kwargs):
-        captured_granularities.append(kwargs.get("retrieval_granularity", "mid"))
-        return await real_layered_search(*args, **kwargs)
-
-    async def record_after_simulated_wall_clock_rollback(db, **kwargs):
-        package = kwargs["package"]
-        package.created_at = datetime.utcnow() + timedelta(seconds=5)
-        db.flush()
-        return await real_record_answer_audit(db, **kwargs)
-
-    verify_calls = 0
-
-    async def fail_then_support(answer, citations, contexts, verification_budget, **_kwargs):
-        nonlocal verify_calls
-        verify_calls += 1
-        verdict = "unsupported" if verify_calls == 1 else "supported"
-        failure_type = "concept_gap" if verdict == "unsupported" else "none"
-        return [
-            {
-                **citation,
-                "claim_text": citation.get("claim_text"),
-                "verdict": verdict,
-                "failure_type": failure_type,
-                "confidence": 0.9 if verdict == "supported" else 0.2,
-                "diagnostics": {
-                    "test_verifier": "fail_then_support",
-                    "citation_provenance_valid": True,
-                    "citation_provenance_session_hash": "a" * 64,
-                },
-            }
-            for citation in citations[: max(1, verification_budget)]
-        ]
-
-    monkeypatch.setattr(agent_graph, "layered_search", capture_layered_search)
-    monkeypatch.setattr(
-        agent_graph,
-        "record_answer_audit",
-        record_after_simulated_wall_clock_rollback,
-    )
-    monkeypatch.setattr(agent_graph, "verify_answer_against_context", fail_then_support)
-    monkeypatch.setattr(
-        agent_graph,
-        "replay_citation_provenance_for_persistence",
-        lambda *_args, **kwargs: {
-            "persistence_gate_passed": True,
-            "matches_pre_entailment_session_hash": True,
-            "provenance_session_hash": "a" * 64,
-            "valid_count": len(kwargs.get("citations") or []),
-            "invalid_count": 0,
-            "audits": [
-                {
-                    "citation_index": index,
-                    "chunk_id": _citation.get("chunk_id"),
-                    "char_span": list(
-                        (_citation.get("source_span") or {}).get(
-                            "char_span"
-                        )
-                        or []
-                    ),
-                    "valid": True,
-                    "reasons": [],
-                    "provenance_hash": "b" * 64,
-                }
-                for index, _citation in enumerate(
-                    kwargs.get("citations") or [],
-                    start=1,
-                )
-            ],
-        },
-    )
-
-    response = await agent_graph.run_agent(
-        db_session,
-        AgentRequest(
-            knowledge_base_id=kb.id,
-            question="Explain Bayesian network factorization.",
-            filters=SearchFilters(),
-            top_k=4,
-            retrieval_granularity="coarse",
-        ),
-    )
-
-    assert captured_granularities[:2] == ["coarse", "coarse"]
-    assert response["retrieval_granularity"] == "coarse"
-    assert response["model_audit"]["retrieval_granularity"] == "coarse"
-    assert response["model_audit"]["repair_actions"][0]["retrieval_granularity"] == "coarse"
-    assert verify_calls >= 2
-    repair_action = db_session.scalar(
-        select(AgentAction)
-        .where(AgentAction.run_id == response["run_id"], AgentAction.action_type == "repair_concept_gap")
-        .order_by(AgentAction.created_at.desc())
-    )
-    assert repair_action is not None
-    assert repair_action.status == (
-        "completed"
-        if bool((repair_action.output_json or {}).get("made_semantic_progress"))
-        else "no_progress"
-    )
-    assert repair_action.validation_json["typed_action_schema_protocol_version"] == agent_graph.TYPED_ACTION_SCHEMA_PROTOCOL_VERSION
-    reward = db_session.scalar(
-        select(RewardEvent).where(
-            RewardEvent.answer_session_id
-            == response["answer_model_audit"]["answer_session_id"]
-        )
-    )
-    assert reward is not None
-    cutoff_audit = reward.diagnostics_json["reward_replay_cutoff"]
-    assert cutoff_audit["protocol_version"] == "logical_antecedent_max_v1"
-    assert cutoff_audit["antecedent_count"] >= 1
-    repair_round = response["model_audit"]["repair_actions"][0]
-    if repair_round["repair_candidate_reverted"]:
-        assert cutoff_audit["related_context_package_count"] == 1
-    else:
-        assert cutoff_audit["related_context_package_count"] >= 2
-    assert cutoff_audit["wall_clock_rollback_absorbed"] is True
-
-
-@pytest.mark.asyncio
-async def test_agent_rejected_server_repair_converges_to_verified_insufficiency(
-    monkeypatch,
-    db_session,
-    populated_context_graph,
-):
-    from sqlalchemy import select
-
-    from app.models import AgentAction, AgentRun, AgentTraceEvent
-    from app.schemas import AgentRequest, SearchFilters
-    from app.services import agent_graph
-
-    kb = populated_context_graph["knowledge_base"]
-
-    async def unsupported_verification(
-        answer,
-        citations,
-        contexts,
-        verification_budget,
-        **_kwargs,
-    ):
-        return [
-            {
-                **citation,
-                "claim_text": citation.get("claim_text"),
-                "verdict": "unsupported",
-                "failure_type": "concept_gap",
-                "confidence": 0.1,
-                "diagnostics": {
-                    "test_verifier": "force_typed_repair_rejection",
-                    "citation_provenance_valid": True,
-                    "citation_provenance_session_hash": "a" * 64,
-                },
-            }
-            for citation in citations[: max(1, verification_budget)]
-        ]
-
-    real_validate = agent_graph.validate_typed_actions
-
-    def reject_server_repair(actions, envelope, **kwargs):
-        if kwargs.get("require_required_actions") is False:
-            return [], {
-                "typed_action_schema_protocol_version": (
-                    agent_graph.TYPED_ACTION_SCHEMA_PROTOCOL_VERSION
-                ),
-                "typed_action_schema_protocol_hash": "b" * 64,
-                "accepted": [],
-                "rejected": [
-                    {
-                        "index": 0,
-                        "action_type": actions[0]["action_type"],
-                        "reason": "unit_forced_repair_rejection",
-                    }
-                ],
-                "inserted_required_actions": [],
-                "valid": False,
-            }
-        return real_validate(actions, envelope, **kwargs)
-
-    monkeypatch.setattr(
-        agent_graph,
-        "verify_answer_against_context",
-        unsupported_verification,
-    )
-    monkeypatch.setattr(
-        agent_graph,
-        "validate_typed_actions",
-        reject_server_repair,
-    )
-
-    response = await agent_graph.run_agent(
-        db_session,
-        AgentRequest(
-            knowledge_base_id=kb.id,
-            question="Explain Bayesian network factorization.",
-            filters=SearchFilters(),
-            top_k=4,
-            retrieval_granularity="mid",
-        ),
-    )
-
-    assert response["model_audit"]["grounding_outcome"] == (
-        "insufficient_evidence"
-    )
-    assert response["model_audit"]["repair_convergence_reason"] == (
-        "typed_repair_validation_rejected"
-    )
-    run = db_session.get(AgentRun, response["run_id"])
-    assert run is not None and run.status == "completed"
-    rejection = db_session.scalar(
-        select(AgentTraceEvent).where(
-            AgentTraceEvent.run_id == run.id,
-            AgentTraceEvent.node == "typed_repair_validation",
-        )
-    )
-    assert rejection is not None
-    assert rejection.status == "rejected"
-    assert rejection.scores["action_executed"] is False
-    assert rejection.scores["gray_zone_model_call_count"] == 0
-    assert rejection.scores["validator_diagnostics"]["valid"] is False
-    assert not list(
-        db_session.scalars(
-            select(AgentAction).where(
-                AgentAction.run_id == run.id,
-                AgentAction.action_type.in_(
-                    {
-                        "repair_missing_citation",
-                        "repair_concept_gap",
-                        "repair_bridge_gap",
-                        "repair_structure_context",
-                    }
-                ),
-            )
-        ).all()
-    )
-
-
-@pytest.mark.asyncio
-async def test_retrieval_granularity_agent_citation_guard_rewrites_when_repair_has_no_supported_citation(monkeypatch, db_session, populated_context_graph):
-    from app.schemas import AgentRequest, SearchFilters
-    from app.services import agent_graph
-    from app.services.embeddings import (
-        ChatCallResult,
-        ChatProvider as TrustedChatProvider,
-    )
-
-    kb = populated_context_graph["knowledge_base"]
-    question = "解释贝叶斯网络分解。"
-    prompt_metadata = dict(
-        TrustedChatProvider()._answer_prompt_bundle(
-            question,
-            context_quality="normal",
-        )["protocol_metadata"]
-    )
-
-    class UngroundedChatProvider:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-        async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
-            if "query facet extractor" in system_prompt:
-                return {
-                    "facet_groups": [
-                        {"facet": "Bayesian network", "role": "domain", "aliases": ["Bayesian networks"]},
-                        {
-                            "facet": "factorization",
-                            "role": "procedure",
-                            "aliases": ["conditional probability factorization"],
-                        },
-                    ],
-                    "answer_shape": "grounded_answer",
-                    "drop_terms": [],
-                }
-            return fallback or {"typed_actions": []}
-
-        async def answer_question_with_meta(self, question: str, contexts: list[dict], history: list[dict] | None = None, context_quality: str = "normal", **_kwargs):
-            return ChatCallResult(
-                answer="这是没有上下文支撑的外部公式和结论。",
-                provider="unit_chat",
-                model="unit-chat",
-                external_called=False,
-                prompt_protocol_version=prompt_metadata["protocol_version"],
-                prompt_protocol_hash=prompt_metadata["prompt_protocol_hash"],
-                grounding_envelope_protocol_version=prompt_metadata[
-                    "protocol_version"
-                ],
-                grounding_envelope_hash=prompt_metadata["envelope_hash"],
-                profile_hash=prompt_metadata["profile_hash"],
-            )
-
-    async def guard_aware_verifier(answer, citations, contexts, verification_budget, **_kwargs):
-        if "原文摘录" in answer:
-            return [
-                {
-                    **citation,
-                    "claim_text": citation.get("claim_text"),
-                    "verdict": "supported",
-                    "failure_type": "none",
-                    "confidence": 0.9,
-                    "diagnostics": {
-                        "test_verifier": "guard_supported",
-                        "citation_provenance_session_hash": "a" * 64,
-                    },
-                }
-                for citation in citations[: max(1, verification_budget)]
-            ]
-        return [
-            {
-                **(citations[0] if citations else {"chunk_id": None, "source_span": {}}),
-                "claim_text": answer[:120],
-                "verdict": "unsupported",
-                "failure_type": "unsupported_claim",
-                "confidence": 0.1,
-                "diagnostics": {
-                    "test_verifier": "force_guard",
-                    "citation_provenance_session_hash": "a" * 64,
-                },
-            }
-        ]
-
-    monkeypatch.setattr(agent_graph, "ChatProvider", UngroundedChatProvider)
-    monkeypatch.setattr(agent_graph, "verify_answer_against_context", guard_aware_verifier)
-    monkeypatch.setattr(
-        agent_graph,
-        "replay_citation_provenance_for_persistence",
-        lambda *_args, **kwargs: {
-            "persistence_gate_passed": True,
-            "matches_pre_entailment_session_hash": True,
-            "provenance_session_hash": "a" * 64,
-            "valid_count": len(kwargs.get("citations") or []),
-            "invalid_count": 0,
-            "audits": [
-                {
-                    "citation_index": index,
-                    "chunk_id": _citation.get("chunk_id"),
-                    "char_span": list(
-                        (_citation.get("source_span") or {}).get(
-                            "char_span"
-                        )
-                        or []
-                    ),
-                    "valid": True,
-                    "reasons": [],
-                    "provenance_hash": "b" * 64,
-                }
-                for index, _citation in enumerate(
-                    kwargs.get("citations") or [],
-                    start=1,
-                )
-            ],
-        },
-    )
-
-    response = await agent_graph.run_agent(
-        db_session,
-        AgentRequest(
-            knowledge_base_id=kb.id,
-            question=question,
-            filters=SearchFilters(),
-            top_k=4,
-            retrieval_granularity="mid",
-        ),
-    )
-
-    # Zero supported exact claims produce the deterministic insufficiency
-    # outcome; a context excerpt must not be promoted into a factual answer.
-    assert response["citations"] == []
-    assert response["answer"] == agent_graph.evidence_insufficient_answer(
-        question, "insufficient_corpus"
-    )
-    assert response["model_audit"]["citation_guard_applied"] is True
-    assert response["model_audit"]["repair_actions"][-1]["deterministic_citation_guard"] is True
-    assert response["model_audit"]["citation_verification_pass_rate"] == 0.0
-    assert response["model_audit"]["grounding_outcome"] == "insufficient_evidence"
-
-
-@pytest.mark.asyncio
-async def test_run_agent_uses_bound_profile_prompt_pack(
-    monkeypatch,
-    db_session,
-    populated_context_graph,
-    fake_profile_lifecycle_side_effects,
-):
-    from app.schemas import AgentRequest, SearchFilters
-    from app.services import agent_graph
-    from app.services.embeddings import (
-        ChatCallResult,
-        ChatProvider as TrustedChatProvider,
-    )
-    from app.services.strategy_profiles import active_profile_json, bind_profile_to_knowledge_base, create_profile, default_profile_payload
-
-    kb = populated_context_graph["knowledge_base"]
-    profile_payload = default_profile_payload()
-    profile_payload["prompt_pack"]["answer_system_prefix"] = "Custom active profile prefix."
-    profile, warnings = create_profile(
-        db_session,
-        name="Unit custom profile",
-        library_type="custom",
-        profile_json=profile_payload,
-    )
-    assert warnings == []
-    bind_profile_to_knowledge_base(db_session, knowledge_base_id=kb.id, profile_id=profile.id)
-    captured: dict[str, str] = {}
-
-    class CapturingChatProvider:
-        async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
-            if "query facet extractor" in system_prompt:
-                return {
-                    "facet_groups": [
-                        {"facet": "Bayesian network", "role": "domain", "aliases": ["Bayesian networks"]},
-                        {
-                            "facet": "factorization",
-                            "role": "procedure",
-                            "aliases": ["conditional probability factorization"],
-                        },
-                    ],
-                    "answer_shape": "grounded_answer",
-                    "drop_terms": [],
-                }
-            return fallback or {"verifications": []}
-
-        async def answer_question_with_meta(self, question: str, contexts: list[dict], history: list[dict] | None = None, context_quality: str = "normal", **_kwargs):
-            profile_json = active_profile_json()
-            captured["answer_system_prefix"] = profile_json["prompt_pack"]["answer_system_prefix"]
-            prompt_metadata = dict(
-                TrustedChatProvider()._answer_prompt_bundle(
-                    question,
-                    context_quality=context_quality,
-                )["protocol_metadata"]
-            )
-            first = contexts[0]["content"] if contexts else "no context"
-            return ChatCallResult(
-                answer=f"Grounded answer: {first[:120]}",
-                provider="unit_chat",
-                model="unit-chat",
-                external_called=False,
-                prompt_protocol_version=prompt_metadata["protocol_version"],
-                prompt_protocol_hash=prompt_metadata["prompt_protocol_hash"],
-                grounding_envelope_protocol_version=prompt_metadata[
-                    "protocol_version"
-                ],
-                grounding_envelope_hash=prompt_metadata["envelope_hash"],
-                profile_hash=prompt_metadata["profile_hash"],
-            )
-
-    monkeypatch.setattr(agent_graph, "ChatProvider", CapturingChatProvider)
-
-    response = await agent_graph.run_agent(
-        db_session,
-        AgentRequest(
-            knowledge_base_id=kb.id,
-            question="Explain Bayesian network factorization.",
-            filters=SearchFilters(),
-            top_k=4,
-        ),
-    )
-
-    assert response["context_package_id"]
-    assert captured["answer_system_prefix"] == "Custom active profile prefix."
-
-
-@pytest.mark.asyncio
-async def test_agent_claim_gate_removes_unsupported_claim_and_persists_exact_partial(
-    monkeypatch,
-    db_session,
-    populated_context_graph,
-):
-    from sqlalchemy import select
-
-    from app.models import AnswerSession, CitationVerification, RewardEvent
-    from app.schemas import AgentRequest, SearchFilters
-    from app.services import agent_graph
-    from app.services.embeddings import (
-        ChatCallResult,
-        ChatProvider as TrustedChatProvider,
-    )
-
-    kb = populated_context_graph["knowledge_base"]
-    question = "Explain Bayesian network factorization."
-    true_claim = (
-        "Bayesian networks factorize a joint distribution into local "
-        "conditional probabilities."
-    )
-    false_claim = "The Moon is made of cheese."
-    generated_answer = f"{true_claim} {false_claim}"
-    prompt_metadata = dict(
-        TrustedChatProvider()._answer_prompt_bundle(
-            question,
-            context_quality="normal",
-        )["protocol_metadata"]
-    )
-
-    class MixedClaimProvider:
-        async def classify_json(
-            self,
-            system_prompt: str,
-            user_prompt: str,
-            fallback: dict | None = None,
-        ) -> dict:
-            if "query facet extractor" in system_prompt:
-                return {
-                    "facet_groups": [
-                        {
-                            "facet": "Bayesian network",
-                            "role": "domain",
-                            "aliases": ["Bayesian networks"],
-                        },
-                        {
-                            "facet": "factorization",
-                            "role": "procedure",
-                            "aliases": [
-                                "conditional probability factorization"
-                            ],
-                        },
-                    ],
-                    "answer_shape": "grounded_answer",
-                    "drop_terms": [],
-                }
-            return fallback or {"typed_actions": []}
-
-        async def answer_question_with_meta(
-            self,
-            question: str,
-            contexts: list[dict],
-            history: list[dict] | None = None,
-            context_quality: str = "normal",
-            **_kwargs,
-        ) -> ChatCallResult:
-            return ChatCallResult(
-                answer=generated_answer,
-                provider="unit_chat",
-                model="unit-chat",
-                external_called=False,
-                prompt_protocol_version=prompt_metadata["protocol_version"],
-                prompt_protocol_hash=prompt_metadata["prompt_protocol_hash"],
-                grounding_envelope_protocol_version=prompt_metadata[
-                    "protocol_version"
-                ],
-                grounding_envelope_hash=prompt_metadata["envelope_hash"],
-                profile_hash=prompt_metadata["profile_hash"],
-            )
-
-    verification_answers: list[str] = []
-
-    async def mixed_claim_verifier(
-        answer,
-        citations,
-        contexts,
-        verification_budget,
-        **_kwargs,
-    ):
-        verification_answers.append(answer)
-        rows = []
-        for citation in citations[: max(1, verification_budget)]:
-            unsupported = "Moon" in str(citation.get("claim_text") or "")
-            rows.append(
-                {
-                    **citation,
-                    "verdict": "unsupported" if unsupported else "supported",
-                    "failure_type": (
-                        "unsupported_claim" if unsupported else "none"
-                    ),
-                    "confidence": 0.1 if unsupported else 0.95,
-                    "diagnostics": {
-                        "test_verifier": "mixed_claim_exact_binding",
-                        "citation_provenance_valid": True,
-                        "citation_provenance_session_hash": "a" * 64,
-                        "claim_id": citation.get("claim_id"),
-                        "claim_index": citation.get("claim_index"),
-                    },
-                }
-            )
-        return rows
-
-    real_envelope = agent_graph.agent_operating_envelope
-    monkeypatch.setattr(
-        agent_graph,
-        "agent_operating_envelope",
-        lambda: {**real_envelope(), "repair_round_budget": 0},
-    )
-    monkeypatch.setattr(agent_graph, "ChatProvider", MixedClaimProvider)
-    monkeypatch.setattr(
-        agent_graph,
-        "verify_answer_against_context",
-        mixed_claim_verifier,
-    )
-    monkeypatch.setattr(
-        agent_graph,
-        "replay_citation_provenance_for_persistence",
-        lambda *_args, **kwargs: {
-            "persistence_gate_passed": True,
-            "matches_pre_entailment_session_hash": True,
-            "provenance_session_hash": "a" * 64,
-            "valid_count": len(kwargs.get("citations") or []),
-            "invalid_count": 0,
-            "transactional_replay": True,
-            "lock_backend": "sqlite",
-            "rows_locked": False,
-            "audits": [
-                {
-                    "citation_index": int(
-                        citation.get("citation_index") or index
-                    ),
-                    "chunk_id": citation.get("chunk_id"),
-                    "char_span": list(
-                        (citation.get("source_span") or {}).get(
-                            "char_span"
-                        )
-                        or []
-                    ),
-                    "valid": True,
-                    "reasons": [],
-                    "provenance_hash": "b" * 64,
-                }
-                for index, citation in enumerate(
-                    kwargs.get("citations") or [],
-                    start=1,
-                )
-            ],
-        },
-    )
-
-    response = await agent_graph.run_agent(
-        db_session,
-        AgentRequest(
-            knowledge_base_id=kb.id,
-            question=question,
-            filters=SearchFilters(),
-            top_k=4,
-            retrieval_granularity="mid",
-        ),
-    )
-
-    assert response["answer"] == true_claim
-    assert false_claim not in response["answer"]
-    assert verification_answers == [generated_answer, true_claim]
-    assert response["citations"]
-    assert {
-        citation["claim_text"] for citation in response["citations"]
-    } == {true_claim}
-    audit = response["model_audit"]
-    assert audit["exact_answer_hash"] == agent_graph.exact_answer_hash(
-        true_claim
-    )
-    assert audit["unsupported_claims_removed"] is True
-    assert audit["citation_verification_pass_rate"] == 1.0
-    assert audit["claim_grounded_gate"]["all_claims_supported"] is True
-
-    answer_session = db_session.scalar(
-        select(AnswerSession).where(
-            AnswerSession.id == audit["answer_session_id"]
-        )
-    )
-    assert answer_session is not None
-    assert answer_session.answer == true_claim
-    assert answer_session.diagnostics_json["exact_answer_hash"] == (
-        agent_graph.exact_answer_hash(true_claim)
-    )
-    persisted_verifications = list(
-        db_session.scalars(
-            select(CitationVerification).where(
-                CitationVerification.answer_session_id == answer_session.id
-            )
-        ).all()
-    )
-    assert len(persisted_verifications) == 1
-    assert persisted_verifications[0].verdict == "supported"
-    reward = db_session.scalar(
-        select(RewardEvent).where(
-            RewardEvent.answer_session_id == answer_session.id
-        )
-    )
-    assert reward is not None
-    assert reward.reward_json["citation_pass_rate"] == 1.0
-
-
-@pytest.mark.asyncio
-async def test_agent_uses_distinct_typed_repair_mechanisms_across_rounds(
-    monkeypatch,
-    db_session,
-    populated_context_graph,
-):
-    from sqlalchemy import select
-
-    from app.models import AgentAction, AgentObservation, RetrievalTrace
-    from app.schemas import AgentRequest, QAResponse, SearchFilters
-    from app.services import agent_graph, policy_reward
-    from app.services.embeddings import (
-        ChatCallResult,
-        ChatProvider as TrustedChatProvider,
-    )
-
-    kb = populated_context_graph["knowledge_base"]
-    question = "Explain Bayesian network factorization."
-    answer = "An intentionally unsupported factorization claim."
-    prompt_metadata = dict(
-        TrustedChatProvider()._answer_prompt_bundle(
-            question,
-            context_quality="normal",
-        )["protocol_metadata"]
-    )
-
-    class UnsupportedClaimProvider:
-        async def classify_json(
-            self,
-            system_prompt: str,
-            user_prompt: str,
-            fallback: dict | None = None,
-        ) -> dict:
-            if "query facet extractor" in system_prompt:
-                return {
-                    "facet_groups": [
-                        {
-                            "facet": "Bayesian network",
-                            "role": "domain",
-                            "aliases": ["Bayesian networks"],
-                        },
-                        {
-                            "facet": "factorization",
-                            "role": "procedure",
-                            "aliases": ["conditional probability"],
-                        },
-                    ],
-                    "answer_shape": "grounded_answer",
-                    "drop_terms": [],
-                }
-            return fallback or {"typed_actions": []}
-
-        async def answer_question_with_meta(
-            self,
-            question: str,
-            contexts: list[dict],
-            history: list[dict] | None = None,
-            context_quality: str = "normal",
-            **_kwargs,
-        ) -> ChatCallResult:
-            return ChatCallResult(
-                answer=answer,
-                provider="unit_chat",
-                model="unit-chat",
-                external_called=False,
-                prompt_protocol_version=prompt_metadata["protocol_version"],
-                prompt_protocol_hash=prompt_metadata["prompt_protocol_hash"],
-                grounding_envelope_protocol_version=prompt_metadata[
-                    "protocol_version"
-                ],
-                grounding_envelope_hash=prompt_metadata["envelope_hash"],
-                profile_hash=prompt_metadata["profile_hash"],
-            )
-
-    async def always_concept_gap(
-        answer,
-        citations,
-        contexts,
-        verification_budget,
-        **_kwargs,
-    ):
-        return [
-            {
-                **citation,
-                "verdict": "unsupported",
-                "failure_type": "concept_gap",
-                "confidence": 0.1,
-                "diagnostics": {
-                    "test_verifier": "always_concept_gap",
-                    "citation_provenance_valid": True,
-                    "citation_provenance_session_hash": "a" * 64,
-                    "claim_id": citation.get("claim_id"),
-                    "claim_index": citation.get("claim_index"),
-                },
-            }
-            for citation in citations[: max(1, verification_budget)]
-        ]
-
-    real_envelope = agent_graph.agent_operating_envelope
-    monkeypatch.setattr(
-        agent_graph,
-        "agent_operating_envelope",
-        lambda: {**real_envelope(), "repair_round_budget": 2},
-    )
-    monkeypatch.setattr(agent_graph, "ChatProvider", UnsupportedClaimProvider)
-    monkeypatch.setattr(
-        agent_graph,
-        "verify_answer_against_context",
-        always_concept_gap,
-    )
-    # This scenario verifies deterministic alternate-direction selection
-    # after a no-progress round.  The populated graph may otherwise produce a
-    # genuinely new semantic evidence set, which is allowed to keep the same
-    # typed mechanism eligible under the production protocol.
-    monkeypatch.setattr(
-        agent_graph,
-        "repair_made_progress",
-        lambda _before, _after: False,
-    )
-    monkeypatch.setattr(
-        policy_reward,
-        "repair_made_progress",
-        lambda _before, _after: False,
-    )
-    monkeypatch.setattr(
-        agent_graph,
-        "replay_citation_provenance_for_persistence",
-        lambda *_args, **kwargs: {
-            "persistence_gate_passed": True,
-            "matches_pre_entailment_session_hash": True,
-            "provenance_session_hash": "a" * 64,
-            "valid_count": len(kwargs.get("citations") or []),
-            "invalid_count": 0,
-            "transactional_replay": True,
-            "lock_backend": "sqlite",
-            "rows_locked": False,
-            "audits": [
-                {
-                    "citation_index": int(
-                        citation.get("citation_index") or index
-                    ),
-                    "chunk_id": citation.get("chunk_id"),
-                    "char_span": list(
-                        (citation.get("source_span") or {}).get(
-                            "char_span"
-                        )
-                        or []
-                    ),
-                    "valid": True,
-                    "reasons": [],
-                    "provenance_hash": "b" * 64,
-                }
-                for index, citation in enumerate(
-                    kwargs.get("citations") or [],
-                    start=1,
-                )
-            ],
-        },
-    )
-
-    response = await agent_graph.run_agent(
-        db_session,
-        AgentRequest(
-            knowledge_base_id=kb.id,
-            question=question,
-            filters=SearchFilters(),
-            top_k=4,
-            retrieval_granularity="coarse",
-        ),
-    )
-
-    rounds = [
-        item
-        for item in response["model_audit"]["repair_actions"]
-        if item.get("repair_round_index") is not None
-    ]
-    assert len(rounds) == 2
-    assert [item["action_type"] for item in rounds] == [
-        "repair_concept_gap",
-        "repair_missing_citation",
-    ]
-    assert len({item["executor_mechanism"] for item in rounds}) == 2
-    assert all(item["retrieval_granularity"] == "coarse" for item in rounds)
-    assert all(item["result_top_k"] == 4 for item in rounds)
-    assert all(item["global_top_k_increased"] is False for item in rounds)
-    assert all(item["gray_zone_model_call_count"] == 0 for item in rounds)
-    assert len({item["conversation_state_scope_hash"] for item in rounds}) == 1
-    assert len({item["query_facets_hash"] for item in rounds}) == 1
-    assert len({item["action_input_hash"] for item in rounds}) == 2
-    assert all(
-        item["repair_audit"]["candidate_reverted_to_last_valid_package"]
-        is True
-        for item in rounds
-    )
-    assert all(
-        len(item["repair_audit"]["candidate_semantic_progress_hash"])
-        == 64
-        for item in rounds
-    )
-    QAResponse.model_validate(response)
-    assert response["model_audit"]["repair_rounds_used"] == 2
-    assert response["model_audit"]["grounding_outcome"] == (
-        "insufficient_evidence"
-    )
-
-    action_rows = list(
-        db_session.scalars(
-            select(AgentAction)
-            .where(
-                AgentAction.run_id == response["run_id"],
-                AgentAction.action_type.in_(
-                    ["repair_concept_gap", "repair_missing_citation"]
-                ),
-            )
-            .order_by(AgentAction.action_index.asc())
-        ).all()
-    )
-    assert [row.action_type for row in action_rows] == [
-        "repair_concept_gap",
-        "repair_missing_citation",
-    ]
-    assert all(
-        row.validation_json["typed_action_schema_protocol_version"]
-        == agent_graph.TYPED_ACTION_SCHEMA_PROTOCOL_VERSION
-        for row in action_rows
-    )
-    observations = list(
-        db_session.scalars(
-            select(AgentObservation)
-            .where(
-                AgentObservation.action_id.in_(
-                    [row.id for row in action_rows]
-                ),
-                AgentObservation.observation_type == "typed_repair_round",
-            )
-            .order_by(AgentObservation.created_at.asc())
-        ).all()
-    )
-    assert len(observations) == len(action_rows)
-    observations_by_action = {
-        str(row.action_id): row for row in observations
-    }
-    for action_row in action_rows:
-        validation = dict(action_row.validation_json or {})
-        output = dict(action_row.output_json or {})
-        validated_targets = dict(validation.get("validated_targets") or {})
-        canonical_refs = dict(
-            validated_targets.get("canonical_target_refs") or {}
-        )
-        observation = observations_by_action[str(action_row.id)]
-
-        if (
-            action_row.action_type == "repair_missing_citation"
-            and not canonical_refs.get("source_chunk_ids")
-        ):
-            # A claim without a bound source span has no graph node target.
-            # The package/trace/claim refs are the canonical typed target;
-            # persisting a Context Package id as a graph target is forbidden.
-            assert action_row.target_ids_json == []
-        else:
-            assert action_row.target_ids_json, action_row.action_type
-        assert validation["repair_directive_validator_result"] == "accepted"
-        assert validation["repair_directive_validator_protocol_version"] == (
-            "typed_repair_directive_validator_v1"
-        )
-        assert validated_targets["action_target_ids"] == (
-            action_row.target_ids_json
-        )
-        assert canonical_refs["source_context_package_id"]
-        assert canonical_refs["source_retrieval_trace_id"]
-        assert canonical_refs["claim_ids"]
-        assert canonical_refs["target_refs_hash"]
-        assert output["validated_targets"] == validated_targets
-        assert observation.observation_json == output
-        assert observation.verdict == (
-            "observed" if output["made_semantic_progress"] else "no_progress"
-        )
-        assert action_row.status == (
-            "completed" if output["made_semantic_progress"] else "no_progress"
-        )
-    for round_audit in rounds:
-        trace_id = round_audit["repaired_retrieval_trace_id"]
-        if round_audit["repair_candidate_reverted"]:
-            trace_id = round_audit["repair_audit"].get(
-                "candidate_retrieval_trace_id"
-            )
-        trace_row = db_session.get(
-            RetrievalTrace,
-            trace_id,
-        )
-        assert trace_row is not None
-        assert trace_row.convergence_json["gray_zone_model_call_count"] == 0
-        repair_directive = trace_row.diagnostics_json["repair_directive"]
-        assert repair_directive["gray_zone_decision_authority"] is False
-        assert repair_directive["gray_zone_rule_inputs_modified"] is False
+    monkeypatch.setattr(agent_graph, "evaluate_graph_evidence", uncertain)
+    response = await agent_graph.run_agent(db_session, AgentRequest(knowledge_base_id=populated_context_graph["knowledge_base"].id,
+        question="Explain Bayesian network factorization.", filters=SearchFilters(), top_k=4))
+    AgentResponse.model_validate(response)
+    assert response["context_package_id"] and response["citations"]
+    assert response["answer_model_audit"]["answer_reflection"]["outcome"] == "accepted_after_reflection"
+    assert response["answer_model_audit"]["answer_reflection"]["reflection_model_call_count"] >= 1
+    gate = next(event for event in response["trace"] if event["node"] == "evidence_gate")
+    assert gate["status"] == "review_required"
+    assert db_session.get(AgentRun, response["run_id"]).status == "completed"

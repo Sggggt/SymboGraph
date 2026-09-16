@@ -5,15 +5,19 @@ from worker_app.bootstrap import API_ROOT  # noqa: F401
 from worker_app.celery_app import celery_app
 from app.core.config import get_settings
 from app.db import SessionLocal
-from app.models import KnowledgeBase
+from app.models import Document, KnowledgeBase
 from app.services.ingestion import (
     finalize_interrupted_batches,
     ingest_file,
     mark_batch_task_started,
     run_batch_ingestion,
     run_context_graph_rebuild_batch,
+    run_ingestion_job,
     run_uploaded_files_ingestion,
 )
+from app.services.lexical_storage import rebuild_lexical_index_for_knowledge_base
+from app.services.lexical_storage import reconcile_pending_lexical_index_jobs
+from app.services.context_graph import invalidate_context_graph_cache_after_commit
 from app.services.maintenance import reconcile_policy_state, reconcile_vector_store_sync
 from app.services.runtime_settings import (
     refresh_runtime_settings_if_needed,
@@ -70,11 +74,34 @@ def _refresh_runtime_and_require_durable_storage() -> None:
 @celery_app.task(name="ingest_path")
 def ingest_path(path: str, trigger_source: str = "watchdog", job_id: str | None = None) -> dict:
     _refresh_runtime_and_require_durable_storage()
+    if job_id is not None:
+        return asyncio.run(
+            run_ingestion_job(job_id, Path(path), trigger_source=trigger_source)
+        )
     session = SessionLocal()
     try:
-        return asyncio.run(ingest_file(session, Path(path), trigger_source=trigger_source, existing_job_id=job_id))
+        result = asyncio.run(
+            ingest_file(session, Path(path), trigger_source=trigger_source)
+        )
+        document = session.get(Document, result["document_id"])
+        if document is None:
+            raise RuntimeError("Watch ingestion lost its document identity")
+        knowledge_base_id = document.knowledge_base_id
     finally:
         session.close()
+    lexical_stats = asyncio.run(
+        rebuild_lexical_index_for_knowledge_base(
+            knowledge_base_id,
+            operation="watch_ingestion_lexical_index_build",
+        )
+    )
+    return {
+        **result,
+        "stats": {
+            **dict(result.get("stats") or {}),
+            "lexical_index": lexical_stats,
+        },
+    }
 
 
 @celery_app.task(name="ingest_batch", bind=True)
@@ -114,7 +141,12 @@ def reconcile_interrupted_ingestion_batches_task() -> dict:
 
     _refresh_runtime_and_require_durable_storage()
     finalize_interrupted_batches()
-    return {"status": "reconciled"}
+    lexical = asyncio.run(
+        reconcile_pending_lexical_index_jobs(
+            invalidate=invalidate_context_graph_cache_after_commit,
+        )
+    )
+    return {"status": "reconciled", "lexical_index": lexical}
 
 
 @celery_app.task(name="reconcile_profile_lifecycle")

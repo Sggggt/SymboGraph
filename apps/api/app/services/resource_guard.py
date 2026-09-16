@@ -7,11 +7,31 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.core.config import get_settings
+
 
 class ResourceExhaustedError(RuntimeError):
     def __init__(self, message: str, *, snapshot: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.snapshot = snapshot or {}
+
+
+def release_unused_memory() -> dict[str, Any]:
+    """Release completed phase objects; persistent recovery facts remain in DB."""
+    before = _process_rss_bytes()
+    collected = gc.collect()
+    supported = False
+    if os.name == "posix":
+        import ctypes
+        libc = ctypes.CDLL(None)
+        trim = getattr(libc, "malloc_trim", None)
+        if trim is not None:
+            trim.argtypes = [ctypes.c_size_t]
+            trim.restype = ctypes.c_int
+            trim(0)
+            supported = True
+    return {"collected_objects":collected,"allocator_trim_supported":supported,
+            "rss_before":before,"rss_after":_process_rss_bytes()}
 
 
 @dataclass(frozen=True)
@@ -103,9 +123,10 @@ def memory_pressure_snapshot() -> MemoryPressureSnapshot:
     if current is None or limit is None:
         current, limit, source = _system_memory()
     ratio = (float(current) / float(limit)) if current is not None and limit else None
-    soft = _env_float("INGESTION_MEMORY_SOFT_LIMIT_RATIO", 0.78)
-    hard = _env_float("INGESTION_MEMORY_HARD_LIMIT_RATIO", 0.88)
-    critical = _env_float("INGESTION_MEMORY_CRITICAL_LIMIT_RATIO", 0.94)
+    settings = get_settings()
+    soft = float(settings.ingestion_memory_soft_limit_ratio)
+    hard = float(settings.ingestion_memory_hard_limit_ratio)
+    critical = float(settings.ingestion_memory_critical_limit_ratio)
     if ratio is None:
         level = "unknown"
     elif ratio >= critical:

@@ -1,5 +1,78 @@
 from __future__ import annotations
 
+
+def test_frozen_canonical_subtrees_replay_parent_context_and_cannot_mutate():
+    import json
+    import pytest
+    from app.services.graph_state_hashes import _canonical_value,_canonical_bytes
+    address="11111111-1111-4111-8111-111111111111"
+    value=_canonical_value({address:["b","a",address],"numeric":[1.25,-0.0],"nested":{"id":"ignored","score":2.0}})
+    plain=json.loads(json.dumps(value))
+    for parent in (None,"diagnostics","support_chunk_ids","nodes"):
+        assert _canonical_bytes(_canonical_value(value,parent_key=parent)) == _canonical_bytes(_canonical_value(plain,parent_key=parent))
+    sequence=_canonical_value(["z","a",address])
+    for parent in ("aliases","support_chunk_ids","diagnostics"):
+        assert _canonical_bytes(_canonical_value(sequence,parent_key=parent)) == _canonical_bytes(_canonical_value(list(sequence),parent_key=parent))
+    with pytest.raises(TypeError,match="immutable"): value["numeric"].append(9.0)
+    with pytest.raises(TypeError,match="immutable"): value["nested"]["score"]=8.0
+
+
+def test_shared_frozen_inputs_do_not_cache_mutable_reference_environments():
+    from app.services.graph_state_hashes import freeze_graph_input,_canonical_value,_FrozenReferences
+    source={"chunk_id":"unit-test-address","signals":[1.,2.]}
+    frozen=freeze_graph_input(source)
+    source["signals"][0]=9.
+    refs={"unit-test-address":"first-business-key"}
+    first=_canonical_value(frozen,references=refs)
+    assert first["signals"] == [1.,2.]
+    refs["unit-test-address"]="second-business-key"
+    assert _canonical_value(frozen,references=refs)["chunk_id"] == "second-business-key"
+    fixed=_FrozenReferences(refs)
+    projected=_canonical_value(frozen,references=fixed)
+    assert _canonical_value(frozen,references=fixed) is projected
+
+
+def test_cached_canonical_bytes_are_identical_to_standard_json():
+    import json
+    import numpy as np
+    from app.services.graph_state_hashes import _canonical_value,_canonical_bytes,freeze_graph_input
+    vector=freeze_graph_input(np.random.default_rng(53).normal(size=1024).tolist())
+    payload={"z":[{"vector":vector,"text":"中文\\\"\n\t😀"} for _ in range(6)],
+        "aliases":["z","a","z"],"zero":-0.0,"large":2**90,
+        "nested":{"newlines":"\r\n\x01","small":5e-324,"limit":1.7976931348623157e308}}
+    normalized=_canonical_value(payload)
+    expected=json.dumps(normalized,ensure_ascii=False,sort_keys=True,separators=(",",":"),allow_nan=False).encode("utf-8")
+    assert _canonical_bytes(normalized) == expected
+    assert _canonical_bytes(normalized) == expected
+    import hashlib
+    from app.services.graph_state_hashes import canonical_graph_hash,CANONICAL_GRAPH_JSON_PROTOCOL_VERSION
+    envelope={"canonical_protocol_version":CANONICAL_GRAPH_JSON_PROTOCOL_VERSION,"protocol_version":"unit-test","payload":payload}
+    expected_hash=hashlib.sha256(json.dumps(_canonical_value(envelope),ensure_ascii=False,sort_keys=True,separators=(",",":"),allow_nan=False).encode()).hexdigest()
+    assert canonical_graph_hash("unit-test",normalized) == expected_hash
+
+
+def test_streamed_fact_hash_is_byte_identical_with_spills_and_duplicates():
+    from app.services.graph_state_hashes import canonical_fact_set_hash, canonical_graph_hash, _sort_canonical
+    facts = [{"label": "公开合成" + "x" * 9000, "index": i % 400, "value": i / 17,
+              "aliases": ["b", "a"], "created_at": "ignored", "vector": [0.0, -0.0, 1.25]}
+             for i in range(1200)]
+    expected = canonical_graph_hash("unit-test-stream", _sort_canonical(facts))
+    assert canonical_fact_set_hash("unit-test-stream", iter(reversed(facts))) == expected
+    assert canonical_fact_set_hash("unit-test-stream", []) == canonical_graph_hash("unit-test-stream", [])
+
+
+def test_edge_business_key_lookup_does_not_decode_feature_payload():
+    from app.services.graph_state_hashes import relation_edge_business_keys
+    class Edge:
+        id = "edge"
+        source_chunk_id = "left"
+        target_chunk_id = "right"
+        edge_type = "dense_semantic"
+        @property
+        def features_json(self):
+            raise AssertionError("Address lookup must not decode full features")
+    assert len(relation_edge_business_keys([Edge()], {"left":"business-left", "right":"business-right"})["edge"]) == 64
+
 import copy
 import hashlib
 import re

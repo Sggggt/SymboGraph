@@ -16,6 +16,7 @@ interface CitationCardProps {
 export interface CitationDisplayAudit {
   complete: boolean;
   supported: boolean;
+  sourceBound?: boolean;
   reasons: string[];
 }
 
@@ -121,8 +122,9 @@ export function auditCitation(citation: Citation): CitationDisplayAudit {
     }
   };
 
-  add(citation.contract_version !== "citation_public_v1", "citation contract version is missing or unsupported");
-  add(!span || span.contract_version !== "raw_chunk_source_span_v1", "raw source-span contract is missing or unsupported");
+  const sourceBindingMode = citation.contract_version === "citation_public_v2";
+  add(!["citation_public_v1", "citation_public_v2"].includes(citation.contract_version), "citation contract version is missing or unsupported");
+  add(!span || (sourceBindingMode ? span.contract_version !== "raw_chunk_source_span_v2" : !["raw_chunk_source_span_v1", "raw_chunk_source_span_v3"].includes(span.contract_version)), "raw source-span contract is missing or unsupported");
   if (!span) {
     return { complete: false, supported: false, reasons };
   }
@@ -140,7 +142,9 @@ export function auditCitation(citation: Citation): CitationDisplayAudit {
   add(!nonEmpty(citation.context_package_id) || citation.context_package_id !== span.context_package_id, "context_package_id is missing or inconsistent");
   add(!nonEmpty(citation.retrieval_trace_id) || citation.retrieval_trace_id !== span.retrieval_trace_id, "retrieval_trace_id is missing or inconsistent");
   add(!nonEmpty(citation.answer_session_id), "answer_session_id is missing");
-  add(!nonEmpty(citation.citation_verification_id) || citation.citation_verification_id !== span.verification_id, "citation verification id is missing or inconsistent");
+  if (!sourceBindingMode) {
+    add(!nonEmpty(citation.citation_verification_id) || citation.citation_verification_id !== span.verification_id, "citation verification id is missing or inconsistent");
+  }
   add(!Array.isArray(span.char_span) || span.char_span.length !== 2, "raw char_span is missing");
   add(!orderedNumericPair(span.char_span), "raw char_span is not an ordered non-negative pair");
   add(Boolean(span.raw_chunk_char_span) && !orderedNumericPair(span.raw_chunk_char_span ?? undefined), "raw chunk char_span is invalid");
@@ -155,6 +159,39 @@ export function auditCitation(citation: Citation): CitationDisplayAudit {
   add(!nonEmpty(span.source_snapshot_verification?.checksum) || span.source_snapshot_verification?.checksum !== span.source_checksum, "immutable source snapshot checksum is missing or inconsistent");
   add(typeof span.source_snapshot_verification?.size_bytes !== "number" || span.source_snapshot_verification.size_bytes < 0, "immutable source snapshot size is missing or invalid");
   add(!nonEmpty(span.source_checksum) || !nonEmpty(span.chunk_text_hash) || !nonEmpty(span.raw_span_text_hash), "source or span integrity hashes are missing");
+
+  if (citation.contract_version === "citation_public_v2") {
+    const binding = citation.source_binding;
+    const boundSpan = citation.source_span;
+    const legacyBinding = binding?.contract_version === "answer_source_binding_public_v1" && binding.protocol_version === "answer_source_binding_v1";
+    const retrievalBinding = binding?.contract_version === "answer_source_binding_public_v2" && binding.protocol_version === "answer_source_binding_v2";
+    const integrityBinding = binding?.contract_version === "answer_source_binding_public_v3" && binding.protocol_version === "answer_source_binding_v2";
+    add(!legacyBinding && !retrievalBinding && !integrityBinding, "source binding contract is missing or unsupported");
+    add(citation.verification !== null || citation.citation_verification_id !== null || boundSpan.verification_id !== null, "source binding is mixed with legacy verification");
+    add(!nonEmpty(citation.source_binding_id) || citation.source_binding_id !== boundSpan.source_binding_id || citation.source_binding_id !== binding?.source_binding_id, "source binding id is missing or inconsistent");
+    add(!nonEmpty(citation.unit_id) || citation.unit_id !== binding?.unit_id || citation.unit_index !== binding?.unit_index, "answer unit binding is inconsistent");
+    add(!nonEmpty(citation.unit_text) || !nonEmpty(citation.answer_hash) || citation.answer_hash !== binding?.answer_hash, "answer unit text or identity is missing");
+    add(binding?.status !== "source_bound" || binding.provenance_status !== "valid" || binding.structure_context_status !== "valid" || binding.transactional_replay !== true, "source provenance replay is incomplete");
+    add(binding?.semantic_entailment_claimed !== false, "source binding must not claim semantic entailment");
+    const authorityHash = integrityBinding
+      ? binding.source_integrity_admission_hash
+      : retrievalBinding
+        ? binding?.retrieval_gate_audit_hash
+        : binding?.reflection_audit_hash;
+    add(!/^[0-9a-f]{64}$/.test(binding?.binding_hash ?? "") || !/^[0-9a-f]{64}$/.test(authorityHash ?? ""), "source binding audit identity is invalid");
+    add(retrievalBinding && (!nonEmpty(binding?.retrieval_gate_observation_id) || binding?.reflection_audit_hash != null), "retrieval source binding authority is invalid");
+    add(legacyBinding && (binding?.retrieval_gate_audit_hash != null || binding?.retrieval_gate_observation_id != null), "legacy source binding is mixed with retrieval gate authority");
+    if (integrityBinding) {
+      add(
+        !nonEmpty(binding.source_integrity_admission_observation_id) ||
+          binding.reflection_audit_hash != null ||
+          binding.retrieval_gate_audit_hash != null ||
+          binding.retrieval_gate_observation_id != null,
+        "source-integrity binding authority is invalid",
+      );
+    }
+    return { complete: reasons.length === 0, supported: false, sourceBound: reasons.length === 0, reasons };
+  }
 
   if (!verification) {
     reasons.push("citation verification audit is missing");
@@ -266,24 +303,26 @@ export function CitationCard({ citation, index }: CitationCardProps) {
       : firstSection || "来源名称缺失";
   const statusLabel = !audit.complete
     ? "来源不可用"
-    : audit.supported
+    : audit.sourceBound
+      ? "来源已核对"
+      : audit.supported
       ? "已核验"
       : verification?.verdict === "contradicted"
         ? "与回答冲突"
         : "未支持";
 
   return (
-    <Card data-testid="citation-audit-card" className={cn("border-white/10 bg-white/[0.03] text-white", !audit.complete && "border-rose-300/25 bg-rose-400/[0.035]")}>
-      <CardHeader>
-        <CardTitle className="flex flex-wrap items-start justify-between gap-3">
-          <span className="min-w-0 break-words">{sourceTitle}</span>
-          <span className="flex flex-wrap gap-1.5">
+    <Card data-testid="citation-audit-card" className={cn("min-w-0 max-w-full overflow-hidden border-white/10 bg-white/[0.03] text-white", !audit.complete && "border-rose-300/25 bg-rose-400/[0.035]")}>
+      <CardHeader className="min-w-0">
+        <CardTitle className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
+          <span data-overflow-text className="block min-w-0 truncate">{sourceTitle}</span>
+          <span className="flex shrink-0 flex-nowrap gap-1.5">
             <Badge variant="outline">#{index + 1}</Badge>
-            <Badge variant={audit.supported ? "secondary" : "outline"}>{statusLabel}</Badge>
+            <Badge variant={audit.supported || audit.sourceBound ? "secondary" : "outline"}>{statusLabel}</Badge>
           </span>
         </CardTitle>
       </CardHeader>
-      <CardContent className="flex flex-col gap-4">
+      <CardContent className="flex min-w-0 flex-col gap-4">
         {!audit.complete ? (
           <div data-testid="citation-fail-closed" role="alert" className="rounded-xl border border-rose-300/30 bg-rose-400/[0.07] p-3 text-xs text-rose-50/80">
             <p className="flex items-center gap-2 font-semibold text-rose-100"><ShieldAlert className="size-4" />这条来源暂时无法核验</p>
@@ -295,14 +334,15 @@ export function CitationCard({ citation, index }: CitationCardProps) {
             <div className="flex flex-wrap gap-2 text-xs text-white/52">
               {pageLabel ? <span className="kg-micro-chip rounded-full px-2.5 py-1">{pageLabel}</span> : null}
               {sectionLabel !== "—" ? <span className="kg-micro-chip rounded-full px-2.5 py-1">章节：{sectionLabel}</span> : null}
-              {audit.supported ? (
+              {audit.supported || audit.sourceBound ? (
                 <span className="inline-flex items-center gap-1 rounded-full border border-emerald-300/20 bg-emerald-300/[0.06] px-2.5 py-1 text-emerald-100/78">
                   <ShieldCheck className="size-3" />
-                  内容与回答一致
+                  {audit.sourceBound ? "原文地址已核对" : "内容与回答一致"}
                 </span>
               ) : null}
             </div>
             {citation.claim_text ? <p className="text-xs leading-6 text-white/42">支持的回答内容：{citation.claim_text}</p> : null}
+            {citation.contract_version === "citation_public_v2" ? <p className="text-xs leading-6 text-white/42">引用的回答内容：{citation.unit_text}</p> : null}
           </>
         )}
       </CardContent>

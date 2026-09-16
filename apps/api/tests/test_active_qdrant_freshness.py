@@ -329,7 +329,8 @@ async def test_layered_search_does_not_fall_back_to_old_coarse_graph_when_dense_
 
 
 @pytest.mark.asyncio
-async def test_agent_rejects_old_graph_before_any_provider_call(
+@pytest.mark.usefixtures("historical_retrieval_agent_executor")
+async def test_agent_rejects_old_graph_after_unified_intent_before_retrieval_models(
     monkeypatch: pytest.MonkeyPatch,
     db_session,
     populated_context_graph,
@@ -344,13 +345,47 @@ async def test_agent_rejects_old_graph_before_any_provider_call(
     db_session.flush()
     provider_calls: list[str] = []
 
-    async def forbidden_provider(*args, **kwargs):
-        provider_calls.append("called")
-        raise AssertionError("provider must not run before active graph admission")
+    async def perceived_retrieval_intent(*args, **kwargs):
+        provider_calls.append("perception")
+        return {
+            "intent": "definition",
+            "direct_answer_kind": "none",
+            "entities": [],
+            "sub_queries": ["old graph agent admission"],
+            "needs_graph": True,
+            "suggested_strategy": "global_dense",
+            "history_turns": 0,
+        }
 
-    monkeypatch.setattr(agent_graph, "perceive_query_intent", forbidden_provider)
-    monkeypatch.setattr(agent_graph, "propose_query_facets", forbidden_provider)
-    monkeypatch.setattr(agent_graph, "propose_agent_plan", forbidden_provider)
+    from app.services.retrieval_models import RetrievalModels, TaskPlanningOutput
+    async def planned_intent(self, **_kwargs):
+        intent = await perceived_retrieval_intent()
+        intent.pop('history_turns')
+        return TaskPlanningOutput(perception=intent,
+            requirements=({'facet':'Bayesian network','lexical_role':'domain'},),answer_shape='definition'), {'model_call_count':1}
+    monkeypatch.setattr(RetrievalModels,'plan',planned_intent)
+
+    async def forbidden_retrieval_provider(*args, **kwargs):
+        provider_calls.append("called")
+        raise AssertionError(
+            "facet/planner models must not run before active graph admission"
+        )
+
+    monkeypatch.setattr(
+        agent_graph,
+        "perceive_query_intent",
+        perceived_retrieval_intent,
+    )
+    monkeypatch.setattr(
+        agent_graph,
+        "propose_query_facets",
+        forbidden_retrieval_provider,
+    )
+    monkeypatch.setattr(
+        agent_graph,
+        "propose_agent_plan",
+        forbidden_retrieval_provider,
+    )
 
     with pytest.raises(
         context_graph.ActiveContextGraphAdmissionError,
@@ -365,7 +400,7 @@ async def test_agent_rejects_old_graph_before_any_provider_call(
                 top_k=4,
             ),
         )
-    assert provider_calls == []
+    assert provider_calls == ["perception"]
 
 
 @pytest.mark.asyncio

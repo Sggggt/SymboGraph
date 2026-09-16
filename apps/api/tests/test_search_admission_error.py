@@ -21,16 +21,15 @@ class _TransactionSpy:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("route_name", "service_name"),
+    "route_name",
     [
-        ("search", "search_chunks_with_audit"),
-        ("graph_search", "layered_context_search_chunks_with_audit"),
+        "search",
+        "graph_search",
     ],
 )
 async def test_search_routes_return_typed_sanitized_graph_admission_conflict(
     monkeypatch: pytest.MonkeyPatch,
     route_name: str,
-    service_name: str,
 ) -> None:
     from app.routers import search as search_router
     from app.schemas import (
@@ -38,6 +37,7 @@ async def test_search_routes_return_typed_sanitized_graph_admission_conflict(
         SearchRequest,
     )
     from app.services.context_graph import ActiveContextGraphAdmissionError
+    from app.services import intent_execution_agent
 
     secret = "Authorization: Bearer sk-secret"
     internal_chunk_id = "chunk-internal-123"
@@ -53,7 +53,11 @@ async def test_search_routes_return_typed_sanitized_graph_admission_conflict(
         "get_requested_knowledge_base",
         lambda db, knowledge_base_id=None: SimpleNamespace(id=knowledge_base_id),
     )
-    monkeypatch.setattr(search_router, service_name, reject_stale_graph)
+    monkeypatch.setattr(
+        intent_execution_agent,
+        "execute_intent_search",
+        reject_stale_graph,
+    )
     db = _TransactionSpy()
 
     with pytest.raises(HTTPException) as captured:
@@ -109,3 +113,55 @@ def test_graph_admission_payload_is_stable_and_contains_no_dynamic_exception_fie
         "retry_after_rebuild",
         "rebuild_required",
     }
+
+
+@pytest.mark.asyncio
+async def test_sync_qa_failure_returns_persisted_run_identity_for_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.db as db_module
+    from app.routers import search as search_router
+    from app.schemas import QARequest
+
+    run_id = "11111111-1111-4111-8111-111111111111"
+    session_id = "22222222-2222-4222-8222-222222222222"
+
+    class Admission:
+        released = False
+
+        async def release(self) -> None:
+            self.released = True
+
+    class SessionContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+    admission = Admission()
+
+    async def acquire(_kind: str):
+        return admission
+
+    async def fail_after_acceptance(*_args, **_kwargs):
+        error = RuntimeError("unit-test-provider-failure")
+        error.agent_run_id = run_id
+        error.agent_session_id = session_id
+        raise error
+
+    monkeypatch.setattr(search_router, "acquire_agent_request_slot", acquire)
+    monkeypatch.setattr(search_router, "run_agent", fail_after_acceptance)
+    monkeypatch.setattr(db_module, "SessionLocal", SessionContext)
+
+    with pytest.raises(HTTPException) as captured:
+        await search_router.qa(QARequest(question="synthetic recovery check"))
+
+    assert captured.value.status_code == 502
+    assert captured.value.detail == {
+        "code": "agent_qa_failed",
+        "message": "unit-test-provider-failure",
+        "run_id": run_id,
+        "session_id": session_id,
+    }
+    assert admission.released is True

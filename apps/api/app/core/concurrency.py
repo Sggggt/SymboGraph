@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from app.core.config import get_settings
+from app.services.qa_performance import qa_stage
 
 
 _MODEL_SEMAPHORE: asyncio.Semaphore | None = None
@@ -30,5 +31,9 @@ def model_request_semaphore() -> asyncio.Semaphore:
 @asynccontextmanager
 async def model_request_slot() -> AsyncIterator[None]:
     semaphore = model_request_semaphore()
-    async with semaphore:
+    with qa_stage("model_queue"):
+        await semaphore.acquire()
+    try:
         yield
+    finally:
+        semaphore.release()

@@ -621,14 +621,14 @@ async def test_search_route_commits_retrieval_trace(db_session, populated_contex
         SearchRequest(knowledge_base_id=kb.id, query="Bayes theorem prior posterior", filters=SearchFilters(), top_k=3),
         db_session,
     )
-    trace_id = payload["model_audit"]["retrieval_trace_id"]
+    trace_id = payload["retrieval_trace_id"]
 
-    assert payload["retrieval_granularity"] == "mid"
-    assert payload["model_audit"]["retrieval_granularity"] == "mid"
+    assert payload["entry_layer"] == "chunk"
+    assert payload["terminal_outcome"] == "completed"
     assert db_session.get(RetrievalTrace, trace_id) is not None
     trace = db_session.get(RetrievalTrace, trace_id)
-    assert trace.diagnostics_json["retrieval_granularity"] == "mid"
-    assert db_session.scalar(select(func.count(GraphRetrievalStep.id)).where(GraphRetrievalStep.retrieval_trace_id == trace_id)) >= 4
+    assert trace.diagnostics_json["protocol_version"] == "intent_execution_retrieval_v1"
+    assert db_session.scalar(select(func.count(GraphRetrievalStep.id)).where(GraphRetrievalStep.retrieval_trace_id == trace_id)) >= 1
 
 
 @pytest.mark.asyncio
@@ -850,9 +850,16 @@ def test_runtime_env_sync_treats_legacy_runtime_keys_as_deprecated(monkeypatch, 
     )
     monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
     monkeypatch.setattr(runtime_settings, "ENV_EXAMPLE_PATH", example_path)
+    settings_path = tmp_path / "settings.json"
+    settings_example = Path(__file__).resolve().parents[3] / "settings.example.json"
+    if not settings_example.exists():
+        settings_example = Path("/workspace/settings.example.json")
+    settings_path.write_bytes(settings_example.read_bytes())
+    monkeypatch.setattr(runtime_settings, "SETTINGS_PATH", settings_path)
 
     status = runtime_settings.env_sync_status()
-    assert status["synced"] is True
+    assert status["synced"] is False
+    assert "FIXED_CHUNK_SIZE_TOKENS" in status["overlap_keys"]
     assert status["deprecated_keys"] == [
         "CHUNK_TOKEN_BUDGET",
         "CITATION_VERIFICATION_SAMPLE_MAX",
@@ -900,6 +907,12 @@ def test_runtime_env_sync_does_not_require_deployment_only_postgres_keys(
     )
     monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
     monkeypatch.setattr(runtime_settings, "ENV_EXAMPLE_PATH", example_path)
+    settings_path = tmp_path / "settings.json"
+    settings_example = Path(__file__).resolve().parents[3] / "settings.example.json"
+    if not settings_example.exists():
+        settings_example = Path("/workspace/settings.example.json")
+    settings_path.write_bytes(settings_example.read_bytes())
+    monkeypatch.setattr(runtime_settings, "SETTINGS_PATH", settings_path)
 
     status = runtime_settings.env_sync_status()
 
@@ -912,6 +925,7 @@ def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch)
     from app.services import runtime_settings
 
     get_settings.cache_clear()
+    monkeypatch.setenv('CHAT_JSON_MAX_TOKENS','12000')
     monkeypatch.setenv("FIXED_CHUNK_SIZE_TOKENS", "512")
     monkeypatch.setenv("FIXED_CHUNK_OVERLAP_TOKENS", "80")
     monkeypatch.setenv("CONTEXT_PACKAGE_TOKEN_BUDGET", "2400")
@@ -928,25 +942,35 @@ def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch)
         runtime_settings,
         "_env_entries",
         lambda _path: {
-            "FIXED_CHUNK_SIZE_TOKENS": "512",
-            "FIXED_CHUNK_OVERLAP_TOKENS": "80",
-            "CONTEXT_PACKAGE_TOKEN_BUDGET": "2400",
-            "UPLOAD_MAX_BYTES": "104857600",
-            "AGENT_REQUEST_CONCURRENCY": "5",
-            "SOURCE_IO_CONCURRENCY": "7",
-            "AGENT_REQUEST_QUEUE_LIMIT": "9",
-            "AGENT_REQUEST_QUEUE_TIMEOUT_SECONDS": "45",
-            "AGENT_REQUEST_LEASE_TTL_SECONDS": "360",
-            "RETRIEVAL_RESULT_TOP_K_DEFAULT": "7",
-            "AGENT_COARSE_INITIAL_BUDGET": "6",
-            "AGENT_COARSE_TOP_K": "4",
-            "AGENT_COARSE_DRILLDOWN_MID_INITIAL_BUDGET": "10",
-            "AGENT_MID_INITIAL_BUDGET": "9",
-            "AGENT_CHUNK_INITIAL_BUDGET": "11",
-            "AGENT_STRUCTURE_RESTORE_PER_CHUNK_BUDGET": "3",
-            "CONCEPT_I18N_ENABLED": "false",
-            "QUERY_FACET_BILINGUAL_ENABLED": "false",
-            "RQ_KMEANS_LEVELS": "4",
+            "CHAT_MODEL": "unit-model",
+        },
+    )
+    monkeypatch.setattr(
+        runtime_settings,
+        "_runtime_settings_values",
+        lambda: {
+            **{
+                key: getattr(get_settings(), key)
+                for key in runtime_settings.RUNTIME_JSON_SETTINGS
+            },
+            "fixed_chunk_size_tokens": 512,
+            "fixed_chunk_overlap_tokens": 80,
+            "context_package_token_budget": 2400,
+            "upload_max_bytes": 104857600,
+            "agent_request_concurrency": 5,
+            "source_io_concurrency": 7,
+            "agent_request_queue_limit": 9,
+            "agent_request_queue_timeout_seconds": 45,
+            "agent_request_lease_ttl_seconds": 360,
+            "retrieval_result_top_k_default": 7,
+            "agent_coarse_initial_budget": 6,
+            "agent_coarse_top_k": 4,
+            "agent_coarse_drilldown_mid_initial_budget": 10,
+            "agent_mid_initial_budget": 9,
+            "agent_chunk_initial_budget": 11,
+            "agent_structure_restore_per_chunk_budget": 3,
+            "concept_i18n_enabled": False,
+            "query_facet_bilingual_enabled": False,
         },
     )
 
@@ -985,7 +1009,7 @@ def test_model_settings_payload_uses_fixed_chunk_and_context_budget(monkeypatch)
     assert "agent_request_lease_ttl_seconds" in payload["lifecycle"]["hot_reloadable"]
     assert "chat_json_max_tokens" in payload["lifecycle"]["hot_reloadable"]
     assert payload["chat_json_max_tokens"] == 12000
-    assert payload["agent_coarse_total_budget"] > 0
+    assert "agent_coarse_total_budget" not in payload
     assert payload["agent_chunk_top_k"] > 0
     assert "lifecycle" in payload
     assert "chunk_token_budget" not in payload
@@ -1316,16 +1340,15 @@ def test_agent_run_status_includes_trace_for_frontend_recovery(db_session, sampl
     assert payload["trace"][0]["node"] == "query_understanding"
 
 
-def test_retrieval_granularity_schema_defaults_and_rejects_invalid_values():
+def test_public_requests_reject_retired_retrieval_mode_fields():
     from pydantic import ValidationError
 
     from app.schemas import AgentRequest, QARequest, SearchRequest
 
-    assert SearchRequest(query="default").retrieval_granularity == "mid"
-    assert QARequest(question="default").retrieval_granularity == "mid"
-    assert AgentRequest(question="default").retrieval_granularity == "mid"
-    assert SearchRequest(query="coarse", retrieval_granularity="coarse").retrieval_granularity == "coarse"
-    for invalid in ("hybrid", "summary", "normal", "普通模式", ""):
+    assert "retrieval_granularity" not in SearchRequest.model_fields
+    assert "retrieval_granularity" not in QARequest.model_fields
+    assert "retrieval_granularity" not in AgentRequest.model_fields
+    for invalid in ("mid", "coarse", "hybrid", "summary", "normal", "普通模式", ""):
         with pytest.raises(ValidationError):
             SearchRequest(query="invalid", retrieval_granularity=invalid)
 
@@ -1409,7 +1432,7 @@ def test_model_settings_put_rejects_fixed_rq_depth_without_env_write_or_version_
     monkeypatch.setattr(runtime_settings, "ENV_EXAMPLE_PATH", example_path)
     monkeypatch.setattr(
         settings_router,
-        "save_model_settings_to_root_env",
+        "save_model_settings_to_root_configuration",
         lambda db, payload: service_calls.append(dict(payload)),
     )
     monkeypatch.setattr(
@@ -1830,12 +1853,11 @@ def test_default_profile_prompt_pack_includes_system_prompt_registry():
         "answer_system_template",
         "query_rewrite_system",
         "json_response_fallback_system",
-        "reflection_review_system",
+        "reflection_reviewer_system",
         "question_perception_system",
         "query_facet_extractor_system",
         "agent_planner_system",
         "agent_evidence_evaluator_system",
-        "citation_entailment_judge_system",
         "mid_concept_definition_system",
         "coarse_concept_definition_system",
         "concept_i18n_system",
@@ -1845,6 +1867,8 @@ def test_default_profile_prompt_pack_includes_system_prompt_registry():
         assert key in prompt_pack
         assert isinstance(prompt_pack[key], str)
         assert prompt_pack[key].strip()
+    assert "citation_entailment_judge_system" not in prompt_pack
+    assert "reflection_review_system" not in prompt_pack
 
 
 def test_batch_summary_matches_response_schema(db_session, sample_knowledge_base):

@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from _gray_zone_audit import audit_gray_zone_traces
@@ -251,9 +251,143 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def audit_target_gray_zone_traces(
+    traces: list[dict],
+    *,
+    require_gray_coverage: bool = False,
+) -> dict:
+    records = [
+        dict(record)
+        for trace in traces
+        for record in trace.get("gray_zone_path_decisions") or []
+    ]
+    for record in records:
+        inputs = record.get("inputs")
+        canonical = (
+            json.dumps(
+                inputs,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            if isinstance(inputs, dict)
+            else ""
+        )
+        require(
+            record.get("protocol_version")
+            == "deterministic_support_progress_v2"
+            and record.get("model_call_count") == 0
+            and bool(canonical)
+            and hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            == record.get("input_hash"),
+            "Target gray-zone decision failed deterministic hash replay",
+        )
+    gray = sum((item.get("inputs") or {}).get("zone") == "gray" for item in records)
+    red = sum((item.get("inputs") or {}).get("zone") == "red" for item in records)
+    hard = sum((item.get("inputs") or {}).get("zone") == "hard_stop" for item in records)
+    if require_gray_coverage:
+        require(gray > 0, "Target smoke trace did not exercise a gray decision")
+    return {
+        "protocol_version": "intent_execution_gray_zone_smoke_v1",
+        "status": "passed",
+        "pass": True,
+        "gray_zone_coverage": gray > 0,
+        "trace_count": len(traces),
+        "gray_rule_record_count": gray,
+        "red_partition_record_count": red,
+        "hard_stop_partition_record_count": hard,
+        "determinism": {
+            "all_input_hashes_replayed": True,
+            "model_call_count": 0,
+            "cycle_reward": 0,
+        },
+    }
+
+
 def validate_qa_acceptance_payload(qa: dict) -> dict:
-    require(qa.get("answer"), f"QA returned no answer: {qa}")
+    require(qa.get("answer"), "QA returned no answer")
     qa_audit = qa.get("model_audit") or {}
+    if qa_audit.get("protocol_version") == "intent_execution_retrieval_v1":
+        citations = list(qa.get("citations") or [])
+        outcome = qa.get("terminal_outcome")
+        direct = qa.get("route") == "system_capability"
+        accepted = outcome in {"completed", "partial_answer"} and not direct
+        require(qa_audit.get("planning_model_call_count") == 1, "Target planning call count differs")
+        require(qa_audit.get("post_generation_model_call_count", 0) == 0, "Target path called post-generation review")
+        require(qa_audit.get("source_admission_model_call_count", 0) == 0, "Target source admission called a model")
+        require(not qa_audit.get("policy_update_eligible"), "Target path enabled online policy updates")
+        require(qa_audit.get("generation_model_call_count", 0) == int(accepted), "Target one-shot generation contract failed")
+        if direct:
+            require(not citations and qa.get("context_package_id") is None and qa.get("retrieval_trace_id") is None,
+                    "System capability response has corpus sources")
+        elif accepted:
+            require(bool(citations), "Completed target factual QA has no sources")
+            require(qa.get("context_package_id") and qa.get("retrieval_trace_id"), "Completed target QA lacks package identity")
+            require(qa_audit.get("source_binding_count") == len(citations), "Target source count differs from binding audit")
+        else:
+            require(not citations, "Grounding terminal returned unsupported citations")
+        require(all(
+            (citation.get("source_binding") or {}).get("contract_version") == "answer_source_binding_public_v3"
+            and (citation.get("source_binding") or {}).get("protocol_version") == "answer_source_binding_v2"
+            and (citation.get("source_binding") or {}).get("status") == "source_bound"
+            and bool((citation.get("source_binding") or {}).get("source_integrity_admission_hash"))
+            and citation.get("source_binding_id") == (citation.get("source_span") or {}).get("source_binding_id")
+            for citation in citations
+        ), "Target source-integrity binding contract is inconsistent")
+        timing = qa_audit.get("qa_performance") or {}
+        require(timing.get("protocol_version") == "qa_stage_timing_v1"
+                and timing.get("unfinished_span_count") == 0, "Target QA timing audit is missing or unfinished")
+        return {
+            "model_audit": qa_audit,
+            "citation_verification_pass_rate": None,
+            "source_binding_pass_rate": 1.0 if citations else None,
+            "insufficient_evidence": not accepted and not direct,
+            "evidence_gate_blocked": False,
+            "context_package_required": accepted,
+            "returned_citation_count": len(citations),
+            "terminal_outcome": outcome,
+            "entry_layer": qa.get("entry_layer"),
+        }
+    current = qa_audit.get("retrieval_control") or {}
+    if current.get("protocol_version") == "retrieval_answer_v1":
+        citations = list(qa.get("citations") or [])
+        accepted = current.get("gate_outcome") in {"ready_full", "ready_partial"}
+        require(current.get("post_generation_review_count") == 0, "Post-generation review was called")
+        require(current.get("generation_call_count") == int(accepted), "One-shot generation contract failed")
+        require(not qa_audit.get("policy_update_eligible"), "Retired answer policy received a retrieval reward")
+        require(current.get("source_binding_count") == len(citations), "Source count differs from audit")
+        require(bool(citations) == accepted, "Ready/gap response has inconsistent sources")
+        require(all((c.get("source_binding") or {}).get("protocol_version") == "answer_source_binding_v2"
+            and (c.get("source_binding") or {}).get("status") == "source_bound"
+            and (c.get("source_binding") or {}).get("semantic_entailment_claimed") is False
+            and c.get("source_binding_id") == (c.get("source_span") or {}).get("source_binding_id")
+            for c in citations), "Current source binding contract is inconsistent")
+        timing = qa_audit.get("qa_performance") or {}
+        require(timing.get("protocol_version") == "qa_stage_timing_v1"
+                and timing.get("unfinished_span_count") == 0, "QA timing audit is missing or unfinished")
+        return {"model_audit": qa_audit, "citation_verification_pass_rate": None,
+            "source_binding_pass_rate": current.get("source_binding_pass_rate"),
+            "insufficient_evidence": not accepted, "evidence_gate_blocked": not accepted,
+            "context_package_required": accepted, "returned_citation_count": len(citations)}
+    reflection = qa_audit.get("answer_reflection") or {}
+    if reflection.get("protocol_version") == "agent_answer_reflection_v1":
+        citations = list(qa.get("citations") or [])
+        accepted = reflection.get("outcome") in {"accepted_without_reflection", "accepted_after_reflection"}
+        require(reflection.get("citation_judge_model_call_count") == 0, "Retired citation judge was called")
+        require(reflection.get("self_assessment_is_reward_label") is False, "Model self-score was treated as a reward label")
+        if accepted:
+            require(bool(citations), "Accepted factual QA has no source bindings")
+            require(reflection.get("source_binding_pass_rate") == 1.0, "Source binding did not pass")
+        require(all(c.get("contract_version") == "citation_public_v2" and c.get("verification") is None
+            and (c.get("source_binding") or {}).get("status") == "source_bound"
+            and (c.get("source_binding") or {}).get("semantic_entailment_claimed") is False
+            and c.get("source_binding_id") == (c.get("source_span") or {}).get("source_binding_id")
+            for c in citations), "Source binding contract is inconsistent")
+        return {"model_audit": qa_audit, "citation_verification_pass_rate": None,
+            "source_binding_pass_rate": reflection.get("source_binding_pass_rate"),
+            "insufficient_evidence": not accepted, "evidence_gate_blocked": False,
+            "context_package_required": True, "returned_citation_count": len(citations)}
     grounding_outcome = qa_audit.get("grounding_outcome")
     evaluator = qa_audit.get("evidence_evaluator") or {}
     evidence_gate_blocked = bool(
@@ -283,6 +417,104 @@ def validate_qa_acceptance_payload(qa: dict) -> dict:
         "context_package_required": not evidence_gate_blocked,
         "returned_citation_count": len(citations),
     }
+
+
+def _decode_pe_payload(payload: dict) -> dict:
+    """Check the public canonical envelope before consuming control identities."""
+    raw = payload.get("canonical_json")
+    require(payload.get("encoding") == "canonical_json_v1" and isinstance(raw, str),
+            "P&E canonical payload is missing")
+    require(hashlib.sha256(raw.encode("utf-8")).hexdigest() == payload.get("sha256"),
+            "P&E canonical payload hash differs")
+    try:
+        value = json.loads(raw)
+        canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError):
+        raise RuntimeError("P&E canonical payload is invalid") from None
+    require(isinstance(value, dict) and raw == canonical, "P&E control payload is not canonical object JSON")
+    return value
+
+
+def load_qa_retrieval_traces(client, qa: dict, acceptance: dict, *, knowledge_base_id: str) -> tuple[list[dict], dict]:
+    """Read every executed gap trace without inventing a final answer trace."""
+    current = acceptance["model_audit"].get("retrieval_control") or {}
+    is_gap = current.get("protocol_version") == "retrieval_answer_v1" and acceptance["insufficient_evidence"]
+    if not is_gap:
+        trace_id = qa.get("retrieval_trace_id")
+        require(trace_id, "QA did not return retrieval_trace_id")
+        trace_ids = [trace_id]
+    else:
+        require(current.get("gate_outcome") in {"scoped_not_found", "scope_ambiguous", "source_unresolved",
+                "representation_incomplete", "budget_exhausted"}, "Unknown or non-terminal QA gap outcome")
+        require(not qa.get("citations") and not qa.get("context_package_id") and not qa.get("retrieval_trace_id")
+                and current.get("generation_call_count") == 0 and current.get("source_binding_count") == 0,
+                "QA gap contains answer-generation artifacts")
+        run_id = qa.get("run_id")
+        require(isinstance(run_id, str) and bool(run_id), "QA gap has no persisted run")
+        route_id = quote(run_id, safe="")
+        task = client.request_json("GET", f"/tasks/{route_id}")
+        require(task.get("run_id") == run_id and task.get("session_id") == qa.get("session_id")
+                and task.get("status") == task.get("state") == "needs_clarification"
+                and task.get("route") == qa.get("route") == "layered_context_graph"
+                and task.get("answer") == qa.get("answer") and not task.get("error"),
+                "QA gap differs from its persisted terminal task")
+        pe = client.request_json("GET", f"/agent/runs/{route_id}/pe-audit")
+        require(pe.get("contract_version") == "agent_pe_audit_public_v1" and pe.get("run_id") == run_id
+                and pe.get("knowledge_base_id") == knowledge_base_id
+                and pe.get("run_status") == task["status"]
+                and pe.get("provider_raw_response_exposed") is False and pe.get("credentials_exposed") is False,
+                "QA gap P&E identity or public safety differs")
+        for name in ("plans", "actions", "observations"):
+            rows = pe.get(name)
+            require(isinstance(rows, list) and (pe.get("counts") or {}).get(name) == len(rows),
+                    "QA gap P&E rows are incomplete")
+            require([row.get("order_index") for row in rows] == list(range(len(rows)))
+                    and len({row.get("id") for row in rows}) == len(rows)
+                    and all(row.get("run_id") == run_id for row in rows), "QA gap P&E row ownership differs")
+        trace_ids = []
+        for plan in pe["plans"]:
+            require(plan.get("knowledge_base_id") == knowledge_base_id, "QA gap plan crosses knowledge bases")
+            trace_id = plan.get("retrieval_trace_id")
+            require(plan.get("status") != "executed" or trace_id, "Executed QA plan lost its retrieval trace")
+            if trace_id and trace_id not in trace_ids:
+                trace_ids.append(trace_id)
+        for action in pe["actions"]:
+            require(action.get("status") not in {"executing", "failed", "cancelled"},
+                    "Technical action failure cannot become a successful gap")
+            trace_id = _decode_pe_payload(action["output"]).get("retrieval_trace_id")
+            require(not trace_id or trace_id in trace_ids, "QA action trace has no owning plan")
+        transitions = []
+        for observation in pe["observations"]:
+            value = _decode_pe_payload(observation["observation"])
+            trace_id = value.get("retrieval_trace_id")
+            require(not trace_id or trace_id in trace_ids, "QA observation trace has no owning plan")
+            if observation.get("observation_type") == "retrieval_state_transition":
+                require(observation.get("run_control_protocol") == "retrieval_fsm_v1"
+                        and value.get("protocol_version") == "retrieval_fsm_transition_v1"
+                        and value.get("run_id") == run_id, "QA gap FSM identity differs")
+                event = {key: item for key, item in value.items() if key != "event_hash"}
+                canonical = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                require(hashlib.sha256(canonical.encode()).hexdigest() == value.get("event_hash"),
+                        "QA gap FSM event hash differs")
+                transitions.append(value)
+        transitions.sort(key=lambda event: event["sequence_index"])
+        require(transitions and [event["sequence_index"] for event in transitions] == list(range(1, len(transitions) + 1)),
+                "QA gap FSM transition sequence is incomplete")
+        for index, event in enumerate(transitions):
+            require(event["before"]["sequence_index"] == index and event["after"]["sequence_index"] == index + 1
+                    and (index == 0 or transitions[index - 1]["after"] == event["before"]),
+                    "QA gap FSM transitions do not join")
+        final = transitions[-1]["after"]
+        require(final.get("state") == "insufficient" and final.get("generation_started") is False
+                and final.get("repairs_used") == current.get("repairs_used"), "QA gap FSM terminal differs")
+    traces = []
+    for trace_id in trace_ids:
+        require(isinstance(trace_id, str) and bool(trace_id), "QA retrieval trace identity is invalid")
+        trace = client.request_json("GET", f"/retrieval-traces/{quote(trace_id, safe='')}/graph-steps")
+        require(trace.get("trace_id") == trace_id and trace.get("steps"), "QA retrieval trace identity or steps differ")
+        traces.append(trace)
+    return traces, {"name": "qa_terminal_audit", "pass": True,
+                    "insufficient_evidence": bool(is_gap), "trace_count": len(traces)}
 
 
 def validate_retrieval_rq_seed_diagnostics(trace: dict) -> dict[str, int]:
@@ -339,6 +571,7 @@ def select_smoke_knowledge_base(
     knowledge_bases: list[dict],
     *,
     requested_id: str | None,
+    freshness_loader=None,
 ) -> tuple[dict, str]:
     if requested_id:
         selected = next(
@@ -356,6 +589,11 @@ def select_smoke_knowledge_base(
         and bool(item.get("context_graph_hash"))
         and not item.get("stale_reason")
     ]
+    if freshness_loader is not None:
+        graph_ready = [item for item in graph_ready
+                       if (freshness_loader(item["id"]).get("freshness") or {}).get("is_admissible") is True]
+    else:
+        graph_ready = [item for item in graph_ready if (item.get("freshness") or {}).get("is_admissible") is not False]
     require(
         bool(graph_ready),
         "No graph-ready knowledge base is available; pass --knowledge-base-id "
@@ -364,10 +602,27 @@ def select_smoke_knowledge_base(
     return graph_ready[0], "first_fresh_graph_ready"
 
 
+def safe_smoke_report(payload: dict) -> dict:
+    """Reports contain aggregate checks, never provider or graph payloads."""
+    report = {key: payload[key] for key in ("script", "mode", "execute", "pass", "error_type", "error_code") if key in payload}
+    report["checks"] = []
+    for check in payload.get("checks", []):
+        summary = {key: value for key, value in check.items() if key in {
+            "name", "pass", "count", "nodes", "edges", "result_count", "returned_citation_count", "persisted_citation_span_count",
+            "citation_verification_pass_rate", "source_binding_pass_rate", "insufficient_evidence", "evidence_gate_blocked",
+            "gray_zone_coverage", "gray_zone_coverage_required", "trace_count", "gray_rule_record_count", "red_partition_record_count", "hard_stop_partition_record_count"}}
+        for key in ("contract_counts", "rq_seed_counts", "counts"):
+            if isinstance(check.get(key), dict):
+                summary[key] = {name: number for name, number in check[key].items() if isinstance(number, (int, float))}
+        report["checks"].append(summary)
+    report["selection"] = {key: value for key, value in payload.get("knowledge_base_selection", {}).items() if key in {"reason", "active_chunk_count"}}
+    return report
+
+
 def write_report(payload: dict) -> Path:
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     path = OUTPUT_ROOT / f"docker_smoke_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    path.write_text(json.dumps(safe_smoke_report(payload), ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
 
@@ -523,9 +778,15 @@ def main() -> int:
 
         knowledge_bases = client.request_json("GET", "/knowledge_bases")
         require(isinstance(knowledge_bases, list) and knowledge_bases, "No knowledge bases returned")
+        stats_cache = {}
+        def load_stats(kb_id):
+            if kb_id not in stats_cache:
+                stats_cache[kb_id] = client.request_json("GET", f"/knowledge_bases/{kb_id}/context-graph/stats")
+            return stats_cache[kb_id]
         selected, selection_reason = select_smoke_knowledge_base(
             knowledge_bases,
             requested_id=args.knowledge_base_id,
+            freshness_loader=load_stats,
         )
         knowledge_base_id = selected["id"]
         payload["knowledge_base_id"] = knowledge_base_id
@@ -575,10 +836,12 @@ def main() -> int:
             require(batch.get("state") == "completed", f"Batch did not complete cleanly: {batch}")
             payload["checks"].append({"name": "batch_completed", "pass": True, "payload": batch})
 
-        stats = client.request_json("GET", f"/knowledge_bases/{knowledge_base_id}/context-graph/stats")
+        stats = load_stats(knowledge_base_id)
+        require((stats.get("freshness") or {}).get("is_admissible") is True,
+                "Selected knowledge base is not admissible; rebuild and promote it before Search/QA smoke")
         require((stats.get("counts") or {}).get("active_chunks", 0) > 0, f"No current chunks: {stats}")
         require((stats.get("counts") or {}).get("chunk_relation_edges", 0) >= 0, f"Missing relation stats: {stats}")
-        payload["checks"].append({"name": "context_graph_stats", "pass": True, "payload": stats})
+        payload["checks"].append({"name": "context_graph_stats", "pass": True, "counts": stats.get("counts") or {}})
 
         for graph_type in ("chunk-structure", "chunk-relation", "mid-concepts", "coarse-concepts"):
             graph = client.request_json("GET", f"/knowledge_bases/{knowledge_base_id}/graph/{graph_type}", params={"limit": 80})
@@ -614,7 +877,7 @@ def main() -> int:
             report = write_report(payload)
             print(
                 json.dumps(
-                    {"output": str(report), **payload},
+                    {"output": str(report), **safe_smoke_report(payload), "write_plan": payload["write_plan"]},
                     ensure_ascii=False,
                     default=str,
                 )
@@ -627,23 +890,42 @@ def main() -> int:
             search.get("model_audit") or {}
         ).get("retrieval_trace_id")
         require(bool(trace_id), f"Search did not record retrieval_trace_id: {search}")
-        require(
-            (search.get("model_audit") or {}).get("retrieval_trace_id") == trace_id,
-            f"Search trace identity is inconsistent across the public response: {search}",
+        target_search = (
+            (search.get("execution_strategy") or {}).get("protocol_version")
+            == "intent_execution_strategy_v2"
+            and len(str(search.get("accepted_plan_hash") or "")) == 64
         )
+        if target_search:
+            require(
+                search.get("terminal_outcome") == "completed"
+                and search.get("entry_layer") in {"coarse", "mid", "chunk"}
+                and (search.get("execution_strategy") or {}).get("entry_layer")
+                == search.get("entry_layer"),
+                f"Target Search plan or terminal identity is inconsistent: {search}",
+            )
+        else:
+            require(
+                (search.get("model_audit") or {}).get("retrieval_trace_id")
+                == trace_id,
+                f"Search trace identity is inconsistent across the public response: {search}",
+            )
         search_context_package_id = search.get("context_package_id")
         require(
             bool(search_context_package_id),
             f"Ordinary search did not create a Context Package: {search}",
         )
-        require(
-            (search.get("model_audit") or {}).get("context_package_id")
-            == search_context_package_id,
-            f"Search Context Package identity is inconsistent: {search}",
-        )
-        require((search.get("model_audit") or {}).get("query_rq_path"), f"Search audit did not include query RQ path: {search}")
+        if not target_search:
+            require(
+                (search.get("model_audit") or {}).get("context_package_id")
+                == search_context_package_id,
+                f"Search Context Package identity is inconsistent: {search}",
+            )
+            require(
+                (search.get("model_audit") or {}).get("query_rq_path"),
+                f"Search audit did not include query RQ path: {search}",
+            )
         search_cache_audit = (search.get("model_audit") or {}).get(
-            "retrieval_cache"
+            "intent_retrieval_cache" if target_search else "retrieval_cache"
         )
         require(
             isinstance(search_cache_audit, dict),
@@ -656,18 +938,76 @@ def main() -> int:
             and search_cache_audit.get("gray_zone_model_call_count") == 0,
             f"Search retrieval cache card violated the evidence/gray boundary: {search_cache_audit}",
         )
-        require(any(((item.get("metadata") or {}).get("rq")) for item in search.get("results", [])), f"Search results did not include RQ candidate metrics: {search}")
+        if not target_search:
+            require(
+                any(
+                    ((item.get("metadata") or {}).get("rq"))
+                    for item in search.get("results", [])
+                ),
+                f"Search results did not include RQ candidate metrics: {search}",
+            )
         trace = client.request_json("GET", f"/retrieval-traces/{trace_id}/graph-steps")
         require(trace.get("steps"), f"Retrieval trace has no steps: {trace}")
-        require(
-            not any(step.get("layer") == "fine" for step in trace.get("steps", [])),
-            f"Retrieval trace still exposes RQ prefix as an active traversal layer: {trace}",
-        )
-        rq_seed_counts = validate_retrieval_rq_seed_diagnostics(trace)
-        require(
-            any(step.get("layer") == "chunk" and step.get("action") == "walk_graph_frontier" for step in trace.get("steps", [])),
-            f"Retrieval trace has no active chunk frontier walk: {trace}",
-        )
+        if target_search:
+            require(
+                trace.get("contract_version")
+                == "intent_execution_retrieval_trace_public_v1"
+                and trace.get("entry_layer") == search.get("entry_layer")
+                and trace.get("retrieval_mode")
+                == "intent_execution_retrieval_v1",
+                f"Target Search trace protocol or entry layer differs: {trace}",
+            )
+            result_ids = {
+                str(item.get("chunk_id") or "")
+                for item in search.get("results") or []
+            }
+            path_ids = {
+                str(item.get("chunk_id") or item.get("node_id") or "")
+                for item in trace.get("path_labels") or []
+                if item.get("path") and item.get("root_node_id")
+            }
+            floor_ids = set(
+                (trace.get("topk_selection") or {}).get(
+                    "channel_floor_chunk_ids"
+                )
+                or []
+            )
+            require(
+                result_ids
+                and result_ids <= path_ids
+                and floor_ids <= result_ids,
+                "Target Search result or channel-floor candidate lacks a graph path label",
+            )
+            require(
+                all(
+                    step.get("action")
+                    in {"fuse_and_traverse", "restore_context_package"}
+                    and step.get("cycle_distance_reward", 0) == 0
+                    for step in trace.get("steps") or []
+                ),
+                "Target Search trace contains a non-graph or rewarded step",
+            )
+            rq_seed_counts = {
+                "graph_path_labels": len(path_ids),
+                "channel_floor_chunks": len(floor_ids),
+            }
+        else:
+            require(
+                not any(
+                    step.get("layer") == "fine"
+                    for step in trace.get("steps", [])
+                ),
+                f"Retrieval trace still exposes RQ prefix as an active traversal layer: {trace}",
+            )
+            rq_seed_counts = validate_retrieval_rq_seed_diagnostics(trace)
+            require(
+                any(
+                    step.get("layer") == "chunk"
+                    and step.get("action") == "walk_graph_frontier"
+                    for step in trace.get("steps", [])
+                ),
+                f"Retrieval trace has no active chunk frontier walk: {trace}",
+            )
         search_package = client.request_json(
             "GET", f"/context-packages/{search_context_package_id}"
         )
@@ -705,12 +1045,25 @@ def main() -> int:
         qa_acceptance = validate_qa_acceptance_payload(qa)
         if qa_acceptance["context_package_required"]:
             require(qa.get("context_package_id"), f"QA did not return context_package_id: {qa}")
-        require(qa.get("retrieval_trace_id"), f"QA did not return retrieval_trace_id: {qa}")
-        qa_trace = client.request_json("GET", f"/retrieval-traces/{qa['retrieval_trace_id']}/graph-steps")
-        require(qa_trace.get("steps"), f"QA retrieval trace has no steps: {qa_trace}")
-        gray_zone_trace_audit = audit_gray_zone_traces(
-            [trace, qa_trace],
-            require_gray_coverage=bool(args.require_gray_coverage),
+        qa_traces, terminal_audit = load_qa_retrieval_traces(
+            client, qa, qa_acceptance, knowledge_base_id=knowledge_base_id,
+        )
+        payload["checks"].append(terminal_audit)
+        smoke_traces = [trace, *qa_traces]
+        gray_zone_trace_audit = (
+            audit_target_gray_zone_traces(
+                smoke_traces,
+                require_gray_coverage=bool(args.require_gray_coverage),
+            )
+            if all(
+                item.get("retrieval_mode")
+                == "intent_execution_retrieval_v1"
+                for item in smoke_traces
+            )
+            else audit_gray_zone_traces(
+                smoke_traces,
+                require_gray_coverage=bool(args.require_gray_coverage),
+            )
         )
         require(
             bool(gray_zone_trace_audit["pass"]),
@@ -748,8 +1101,8 @@ def main() -> int:
                 "pass": True,
                 "run_id": qa.get("run_id"),
                 "answer_session_id": qa_audit.get("answer_session_id"),
-                "retrieval_trace_id": qa["retrieval_trace_id"],
-                "context_package_id": qa["context_package_id"],
+                "retrieval_trace_id": qa.get("retrieval_trace_id"),
+                "context_package_id": qa.get("context_package_id"),
                 "returned_citation_count": qa_acceptance[
                     "returned_citation_count"
                 ],
@@ -757,6 +1110,7 @@ def main() -> int:
                     package.get("citation_spans") or []
                 ),
                 "citation_verification_pass_rate": pass_rate,
+                "source_binding_pass_rate": qa_acceptance.get("source_binding_pass_rate"),
                 "grounding_outcome": qa_audit.get("grounding_outcome"),
                 "insufficient_evidence": qa_acceptance[
                     "insufficient_evidence"
@@ -769,9 +1123,10 @@ def main() -> int:
         payload["pass"] = True
     except Exception as exc:
         payload["pass"] = False
-        payload["error"] = str(exc)
+        payload["error_type"] = type(exc).__name__
+        payload["error_code"] = exc.error_code if isinstance(exc, SmokeTransportError) else "preflight_or_acceptance_check_failed"
         report = write_report(payload)
-        print(json.dumps({"output": str(report), "pass": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps({"output": str(report), "pass": False, "error_type": payload["error_type"], "error_code": payload["error_code"]}, ensure_ascii=False), file=sys.stderr)
         return 1
     report = write_report(payload)
     print(json.dumps({"output": str(report), "pass": True, "checks": len(payload["checks"])}, ensure_ascii=False))

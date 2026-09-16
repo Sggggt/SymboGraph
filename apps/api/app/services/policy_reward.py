@@ -2687,6 +2687,7 @@ def _build_agent_facts(
                 knowledge_base_id=knowledge_base_id,
                 require_required_actions=False,
                 retrieval_granularity=retrieval_granularity,
+                required_actions_override=historical_typed_action_required_actions_for_replay(validation_payload),
                 historical_target_layers_override=(
                     historical_target_layers_for_replay(
                         [appended_payload],
@@ -4629,13 +4630,23 @@ def replay_policy_reward_event(
     db: Session,
     reward: RewardEvent | str,
 ) -> dict[str, Any]:
-    """Rebuild and exactly compare the stored v3 evidence, metrics and fact."""
+    """Replay the frozen reward protocol without converting structural proxies into semantic scores."""
 
     row = (
         _load_row(db, RewardEvent, reward, field="reward_event")
         if isinstance(reward, str)
         else reward
     )
+    if (row.reward_json or {}).get("protocol_version") == "answer_reflection_reward_v1":
+        from app.services.reflection_reward import replay_reflection_reward
+
+        try:
+            metrics = replay_reflection_reward(db, row)
+        except Exception as exc:
+            raise PolicyRewardReplayError(f"Reflection reward replay failed ({type(exc).__name__})") from None
+        if metrics != row.reward_json or (row.diagnostics_json or {}).get("protocol_version") != "answer_reflection_reward_v1":
+            _fail("Reflection RewardEvent metrics or protocol do not match replay")
+        return {"protocol_version": "answer_reflection_reward_v1", "metrics": metrics, "evidence_hash": metrics["evidence_hash"]}
     rebuilt = build_policy_reward_replay(db, row)
     reward_json = dict(row.reward_json or {})
     diagnostics = dict(row.diagnostics_json or {})

@@ -1,178 +1,60 @@
 # API 后端
 
-## 项目简介
+FastAPI 负责资料库、导入、四层图、检索、QA 和运行配置。Worker 调用同一 service 层，不维护第二套业务实现。
 
-`apps/api` 是 SymboGraph 的 FastAPI 后端，负责知识库、上传、解析、固定 token chunk、Chunk Structure Graph、Chunk Relation Graph、RQ membership、Mid/Coarse Concept Graph、layered retrieval、context package、QA、citation verification、runtime settings 和维护入口。
+## 入口
 
-首次构图与普通重建复用同一 ingestion/context-graph 事务、补偿和恢复协议；模型配置只读取根 `.env` 中已按生命周期生效的 Runtime Settings。
+| 文件或模块 | 职责 |
+|---|---|
+| `app/main.py`、`app/api.py`、`app/routers/` | 应用启动、中间件和路由 |
+| `app/models.py`、`app/schemas.py`、`migrations/` | 数据、请求/响应、迁移与约束 |
+| `app/core/config.py`、`app/core/runtime_config.py`、`services/runtime_settings.py` | 双文件配置解析、原子更新和三级生命周期 |
+| `services/ingestion.py`、`parsers.py`、`source_parse_pipeline.py` | 文件解析、版本和补偿 |
+| `services/context_graph.py`、`auto_tpe.py`、`graph_build_workspace.py` | 四层图和构建计算 |
+| `services/intent_execution_agent.py`、`intent_planning.py`、`layered_execution_v1.py` | 当前 Search/QA/SSE 规划、图执行与终态 |
+| `services/retrieval_agent.py`、`retrieval_fsm.py`、`reflection_*` | 历史记录重放与兼容测试，不是目标 serving 主链 |
+| `services/evidence_scope.py`、`source_location.py`、`source_use.py` | 原文范围、位置和用途 |
+| `services/answer_sources.py`、`citation_provenance.py`、`agent_pe_audit.py` | 来源绑定与审计 |
+| `intent_contracts.py`、`services/entry_ranking.py` | 当前意图/策略契约、RQ 重构与 `weighted_rrf_entry_v2` 图入口融合 |
+| `services/lexical_index.py`、`lexical_storage.py` | 原文 BM25、快照重放、候选与发布事务 |
+| `services/qa_performance.py`、`build_performance.py` | 阶段计时 |
+| `services/qdrant_outbox.py`、`maintenance.py` | 派生状态、恢复与维护 |
 
-## 目录
+目标协议已成为当前运行入口：LLM 在一次规划中选择三个根入口并返回 `intent_execution_strategy_v2`；开启双语词面时，可翻译概念组同时携带中英文 surface，标识符和数值保持 neutral。空词面使用 Dense-only，混合计划按层执行 Dense/RQ/BM25 独立提名和图路径遍历。Context Package 经确定性来源准入后只生成一次回答。
 
-| 路径 | 职责 |
-| --- | --- |
-| `app/api.py` | API 路由汇总入口。 |
-| `app/main.py` | FastAPI 应用、CORS、API key 和启动检查。 |
-| `app/models.py` | SQLAlchemy 数据模型、生命周期状态和审计表。 |
-| `app/schemas.py` | Pydantic 请求与响应契约。 |
-| `app/core/config.py` | `.env`、runtime settings 和配置边界。 |
-| `app/services/ingestion.py` | 导入、解析、版本、取消和重建编排。 |
-| `app/services/context_graph.py` | 结构图、独立关系图、RQ address/membership、L3/L2 concept projection、layered retrieval 和 context package。 |
-| `app/services/auto_tpe.py` | chunk 最高版本递增时的自动 TPE 底层关系图工作点选择、trial 诊断和只读状态。 |
-| `app/services/agent_graph.py` | QA、typed action、Agent trace、citation verification 和 reward/policy audit。 |
-| `app/services/retrieval.py` | Layered search facade。 |
-| `app/services/runtime_settings.py` | `.env` 写入、Redis version broadcast、热加载。 |
-| `app/services/maintenance.py` | 清理、对账、补偿和维护操作。 |
-| `app/services/error_sanitizer.py` | 外部模型、embedding、runtime probe 错误脱敏，防止 API key、Authorization header 或 provider 原始响应进入日志/API 响应。 |
-| `migrations/` | Alembic schema。 |
-| `tests/` | API 回归测试。 |
+一次回答的闭合 JSON 在 `answer_units[].text` 中承载 GFM。生成提示明确要求结构化任务按需使用标题、列表、表格和代码块，数学表达使用 `$...$` 或 `$$...$$`，并禁止在外层 JSON 周围添加 Markdown fence。完整响应恰好是一层 `json` fence 时，解析器只剥离这一层兼容包装再执行同一闭合 schema；额外 prose 与非对象根仍失败关闭。普通段落仅在 schema 校验后增加展示用列表标记，不改写事实文字或来源。
 
-## 产品定位
+完整语义见[技术白皮书](../../docs/technical-spec.md)。`reflection_*` 中仍有当前来源恢复/重放依赖，兼容边界见[说明](../../docs/reference/compatibility.md)。
 
-API 层是生产形态的编排层。PostgreSQL 是事实源，Qdrant 和 Redis 是 active 派生或运行态存储；Worker 只复用这里的 service 逻辑，不复制解析、索引、图谱、检索或问答实现。
+FastAPI 路由已注册不等于当前产品 Web 正在调用。接口变更时同步核对 App Router 可达组件、`api.ts`、router、scripts 和兼容调用方。
 
-## 技术栈
+## 运行
 
-| 范围 | 技术 |
-| --- | --- |
-| Web API | FastAPI, Pydantic |
-| ORM / Migration | SQLAlchemy, Alembic |
-| 存储 | PostgreSQL, Qdrant, Redis |
-| 异步任务 | Celery 调用 API service logic |
-| 检索 | Dense embedding, dense-only chunk relation graph, RQ membership, staged layered traversal |
-| QA | OpenAI-compatible chat endpoint, typed action validator, citation verification |
+使用根启动器或现有 Compose project。API 容器工作目录为 `/app/apps/api`；脚本在 `/app/scripts`，原文数据在 `/app/data`，共享配置绑定为 `/workspace/.env` 与 `/workspace/settings.json`。
 
-## 主链路
+根 `.env` 只维护秘密、连接和服务启动字段；根 `settings.json` 只维护非秘密运行、检索与构建字段。两者键集合不相交，不创建 `apps/api/.env`、模块级 JSON 或数据库 active/desired 参数副本。迁移和核对入口见[脚本说明](../../scripts/README.md)。
 
-```text
-upload / source files
--> parser and layout extractor
--> fixed token chunks
--> chunk structure graph
--> contextual embedding and vector index
--> optional automatic TPE operating point selection on chunk-version increments
--> independent chunk relation graph
--> RQ primary prefix address tree and membership
--> RQ L3 mid concept graph / RQ L2 coarse concept graph
--> context graph state
--> layered search or Agent QA
--> context package
--> citation verification
--> reward and policy state
-```
-
-## 环境配置
-
-API 从仓库根目录 `.env` 和 `apps/api/.env` 读取配置。Docker Compose 使用容器网络地址作为服务端连接：
-
-```text
-DATABASE_URL=postgresql+psycopg://<user>:<local-password>@postgres:5432/<database>
-QDRANT_URL=http://qdrant:6333
-REDIS_URL=redis://redis:6379/0
-DATA_ROOT=/app/data
-```
-
-对话、图谱、向量分别使用独立协议字段。对话与图谱可各自选择 `openai` 或 `anthropic`；向量当前只允许真实的 OpenAI-compatible 协议：
-
-```text
-CHAT_API_KEY
-CHAT_API_PROTOCOL
-CHAT_BASE_URL
-CHAT_MODEL
-GRAPH_API_KEY
-GRAPH_API_PROTOCOL
-GRAPH_BASE_URL
-GRAPH_MODEL
-EMBEDDING_API_KEY
-EMBEDDING_API_PROTOCOL
-EMBEDDING_BASE_URL
-EMBEDDING_MODEL
-EMBEDDING_DIMENSIONS
-```
-
-chat/graph 的 `anthropic` 模式使用 Anthropic Messages 契约：base 填 provider 根地址或路径前缀，不能以 `/v1` 或 `/v1/messages` 结尾，客户端固定追加 `/v1/messages`，并仅发送 `X-Api-Key`、固定 `Anthropic-Version` 与 JSON 头。chat/graph 的 `openai` 模式固定追加 `/chat/completions`。`EMBEDDING_API_PROTOCOL` 当前闭合为 `openai`，固定追加 `/embeddings`；它属于 `rebuild_required` candidate，不能通过普通 active settings PUT 热切换，也不能填写 `anthropic`。
-
-正常 active path 保持 `ENABLE_MODEL_FALLBACK=false` 和 `ENABLE_DATABASE_FALLBACK=false`。
-
-## 快速启动
-
-推荐从仓库根目录启动 Docker 栈：
+Alembic 保留上一推送版本已有的 baseline、`20260822_0043` 和 `20260824_0044`，当前版本只增加 `20260916_0045_upgrade_from_v7_1_2.py`。该迁移从上一推送 schema 一次创建来源绑定、保留/扩展、lexical policy/reward 与 BM25 生命周期表，并收敛既有约束和索引；不依赖已删除的中间开发 revision。
 
 ```powershell
-docker compose -f infra/docker-compose.yml up -d --build api worker postgres redis qdrant
+docker exec course-kg-api python -m pytest tests
+docker exec course-kg-api python /app/scripts/check_release_schema.py --help
 ```
 
-健康检查：
+后端支持 Python 3.11 以上，Docker 镜像使用锁定的 Python 3.13 环境和 `uv.lock`。纯单元测试可以使用隔离开发环境；生产形态 PostgreSQL/Qdrant/Redis/模型集成须在 Docker 内执行。
 
-```powershell
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health
-```
+## 修改与验证
 
-## 参数列表
+更新行为时同步 schema、shared types、相关 scripts 与 tests。来源写入保持显式事务；外部副作用先保存意图。出错时保留安全原因，不能吞掉关键审计或启用 fallback 伪装成功。
 
-| 分类 | 参数 |
-| --- | --- |
-| 基础设施 | `DATABASE_URL`, `QDRANT_URL`, `QDRANT_COLLECTION`, `REDIS_URL`, `CORS_ORIGINS`, `API_KEYS` |
-| 对话模型 | `CHAT_API_KEY`, `CHAT_API_PROTOCOL` (`openai`/`anthropic`), `CHAT_BASE_URL`, `CHAT_RESOLVE_IP`, `CHAT_MODEL` |
-| 图谱模型 | `GRAPH_API_KEY`, `GRAPH_API_PROTOCOL` (`openai`/`anthropic`), `GRAPH_BASE_URL`, `GRAPH_RESOLVE_IP`, `GRAPH_MODEL` |
-| 向量模型 | `EMBEDDING_API_KEY`, `EMBEDDING_API_PROTOCOL` (`openai`), `EMBEDDING_BASE_URL`, `EMBEDDING_RESOLVE_IP`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_BATCH_SIZE` |
-| 模型桥接 | `MODEL_BRIDGE_ENABLED`, `MODEL_BRIDGE_PORT`, `MODEL_BRIDGE_ADMIN_TOKEN` |
-| 片段与图构建 | `FIXED_CHUNK_SIZE_TOKENS`, `FIXED_CHUNK_OVERLAP_TOKENS`, `RQ_KMEANS_LEVELS`, `RQ_KMEANS_MAX_K`, `RQ_RESIDUAL_TAU` |
-| 稠密关系运行点 | `DENSE_KNN_K_MIN`, `DENSE_KNN_K_MAX`, `DENSE_REVERSE_B_MIN_BASE`, `DENSE_REVERSE_B_MAX_BASE`, `DENSE_REVERSE_B_MIN_DOC`, `DENSE_REVERSE_B_MAX_DOC`, `DENSE_REVERSE_B_MIN_LANG`, `DENSE_REVERSE_B_MAX_LANG`, `DENSE_MIN_COSINE`, `DENSE_STRONG_COSINE`, `CROSS_DOC_OUT_QUOTA_MIN`, `CROSS_DOC_OUT_QUOTA_MAX`, `CROSS_DOC_MIN_COSINE`, `CROSS_LANGUAGE_OUT_QUOTA_MIN`, `CROSS_LANGUAGE_OUT_QUOTA_MAX`, `CROSS_LANGUAGE_MIN_COSINE` |
-| 自动 TPE 运行点 | `ENABLE_AUTO_TPE`, `TPE_TRIAL_BUDGET`, `TPE_STARTUP_RANDOM_TRIALS`, `TPE_GOOD_QUANTILE_GAMMA`, `TPE_PROBE_QUERY_BUDGET`, `TPE_TRIAL_TIMEOUT_SECONDS`, `TPE_CANDIDATE_POOL_SIZE` |
-| 运行点硬门限 | `OPERATING_POINT_HARD_GATE_MAX_EDGE_DENSITY`, `OPERATING_POINT_HARD_GATE_MAX_ISOLATED_RATIO`, `OPERATING_POINT_HARD_GATE_MAX_HUBNESS_RATIO`, `OPERATING_POINT_HARD_GATE_MIN_STRUCTURE_RECOVERY_RATE`, `OPERATING_POINT_HARD_GATE_MAX_CANDIDATE_LATENCY_P95_MS` |
-| 智能体遍历预算 | `AGENT_COARSE_INITIAL_BUDGET`, `AGENT_COARSE_TOP_K`, `AGENT_MID_PER_COARSE_BUDGET`, `AGENT_COARSE_DRILLDOWN_MID_INITIAL_BUDGET`, `AGENT_MID_INITIAL_BUDGET`, `AGENT_MID_TOP_K`, `AGENT_CHUNK_PER_MID_BUDGET`, `AGENT_CHUNK_INITIAL_BUDGET`, `AGENT_CHUNK_TOP_K`, `CANDIDATE_POOL_DEDUPE_BUDGET` |
-| 智能体路径与上下文边界 | `AGENT_MAX_DEPTH_PER_LAYER`, `AGENT_MAX_LABELS_PER_NODE`, `AGENT_MAX_EDGE_REUSE`, `AGENT_MAX_CYCLE_REWARD_PER_PATH`, `AGENT_CYCLE_REWARD_DISTANCE_THRESHOLD`, `AGENT_PATH_DISTANCE_GREEN_THRESHOLD`, `AGENT_PATH_DISTANCE_GRAY_THRESHOLD`, `AGENT_PATH_DISTANCE_HARD_THRESHOLD`, `AGENT_STRUCTURE_RESTORE_PER_CHUNK_BUDGET`, `CONTEXT_PATH_SUMMARY_BUDGET` |
-| 智能体规划与验证边界 | `AGENT_PLANNING_ROUND_BUDGET`, `AGENT_MAX_TYPED_ACTIONS_PER_ROUND`, `AGENT_REPAIR_ROUND_BUDGET`, `AGENT_VERIFICATION_BUDGET` |
-| 智能体兼容别名 | `AGENT_COARSE_TOTAL_BUDGET`, `AGENT_STRUCTURE_RESTORE_BUDGET` |
-| 运行边界 | `ENABLE_MODEL_FALLBACK`, `ENABLE_DATABASE_FALLBACK`, `MODEL_REQUEST_CONCURRENCY`, `MODEL_REQUEST_TIMEOUT_SECONDS` |
+`/qa/stream` 在长规划、图检索和生成等待期间发送 10 秒间隔的 SSE 注释保活，并关闭代理缓冲。保活帧不进入 Agent trace。请求接纳后由独立 run owner 持有数据库会话与租约，SSE 连接只是观察者；页面离开、刷新或网络断线只结束观察，不取消执行。显式取消才会设置取消信号。生成使用 provider 原生文本 delta，增量 JSON 投影器只发布 `answer_units[].text`，完成 schema/来源校验后以至多一个 `answer_replace` 收敛展示格式；不存在回答完成后的 256 字符伪流式切片。首个可见增量进入 `first_response_ms`/`first_token_ms`。所有完成、失败和取消终态都持久化，客户端可按 run 恢复。
 
-## 验证
+问答请求接纳并创建 run 后，先将用户问题写入 PostgreSQL 会话，再开始规划、检索或模型调用。成功时追加回答；失败或取消时追加安全终态文案，因此已接纳的问题不会因执行异常丢失。会话列表逐条校验当前公共 schema，只返回兼容会话；一个旧协议或损坏会话只产生安全排除计数，不能使整个列表返回 500。被排除记录不删除、不改写，按 id 读取返回 409。历史来源的严格物理重放仍在 `verified_context_reuse` 前执行，失败时禁用复用并进入新的正式图检索。
 
-从 `apps/api` 执行：
+显式删除会话会移除 transcript/state，并把关联 run 与 AnswerSession 的 session 外键置空；run、来源绑定、来源准入 observation 和其他审计事实不随 UI 会话删除。PostgreSQL 路径使用单条 `DELETE ... RETURNING`，由两个 `ON DELETE SET NULL` 外键在同一语句内解绑；SQLite 测试/兼容路径显式执行等价更新。
 
-```powershell
-python -m pytest tests
-```
+图遍历允许同一 chunk 从不同根路径到达；公开 Search/QA 结果在 `top_k` 前按稳定路径优先级去重，并记录原始路径候选、唯一节点和重复路径数量。`SearchResponse` 对重复 `chunk_id` fail closed，前端可以安全使用 chunk id 作为组件身份。
 
-容器内执行：
+在线请求使用有界图准入核对 active 指针、协议、freshness 与各层精确计数；构建、promotion、reconcile 和质量验收继续使用逐项深度准入。多 requirement 的 BM25 共享一次原文域/统计核验和联合 postings 读取，但每个 requirement 与完整查询分别计分、排序和截断，结果与逐视图执行等价。
 
-```powershell
-docker exec -w /app/apps/api course-kg-api python -m pytest tests
-```
-
-## 运维测试
-
-从仓库根目录执行：
-
-```powershell
-python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
-python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api --execute
-python scripts/diagnose_context_graph.py
-python scripts/evaluate_layered_retrieval.py
-python scripts/evaluate_layered_retrieval.py --query "<query>" --execute
-python scripts/check_context_package_quality.py
-python scripts/check_technical_spec_compliance.py --knowledge-base-name "<knowledge-base-name>"
-python scripts/reconcile_vector_records.py
-```
-
-Docker smoke 第一条命令只执行 GET 预检；确认报告中的精确 KB/query/POST
-目标后才运行带 `--execute` 的第二条。Layered retrieval evaluator 默认只重放
-已持久化 trace，新检索必须显式提供 query 与 `--execute`。
-
-## 文档
-
-- [../../docs/technical-spec.md](../../docs/technical-spec.md)：Four-Layer Context Graph RAG 技术白皮书。
-- [../../scripts/README.md](../../scripts/README.md)：运维脚本说明。
-- [tests/README.md](tests/README.md)：API 测试说明。
-
-## 边界
-
-- API 层负责后端编排，Worker 不复制实现。
-- PostgreSQL 保存事实源、生命周期、trace、answer audit、citation verification、reward 和 compensation。
-- Qdrant 和 Redis 必须可从 PostgreSQL 重建或刷新。
-- 结构图只用于原文地址和上下文恢复，不进入 chunk relation graph。
-- Mid concepts 必须由 RQ L3 prefixes 投影，Coarse concepts 必须由 RQ L2 prefixes 投影。
-- Mid/coarse edges 必须由底层 chunk relation edge support 投影。
-- 外部副作用失败必须写 compensation log 并抛出可行动错误。
-- QA 事实只来自 context package 和 raw chunk citation span。
-- 无 fallback 的集成路径必须在 Docker 栈内验证。
+新增耗时阶段先加入强类型 allowlist。新模型调用先保存 prepared 意图，完成后才写 completed；技术超时与证据不足分开。测试分组见 [tests](tests/README.md) 和[开发说明](../../docs/development.md)。

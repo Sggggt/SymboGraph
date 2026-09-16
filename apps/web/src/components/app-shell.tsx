@@ -3,27 +3,32 @@
 import { useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
+import dynamic from "next/dynamic";
 import { usePathname } from "next/navigation";
 import { motion } from "framer-motion";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { BookOpenText, BrainCircuit, FolderPlus, Home, RefreshCw, Search, Settings, Share2, Sparkles, TerminalSquare, Trash2, Upload } from "lucide-react";
+import { BookOpenText, BrainCircuit, FolderPlus, Home, LoaderCircle, RefreshCw, Settings, Share2, Sparkles, TerminalSquare, Trash2, Upload } from "lucide-react";
 
-import { AmbientCanvas } from "@/components/ambient-canvas";
 import { useKnowledgeBaseContext } from "@/components/knowledge-base-context";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { OverflowTooltip } from "@/components/overflow-tooltip";
 import { deleteKnowledgeBase, refreshKnowledgeBase } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const navigation = [
   { href: "/", label: "概览", caption: "首页", icon: Home },
   { href: "/upload", label: "导入", caption: "导入", icon: Upload },
-  { href: "/search", label: "搜索", caption: "搜索", icon: Search },
   { href: "/qa", label: "问答", caption: "对话", icon: BrainCircuit },
   { href: "/graph", label: "图谱", caption: "图谱", icon: Share2 },
   { href: "/settings", label: "设置", caption: "模型", icon: Settings },
 ];
+
+const AmbientCanvas = dynamic(
+  () => import("@/components/ambient-canvas").then((module) => module.AmbientCanvas),
+  { ssr: false },
+);
 
 const CREATE_KB_TUTORIAL_STORAGE_KEY = "symbograph.hideCreateKnowledgeBaseTutorial";
 
@@ -74,8 +79,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   });
 
   return (
-    <div className="kg-future-field relative min-h-screen overflow-x-hidden bg-[#030714] text-foreground">
+    <div className="kg-future-field kg-text-boundary relative min-h-screen overflow-x-hidden bg-[#030714] text-foreground">
       <AmbientCanvas />
+      <OverflowTooltip />
 
       <aside className="fixed inset-y-0 left-0 z-40 hidden w-[76px] border-r border-white/7 bg-[rgba(3,7,20,0.55)] backdrop-blur-2xl lg:flex lg:flex-col lg:items-center lg:gap-7 lg:py-6">
         <Image
@@ -117,8 +123,28 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </nav>
       </aside>
 
+      <nav className="fixed inset-x-3 bottom-3 z-50 grid grid-cols-5 rounded-2xl border border-cyan-100/12 bg-[rgba(3,8,21,0.92)] px-1 py-1.5 shadow-[0_16px_44px_rgba(0,0,0,0.42)] backdrop-blur-2xl lg:hidden" aria-label="移动端主导航">
+        {navigation.map(({ href, caption, icon: Icon }) => {
+          const active = pathname === href;
+          return (
+            <Link
+              key={href}
+              href={href}
+              aria-current={active ? "page" : undefined}
+              className={cn(
+                "flex min-w-0 flex-col items-center gap-1 px-1 py-1.5 text-[10px] text-white/44 transition",
+                active && "text-cyan-100",
+              )}
+            >
+              <Icon className="size-4" />
+              <span className="truncate">{caption}</span>
+            </Link>
+          );
+        })}
+      </nav>
+
       <div className="relative min-h-screen lg:pl-[76px]">
-        <header className="fixed inset-x-0 top-0 z-30 border-b border-white/6 bg-[rgba(3,7,20,0.78)] backdrop-blur-2xl lg:left-[76px]">
+        <header className="fixed inset-x-0 top-0 z-30 bg-[rgba(3,7,20,0.78)] shadow-[0_18px_48px_rgba(0,0,0,0.16)] backdrop-blur-2xl lg:left-[76px]">
           <div className="flex flex-wrap items-center justify-between gap-4 px-5 py-3 lg:px-7">
             <div className="flex min-w-0 items-center gap-3">
               <Image
@@ -207,7 +233,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </div>
         </header>
 
-        <main className="px-4 pb-5 pt-[12.5rem] sm:pt-[10.5rem] lg:px-7 lg:pb-7 lg:pt-[8.5rem]">
+        <main className="px-4 pb-24 pt-[12.5rem] sm:pt-[10.5rem] lg:px-6 lg:pb-7 lg:pt-[8.5rem] xl:px-8 2xl:px-10">
           <div className="flex w-full flex-col gap-8">{children}</div>
         </main>
       </div>
@@ -216,7 +242,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.88)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl">
           <DialogHeader className="border-b border-white/8 px-6 py-5">
             <DialogTitle>新建资料库空间</DialogTitle>
-            <DialogDescription>创建资料库看板、图谱、搜索和问答上下文。资料文件会统一进入当前资料库存储文件夹。</DialogDescription>
+            <DialogDescription>创建资料库看板、图谱和问答上下文。资料文件会统一进入当前资料库存储文件夹。</DialogDescription>
           </DialogHeader>
           <form
             className="space-y-4 px-6 py-5"
@@ -338,11 +364,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </DialogHeader>
           <div className="space-y-4 px-6 py-5">
             {deleteKnowledgeBaseMutation.isPending ? (
-              <div>
-                <p className="text-sm text-white/72">正在删除资料库数据...</p>
-                <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/8">
-                  <div className="h-full w-2/3 animate-pulse rounded-full bg-[linear-gradient(90deg,#fb7185,#fbbf24,#fb7185)]" />
-                </div>
+              <div className="flex items-center gap-3 text-sm text-white/72" role="status">
+                <LoaderCircle className="size-5 animate-spin text-rose-100" />
+                正在删除资料库数据...
               </div>
             ) : deleteKnowledgeBaseResult ? (
               <p className="rounded-2xl border border-emerald-200/16 bg-emerald-300/[0.055] px-4 py-3 text-sm leading-6 text-emerald-50/78">{deleteKnowledgeBaseResult}</p>

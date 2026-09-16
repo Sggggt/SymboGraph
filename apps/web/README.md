@@ -1,103 +1,38 @@
 # Web 前端
 
-## 项目简介
+Next.js 16.2.4、React 和 TypeScript 提供资料库管理、上传、图谱、引用问答和设置界面。检索由问答流程调用，前端不再提供独立检索页。
 
-`apps/web` 是 SymboGraph 的 Next.js 前端，用于管理本地知识库、上传资料、查看导入日志、浏览四层图谱、执行 layered search、展开 context package、进行引用问答并配置 profile/runtime settings。
+## 代码地图
 
-## 目录
+| 位置 | 内容 |
+|---|---|
+| `src/app/` | App Router 页面 |
+| `src/components/app-shell.tsx` | 导航与资料库切换 |
+| `upload-workspace.tsx` | 导入、全量重解析和批次状态 |
+| `graph-panel.tsx` | 四层图与自然语言节点详情 |
+| `qa-workspace.tsx` | 持久对话、SSE 终态、引用和受控诊断 |
+| `markdown-renderer.tsx` | GFM、代码块与 KaTeX 富文本渲染 |
+| `overflow-tooltip.tsx` | 卡片溢出检测与延迟一秒全文提示 |
+| `settings-workspace.tsx` | Profile 与 Runtime Settings |
+| `src/lib/api.ts` | API 请求和共享类型 |
+| `src/lib/agent-trace.ts` | 状态和审计的展示映射 |
 
-| 路径 | 职责 |
-| --- | --- |
-| `src/app/` | Next.js App Router 页面入口。 |
-| `src/components/app-shell.tsx` | 应用壳层、导航、资料库切换。 |
-| `src/components/overview-dashboard.tsx` | 知识库概览、导入状态和快捷入口。 |
-| `src/components/upload-workspace.tsx` | 上传、全量重新解析、批次状态、中文日志流和自动 TPE 参数/状态弹窗。 |
-| `src/components/graph-panel.tsx` | Chunk Structure、Chunk Relations / RQ Membership、Mid Concepts、Coarse Concepts，以及双击节点后的自然语言详情卡片。 |
-| `src/components/search-workspace.tsx` | Layered search、trace、context package 和图路径。 |
-| `src/components/qa-workspace.tsx` | QA、Agent trace、citations、verification 和会话。 |
-| `src/components/settings-workspace.tsx` | Profile settings 与 runtime settings。 |
-| `src/lib/api.ts` | 后端 API 集中入口。 |
-| `src/lib/agent-trace.ts` | Agent trace 中文展示映射。 |
-| `src/lib/ingestion-log-meta.ts` | 导入日志阶段中文展示映射。 |
+未写目录的组件文件位于 `src/components/`。
 
-## 产品定位
+产品路由可达性以 App Router 入口、实际导入的组件和 `api.ts` 调用图为准。源码中存在组件或包装器不能作为产品在用证据。
 
-Web 前端是四层图谱和问答审计的可视化入口。搜索页展示 deterministic layered traversal、RQ membership seed、frontier/path diagnostics 和 context package；QA 页面展示 Agent 计划、typed actions、observations、citation verification 和 repair；设置页分离 Profile Settings 与 Runtime Settings。
+## 开发
 
-## 技术栈
-
-| 范围 | 技术 |
-| --- | --- |
-| Framework | Next.js 16.2.4 App Router |
-| UI | React 19.2.4, TypeScript, Tailwind CSS, lucide-react |
-| 数据 | TanStack Query, shared TypeScript contracts |
-| 图谱 | ECharts |
-| 测试 | Vitest, ESLint, TypeScript typecheck |
-
-修改 `apps/web` 前必须优先查看本地 Next.js 文档：
-
-```text
-apps/web/node_modules/next/dist/docs/
-```
-
-若本地文档不存在，以当前依赖版本、现有代码和实际构建结果为准。
-
-## 主链路
-
-```text
-dashboard
--> upload / batch log / automatic TPE controls
--> graph payload
--> layered search trace
--> RQ membership seed diagnostics
--> context package
--> QA stream
--> Agent trace groups
--> citation verification
--> runtime/profile settings
-```
-
-## 环境配置
-
-Web 的浏览器端 API 地址必须使用宿主机可访问地址。Docker Compose 和 Dockerfile 当前都注入：
-
-```env
-NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000/api
-```
-
-`infra/docker-compose.yml` 会按 `API_HOST_PORT` 生成 `http://127.0.0.1:${API_HOST_PORT:-8000}/api`；`src/lib/api.ts` 在未设置该变量时回退到 `http://localhost:8000/api`。
-
-本地浏览器访问默认地址：
-
-```text
-http://127.0.0.1:3000
-```
-
-## 快速启动
-
-推荐通过 Docker Compose：
+从仓库根安装锁定依赖：
 
 ```powershell
-docker compose -f infra/docker-compose.yml up -d --build web
-```
-
-本地开发：
-
-```powershell
+npm ci
 npm run dev --workspace web
 ```
 
-## 参数列表
+依赖提升后，本地 Next.js 文档通常在 `node_modules/next/dist/docs/`；也检查 `apps/web/node_modules/next/dist/docs/`。修改前以本地 16.2.4 文档和当前构建为准。
 
-| 分类 | 参数 |
-| --- | --- |
-| API | `NEXT_PUBLIC_API_BASE_URL` |
-| Next.js | 版本固定在 `apps/web/package.json` 的 `next@16.2.4` |
-| 测试 | `npm run typecheck --workspace web`, `npm run lint --workspace web`, `npm run test --workspace web` |
-
-## 验证
-
-从仓库根目录执行：
+默认 API 为 `http://127.0.0.1:8000/api`。Web 已从本项目 Compose 移出，使用 `start-web.ps1` 或根 `start-app.ps1` 在宿主启动；资源管理器双击对应 `.bat` 时，启动窗口会在成功或失败后等待按键，服务继续在后台运行。端口、构建和运行方式见 [infra](../../infra/README.md)。不要创建另一份后端运行配置。
 
 ```powershell
 npm run typecheck --workspace web
@@ -105,36 +40,20 @@ npm run lint --workspace web
 npm run test --workspace web
 ```
 
-前端可视变更需要浏览器检查关键页面：
+## 界面边界
 
-```text
-/upload
-/search
-/qa
-/graph
-/settings
-```
+界面已取消普通/摘要模式选择器及请求中的 `retrieval_granularity`。意图、入口层和权重来自服务端 LLM 策略；产品页展示简短执行说明，具体分数/权重矩阵只放诊断入口。回答简洁度或格式偏好与检索层级分开，不能通过前端默认值重新建立固定映射。
 
-## 运维测试
+服务端状态优先用 React Query，mutation 后明确失效缓存。会话消息使用稳定 query key 和无限 staleTime，同一 App 生命周期中离开再进入问答页直接显示缓存，不重新加载对话；完整刷新只用一次 messages 响应水合消息、引用和最近 trace，不逐 run 串行补取。进入问答页时自动恢复当前资料库最近的持久会话；用户显式新建会话后保持空白，`activeSessionId=null` 不等于存在水合任务。手动选择历史时先读取消息再提交 activeSessionId；删除时先乐观移除列表项，失败恢复缓存，成功后的服务端重取不延长 mutation。缓存项对应的服务端会话已不存在时移除该项、刷新列表并显示可读提示，不抛出未处理 Promise。模型配置和会话首次水合期间显示统一旋转图标，不把尚未返回的数据写成“模型不可用”，也不使用加载卡片或 skeleton。SSE token 直接追加到当前回答，`answer_replace` 只负责最终校验后的展示收敛；生成期间跟随底部平滑滚动，终态后停止主动滚动。SSE 收到完成、失败或取消后，不能重新显示加载中；拿到 run id 后若连接中断，后台 owner 继续执行，页面保留本轮指针并轮询持久 run，恢复完成、失败或取消终态。SSE keep-alive 注释不显示为 trace。
 
-```powershell
-python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
-```
+全站内容使用可用宽度，不再由 `.kg-page` 固定居中上限压缩。圆角、完整边框和背景由组件自身决定；禁止全局把圆角改为 0 或只保留上下边框。问答恢复上一提交版的居中标题、嵌入式智能体消息和固定输入区，空状态不生成资料名或固定问题胶囊。运行设置按模型连接、运行控制、检索入口、图协议、重建参数和服务参数分页，桌面使用右侧嵌入导航，移动端在导航内部横向滚动。
 
-截图、视觉 QA 和临时浏览器输出写入被 Git 忽略的 `output/`，核验后清空。
+主导航固定为概览、导入、问答、图谱和设置，`/search` 不属于产品路由。卡片及弹窗中需要单行收敛的标题/标识使用显式 `data-overflow-text` 或 `truncate` 槽位，超出边界时显示省略号，指针停留一秒后在可滚动提示层显示全文；普通段落保持自然换行，不能用全局叶子选择器强制单行。`.markdown-output` 继续由 ReactMarkdown、GFM、remark-math、rehype-katex 和 KaTeX CSS 处理段落、列表、表格、代码及行内/块公式。
 
-## 文档
+开发服务器使用 `.next`，生产构建和 `next start` 使用 `.next-production`。两者分离后，可以在宿主开发服务运行时执行 production build，而不会把旧 CSS 或路由产物混入当前页面；两类目录均由 Git 忽略。
 
-- [../../README.md](../../README.md)：仓库总览。
-- [../../docs/technical-spec.md](../../docs/technical-spec.md)：技术白皮书。
-- [../../packages/shared/src/index.ts](../../packages/shared/src/index.ts)：共享类型契约。
+产品页展示回答、必要状态、短证据和原文引用。完整 plan、frontier、budget、UUID、hash 和原始 JSON 放在受控诊断入口。系统能力直答不显示虚假引用；历史证据复用展示本轮的新来源绑定。
 
-## 边界
+引用卡片同时识别 `answer_source_binding_public_v1/v2/v3`。v3 以 `source_integrity_admission_hash` 和对应 observation id 作为唯一 authority，不与旧 verification 或 retrieval-gate authority 混用；合法 v3 引用显示“来源已核对”。
 
-- 前端 API 访问默认集中在 `src/lib/api.ts`。
-- 服务端状态优先使用 TanStack Query，mutation 后明确失效相关 query。
-- shared TS 类型必须与 Pydantic schema 和脚本输出同步。
-- 用户可见 trace/log 文案中文优先，底层 JSON key 保持英文协议字段。
-- 前端不保存 API key、Authorization header 或 provider 原始响应。
-- 搜索页不触发完整 Agent P&E；QA 页面才展示 Agent plan/action/observation、verification 和 repair。
-- 图谱页必须展示四层图，Mid 视为 RQ L3 投影，Coarse 视为 RQ L2 投影；右侧详情卡展示自然语言说明、关键数据、证据定位和相邻关系，不暴露 legacy fine bucket 聚类、legacy graph 入口或 raw metadata JSON。
+共享契约变动需要 typecheck 和相关组件/API 测试。本地验证结果保存在 Git 忽略的工作记录中。

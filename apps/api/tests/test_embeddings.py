@@ -11,6 +11,26 @@ import pytest
 
 
 @pytest.mark.asyncio
+async def test_unified_question_perception_uses_production_budget(monkeypatch, no_fallback_env):
+    from app.services import embeddings
+    from app.services.agent_intent import QUESTION_PERCEPTION_PROTOCOL_VERSION
+    provider = embeddings.ChatProvider()
+    captured = []
+    async def fake_post(payload):
+        captured.append(payload)
+        return {"intent": "direct_answer", "direct_answer_kind": "model_identity", "entities": [],
+                "sub_queries": ["How does the configured model relate to the Agent?"], "needs_graph": False, "suggested_strategy": "none"}
+    monkeypatch.setattr(provider, "_post_chat_json_with_response_format_fallback", fake_post)
+    result = await provider.perceive_question("How does the configured model relate to your identity?")
+    assert result["direct_answer_kind"] == "model_identity"
+    assert QUESTION_PERCEPTION_PROTOCOL_VERSION == "agent_question_perception_v3"
+    assert captured[-1]["max_tokens"] == 4096
+    provider.settings = provider.settings.model_copy(update={"chat_json_max_tokens": 2048})
+    await provider.perceive_question("Summarize that previous procedure.")
+    assert captured[-1]["max_tokens"] == 2048
+
+
+@pytest.mark.asyncio
 async def test_chat_answer_payload_has_no_output_token_cap(monkeypatch, no_fallback_env):
     from app.services import embeddings
     from app.services.embeddings import ChatProvider
@@ -201,6 +221,7 @@ async def test_embedding_provider_syncs_model_bridge_before_external_request(mon
 
     monkeypatch.setattr(runtime_settings, "sync_model_bridge_runtime_config", fake_sync_model_bridge_runtime_config)
     monkeypatch.setattr(embeddings, "post_openai_compatible_json", fake_post)
+    monkeypatch.setattr(embeddings, "enforce_memory_budget", lambda *_args, **_kwargs: None)
 
     result = await EmbeddingProvider().embed_texts_with_meta(["query"], text_type="query")
 
@@ -1080,6 +1101,25 @@ def test_chat_json_parser_fails_closed_without_leaking_provider_text():
     assert non_object.value.diagnostics["json_type"] == "list"
 
     assert provider._parse_json_object('{"concepts": []}') == {"concepts": []}
+    assert provider._parse_json_object(
+        '{"text": "line one\nline two", "items": [1, 2,],}'
+    ) == {"text": "line one\nline two", "items": [1, 2]}
+    assert provider._parse_json_object(
+        r'{"text":"finite\_state"}'
+    ) == {"text": r"finite\_state"}
+    assert provider._parse_json_object(
+        '{"text":"compare "Case I" and "Case II""}'
+    ) == {"text": 'compare "Case I" and "Case II"'}
+    assert provider._parse_json_object(
+        '{"first":"one" "second":"two","items":["a" "b"]}'
+    ) == {"first": "one", "second": "two", "items": ["a", "b"]}
+    assert provider._parse_json_object(
+        '```json\n{"concepts": []}\n```'
+    ) == {"concepts": []}
+    with pytest.raises(embeddings.ProviderJSONShapeError):
+        provider._parse_json_object(
+            '```json\n{"concepts": []}\n```\nextra prose'
+        )
 
 
 @pytest.mark.asyncio

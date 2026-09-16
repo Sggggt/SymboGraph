@@ -1,60 +1,55 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# UTF-8 text is maintained with LF unless a Windows entrypoint needs CRLF.
+* text=auto eol=lf
 
-# Python scripts should use LF for cross-platform consistency
 *.py text eol=lf
-
-# Shell scripts must use LF
 *.sh text eol=lf
-
-# Windows batch files should use CRLF
-*.bat text eol=crlf
-*.cmd text eol=crlf
-
-# PowerShell entrypoints use stable Windows line endings.
-*.ps1 text eol=crlf
-
-# Web source files: LF is standard
 *.js text eol=lf
 *.jsx text eol=lf
 *.ts text eol=lf
 *.tsx text eol=lf
 *.json text eol=lf
+*.md text eol=lf
+*.mdx text eol=lf
 *.css text eol=lf
 *.html text eol=lf
 *.svg text eol=lf
-*.md text eol=lf
-*.yml text eol=lf
-*.yaml text eol=lf
-*.lock text eol=lf
-*.ipynb text eol=lf
-.gitattributes text eol=lf
-.gitignore text eol=lf
-.dockerignore text eol=lf
-.env.example text eol=lf
-
-# Docker files
-Dockerfile text eol=lf
-docker-compose.yml text eol=lf
-docker-compose.yaml text eol=lf
-
-# Config files
 *.toml text eol=lf
 *.ini text eol=lf
 *.cfg text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.lock text eol=lf
+*.csv text eol=lf
+*.ipynb text eol=lf
+Dockerfile* text eol=lf
+.env* text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+.dockerignore text eol=lf
+.gitkeep text eol=lf
 
-# Treat binary files as binary (do not convert line endings)
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets and archives must not undergo text conversion.
 *.png binary
 *.jpg binary
 *.jpeg binary
 *.gif binary
 *.ico binary
-*.pdf binary
 *.webp binary
 *.avif binary
+*.pdf binary
+*.docx binary
+*.pptx binary
+*.xlsx binary
 *.woff binary
 *.woff2 binary
+*.ttf binary
 *.zip binary
 *.tar binary
 *.gz binary
+*.7z binary
+*.parquet binary
 *.db binary

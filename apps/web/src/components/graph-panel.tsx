@@ -664,7 +664,7 @@ function GraphPanelContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBaseI
             <div className="mt-2 flex flex-wrap items-center gap-3">
               <h2 className="break-words text-3xl font-semibold text-white">{activeLayer.label}</h2>
               <GraphStaleBadge isStale={Boolean(graph.freshness?.is_stale)} />
-              {freshnessReason ? <span className="rounded-full border border-amber-200/25 bg-amber-300/[0.08] px-3 py-1.5 text-amber-50">{freshnessReason}</span> : null}
+              {freshnessReason ? <span data-overflow-text className="block min-w-0 max-w-full truncate rounded-full border border-amber-200/25 bg-amber-300/[0.08] px-3 py-1.5 text-amber-50">{freshnessReason}</span> : null}
             </div>
           </div>
 
@@ -776,7 +776,7 @@ export function GraphNodeSummary({ node, graph, graphType }: { node: GraphNode |
       <section className="mt-6 rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
         <p className="section-kicker">节点详情</p>
         <h2 className="mt-2 break-words text-2xl font-semibold text-white">图谱节点解读</h2>
-        <p className="mt-4 break-words text-sm leading-7 text-white/58">双击图中的节点后，这里会按当前图层展示它的证据来源、邻接关系和检索作用。</p>
+        <p className="mt-4 break-words text-sm leading-7 text-white/58">悬停节点可查看名称；双击后，这里会按当前图层展示证据来源、邻接关系和检索作用。</p>
       </section>
     );
   }

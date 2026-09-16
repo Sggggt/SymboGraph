@@ -676,7 +676,8 @@ async def test_policy_prior_is_visible_to_planner_only_as_advisory_input(
 
 
 @pytest.mark.asyncio
-async def test_real_agent_reward_changes_next_admitted_policy_prior_and_cache_identity(
+@pytest.mark.usefixtures('historical_answer_executor')
+async def test_historical_agent_reward_changes_next_admitted_policy_prior_and_cache_identity(
     db_session, populated_context_graph
 ) -> None:
     from sqlalchemy import select
@@ -700,7 +701,7 @@ async def test_real_agent_reward_changes_next_admitted_policy_prior_and_cache_id
     from app.services.policy_reward import replay_policy_reward_event
 
     kb = populated_context_graph["knowledge_base"]
-    seed = _policy_row(db_session, kb.id)
+    _policy_row(db_session, kb.id)
     envelope = agent_operating_envelope()
     response = await agent_graph.run_agent(
         db_session,
@@ -711,7 +712,7 @@ async def test_real_agent_reward_changes_next_admitted_policy_prior_and_cache_id
             top_k=4,
         ),
     )
-    # Prove that every UUID-free reward/policy witness survives the actual
+    # Prove that the reflection reward/policy witnesses survive the actual
     # transaction boundary, rather than succeeding only against dirty ORM
     # objects in the creating session.
     db_session.commit()
@@ -725,7 +726,7 @@ async def test_real_agent_reward_changes_next_admitted_policy_prior_and_cache_id
     assert reward is not None
     assert reward.policy_state_id is not None
     replay = replay_policy_reward_event(db_session, reward)
-    assert reward.reward_json["reward_metric_evidence_hash"] == replay[
+    assert reward.reward_json["evidence_hash"] == replay[
         "evidence_hash"
     ]
     state = db_session.get(PolicyState, reward.policy_state_id)
@@ -759,6 +760,19 @@ async def test_real_agent_reward_changes_next_admitted_policy_prior_and_cache_id
     ):
         update_policy_state_from_reward(db_session, kb.id, reward)
 
+    # New reflection rewards start their own protocol lineage. A second
+    # accepted run must retain a verifiable link to the first reflection state.
+    assert state.reward_summary_json["previous_policy_state_id"] is None
+    second_response = await agent_graph.run_agent(db_session, AgentRequest(
+        knowledge_base_id=kb.id, question="Explain Bayesian network factorization.",
+        filters=SearchFilters(), top_k=4,
+    ))
+    second_reward = db_session.scalar(select(RewardEvent).where(
+        RewardEvent.answer_session_id == second_response["answer_model_audit"]["answer_session_id"]
+    ))
+    second_state = db_session.get(PolicyState, second_reward.policy_state_id)
+    assert second_state.reward_summary_json["previous_policy_state_id"] == state.id
+    seed = state
     # A synchronized rewrite of the predecessor gets a new canonical hash;
     # the learned state's immutable predecessor witness must not be laundered.
     seed_weights = dict(seed.weights_json)
@@ -771,7 +785,7 @@ async def test_real_agent_reward_changes_next_admitted_policy_prior_and_cache_id
     flag_modified(seed, "reward_summary_json")
     seed.state_hash = canonical_policy_state_hash_for_row(seed)
     db_session.commit()
-    with pytest.raises(PolicyStateValidationError, match="predecessor|evidence"):
+    with pytest.raises(PolicyStateValidationError, match="predecessor|evidence|posterior"):
         read_policy_operating_prior(
             db_session,
             kb.id,

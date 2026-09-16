@@ -37,6 +37,68 @@ def _install_profile_side_effect_fakes(
     return calls
 
 
+@pytest.mark.parametrize("cache_failure", [False, True])
+def test_retire_answer_prompts_is_planned_atomic_idempotent_and_recoverable(
+    monkeypatch, db_session, sample_knowledge_base, cache_failure,
+):
+    from app.models import PromptProtocolVersion, StrategyProfile
+    from app.services import strategy_profiles as profiles
+
+    calls = _install_profile_side_effect_fakes(
+        monkeypatch, cache_error=RuntimeError("unit-test cache unavailable") if cache_failure else None,
+    )
+    legacy = profiles.default_profile_payload()
+    legacy["prompt_pack"].update(profiles.RETIRED_ANSWER_PROMPT_DEFAULTS)
+    legacy["prompt_pack"]["answer_system_prefix"] = "Keep this custom answer guidance."
+    row = StrategyProfile(name="unit-test-old-review-profile", library_type="general", is_builtin=False,
+        is_active=True, profile_json=legacy, profile_hash=profiles.profile_hash(legacy))
+    db_session.add(row)
+    db_session.flush()
+    sample_knowledge_base.active_profile_id = row.id
+    db_session.commit()
+    before_hash = row.profile_hash
+
+    planned = profiles.retire_legacy_answer_prompts(db_session)
+    assert planned["execute"] is False and len(planned["targets"]) == 1
+    assert row.profile_hash == before_hash and calls["cache"] == []
+    assert db_session.scalar(select(PromptProtocolVersion)) is None
+    if cache_failure:
+        with pytest.raises(RuntimeError, match="side effects remain pending"):
+            profiles.retire_legacy_answer_prompts(db_session, execute=True)
+    else:
+        result = profiles.retire_legacy_answer_prompts(db_session, execute=True)
+        assert len(result["lifecycle_event_ids"]) == 1
+    event = db_session.scalar(select(PromptProtocolVersion))
+    assert event is not None and event.state == ("pending_dispatch" if cache_failure else "active")
+    lifecycle = event.prompt_pack_json["lifecycle"]
+    assert lifecycle["cache_invalidation_required"] is True
+    assert lifecycle["concept_rebuild_required"] is False and lifecycle["active_graph_mutated"] is False
+    assert row.profile_hash != before_hash
+    assert row.profile_json["prompt_pack"]["answer_system_prefix"] == "Keep this custom answer guidance."
+    assert not set(row.profile_json["prompt_pack"]).intersection(profiles.RETIRED_ANSWER_PROMPT_DEFAULTS)
+    profiles.profile_to_payload(row)
+    assert profiles.retire_legacy_answer_prompts(db_session, execute=True)["targets"] == []
+    if cache_failure:
+        _install_profile_side_effect_fakes(monkeypatch)
+        recovered = profiles.reconcile_pending_profile_lifecycle_events(db_session, raise_on_error=True)
+        assert recovered["failed"] == [] and event.state == "active"
+
+
+def test_retire_answer_prompts_refuses_tampered_profile(db_session):
+    from app.models import StrategyProfile
+    from app.services import strategy_profiles as profiles
+
+    legacy = profiles.default_profile_payload()
+    legacy["prompt_pack"].update(profiles.RETIRED_ANSWER_PROMPT_DEFAULTS)
+    row = StrategyProfile(name="unit-test-tampered-review-profile", library_type="general", is_builtin=False,
+        is_active=True, profile_json=legacy, profile_hash="0" * 16)
+    db_session.add(row)
+    db_session.flush()
+    with pytest.raises(profiles.ProfileIntegrityError, match="hash mismatch"):
+        profiles.retire_legacy_answer_prompts(db_session, execute=True)
+    assert row.profile_json == legacy
+
+
 def test_profile_lifecycle_diff_classifies_hot_rebuild_ui_and_preferences() -> None:
     from app.services.strategy_profiles import (
         default_profile_payload,
@@ -578,6 +640,6 @@ def test_conversation_preferences_change_language_and_safe_prompt_guidance() -> 
     assert "资料来源、章节范围、比较对象" in clarification
     assert bundle["target_language"] == "Chinese"
     system = bundle["system_content"]
-    assert "keep citation wording compact" in system
+    assert "keep source explanations compact" in system
     assert "make clarification requests detailed and actionable" in system
     assert "cannot relax the immutable grounding envelope" in system

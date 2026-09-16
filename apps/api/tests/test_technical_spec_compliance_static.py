@@ -6,7 +6,13 @@ import sys
 from types import SimpleNamespace
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+_IMAGE_ROOT = Path(__file__).resolve().parents[3]
+_SOURCE_MOUNT_ROOT = Path("/workspace")
+REPO_ROOT = (
+    _SOURCE_MOUNT_ROOT
+    if (_SOURCE_MOUNT_ROOT / "docs/technical-spec.md").is_file()
+    else _IMAGE_ROOT
+)
 SCRIPTS_ROOT = REPO_ROOT / "scripts"
 
 
@@ -66,7 +72,7 @@ def test_current_tree_has_no_legacy_token_in_active_source() -> None:
     assert _legacy_token_issues(module) == []
 
 
-def test_citation_compliance_gate_tracks_current_claim_level_protocol() -> None:
+def test_citation_compliance_gate_tracks_target_source_integrity_protocol() -> None:
     script = (SCRIPTS_ROOT / "check_technical_spec_compliance.py").read_text(
         encoding="utf-8"
     )
@@ -74,9 +80,13 @@ def test_citation_compliance_gate_tracks_current_claim_level_protocol() -> None:
         encoding="utf-8"
     )
 
-    assert "claim_structure_plus_llm_entailment_v2" in script
-    assert "claim_structure_plus_llm_entailment_v2" in technical_spec
-    assert '!= "structure_plus_llm_entailment_v1"' not in script
+    target = (SCRIPTS_ROOT / "evaluate_intent_execution.py").read_text(
+        encoding="utf-8"
+    )
+    assert "admit_context_package" in script
+    assert "source_integrity_admission" in target
+    assert "source_integrity_admission_v1" in technical_spec
+    assert "record_retrieval_reward(" not in target
 
 
 def test_cross_language_edge_identity_audit_replays_endpoint_hashes_and_fails_closed() -> None:

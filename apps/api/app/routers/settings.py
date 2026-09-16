@@ -31,7 +31,7 @@ from app.services.profile_assistant import get_profile_assistant_state, stream_p
 from app.services.runtime_settings import (
     model_settings_payload,
     runtime_check_payload,
-    save_model_settings_to_root_env,
+    save_model_settings_to_root_configuration,
 )
 from app.services.runtime_settings_lifecycle import (
     apply_runtime_settings_activation_intent,
@@ -70,7 +70,7 @@ def save_model_settings(
     db: Session = Depends(get_db),
 ) -> dict:
     try:
-        return save_model_settings_to_root_env(
+        return save_model_settings_to_root_configuration(
             db,
             request.model_dump(exclude_unset=True),
         )

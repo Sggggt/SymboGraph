@@ -178,7 +178,7 @@ async def test_redis_unavailable_rejects_without_local_fallback():
 
 @pytest.mark.asyncio
 async def test_independent_redis_adapters_share_one_global_active_budget():
-    import redis.asyncio as redis
+    redis = pytest.importorskip("redis.asyncio")
 
     from app.core.config import get_settings
     from app.services.agent_admission import AgentAdmissionError, RedisAgentAdmissionAdapter, acquire_agent_request_slot
@@ -367,7 +367,11 @@ async def test_lost_sse_lease_emits_structured_error_marks_run_failed_and_releas
             )
         )
         meta = await stream.__anext__()
-        error_event = await asyncio.wait_for(stream.__anext__(), timeout=2)
+        streamed = []
+        while not streamed or streamed[-1]["type"] != "error":
+            streamed.append(await asyncio.wait_for(stream.__anext__(), timeout=2))
+        error_event = streamed[-1]
+        assert all(event["type"] == "trace" for event in streamed[:-1])
         assert error_event["type"] == "error"
         assert error_event["detail"]["code"] == "agent_admission_unavailable"
         with pytest.raises(StopAsyncIteration):
@@ -379,6 +383,93 @@ async def test_lost_sse_lease_emits_structured_error_marks_run_failed_and_releas
     assert run.status == "failed"
     assert run.error_message == "agent_admission_unavailable"
     assert await adapter.snapshot() == {"active": 0, "queued": 0}
+
+
+@pytest.mark.asyncio
+async def test_sse_lease_loss_during_context_preparation_drains_before_session_close(monkeypatch, db_session, sample_knowledge_base):
+    from threading import Event
+    from sqlalchemy import func, select
+    from app import db as db_module
+    from app.models import AgentRun
+    from app.schemas import AgentRequest
+    from app.services import agent_admission, agent_graph
+    from app.services.storage import raise_if_source_io_cancelled
+
+    class BrokenHeartbeat(agent_admission.LocalAgentAdmissionAdapter):
+        async def heartbeat(self, *args, **kwargs):
+            raise ConnectionError("unit-test heartbeat outage")
+
+    adapter = BrokenHeartbeat()
+    monkeypatch.setattr(agent_admission.AgentAdmissionConfig, "from_settings", classmethod(lambda cls: admission_config(ttl=1)))
+    worker_done = Event()
+    close_calls = []
+    original_close = db_session.close
+
+    def prepare(*_args):
+        try:
+            for _ in range(150):
+                raise_if_source_io_cancelled()
+                time.sleep(0.01)
+            raise AssertionError("Lease loss did not interrupt preparation")
+        finally:
+            worker_done.set()
+
+    def close():
+        assert worker_done.is_set(), "Session closed while its worker was active"
+        close_calls.append(True)
+        original_close()
+
+    monkeypatch.setattr(agent_graph, "create_agent_run_context", prepare)
+    monkeypatch.setattr(db_session, "close", close)
+    monkeypatch.setattr(db_module, "SessionLocal", lambda: db_session)
+    with agent_admission.use_agent_admission_adapter(adapter):
+        stream = agent_graph.stream_agent_events(AgentRequest(knowledge_base_id=sample_knowledge_base.id, question="unit-test preparing request"))
+        event = await asyncio.wait_for(stream.__anext__(), 3)
+        assert event["type"] == "error" and event["detail"]["code"] == "agent_admission_unavailable"
+        with pytest.raises(StopAsyncIteration):
+            await stream.__anext__()
+    assert close_calls and worker_done.is_set()
+    assert db_session.scalar(select(func.count()).select_from(AgentRun)) == 0
+    assert await adapter.snapshot() == {"active": 0, "queued": 0}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_sse_context_preparation_does_not_leave_queued_run(monkeypatch, db_session, sample_knowledge_base, local_agent_admission):
+    from threading import Event
+    from sqlalchemy import select
+    from app import db as db_module
+    from app.models import AgentRun
+    from app.schemas import AgentRequest
+    from app.services import agent_graph
+    from test_source_io_liveness import wait_for_thread
+
+    created, release = Event(), Event()
+    original = agent_graph.create_agent_run_context
+    def prepare(*args):
+        result = original(*args)
+        created.set()
+        assert release.wait(3)
+        return result
+    monkeypatch.setattr(agent_graph, "create_agent_run_context", prepare)
+    monkeypatch.setattr(db_module, "SessionLocal", lambda: db_session)
+    stream = agent_graph.stream_agent_events(AgentRequest(knowledge_base_id=sample_knowledge_base.id, question="unit-test cancelled preparation"))
+    task = asyncio.create_task(stream.__anext__())
+    try:
+        await wait_for_thread(created)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        run = db_session.scalar(select(AgentRun).order_by(AgentRun.created_at.desc()).limit(1))
+        assert run is not None and run.status == "cancelled"
+        assert await local_agent_admission.snapshot() == {"active": 0, "queued": 0}
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await stream.aclose()
 
 
 @pytest.mark.asyncio

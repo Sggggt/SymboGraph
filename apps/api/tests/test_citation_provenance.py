@@ -54,16 +54,17 @@ def _exact_answer_model_audit(question: str) -> dict[str, object]:
     }
 
 
-async def _build_package(db_session, sample_knowledge_base, tmp_path):
+async def _build_package(db_session, sample_knowledge_base, tmp_path, *, source_name="citation-provenance.md", source_text=None, hit_index=0, parsed_sections=None):
+    from app.services.context_graph import stable_hash, gray_zone_runtime_settings_hash
+    source_text = source_text or "Bayesian networks factorize a joint distribution into local conditional probabilities."
     logical_source = (
         Path(sample_knowledge_base.source_root)
         / "source_slots"
-        / "citation-provenance.md"
+        / source_name
     )
     logical_source.parent.mkdir(parents=True, exist_ok=True)
     logical_source.write_text(
-        "# Factorization\n"
-        "Bayesian networks factorize a joint distribution into local conditional probabilities.\n",
+        "# Factorization\n" + source_text + "\n",
         encoding="utf-8",
     )
     frozen_snapshot = snapshot_source_file(
@@ -97,13 +98,10 @@ async def _build_package(db_session, sample_knowledge_base, tmp_path):
         knowledge_base=sample_knowledge_base,
         document=document,
         version=version,
-        sections=[
+        sections=parsed_sections if parsed_sections is not None else [
             ParsedSection(
                 title="Factorization",
-                text=(
-                    "Bayesian networks factorize a joint distribution into "
-                    "local conditional probabilities."
-                ),
+                text=source_text,
                 page_number=1,
                 section="Factorization",
             )
@@ -116,9 +114,9 @@ async def _build_package(db_session, sample_knowledge_base, tmp_path):
     path_labels = [
         {
             "layer": "chunk",
-            "node_id": chunks[0].id,
-            "chunk_id": chunks[0].id,
-            "path": [chunks[0].id],
+            "node_id": chunks[hit_index].id,
+            "chunk_id": chunks[hit_index].id,
+            "path": [chunks[hit_index].id],
             "path_edge_ids": [],
             "covered_facets": ["factorization"],
             "evidence_roles": ["definition"],
@@ -128,17 +126,21 @@ async def _build_package(db_session, sample_knowledge_base, tmp_path):
         knowledge_base_id=sample_knowledge_base.id,
         query="How do Bayesian networks factorize a joint distribution?",
         retrieval_mode="layered_context_graph",
+        conversation_state_scope_hash="",
         runtime_settings_hash=runtime_settings_state_hash(),
-        result_chunk_ids_json=[chunks[0].id],
+        agent_operating_envelope_hash=stable_hash({}),
+        result_chunk_ids_json=[chunks[hit_index].id],
         path_labels_json=path_labels,
         convergence_json={
+            "agent_operating_envelope_hash": stable_hash({}),
             "gray_zone_decision_count": 0,
             "gray_zone_rule_evaluation_count": 0,
             "red_zone_pruned_count": 0,
             "hard_stop_pruned_count": 0,
             "gray_zone_model_call_count": 0,
         },
-        diagnostics_json={"agent_operating_envelope": {}},
+        diagnostics_json={"agent_operating_envelope": {}, "agent_operating_envelope_hash": stable_hash({}),
+                          "gray_zone_runtime_settings_hash": gray_zone_runtime_settings_hash({})},
     )
     db_session.add(trace)
     db_session.flush()
@@ -149,10 +151,10 @@ async def _build_package(db_session, sample_knowledge_base, tmp_path):
         trace=trace,
         results=[
             {
-                "chunk_id": chunks[0].id,
+                "chunk_id": chunks[hit_index].id,
                 "metadata": {
                     "traversal": {
-                        "path": [chunks[0].id],
+                        "path": [chunks[hit_index].id],
                         "path_edge_ids": [],
                         "covered_facets": ["factorization"],
                         "evidence_roles": ["definition"],
@@ -177,7 +179,7 @@ async def _build_package(db_session, sample_knowledge_base, tmp_path):
             layer="chunk",
             action="walk_chunk_graph",
             action_type="walk_chunk_graph",
-            selected_topk_ids_json=[chunks[0].id],
+            selected_topk_ids_json=[chunks[hit_index].id],
             diagnostics_json={"path_labels": path_labels},
         )
     )

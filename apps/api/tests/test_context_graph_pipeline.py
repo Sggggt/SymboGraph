@@ -803,6 +803,11 @@ def test_context_package_token_count_is_audited_and_later_oversized_chunk_is_ski
     assert package.token_count == audited_count == 3
     assert package.token_count <= package.token_budget
     assert package.diagnostics_json["token_budget_audit"]["skipped_chunk_ids"] == [chunks[1].id]
+    assert set(package.why_selected_json) == {chunks[0].id}
+    assert package.hit_chunk_ids_json == [chunks[0].id]
+    assert chunks[1].id not in package.restored_chunk_ids_json
+    assert package.diagnostics_json["restore_counts"]["hit_chunks"] == 1
+    assert all(summary["node_id"] != chunks[1].id for summary in package.diagnostics_json["node_contributions"])
 
     package.token_count += 1
     with pytest.raises(RuntimeError, match="token count audit mismatch"):
@@ -1628,6 +1633,7 @@ def test_traversal_producer_ignores_external_llm_facets_for_every_gray_decision(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("populated_context_graph", [None, {"ocr_image_errors": ["unit-test image decode failure"]}], indirect=True)
 async def test_layered_retrieval_writes_trace_and_context_package(
     monkeypatch,
     db_session,
@@ -1710,7 +1716,7 @@ async def test_layered_retrieval_writes_trace_and_context_package(
     package = build_context_package(
         db_session,
         knowledge_base_id=kb.id,
-        query="Markov blanket",
+        query=result.trace.query,
         trace=result.trace,
         results=result.results,
         snapshot_verifier=result.snapshot_verifier,

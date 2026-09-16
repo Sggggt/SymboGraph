@@ -71,6 +71,10 @@ body {
 
 body {
   margin: 0;
+  background-image:
+    radial-gradient(circle at 18% 12%, rgba(70, 190, 255, 0.09), transparent 34%),
+    radial-gradient(circle at 84% 18%, rgba(112, 91, 255, 0.075), transparent 32%);
+  background-attachment: fixed;
 }
 
 a {
@@ -150,8 +154,33 @@ select option:hover {
   min-height: calc(100dvh - 11.5rem);
   align-items: stretch;
   overflow: visible;
+  width: 100%;
+  margin-inline: 0;
 }
 
+.kg-text-boundary :where([data-overflow-text], .truncate) {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kg-text-boundary [class*="line-clamp-"] {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.kg-text-boundary .kg-micro-chip {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Rich answers keep their authored flow; code and KaTeX retain their own overflow. */
 .kg-page > .kg-scroll-panel {
   height: calc(100dvh - 11.5rem);
   max-height: calc(100dvh - 11.5rem);
@@ -375,30 +404,6 @@ select option:hover {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 
-.tech-dot {
-  width: 0.45rem;
-  height: 0.45rem;
-  border-radius: 999px;
-  background: #74e3ff;
-  box-shadow: 0 0 0 0 rgba(116, 227, 255, 0.5);
-  animation: tech-pulse 1.9s ease-out infinite;
-}
-
-.tech-progress {
-  position: relative;
-  overflow: hidden;
-}
-
-.tech-progress::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(90deg, transparent 0%, rgba(116, 227, 255, 0.42) 50%, transparent 100%);
-  width: 200%;
-  left: -50%;
-  animation: tech-progress-scan 2.4s ease-in-out infinite alternate;
-}
-
 .tech-answer {
   position: relative;
   overflow: hidden;
@@ -418,41 +423,6 @@ select option:hover {
   width: 0.7ch;
   color: rgba(116, 227, 255, 0.9);
   animation: tech-cursor 0.9s steps(1) infinite;
-}
-
-.context-bars {
-  display: inline-grid;
-  grid-auto-flow: column;
-  align-items: end;
-  gap: 3px;
-  height: 12px;
-}
-
-.context-bars span {
-  width: 3px;
-  border-radius: 999px;
-  background: linear-gradient(180deg, rgba(116, 227, 255, 0.96), rgba(124, 124, 255, 0.35));
-  animation: tech-bars 1.05s ease-in-out infinite;
-}
-
-.context-bars span:nth-child(1) {
-  height: 35%;
-  animation-delay: 0s;
-}
-
-.context-bars span:nth-child(2) {
-  height: 85%;
-  animation-delay: 0.12s;
-}
-
-.context-bars span:nth-child(3) {
-  height: 55%;
-  animation-delay: 0.24s;
-}
-
-.context-bars span:nth-child(4) {
-  height: 100%;
-  animation-delay: 0.36s;
 }
 
 @keyframes tech-beam-sweep {
@@ -480,23 +450,6 @@ select option:hover {
   }
 }
 
-@keyframes tech-progress-scan {
-  0% { transform: translateX(-35%); }
-  100% { transform: translateX(35%); }
-}
-
-@keyframes tech-pulse {
-  0% {
-    box-shadow: 0 0 0 0 rgba(116, 227, 255, 0.48);
-  }
-  70% {
-    box-shadow: 0 0 0 8px rgba(116, 227, 255, 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgba(116, 227, 255, 0);
-  }
-}
-
 @keyframes tech-cursor {
   0%,
   49% {
@@ -508,25 +461,10 @@ select option:hover {
   }
 }
 
-@keyframes tech-bars {
-  0%,
-  100% {
-    transform: scaleY(0.45);
-    opacity: 0.45;
-  }
-  50% {
-    transform: scaleY(1);
-    opacity: 1;
-  }
-}
-
 @media (prefers-reduced-motion: reduce) {
   .tech-surface::after,
   .tech-card::before,
-  .tech-progress::after,
-  .tech-dot,
-  .stream-cursor,
-  .context-bars span {
+  .stream-cursor {
     animation: none !important;
   }
 }
@@ -578,22 +516,7 @@ select option:hover {
 }
 
 .kg-glass-line::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  padding: 1px;
-  background: linear-gradient(135deg, rgba(118, 226, 255, 0.38), transparent 24%, transparent 68%, rgba(148, 130, 255, 0.28));
-  mask:
-    linear-gradient(#fff 0 0) content-box,
-    linear-gradient(#fff 0 0);
-  mask-composite: exclude;
-  -webkit-mask:
-    linear-gradient(#fff 0 0) content-box,
-    linear-gradient(#fff 0 0);
-  -webkit-mask-composite: xor;
-  pointer-events: none;
-  opacity: 0.62;
+  content: none;
 }
 
 .kg-scan-edge {
@@ -670,20 +593,6 @@ select option:hover {
   background: linear-gradient(90deg, transparent, rgba(98, 216, 255, 0.55), rgba(144, 132, 255, 0.4), transparent);
 }
 
-.kg-shimmer {
-  position: relative;
-  overflow: hidden;
-}
-
-.kg-shimmer::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  transform: translateX(-120%);
-  background: linear-gradient(90deg, transparent, rgba(146, 226, 255, 0.12), transparent);
-  animation: kg-shimmer 1.7s ease-in-out infinite;
-}
-
 @keyframes kg-scan-edge {
   0%,
   26% {
@@ -697,11 +606,5 @@ select option:hover {
   100% {
     transform: translateX(420%) skewX(-18deg);
     opacity: 0;
-  }
-}
-
-@keyframes kg-shimmer {
-  100% {
-    transform: translateX(120%);
   }
 }

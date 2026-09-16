@@ -344,9 +344,35 @@ def static_checks() -> list[dict[str, Any]]:
                 f"context_graph.py is missing {token}.",
             )
     agent_graph = source_text("apps/api/app/services/agent_graph.py")
-    for token in ("propose_agent_plan", "validate_typed_actions", "verify_answer_against_context", "repair_round_budget", "update_policy_state_from_reward"):
-        if token not in agent_graph:
-            add_issue(issues, "blocker", "agent_closure_gap", f"agent_graph.py is missing {token}.")
+    if "execute_intent_execution_agent" not in agent_graph:
+        add_issue(issues, "blocker", "agent_serving_switch_gap", "agent_graph.py does not dispatch the target controller.")
+    target_agent = source_text("apps/api/app/services/intent_execution_agent.py")
+    target_executor = source_text("apps/api/app/services/layered_execution_v1.py")
+    for token in (
+        "plan_intent_execution",
+        "execute_layered_retrieval",
+        "admit_context_package",
+        "single_grounded_generation",
+        "verified_context_reuse",
+    ):
+        if token not in target_agent:
+            add_issue(issues, "blocker", "target_agent_contract_gap", f"intent_execution_agent.py is missing {token}.")
+    for token in (
+        "weighted_rrf_entry_v2",
+        "deterministic_support_progress_v2",
+        "reward_call_count\": 0",
+        "post_retrieval_model_call_count\": 0",
+    ):
+        if token not in target_executor:
+            add_issue(issues, "blocker", "target_executor_contract_gap", f"layered_execution_v1.py is missing {token}.")
+    for forbidden in (
+        "evaluate_graph_evidence(",
+        "assess_retrieval_sufficiency(",
+        "record_retrieval_reward(",
+        "update_policy_state_from_reward(",
+    ):
+        if forbidden in target_agent or forbidden in target_executor:
+            add_issue(issues, "blocker", "retired_online_control_reentered_target", f"Target serving path contains {forbidden}.")
     allowed_actions = assigned_string_collection(agent_graph, "ALLOWED_TYPED_ACTIONS")
     forbidden_gray_outputs = assigned_string_collection(agent_graph, "FORBIDDEN_GRAY_PLANNER_OUTPUTS")
     if allowed_actions is None:
@@ -372,6 +398,8 @@ def _check_policy_reward_consumption(
     db: Any,
     knowledge_base_id: str,
     issues: list[dict[str, Any]],
+    *,
+    target_protocol_active: bool = False,
 ) -> dict[str, Any]:
     """Classify audit-only rewards separately from trainable Agent rewards.
 
@@ -429,6 +457,29 @@ def _check_policy_reward_consumption(
                 context_type=type(context).__name__,
                 diagnostics_type=type(diagnostics).__name__,
             )
+            continue
+
+        if (reward.reward_json or {}).get("protocol_version") == "answer_reflection_reward_v1":
+            try:
+                rebuilt = replay_policy_reward_event(db, reward)
+                metrics = rebuilt["metrics"]
+                if not metrics["training_eligible"]:
+                    if reward.policy_state_id is not None or diagnostics.get("policy_consumption_status") != "ineligible":
+                        raise ValueError("ineligible reflection reward has a Policy binding")
+                    audit_only_ids.append(str(reward.id))
+                else:
+                    eligible_ids.append(str(reward.id))
+                    if reward.policy_state_id is None:
+                        unconsumed_ids.append(str(reward.id))
+                    else:
+                        from app.services.reflection_reward import validate_reflection_policy_state
+                        state = db.get(PolicyState, reward.policy_state_id)
+                        if state is None or (state.reward_summary_json or {}).get("last_reward_event_id") != reward.id:
+                            raise ValueError("reflection reward lacks reciprocal Policy linkage")
+                        validate_reflection_policy_state(db, state, knowledge_base_id=knowledge_base_id)
+                        consumed_ids.append(str(reward.id))
+            except Exception as exc:
+                record_corruption(reward, "persisted reflection reward replay failed", error_type=type(exc).__name__)
             continue
 
         run_ref_present = "agent_run_id" in context
@@ -592,8 +643,12 @@ def _check_policy_reward_consumption(
     if corrupt_count:
         add_issue(
             issues,
-            "blocker",
-            "policy_reward_eligibility_or_binding_corrupt",
+            "warning" if target_protocol_active else "blocker",
+            (
+                "historical_policy_reward_eligibility_or_binding_corrupt"
+                if target_protocol_active
+                else "policy_reward_eligibility_or_binding_corrupt"
+            ),
             (
                 "RewardEvent eligibility, AgentRun provenance, persisted replay, "
                 "or PolicyState binding is corrupt; audit-only rewards cannot be "
@@ -608,8 +663,12 @@ def _check_policy_reward_consumption(
     if unconsumed_ids:
         add_issue(
             issues,
-            "blocker",
-            "policy_not_updated_from_reward",
+            "warning" if target_protocol_active else "blocker",
+            (
+                "historical_policy_not_updated_from_reward"
+                if target_protocol_active
+                else "policy_not_updated_from_reward"
+            ),
             (
                 "Validated, explicitly training-eligible Agent rewards exist "
                 "without a consuming PolicyState."
@@ -988,7 +1047,40 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
             if missing_structure_types:
                 add_issue(issues, "blocker", "structure_closure_node_type_missing", "Structure graph is missing required closure node types.", {"missing": missing_structure_types, "present": sorted(structure_node_types)})
         latest_trace = db.scalar(select(RetrievalTrace).where(RetrievalTrace.knowledge_base_id == knowledge_base.id).order_by(RetrievalTrace.created_at.desc()))
-        if latest_trace:
+        if latest_trace and latest_trace.retrieval_mode == "intent_execution_retrieval_v1":
+            diagnostics = latest_trace.diagnostics_json or {}
+            convergence = latest_trace.convergence_json or {}
+            entry_layer = diagnostics.get("entry_layer")
+            expected_layers = {
+                "coarse": {"coarse", "mid", "chunk"},
+                "mid": {"mid", "chunk"},
+                "chunk": {"chunk"},
+            }.get(entry_layer, set())
+            steps = list(db.scalars(select(GraphRetrievalStep).where(
+                GraphRetrievalStep.retrieval_trace_id == latest_trace.id,
+                GraphRetrievalStep.action_type == "deterministic_layer_execution")))
+            checks = {
+                "protocol": diagnostics.get("protocol_version") == "intent_execution_retrieval_v1",
+                "entry_layer": bool(expected_layers),
+                "layer_steps": {step.layer for step in steps} == expected_layers,
+                "zero_cycle_reward": all(float(step.cycle_distance_reward or 0) == 0 for step in steps),
+                "zero_model_control": convergence.get("model_call_count") == 0
+                    and convergence.get("gray_zone_model_call_count") == 0,
+                "zero_reward_control": (latest_trace.scores_json or {}).get("reward_call_count") == 0,
+                "source_admission_contract": diagnostics.get("generation_sufficiency_model_enabled") is False,
+                "staged_selection": bool(latest_trace.stage_queues_json)
+                    and bool(latest_trace.candidate_pools_json)
+                    and bool(latest_trace.topk_selection_json),
+            }
+            for name, passed in checks.items():
+                if not passed:
+                    add_issue(issues, "blocker", "target_trace_" + name, f"Latest target retrieval trace failed {name} replay.")
+            summary["intent_execution_retrieval"] = {
+                "trace_id": latest_trace.id,
+                "entry_layer": entry_layer,
+                "checks": checks,
+            }
+        elif latest_trace:
             if not latest_trace.stage_queues_json or not latest_trace.candidate_pools_json or not latest_trace.topk_selection_json:
                 add_issue(issues, "blocker", "trace_staged_selection_missing", "Latest retrieval trace must persist stage_queues_json, candidate_pools_json and topk_selection_json.")
             step_layers = set(
@@ -1044,7 +1136,7 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
                 add_issue(issues, "blocker", "agent_observations_missing", "Agent observations are missing.")
         else:
             add_issue(issues, "warning", "no_agent_plan", "No Agent plans exist yet; run QA before evaluating Agent coverage.")
-        latest_verification = db.scalar(select(CitationVerification).where(CitationVerification.knowledge_base_id == knowledge_base.id).order_by(CitationVerification.created_at.desc()))
+        latest_verification = None if latest_trace and latest_trace.retrieval_mode == "intent_execution_retrieval_v1" else db.scalar(select(CitationVerification).where(CitationVerification.knowledge_base_id == knowledge_base.id).order_by(CitationVerification.created_at.desc()))
         if latest_verification and (latest_verification.diagnostics_json or {}).get("verification_method") == "context_package_span_presence_v1":
             add_issue(issues, "blocker", "old_citation_verification", "Latest citation verification still uses span-presence-only method.")
         if latest_verification:
@@ -1064,6 +1156,11 @@ def db_checks(knowledge_base_id: str | None, knowledge_base_name: str | None) ->
                 db,
                 knowledge_base.id,
                 issues,
+                target_protocol_active=bool(
+                    latest_trace
+                    and latest_trace.retrieval_mode
+                    == "intent_execution_retrieval_v1"
+                ),
             )
         )
     return summary, issues

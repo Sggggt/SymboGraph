@@ -2814,10 +2814,38 @@ def apply_runtime_settings_activation_intent(intent_id: str) -> dict[str, Any]:
         # never dereference a detached/expired intent after leaving this
         # transaction.
         updates = dict(intent.settings_json or {})
+        lexical_rebuild_kb_ids = (
+            list(
+                db.scalars(
+                    select(RuntimeSettingsShadowBuild.knowledge_base_id)
+                    .where(
+                        RuntimeSettingsShadowBuild.runtime_settings_candidate_id
+                        == candidate.id
+                    )
+                    .order_by(RuntimeSettingsShadowBuild.knowledge_base_id)
+                )
+            )
+            if {"bm25_k1", "bm25_b"}.intersection(updates)
+            else []
+        )
         db.commit()
     try:
         _update_env_file(updates)
         _apply_runtime_env(updates)
+        lexical_rebuild_results: list[dict[str, Any]] = []
+        if lexical_rebuild_kb_ids:
+            import asyncio
+            from app.services.lexical_storage import (
+                rebuild_lexical_index_for_knowledge_base,
+            )
+
+            for knowledge_base_id in lexical_rebuild_kb_ids:
+                lexical_rebuild_results.append(asyncio.run(
+                    rebuild_lexical_index_for_knowledge_base(
+                        knowledge_base_id,
+                        operation="runtime_settings_lexical_rebuild",
+                    )
+                ))
         message = publish_runtime_settings_version(
             changed_keys=[key.upper() for key in sorted(updates)],
             source=f"runtime_settings_{direction}",
@@ -2873,6 +2901,7 @@ def apply_runtime_settings_activation_intent(intent_id: str) -> dict[str, Any]:
                 message.get("local_refresh_pending")
             ),
             "runtime_version_hash": message["version_hash"],
+            "lexical_rebuild_results": lexical_rebuild_results,
             "applied_at": (
                 applied.applied_at.isoformat()
                 if applied.applied_at is not None
@@ -2906,6 +2935,7 @@ def apply_runtime_settings_activation_intent(intent_id: str) -> dict[str, Any]:
         "runtime_local_refresh_pending": bool(
             message.get("local_refresh_pending")
         ),
+        "lexical_rebuild_results": lexical_rebuild_results,
         "idempotent_replay": False,
     }
 

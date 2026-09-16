@@ -24,6 +24,8 @@ from app.models import (
     RetrievalTrace,
 )
 from app.schemas import AgentPEAuditResponse
+from app.reflection_contracts import is_direct_reflection_action
+from app.retrieval_control_contracts import RUN_OBSERVATION_PROTOCOLS, control_hash
 
 
 AGENT_PE_AUDIT_PROTOCOL_VERSION = "agent_pe_audit_public_v1"
@@ -47,6 +49,58 @@ _DANGEROUS_STORAGE_SEGMENTS = frozenset(
 
 class AgentPEAuditIntegrityError(RuntimeError):
     """The persisted P&E rows cannot be exposed as one coherent run audit."""
+
+
+def _validate_run_control_observation(run, observation, payload):
+    from app.services.retrieval_fsm import RetrievalControlState, next_control_state
+    state = RetrievalControlState.model_validate((run.metadata_json or {}).get('retrieval_control'))
+    if (payload.get('protocol_version') not in RUN_OBSERVATION_PROTOCOLS[observation.observation_type]
+            or observation.action_id is not None or payload.get('plan_id') is not None or payload.get('plan_index') is not None):
+        raise AgentPEAuditIntegrityError('Run control observation protocol or ownership conflicts')
+    if observation.observation_type == 'retrieval_state_transition':
+        before = RetrievalControlState.model_validate(payload['before'])
+        after = RetrievalControlState.model_validate(payload['after'])
+        expected = next_control_state(before,after.state,task_hash=after.task_hash,strategy_hash=after.strategy_hash,
+            system_capability=before.state=='planning' and after.state=='completed' and after.task_hash is None)
+        if (payload.get('run_id') != run.id or after != expected or observation.verdict != after.state
+                or after.runtime_hash != state.runtime_hash or after.repair_limit != state.repair_limit
+                or after.task_hash not in {None,state.task_hash}
+                or payload.get('sequence_index') != after.sequence_index or after.sequence_index > state.sequence_index
+                or payload.get('event_hash') != control_hash({k:v for k,v in payload.items() if k!='event_hash'})):
+            raise AgentPEAuditIntegrityError('Run control transition replay failed')
+    elif payload.get('task_hash') != state.task_hash:
+        raise AgentPEAuditIntegrityError('Run control fixed task changed')
+    if 'audit_hash' in payload and payload['audit_hash'] != control_hash({k:v for k,v in payload.items() if k!='audit_hash'}):
+        raise AgentPEAuditIntegrityError('Run control observation hash changed')
+    if observation.observation_type == 'retrieval_sufficiency':
+        from app.services.retrieval_sufficiency import EvidenceSufficiency
+        if (payload.get('status') not in {'prepared','completed'} or observation.verdict != payload['status']
+                or not isinstance(payload.get('control_sequence_index'),int)
+                or not 0 < payload['control_sequence_index'] <= state.sequence_index):
+            raise AgentPEAuditIntegrityError('Sufficiency call lifecycle invalid')
+        if payload['status'] == 'completed':
+            result = EvidenceSufficiency.model_validate(payload['result'])
+            required = {item['id'] for item in run.metadata_json['retrieval_task']['requirements']}
+            if ({item.facet_id for item in result.requirements} != required
+                    or len(result.requirements) != len(required) or payload.get('observation_id') != observation.id):
+                raise AgentPEAuditIntegrityError('Sufficiency task or observation identity changed')
+    if observation.observation_type=='retrieval_scope_resolution':
+        from app.retrieval_control_contracts import SourceLocationRequest
+        from app.services.source_location import location_output_type
+        request=SourceLocationRequest.model_validate(payload['request'])
+        if (request.task_hash!=state.task_hash or payload.get('run_id')!=run.id
+            or payload.get('status') not in {'prepared','completed'} or payload['status']!=observation.verdict
+            or payload.get('semantic_identity_proven') is not False or payload.get('policy_update_eligible') is not False):
+            raise AgentPEAuditIntegrityError('Source location control identity changed')
+        if payload['status']=='completed':
+            location_output_type(request).model_validate(payload['result'])
+    if observation.observation_type == 'retrieval_gate':
+        from app.retrieval_control_contracts import PathFeatureSummary
+        features = PathFeatureSummary.model_validate(payload['features'])
+        if (features.input_hash != control_hash(payload['feature_input'])
+                or payload['decision']['feature_hash'] != control_hash(features.model_dump(mode='json'))
+                or payload['decision']['outcome'] != observation.verdict):
+            raise AgentPEAuditIntegrityError('Run control feature identity changed')
 
 
 def _sensitive_key_kind(value: object) -> str | None:
@@ -95,13 +149,17 @@ def _sensitive_key(value: object) -> bool:
     return _sensitive_key_kind(value) is not None
 
 
+def _safe_storage_flag(key: object, value: Any) -> bool:
+    return semantic_key_segments(key) == ("provider", "response", "persisted") and value is False
+
+
 def _scan_sensitive_exposure(value: Any) -> tuple[bool, bool]:
     provider_exposed = False
     credentials_exposed = False
     if isinstance(value, dict):
         for raw_key, raw_value in value.items():
             kind = _sensitive_key_kind(raw_key)
-            if kind is not None and raw_value != _REDACTED:
+            if kind is not None and raw_value != _REDACTED and not _safe_storage_flag(raw_key, raw_value):
                 if kind == "provider_raw_response":
                     provider_exposed = True
                 else:
@@ -131,7 +189,7 @@ def _sanitize_json(value: Any, *, path: str) -> tuple[Any, list[str]]:
         for raw_key, raw_value in value.items():
             key = str(raw_key)
             child_path = f"{path}.{key}"
-            if _sensitive_key(key):
+            if _sensitive_key(key) and not _safe_storage_flag(key, raw_value):
                 result[key] = _REDACTED
                 redacted.append(child_path)
                 continue
@@ -373,7 +431,10 @@ def _validate_linkage(
                 "Action belongs to a different run"
             )
         plan_id = str(action.plan_id or "")
-        if not plan_id or plan_id not in plan_by_id:
+        direct_review_action = is_direct_reflection_action(
+            action.action_type, action.plan_id, action.validation_json
+        )
+        if (not plan_id or plan_id not in plan_by_id) and not direct_review_action:
             raise AgentPEAuditIntegrityError(
                 "Action plan linkage is missing or crosses run boundaries"
             )
@@ -421,6 +482,21 @@ def _validate_linkage(
                 "Observation action linkage is missing or crosses run boundaries"
             )
         if action is None:
+            if observation.observation_type in RUN_OBSERVATION_PROTOCOLS:
+                try:
+                    _validate_run_control_observation(run,observation,payload)
+                    if observation.observation_type == 'retrieval_gate':
+                        from app.services.source_addressed_assessment import replay_persisted_assessment
+                        replay_persisted_assessment(db, owner=run, card=payload)
+                    elif observation.observation_type == 'retrieval_sufficiency' and payload.get('protocol_version') == 'retrieval_sufficiency_call_v2':
+                        from app.services.source_addressed_assessment import replay_assessment_call
+                        replay_assessment_call(db, owner=run, call=payload)
+                    elif observation.observation_type == 'retrieval_generation_packing' and payload.get('protocol_version') == 'scope_preserving_generation_packing_v1':
+                        from app.services.generation_packing import replay_scope_generation_packing
+                        replay_scope_generation_packing(db,run=run,observation=observation)
+                except (KeyError,TypeError,ValueError):
+                    raise AgentPEAuditIntegrityError('Run control observation replay failed') from None
+                continue
             if observation.observation_type != "evidence_evaluator":
                 raise AgentPEAuditIntegrityError(
                     "Only evidence-evaluator observations may omit action_id"
@@ -431,7 +507,7 @@ def _validate_linkage(
                     "Evaluator observation plan linkage is missing or crosses runs"
                 )
         else:
-            plan_id = str(action.plan_id)
+            plan_id = str(action.plan_id or "")
             supplied_plan_id = payload.get("plan_id")
             if supplied_plan_id is not None and str(supplied_plan_id) != plan_id:
                 raise AgentPEAuditIntegrityError(
@@ -441,7 +517,7 @@ def _validate_linkage(
         if supplied_plan_index is not None and (
             isinstance(supplied_plan_index, bool)
             or not isinstance(supplied_plan_index, int)
-            or supplied_plan_index != int(plan_by_id[plan_id].plan_index)
+            or plan_id not in plan_by_id or supplied_plan_index != int(plan_by_id[plan_id].plan_index)
         ):
             raise AgentPEAuditIntegrityError(
                 "Observation payload plan_index conflicts with its canonical plan"
@@ -730,6 +806,14 @@ def load_agent_pe_audit(
     run = db.get(AgentRun, run_id)
     if run is None:
         raise LookupError("Agent run not found")
+    task_payload=(run.metadata_json or {}).get('retrieval_task')
+    if task_payload is not None:
+        from app.retrieval_control_contracts import TaskContract
+        from app.services.retrieval_models import replay_run_source_reference_roles
+        try:
+            replay_run_source_reference_roles(run.metadata_json,TaskContract.model_validate(task_payload))
+        except (TypeError,ValueError):
+            raise AgentPEAuditIntegrityError('Source reference role audit cannot be replayed') from None
 
     plans = list(
         db.scalars(
@@ -923,7 +1007,7 @@ def load_agent_pe_audit(
 
     action_rows: list[dict[str, Any]] = []
     for order_index, action in enumerate(actions):
-        plan = plan_by_id[str(action.plan_id)]
+        plan = plan_by_id.get(str(action.plan_id or ""))
         target_ids = _string_list(
             action.target_ids_json,
             field="action.target_ids_json",
@@ -974,7 +1058,7 @@ def load_agent_pe_audit(
             path="diagnostics",
         )
         plan_diagnostics = _object(
-            plan.diagnostics_json,
+            plan.diagnostics_json if plan is not None else {},
             field="plan.diagnostics_json",
         )
         action_rows.append(
@@ -982,8 +1066,8 @@ def load_agent_pe_audit(
                 "order_index": order_index,
                 "id": str(action.id),
                 "run_id": str(action.run_id),
-                "plan_id": str(action.plan_id),
-                "plan_index": int(plan.plan_index),
+                "plan_id": str(action.plan_id) if action.plan_id else None,
+                "plan_index": int(plan.plan_index) if plan is not None else None,
                 "parent_action_id": action.parent_action_id,
                 "action_index": int(action.action_index),
                 "action_type": str(action.action_type),
@@ -1046,11 +1130,11 @@ def load_agent_pe_audit(
             else None
         )
         plan_id = (
-            str(action.plan_id)
+            str(action.plan_id or "")
             if action is not None
-            else str(raw_payload["plan_id"])
+            else str(raw_payload.get("plan_id") or '')
         )
-        plan = plan_by_id[plan_id]
+        plan = plan_by_id.get(plan_id)
         evaluator_linkage: dict[str, Any] | None = None
         repair_linkage: dict[str, Any] | None = None
         evaluator = raw_payload.get("evaluator_verdict")
@@ -1083,8 +1167,8 @@ def load_agent_pe_audit(
                     "gray_zone_model_call_count=0"
                 )
             evaluator_linkage = {
-                "plan_id": plan_id,
-                "plan_index": int(plan.plan_index),
+                "plan_id": plan_id or None,
+                "plan_index": int(plan.plan_index) if plan is not None else None,
                 "protocol_version": evaluator.get("protocol_version"),
                 "verdict": evaluator_verdict,
                 "decision_hash": evaluator.get("decision_hash"),
@@ -1186,8 +1270,8 @@ def load_agent_pe_audit(
                 "order_index": order_index,
                 "id": str(observation.id),
                 "run_id": str(observation.run_id),
-                "plan_id": plan_id,
-                "plan_index": int(plan.plan_index),
+                "plan_id": plan_id or None,
+                "plan_index": int(plan.plan_index) if plan is not None else None,
                 "action_id": (
                     str(observation.action_id)
                     if observation.action_id is not None
@@ -1200,6 +1284,7 @@ def load_agent_pe_audit(
                     action.parent_action_id if action is not None else None
                 ),
                 "observation_type": str(observation.observation_type),
+                'run_control_protocol': 'retrieval_fsm_v1' if observation.observation_type in RUN_OBSERVATION_PROTOCOLS else None,
                 "protocol_version": _value(
                     raw_payload.get("protocol_version"),
                     evaluator_object.get("protocol_version"),

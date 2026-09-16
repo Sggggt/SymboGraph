@@ -26,6 +26,7 @@ from app.services.storage import (
 
 
 PARSER_LAYOUT_PROTOCOL_VERSION = "prepared_document_layout_v1"
+PDF_TABLE_GEOMETRY_PROTOCOL_VERSION = "pdf_ruled_table_geometry_v1"
 FLOW_BLOCK_PROTOCOL_VERSION = "deterministic_flow_blocks_v14"
 MARKDOWN_PIPE_TABLE_PROTOCOL_VERSION = "markdown_pipe_table_v5"
 MARKDOWN_BLOCK_START_PROTOCOL_VERSION = "markdown_block_start_precedence_v11"
@@ -1707,6 +1708,10 @@ def _remap_parsed_artifacts(
         remapped.append(
             replace(
                 artifact,
+                **({
+                    "title": clean_extracted_text(artifact.title, source_type=source_type)[0] if artifact.title is not None else None,
+                    "path": clean_extracted_text(artifact.path, source_type=source_type)[0] if artifact.path is not None else None,
+                } if isinstance(artifact, ParsedStructureObject) else {}),
                 text=fragment,
                 char_start=start,
                 char_end=end,
@@ -2235,6 +2240,59 @@ def _normalized_native_bbox(
     }
 
 
+def _pdf_table_objects(page, text: str, layouts: list[ParsedLayoutItem], *, page_number: int):
+    """Add addresses over existing contiguous native text, never rewrite it."""
+    import fitz
+    from app.services.source_parse_pipeline import check_parse_cancellation
+
+    check_parse_cancellation()
+    try:
+        tables = page.find_tables(strategy="lines").tables
+    except Exception:
+        raise ValueError("pdf_table_geometry_detection_failed") from None
+    check_parse_cancellation()
+    if len(tables) > 64:
+        raise ValueError("pdf_table_geometry_capacity_exceeded")
+    objects = []
+    for table_index, table in enumerate(tables):
+        check_parse_cancellation()
+        region = fitz.Rect(table.bbox)
+        if table.row_count < 2 or table.col_count < 2 or region.is_empty or region.is_infinite:
+            continue
+        # A block crossing the boundary is unknown; a caption or neighbouring
+        # paragraph does not acquire table authority merely by proximity.
+        runs: list[list[ParsedLayoutItem]] = []
+        for item in layouts:
+            raw_bbox = item.bbox.get("raw_bbox")
+            contained = (item.metadata.get("parser_source") == "pymupdf_text_block"
+                and raw_bbox and region.contains(fitz.Rect(raw_bbox)))
+            if contained:
+                if not runs or runs[-1][-1].reading_order + 1 != item.reading_order:
+                    runs.append([])
+                runs[-1].append(item)
+        for part_index, run in enumerate(runs):
+            start, end = run[0].char_start, run[-1].char_end
+            block_region = fitz.Rect(run[0].bbox["raw_bbox"])
+            for item in run[1:]:
+                block_region |= fitz.Rect(item.bbox["raw_bbox"])
+            bbox = _normalized_native_bbox(*block_region, width=page.rect.width, height=page.rect.height,
+                page_number=page_number, raw_coordinate_system="pdf_points_top_left")
+            geometry = {"protocol_version": PDF_TABLE_GEOMETRY_PROTOCOL_VERSION,
+                "detector_version": str(fitz.VersionBind),
+                "row_band_count": int(table.row_count), "column_count": int(table.col_count),
+                "region": _normalized_native_bbox(*region, width=page.rect.width, height=page.rect.height,
+                    page_number=page_number, raw_coordinate_system="pdf_points_top_left"),
+                "source_block_indices": [int(item.metadata["source_index"]) for item in run]}
+            objects.append(ParsedStructureObject(
+                structure_id=f"pdf:p{page_number}:table:{table_index}:part:{part_index}",
+                object_type="table", text=text[start:end], char_start=start, char_end=end,
+                title="Table", page_number=page_number, bbox=bbox,
+                coordinate_system="normalized_page_v1", reading_order=run[0].reading_order,
+                metadata={"parser_source": "pymupdf_ruled_table", "native_geometry": True,
+                    "layout_protocol_version": PARSER_LAYOUT_PROTOCOL_VERSION, "table_geometry": geometry}))
+    return objects
+
+
 def parse_pdf(source: FrozenSourceSnapshot) -> list[ParsedSection]:
     import fitz
     from PIL import Image
@@ -2244,6 +2302,12 @@ def parse_pdf(source: FrozenSourceSnapshot) -> list[ParsedSection]:
     sections: list[ParsedSection] = []
     with fitz.open(stream=source.content_bytes, filetype="pdf") as document:
         for idx, page in enumerate(document, start=1):
+            from app.services.build_performance import current_performance
+            from app.services.source_parse_pipeline import check_parse_cancellation
+            check_parse_cancellation()
+            performance = current_performance()
+            if performance:
+                performance.progress("pdf_pages", idx, len(document))
             page_width = float(page.rect.width)
             page_height = float(page.rect.height)
             native_blocks = []
@@ -2370,6 +2434,7 @@ def parse_pdf(source: FrozenSourceSnapshot) -> list[ParsedSection]:
                     )
                 )
             text = "".join(parts)
+            objects.extend(_pdf_table_objects(page, text, layouts, page_number=idx))
             lines = text.splitlines()
             has_table = any("|" in line and "---" in line for line in lines)
             has_formula = _detect_formula(text)
@@ -2399,7 +2464,7 @@ def parse_pdf(source: FrozenSourceSnapshot) -> list[ParsedSection]:
                     layout_items=layouts,
                     structure_objects=objects,
                     parser_metadata={
-                        "parser": "pymupdf_blocks_with_ocr_v1",
+                        "parser": "pymupdf_blocks_with_ocr_and_ruled_tables_v2",
                         "layout_protocol_version": PARSER_LAYOUT_PROTOCOL_VERSION,
                         "native_layout_available": True,
                         "page_size": [page_width, page_height],

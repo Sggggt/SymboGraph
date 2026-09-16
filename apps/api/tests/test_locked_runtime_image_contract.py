@@ -3,7 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+_IMAGE_ROOT = Path(__file__).resolve().parents[3]
+_SOURCE_MOUNT_ROOT = Path("/workspace")
+REPO_ROOT = (
+    _SOURCE_MOUNT_ROOT
+    if (_SOURCE_MOUNT_ROOT / "apps/api/Dockerfile").is_file()
+    else _IMAGE_ROOT
+)
 
 
 def test_api_image_installs_the_exact_uv_lock_into_its_runtime_environment() -> None:
@@ -119,25 +125,33 @@ def test_windows_launcher_uses_the_current_source_mounted_runtime_contract() -> 
     wrapper = (REPO_ROOT / "start-app.bat").read_text(encoding="utf-8")
     rebuild = (REPO_ROOT / "rebuild-images.ps1").read_text(encoding="utf-8")
     rebuild_wrapper = (REPO_ROOT / "rebuild-images.bat").read_text(encoding="utf-8")
+    native_web = (REPO_ROOT / "start-web.ps1").read_text(encoding="utf-8")
+    native_web_wrapper = (REPO_ROOT / "start-web.bat").read_text(
+        encoding="utf-8"
+    )
+    stop_script = (REPO_ROOT / "stop-app.ps1").read_text(encoding="utf-8")
+    compose = (REPO_ROOT / "infra/docker-compose.yml").read_text(encoding="utf-8")
 
     assert '[string]$ComposeProjectName = "knowledgegraph-dev-20260820"' in launcher
     assert '[string]$ApiImage = "course-kg-api:local"' in launcher
-    assert '[string]$WebImage = "course-kg-web:local"' in launcher
+    assert 'course-kg-web' not in launcher
+    assert '\n  web:\n' not in compose
     assert 'RUNTIME_CONFIG_VOLUME_NAME' not in launcher
     assert '"--project-name", $ComposeProjectName' in launcher
     assert '"--profile", "model-bridge"' in launcher
     assert '"config", "--quiet"' in launcher
     assert '& $RebuildImagesScript' in launcher
     assert '-ApiBuildTag $ApiImage' in launcher
-    assert '-WebBuildTag $WebImage' in launcher
+    assert '-WebBuildTag' not in launcher
     assert "digest-qualified and cannot be used as a Docker build output tag" in launcher
     assert 'Re-run without -SkipBuild' in launcher
-    assert '-f infra/docker-compose.yml --profile model-bridge down' in launcher
+    assert '.\\stop-app.ps1' in launcher
     assert '/api/ready' in launcher
     assert 'Wait-ContainerHealthy -ContainerName "course-kg-redis"' in launcher
     assert 'Wait-Url -Url "http://127.0.0.1:6333/readyz"' in launcher
     assert '"runtime-bootstrap"' not in launcher
-    assert 'Runtime settings file: $EnvFile' in launcher
+    assert 'Environment file: $EnvFile' in launcher
+    assert 'Runtime settings file: $SettingsFile' in launcher
     assert '"app.core.migration_safety", "preflight"' in launcher
     assert 'docker stop $containerName' not in launcher
     assert "migrate_initial_runtime_provider_config.py" not in launcher
@@ -146,14 +160,30 @@ def test_windows_launcher_uses_the_current_source_mounted_runtime_contract() -> 
     assert 'generated ephemerally for this launcher process' not in launcher
     assert 'Get-DotEnvValue -Key "MODEL_BRIDGE_ADMIN_TOKEN"' in launcher
     assert 'set "START_APP_EXIT_CODE=%ERRORLEVEL%"' in wrapper
+    assert 'if "%START_APP_EXIT_CODE%"=="0"' in wrapper
+    assert '[READY] SymboGraph startup completed.' in wrapper
+    assert '[FAILED] SymboGraph startup exited with code' in wrapper
+    assert 'if /I not "%SYMBOGRAPH_NO_PAUSE%"=="1"' in wrapper
+    assert "pause >nul" in wrapper
     assert 'exit /b %START_APP_EXIT_CODE%' in wrapper
     assert '[string]$ApiBuildTag = "course-kg-api:local"' in rebuild
-    assert '[string]$WebBuildTag = "course-kg-web:local"' in rebuild
     assert '$env:API_IMAGE = $ApiBuildTag' in rebuild
-    assert '$env:WEB_IMAGE = $WebBuildTag' in rebuild
-    assert '$buildArgs += @("api", "web")' in rebuild
-    assert '$buildArgs += @("api", "worker", "web")' not in rebuild
-    assert "worker uses the exact API image/tag" in rebuild
+    assert 'WEB_IMAGE' not in rebuild
+    assert '$buildArgs += @("api")' in rebuild
+    assert "Worker and beat reuse the exact API image/tag" in rebuild
     assert "Docker build outputs require a mutable image tag" in rebuild
+    assert 'Start-Process -FilePath "npm.cmd"' in native_web
+    assert '-WindowStyle Hidden' in native_web
+    assert 'node_modules\\next\\package.json' in native_web
+    assert 'symbograph_native_web_pid_v1' in native_web
+    assert 'set "START_WEB_EXIT_CODE=%ERRORLEVEL%"' in native_web_wrapper
+    assert 'if "%START_WEB_EXIT_CODE%"=="0"' in native_web_wrapper
+    assert '[READY] SymboGraph Web startup completed.' in native_web_wrapper
+    assert '[FAILED] SymboGraph Web startup exited with code' in native_web_wrapper
+    assert 'if /I not "%SYMBOGRAPH_NO_PAUSE%"=="1"' in native_web_wrapper
+    assert "pause >nul" in native_web_wrapper
+    assert 'exit /b %START_WEB_EXIT_CODE%' in native_web_wrapper
+    assert 'Stop-RecordedWebProcess' in stop_script
+    assert 'Refusing to stop PID' in stop_script
     assert 'set "REBUILD_IMAGES_EXIT_CODE=%ERRORLEVEL%"' in rebuild_wrapper
     assert 'exit /b %REBUILD_IMAGES_EXIT_CODE%' in rebuild_wrapper

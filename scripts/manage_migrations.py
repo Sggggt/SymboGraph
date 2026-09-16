@@ -85,11 +85,6 @@ def main(argv: list[str] | None = None) -> int:
         help="Runtime API image override; prevents stale digest values in .env from becoming build tags.",
     )
     parser.add_argument(
-        "--web-image",
-        default="course-kg-web:local",
-        help="Runtime web image override used for Compose interpolation parity.",
-    )
-    parser.add_argument(
         "--compose-run",
         action="store_true",
         help="Use a one-shot API Compose container; use this when the API cannot start because a migration is blocked.",
@@ -124,7 +119,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.compose_run:
         os.environ["API_IMAGE"] = args.api_image
-        os.environ["WEB_IMAGE"] = args.web_image
         os.environ["COMPOSE_PROJECT_NAME"] = args.compose_project_name
     if args.command == "downgrade" and not args.dry_run and not args.allow_destructive:
         parser.error("executing a downgrade requires --allow-destructive; use --dry-run to print the command only")

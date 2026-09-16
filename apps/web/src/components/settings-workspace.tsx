@@ -43,6 +43,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { cn } from "@/lib/utils";
 import {
   bindStrategyProfile,
   copyStrategyProfile,
@@ -87,6 +88,10 @@ type SettingsForm = {
   agent_request_lease_ttl_seconds: string;
   upload_max_bytes: string;
   concept_i18n_enabled: boolean;
+  query_facet_bilingual_enabled: boolean;
+  ingestion_memory_soft_limit_ratio: string;
+  ingestion_memory_hard_limit_ratio: string;
+  ingestion_memory_critical_limit_ratio: string;
   fixed_chunk_size_tokens: string;
   fixed_chunk_overlap_tokens: string;
   chat_api_key: string;
@@ -123,6 +128,21 @@ type SettingsForm = {
   cross_language_out_quota_min: string;
   cross_language_out_quota_max: string;
   cross_language_min_cosine: string;
+  context_package_token_budget: string;
+  retrieval_result_top_k_default: string;
+  retrieval_v1_dense_candidate_budget: string;
+  retrieval_v1_rq_candidate_budget: string;
+  retrieval_v1_bm25_candidate_budget: string;
+  retrieval_v1_root_entry_budget: string;
+  retrieval_v1_per_parent_entry_budget: string;
+  retrieval_v1_layer_entry_budget: string;
+  retrieval_v1_max_depth: string;
+  retrieval_v1_restore_per_hit: string;
+  lexical_index_max_documents: string;
+  lexical_index_max_postings: string;
+  lexical_index_max_characters: string;
+  bm25_k1: string;
+  bm25_b: string;
 };
 
 type ErrorDialogState = {
@@ -172,11 +192,79 @@ type SwitchRowProps = {
 };
 
 const inputClass = "h-11 rounded-xl border-white/10 bg-white/[0.04] px-3 text-white placeholder:text-white/28";
-const sectionClass = "rounded-2xl border border-white/10 bg-white/[0.035] p-5";
+const sectionClass = "min-w-0 break-words rounded-2xl border border-white/10 bg-white/[0.035] p-5";
+
+type RuntimeSettingsPage =
+  | "connections"
+  | "runtime"
+  | "retrieval"
+  | "graph"
+  | "build"
+  | "deployment";
+
+const runtimeSettingsPages: Array<{
+  id: RuntimeSettingsPage;
+  label: string;
+  description: string;
+}> = [
+  { id: "connections", label: "模型连接", description: "协议、地址、模型与密钥" },
+  { id: "runtime", label: "运行控制", description: "并发、超时、排队与上传" },
+  { id: "retrieval", label: "检索入口", description: "候选、预算与 BM25" },
+  { id: "graph", label: "图协议", description: "距离、RQ 与投影协议" },
+  { id: "build", label: "重建参数", description: "切块、向量、关系与候选" },
+  { id: "deployment", label: "服务参数", description: "重启后生效的工作进程" },
+];
+
+export function RuntimeSettingsNavigation({
+  activePage,
+  onChange,
+}: {
+  activePage: RuntimeSettingsPage;
+  onChange: (page: RuntimeSettingsPage) => void;
+}) {
+  return (
+    <nav
+      aria-label="运行设置分类"
+      data-testid="runtime-settings-navigation"
+      className="min-w-0 max-w-full overflow-hidden rounded-3xl border border-white/10 bg-white/[0.035] p-3 shadow-[0_18px_64px_rgba(0,0,0,0.16)] xl:sticky xl:top-[8.5rem]"
+    >
+      <p className="px-3 pb-2 text-xs font-semibold uppercase tracking-[0.2em] text-cyan-100/52">
+        参数分类
+      </p>
+      <div className="custom-scrollbar flex w-full min-w-0 gap-2 overflow-x-auto pb-1 xl:grid xl:grid-cols-1 xl:overflow-visible xl:pb-0">
+        {runtimeSettingsPages.map((page, index) => {
+          const active = page.id === activePage;
+          return (
+            <button
+              key={page.id}
+              type="button"
+              aria-current={active ? "page" : undefined}
+              onClick={() => onChange(page.id)}
+              className={cn(
+                "flex min-w-[12rem] items-start gap-3 rounded-2xl border px-3 py-3 text-left transition xl:min-w-0",
+                active
+                  ? "border-cyan-200/28 bg-cyan-300/[0.085] text-white shadow-[0_10px_30px_rgba(41,177,255,0.08)]"
+                  : "border-transparent text-white/58 hover:border-white/10 hover:bg-white/[0.035] hover:text-white",
+              )}
+            >
+              <span className="grid size-7 shrink-0 place-items-center rounded-xl bg-white/[0.05] text-xs text-cyan-100/72">
+                {String(index + 1).padStart(2, "0")}
+              </span>
+              <span className="min-w-0">
+                <span className="block text-sm font-medium">{page.label}</span>
+                <span className="mt-0.5 block text-xs leading-5 text-white/42">{page.description}</span>
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </nav>
+  );
+}
 const parameterNameClass = "text-xs uppercase tracking-[0.2em] text-cyan-100/46";
 export const UPLOAD_MAX_BYTES_LIMITS = { defaultValue: 104_857_600, min: 1, max: 10_737_418_240 } as const;
 export const RUNTIME_ENV_AUTHORITY_NOTE =
-  "仓库根 .env 是唯一配置来源。保存后所有参数立即写入该文件；热加载参数立即作用于下一次请求，重建参数等待显式重建与晋升，服务参数在重启后生效。";
+  "根 .env 管理秘密、连接与服务启动参数，根 settings.json 管理非秘密运行与构建参数；每个键只属于一个文件。热加载参数作用于下一次请求，重建参数等待显式重建与晋升，服务参数在重启后生效。";
 export const RQ_KMEANS_PROTOCOL_DEPTH = 3 as const;
 
 export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
@@ -186,13 +274,13 @@ export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   聊天接口协议: "选择 openai 时调用 /chat/completions；选择 anthropic 时调用 /v1/messages。只影响对话模型，不改变 gray-zone 判定。",
   图谱接口协议: "选择 openai 时调用 /chat/completions；选择 anthropic 时调用 /v1/messages。它只决定后续构图模型传输，不参与图检索判定。",
   向量接口协议: "Embedding 当前仅支持 OpenAI-compatible 协议。该字段是独立 rebuild identity，不复用聊天或图谱协议，也不表示已支持 Anthropic embedding。",
-  聊天基础地址: "对话接口的 base URL；协议为 anthropic 时填写服务根地址，由系统固定追加 /v1/messages。只影响下一次问答、检索规划、引用验证和 Profile 助手调用。",
+  聊天基础地址: "对话接口的 base URL；协议为 anthropic 时填写服务根地址，由系统固定追加 /v1/messages。只影响下一次意图规划、一次回答生成和 Profile 助手调用。",
   图谱基础地址: "图谱构建接口的 base URL；协议为 anthropic 时填写服务根地址，由系统固定追加 /v1/messages。只影响下一次构图中的概念命名、粗概念和双语派生调用。",
   向量基础地址: "Embedding 接口的 base URL；后续解析、重嵌入和图谱重建会用它生成 contextual embedding。",
   "聊天 DNS 覆盖 IP": "仅对对话端点使用的 DNS 覆盖；需要固定解析到指定 IP 时填写，留空则使用系统 DNS。",
   "图谱 DNS 覆盖 IP": "仅对图谱构建端点使用的 DNS 覆盖；需要固定解析到指定 IP 时填写，留空则使用系统 DNS。",
   "向量 DNS 覆盖 IP": "仅对向量端点使用的 DNS 覆盖；需要固定解析到指定 IP 时填写，留空则使用系统 DNS。",
-  聊天模型: "用于回答生成、检索规划、Agent 判停、引用辅助判断和 Profile 助手的对话模型名称。",
+  聊天模型: "用于一次意图与执行策略规划、来源准入后的单次回答生成，以及 Profile 助手。",
   图谱模型: "用于中概念命名、粗概念生成和中粗层双语派生的图谱构建模型名称。",
   向量模型: "用于资料 embedding、dense relation 候选和查询向量的模型名称；改变后已有向量需要显式重解析或重建。",
   聊天接口密钥: "对话模型端点的访问密钥。留空会保留已有密钥，页面不会回显真实密钥。",
@@ -201,7 +289,7 @@ export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   清除当前聊天接口密钥: "勾选后保存会删除当前对话密钥；删除后对话模型调用会因缺少凭据而失败。",
   清除当前图谱接口密钥: "勾选后保存会删除当前图谱密钥；删除后构图模型调用会因缺少凭据而失败。",
   清除当前向量接口密钥: "勾选后保存会删除当前向量密钥；删除后解析、重嵌入和检索向量生成会因缺少凭据而失败。",
-  模型请求并发: "限制同时发起的模型请求数量，用于控制概念生成、Agent 判断和回答生成的吞吐与外部端点压力。",
+  模型请求并发: "限制同时发起的模型请求数量，用于控制概念生成、意图规划和回答生成的吞吐与外部端点压力。",
   模型超时秒数: "单次模型请求等待上限；超过该时间会快速失败并进入可诊断错误，不做静默降级。",
   "源文件 I/O 并发": "限制解析、校验和持久化源文件时同时运行的阻塞 I/O 数量；通过有界 semaphore 热加载，防止文件线程无界扩张。",
   "Agent 请求并发": "普通 Agent 与 SSE 请求共用的全局并发上限；Redis 租约跨 API 进程协调，不以进程内任务表作为正确性边界。",
@@ -213,6 +301,19 @@ export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   "证据包 token 预算": "Context Package 可容纳的证据 token 上限；它约束进入回答生成的唯一证据输入规模。",
   中粗层双语派生: "开启后，下一次图谱重建会对 mid/coarse 概念节点和高层概念边额外生成中英双语派生 metadata；关闭时不会产生这部分模型调用成本。",
   "LLM 双语查询面": "开启后，QA 查询面提取会要求 LLM 为显式领域和过程 facet 生成中英双语 aliases；它只影响下一次检索路由，不写事实证据，也不触发图谱重建。",
+  "Dense 候选预算": "每层 Dense 通道独立提名的候选上限，进入本轮 ExecutionStrategy 的冻结预算。",
+  "RQ 候选预算": "每层按完整 RQ 前缀重构向量计算相关性后独立提名的候选上限。",
+  "BM25 候选预算": "混合策略启用时从 active 原文 BM25 快照读取的候选上限；纯向量策略不依赖该索引。",
+  "根入口预算": "LLM 选择 coarse、mid 或 chunk 入口后，根层融合保留的入口数量。",
+  "逐父节点预算": "从每个父节点分别下钻时保留的子候选数量，防止全局 top-k 吞掉小主题。",
+  "单层总预算": "每一层逐父合并和累计距离遍历后最多保留的节点数量。",
+  "最大遍历深度": "每层按非负累计距离扩展的最大深度；循环只用于剪枝，不增加优先级。",
+  "每命中恢复预算": "每个命中片段允许追加的结构上下文数量；完整来源范围仍按跨度和证据包总预算处理。",
+  "BM25 文档上限": "单个候选原文索引允许物化的 active chunk 文档数量硬上限。",
+  "BM25 postings 上限": "单个候选索引允许写入的 postings 总量硬上限。",
+  "BM25 原文字符上限": "单个候选索引允许读取并物化的原文字符总量硬上限。",
+  "BM25 k1": "BM25 词频饱和参数。改变后必须生成并发布新的 lexical 快照。",
+  "BM25 b": "BM25 文档长度归一参数。改变后必须生成并发布新的 lexical 快照。",
   "边距离协议": "本地 allowlist 的关系强度到累计距离转换协议。它改变 active relation graph 语义，只能经 candidate、shadow rebuild、evaluation 和 promotion 生效。",
   "RQ membership 协议": "本地 allowlist 的 RQ 主链归属协议。LLM、prompt 和自由表达式都不能成为协议值；变更必须重建 RQ 与下游概念图。",
   "边投影协议": "底层 chunk relation edge 向 mid/coarse 概念边投影的本地协议；support ids 与 gray predicates 都由确定性实现约束。",
@@ -220,31 +321,6 @@ export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   "RQ softmax 温度": "逐层完整 codebook softmax 的温度 τ_l；它改变 primary membership 概率，必须通过 candidate 重建与 promotion 生效。",
   "RQ 每层候选上限": "每层保留的非主 code 稀疏候选上限；主 residual trajectory 始终保留，不受该值裁掉。",
   "RQ 概率裁剪阈值": "仅裁剪非主 code 的原始完整 softmax 概率阈值；membership 不重归一、不设人工下限。",
-  粗概念起点数量: "摘要模式下从全部粗概念候选中选入图探索的起点数量；普通模式不使用这个参数。",
-  粗概念保留数量: "摘要模式下粗概念图探索后保留并继续下钻的粗概念数量。",
-  每个粗概念中概念预算: "对每个已保留粗概念分别下钻的 mid candidate 数量上限，保证逐父节点探索而不是全局裸 top-k。",
-  普通模式中概念起点数量: "普通模式下，从全体中概念候选池中选入中概念图探索的起点数量。",
-  摘要模式中概念起点数量: "摘要模式下，从粗概念逐父节点下钻合并后的中概念候选池中选入中概念图探索的起点数量。",
-  "中概念 Top K": "中概念图探索后保留并继续下钻到 chunk 层的中概念数量。",
-  每个中概念片段预算: "对每个已选中概念分别下钻到 chunk candidate 的数量上限，控制底层候选扩展范围。",
-  片段起点数量: "从全部 chunk candidates 中选入 chunk 图探索的起点数量。",
-  "片段 Top K": "chunk 图探索后最终保留进入 Context Package 候选的 chunk 数量。",
-  "结果 Top K 默认值": "搜索、QA 和 Agent 请求未显式传 top_k 时返回的直接命中 chunk 数量上限；它不控制图遍历候选规模。",
-  候选去重池预算: "限制跨路径、跨 RQ membership 和跨概念候选合并去重时保留的候选池规模，防止单次检索过载。",
-  每层最大深度: "图遍历在每个层级允许继续扩展的最大深度，避免路径无限扩张。",
-  每节点标签上限: "每个节点参与 dominance pruning 的路径标签数量上限，用来控制同一节点上的重复路径状态。",
-  边复用上限: "同一条图边在单条路径中可被重复使用的次数上限，防止环路反复放大。",
-  "Cycle reward 上限": "同一条路径最多获得的环收敛奖励；奖励只辅助短而强的收敛路径，不能替代证据。",
-  "Cycle reward 距离阈值": "只有总距离足够短的环才会得到收敛奖励，长而弱的环不会提升路径价值。",
-  "路径 green 阈值": "路径累计距离落入 green 区时，由 deterministic executor 按版本化协议处理；LLM 不参与路径分区或判停。",
-  "路径 gray 阈值": "路径累计距离落入 gray 区时，executor 只根据 bounded observation 和版本化 deterministic local rule 输出 typed decision；模型调用数必须为 0。",
-  "路径 hard 阈值": "路径累计距离命中 hard-stop 时 executor 直接剪枝；LLM、Profile 和 Policy 均不能绕过或覆盖该决定。",
-  每个片段结构恢复数量: "对每个最终命中 chunk 最多追加多少 previous/next 或 bridge-neighbor 上下文。",
-  路径摘要预算: "Context Package 中可保留的图路径摘要数量上限，用于解释证据从 coarse 到 mid 再到 chunk 的来源。",
-  规划轮次预算: "QA Agent 可进行 Planner/Evaluator 规划的轮次数上限，控制单次任务内的推理成本。",
-  每轮动作上限: "每个规划轮次最多允许的 typed actions 数量，所有动作仍必须通过 validator 和 deterministic executor。",
-  修复轮次预算: "引用缺失、桥接不足或结构上下文不足时允许的 repair loop 次数；耗尽后只能返回已验证部分或证据不足说明。",
-  引用验证预算: "回答后可执行的 citation verification 次数上限，用于把 claim 绑定回 raw chunk span。",
   固定切块尺寸: "解析时每个稳定 chunk 的目标 token 大小；chunk 是索引和引用地址单位，不假定是完整语义单元。",
   固定切块重叠: "相邻固定 chunk 之间保留的 token 重叠，用来降低边界截断造成的上下文损失。",
   向量维度: "Embedding 向量维数，必须与向量模型和 Qdrant collection 一致；改变后需要重嵌入或重建派生索引。",
@@ -429,7 +505,7 @@ export function ModelProtocolSelect({
   lifecycle: string;
 }) {
   return (
-    <label className="flex flex-col gap-2">
+    <label className="flex min-w-0 max-w-full flex-col gap-2">
       <ParameterName label={label} />
       <select
         value={value}
@@ -457,7 +533,7 @@ export function EmbeddingProtocolSelect({
   disabled?: boolean;
 }) {
   return (
-    <label className="flex flex-col gap-2">
+    <label className="flex min-w-0 max-w-full flex-col gap-2">
       <ParameterName label="向量接口协议" />
       <select
         value={value}
@@ -548,7 +624,7 @@ export function GraphProtocolSettingsSection({
     <section className={sectionClass}>
       <p className="text-sm font-semibold text-white">构图协议与 RQ membership</p>
       <BoundaryNote title="生效边界：candidate → shadow rebuild → evaluation → promotion">
-        普通保存会立即写入根 .env，但不会提前改写已有图；请在下方候选生命周期面板完成 dry-run、真实 shadow build、数值评估和原子 promotion。
+        普通保存会立即写入对应的根配置文件，但不会提前改写已有图；请在下方候选生命周期面板完成 dry-run、真实 shadow build、数值评估和原子 promotion。
       </BoundaryNote>
       <div className="mt-5 grid gap-4 md:grid-cols-2">
         <SettingField label="边距离协议" value={values.edge_distance_protocol} onChange={() => undefined} disabled />
@@ -1043,7 +1119,7 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
       <div className="grid gap-5">
         <section className={sectionClass}>
           <div className="grid gap-4 md:grid-cols-[1fr_0.7fr]">
-            <label className="flex flex-col gap-2">
+            <label className="flex min-w-0 max-w-full flex-col gap-2">
               <span className="text-xs uppercase tracking-[0.2em] text-cyan-100/46">配置档</span>
               <select
                 value={selectedProfileId}
@@ -1191,12 +1267,7 @@ function ProfileSettingsPanel({ onError }: { onError: (error: unknown) => void }
               <div className="flex justify-start">
                 <div className="max-w-[92%] rounded-2xl border border-white/10 bg-white/[0.04] p-3 text-sm leading-7 text-white/78">
                   <div className="mb-2 flex items-center gap-2 text-xs text-cyan-100/65">
-                    <span className="context-bars">
-                      <span />
-                      <span />
-                      <span />
-                      <span />
-                    </span>
+                    <Loader2 className="size-4 animate-spin" />
                     正在生成
                   </div>
                   {assistantDraft ? <p className="whitespace-pre-wrap">{assistantDraft}</p> : null}
@@ -1305,6 +1376,10 @@ type HotReloadSettingsForm = Pick<
   | "agent_request_lease_ttl_seconds"
   | "upload_max_bytes"
   | "concept_i18n_enabled"
+  | "query_facet_bilingual_enabled"
+  | "ingestion_memory_soft_limit_ratio"
+  | "ingestion_memory_hard_limit_ratio"
+  | "ingestion_memory_critical_limit_ratio"
   | "chat_api_key"
   | "clear_chat_api_key"
   | "graph_api_key"
@@ -1312,6 +1387,19 @@ type HotReloadSettingsForm = Pick<
   | "embedding_api_key"
   | "clear_embedding_api_key"
   | "model_bridge_enabled"
+  | "context_package_token_budget"
+  | "retrieval_result_top_k_default"
+  | "retrieval_v1_dense_candidate_budget"
+  | "retrieval_v1_rq_candidate_budget"
+  | "retrieval_v1_bm25_candidate_budget"
+  | "retrieval_v1_root_entry_budget"
+  | "retrieval_v1_per_parent_entry_budget"
+  | "retrieval_v1_layer_entry_budget"
+  | "retrieval_v1_max_depth"
+  | "retrieval_v1_restore_per_hit"
+  | "lexical_index_max_documents"
+  | "lexical_index_max_postings"
+  | "lexical_index_max_characters"
 >;
 
 export function buildHotReloadSettingsPayload(
@@ -1334,6 +1422,10 @@ export function buildHotReloadSettingsPayload(
     agent_request_lease_ttl_seconds: parseIntField(form.agent_request_lease_ttl_seconds),
     upload_max_bytes: parseIntField(form.upload_max_bytes),
     concept_i18n_enabled: form.concept_i18n_enabled,
+    query_facet_bilingual_enabled: form.query_facet_bilingual_enabled,
+    ingestion_memory_soft_limit_ratio: parseFloatField(form.ingestion_memory_soft_limit_ratio),
+    ingestion_memory_hard_limit_ratio: parseFloatField(form.ingestion_memory_hard_limit_ratio),
+    ingestion_memory_critical_limit_ratio: parseFloatField(form.ingestion_memory_critical_limit_ratio),
     chat_api_key: form.chat_api_key.trim() || null,
     clear_chat_api_key: form.clear_chat_api_key,
     graph_api_key: form.graph_api_key.trim() || null,
@@ -1341,6 +1433,19 @@ export function buildHotReloadSettingsPayload(
     embedding_api_key: form.embedding_api_key.trim() || null,
     clear_embedding_api_key: form.clear_embedding_api_key,
     model_bridge_enabled: form.model_bridge_enabled,
+    context_package_token_budget: parseIntField(form.context_package_token_budget),
+    retrieval_result_top_k_default: parseIntField(form.retrieval_result_top_k_default),
+    retrieval_v1_dense_candidate_budget: parseIntField(form.retrieval_v1_dense_candidate_budget),
+    retrieval_v1_rq_candidate_budget: parseIntField(form.retrieval_v1_rq_candidate_budget),
+    retrieval_v1_bm25_candidate_budget: parseIntField(form.retrieval_v1_bm25_candidate_budget),
+    retrieval_v1_root_entry_budget: parseIntField(form.retrieval_v1_root_entry_budget),
+    retrieval_v1_per_parent_entry_budget: parseIntField(form.retrieval_v1_per_parent_entry_budget),
+    retrieval_v1_layer_entry_budget: parseIntField(form.retrieval_v1_layer_entry_budget),
+    retrieval_v1_max_depth: parseIntField(form.retrieval_v1_max_depth),
+    retrieval_v1_restore_per_hit: parseIntField(form.retrieval_v1_restore_per_hit),
+    lexical_index_max_documents: parseIntField(form.lexical_index_max_documents),
+    lexical_index_max_postings: parseIntField(form.lexical_index_max_postings),
+    lexical_index_max_characters: parseIntField(form.lexical_index_max_characters),
   };
 }
 
@@ -1354,6 +1459,8 @@ export function buildRuntimeSettingsPayload(form: SettingsForm): ModelSettingsUp
     embedding_resolve_ip: form.embedding_resolve_ip.trim() || null,
     embedding_model: form.embedding_model.trim(),
     embedding_dimensions: parseIntField(form.embedding_dimensions),
+    bm25_k1: parseFloatField(form.bm25_k1),
+    bm25_b: parseFloatField(form.bm25_b),
     graph_base_url: form.graph_base_url.trim(),
     graph_api_protocol: form.graph_api_protocol,
     graph_resolve_ip: form.graph_resolve_ip.trim() || null,
@@ -1399,6 +1506,8 @@ function rebuildCandidateSettings(
     embedding_resolve_ip: form.embedding_resolve_ip.trim() || null,
     embedding_model: form.embedding_model.trim(),
     embedding_dimensions: parseIntField(form.embedding_dimensions),
+    bm25_k1: parseFloatField(form.bm25_k1),
+    bm25_b: parseFloatField(form.bm25_b),
     graph_base_url: form.graph_base_url.trim(),
     graph_api_protocol: form.graph_api_protocol,
     graph_resolve_ip: form.graph_resolve_ip.trim() || null,
@@ -1624,6 +1733,7 @@ export function SettingsWorkspace() {
   const [embeddingApiKeyEditing, setEmbeddingApiKeyEditing] = useState(false);
   const [errorDialog, setErrorDialog] = useState<ErrorDialogState | null>(null);
   const [activeTab, setActiveTab] = useState<"model" | "profile">("model");
+  const [activeSettingsPage, setActiveSettingsPage] = useState<RuntimeSettingsPage>("connections");
 
   useEffect(() => {
     if (!settingsQuery.data) {
@@ -1657,6 +1767,10 @@ export function SettingsWorkspace() {
       agent_request_lease_ttl_seconds: String(displayedSettings.agent_request_lease_ttl_seconds ?? 300),
       upload_max_bytes: String(displayedSettings.upload_max_bytes ?? UPLOAD_MAX_BYTES_LIMITS.defaultValue),
       concept_i18n_enabled: displayedSettings.concept_i18n_enabled ?? false,
+      query_facet_bilingual_enabled: displayedSettings.query_facet_bilingual_enabled ?? false,
+      ingestion_memory_soft_limit_ratio: String(displayedSettings.ingestion_memory_soft_limit_ratio ?? 0.78),
+      ingestion_memory_hard_limit_ratio: String(displayedSettings.ingestion_memory_hard_limit_ratio ?? 0.88),
+      ingestion_memory_critical_limit_ratio: String(displayedSettings.ingestion_memory_critical_limit_ratio ?? 0.94),
       fixed_chunk_size_tokens: String(displayedSettings.fixed_chunk_size_tokens ?? 512),
       fixed_chunk_overlap_tokens: String(displayedSettings.fixed_chunk_overlap_tokens ?? 80),
       chat_api_key: "",
@@ -1693,6 +1807,21 @@ export function SettingsWorkspace() {
       cross_language_out_quota_min: String(displayedSettings.cross_language_out_quota_min ?? 0),
       cross_language_out_quota_max: String(displayedSettings.cross_language_out_quota_max ?? 3),
       cross_language_min_cosine: String(displayedSettings.cross_language_min_cosine ?? 0.65),
+      context_package_token_budget: String(displayedSettings.context_package_token_budget ?? 2400),
+      retrieval_result_top_k_default: String(displayedSettings.retrieval_result_top_k_default ?? 8),
+      retrieval_v1_dense_candidate_budget: String(displayedSettings.retrieval_v1_dense_candidate_budget ?? 64),
+      retrieval_v1_rq_candidate_budget: String(displayedSettings.retrieval_v1_rq_candidate_budget ?? 64),
+      retrieval_v1_bm25_candidate_budget: String(displayedSettings.retrieval_v1_bm25_candidate_budget ?? 64),
+      retrieval_v1_root_entry_budget: String(displayedSettings.retrieval_v1_root_entry_budget ?? 8),
+      retrieval_v1_per_parent_entry_budget: String(displayedSettings.retrieval_v1_per_parent_entry_budget ?? 8),
+      retrieval_v1_layer_entry_budget: String(displayedSettings.retrieval_v1_layer_entry_budget ?? 80),
+      retrieval_v1_max_depth: String(displayedSettings.retrieval_v1_max_depth ?? 3),
+      retrieval_v1_restore_per_hit: String(displayedSettings.retrieval_v1_restore_per_hit ?? 4),
+      lexical_index_max_documents: String(displayedSettings.lexical_index_max_documents ?? 100000),
+      lexical_index_max_postings: String(displayedSettings.lexical_index_max_postings ?? 4000000),
+      lexical_index_max_characters: String(displayedSettings.lexical_index_max_characters ?? 32000000),
+      bm25_k1: String(displayedSettings.bm25_k1 ?? 1.2),
+      bm25_b: String(displayedSettings.bm25_b ?? 0.75),
     });
     setApiKeyEditing(false);
     setGraphApiKeyEditing(false);
@@ -1709,12 +1838,12 @@ export function SettingsWorkspace() {
       const pendingService = result.pending_service_recreate_changes ?? [];
       setSavedMessage(
         result.apply_error_type
-          ? `.env 已写入；运行时刷新待重试：${result.apply_error_type}`
+          ? `配置已写入；运行时刷新待重试：${result.apply_error_type}`
           : pendingService.length
-            ? `.env 已写入；${pendingService.length} 项重启后生效，${pendingRebuild.length} 项待图谱/索引重建`
+            ? `配置已写入；${pendingService.length} 项重启后生效，${pendingRebuild.length} 项待图谱/索引重建`
             : pendingRebuild.length
-              ? `.env 已写入；${pendingRebuild.length} 项待图谱/索引重建`
-              : ".env 已写入并生效",
+              ? `配置已写入；${pendingRebuild.length} 项待图谱/索引重建`
+              : "配置已写入并生效",
       );
       window.setTimeout(() => setSavedMessage(null), 1800);
       await Promise.all([
@@ -1796,9 +1925,13 @@ export function SettingsWorkspace() {
           </button>
         </div>
         {activeTab === "profile" ? <ProfileSettingsPanel onError={(error) => setErrorDialog(errorDialogFromUnknown(error))} /> : null}
-        <div className={activeTab === "model" ? "grid gap-7 xl:grid-cols-[minmax(320px,0.72fr)_minmax(560px,1.28fr)]" : "hidden"}>
-          <aside className="space-y-6">
-            <div>
+        <div className={activeTab === "model" ? "grid min-w-0 gap-7 xl:grid-cols-[minmax(0,1fr)_280px]" : "hidden"}>
+          <aside className="min-w-0 space-y-6 xl:order-2">
+            <RuntimeSettingsNavigation
+              activePage={activeSettingsPage}
+              onChange={setActiveSettingsPage}
+            />
+            <div className="hidden xl:block">
               <p className="section-kicker">生产参数配置</p>
               <h2 className="glow-text mt-2 text-4xl font-semibold text-white">运行时设置</h2>
               <p className="mt-4 max-w-xl text-sm leading-7 text-cyan-50/62">
@@ -1809,12 +1942,12 @@ export function SettingsWorkspace() {
               </p>
             </div>
 
-            <div className="flex flex-wrap gap-2">
+            <div className="hidden flex-wrap gap-2 xl:flex">
               <StatusPill ok={Boolean(settings?.has_chat_api_key)}>聊天密钥 {settings?.has_chat_api_key ? "已配置" : "未配置"}</StatusPill>
               <StatusPill ok={Boolean(settings?.has_graph_api_key)}>图谱密钥 {settings?.has_graph_api_key ? "已配置" : "未配置"}</StatusPill>
               <StatusPill ok={Boolean(settings?.has_embedding_api_key)}>向量密钥 {settings?.has_embedding_api_key ? "已配置" : "未配置"}</StatusPill>
               <StatusPill ok={bridgeHealthy}>模型桥 {bridgeStatusText}</StatusPill>
-              <StatusPill ok={settingsFileSynced && envSynced}>{settingsFileSynced && envSynced ? "根 .env 已同步" : "根 .env 需检查"}</StatusPill>
+              <StatusPill ok={settingsFileSynced && envSynced}>{settingsFileSynced && envSynced ? "根配置已同步" : "根配置需检查"}</StatusPill>
               <StatusPill ok={pendingRebuildCount === 0}>待重建 {pendingRebuildCount}</StatusPill>
               <StatusPill ok={pendingServiceCount === 0}>待重启 {pendingServiceCount}</StatusPill>
               <StatusPill ok={!settings?.enable_model_fallback && !settings?.enable_database_fallback}>回退已禁用</StatusPill>
@@ -1824,7 +1957,7 @@ export function SettingsWorkspace() {
               <StatusPill ok={Boolean(settings?.runtime_settings_version)}>运行时 {settings?.runtime_settings_version ? "已同步" : "等待中"}</StatusPill>
             </div>
 
-            <div className={sectionClass}>
+            <div className={`${sectionClass} hidden xl:block`}>
               <p className="text-sm font-semibold text-white">生产保护</p>
               <div className="mt-3 grid gap-2 text-sm leading-6 text-white/58">
                 <p>模型回退：{settings?.enable_model_fallback ? "已开启，生产不推荐" : "已关闭"}</p>
@@ -1835,12 +1968,13 @@ export function SettingsWorkspace() {
           </aside>
 
           <form
-            className="grid gap-5"
+            className="grid min-w-0 gap-5 xl:order-1"
             onSubmit={(event) => {
               event.preventDefault();
               void handleSubmit();
             }}
           >
+            {activeSettingsPage === "connections" ? (
             <section className={sectionClass}>
               <div className="mb-5 flex items-center justify-between gap-3">
                 <div>
@@ -1858,7 +1992,7 @@ export function SettingsWorkspace() {
                 修改向量模型后只影响后续解析、重嵌入或全量重建任务；已有资料库向量需要显式重新解析或重建。
               </BoundaryNote>
               {form.model_bridge_enabled ? (
-                <div className="mt-4 border-l border-cyan-200/20 bg-cyan-300/[0.035] px-4 py-3 text-sm text-cyan-50/70">
+                <div className="mt-4 rounded-2xl border border-cyan-200/20 bg-cyan-300/[0.035] px-4 py-3 text-sm text-cyan-50/70">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="font-semibold text-white">模型桥转发状态</span>
                     <StatusPill ok={bridgeHealthy}>{bridgeStatusText}</StatusPill>
@@ -1923,7 +2057,7 @@ export function SettingsWorkspace() {
                 <SettingField label="向量模型" value={form.embedding_model} onChange={(value) => updateForm("embedding_model", value)} />
               </div>
               <div className="mt-6 grid gap-4 md:grid-cols-2">
-                <label className="flex flex-col gap-2">
+                <label className="flex min-w-0 max-w-full flex-col gap-2">
                   <ParameterName label="聊天接口密钥" />
                   <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3">
                     <KeyRound className="size-4 text-cyan-100/58" />
@@ -1947,7 +2081,7 @@ export function SettingsWorkspace() {
                   </div>
                 </label>
 
-                <label className="flex flex-col gap-2">
+                <label className="flex min-w-0 max-w-full flex-col gap-2">
                   <ParameterName label="图谱接口密钥" />
                   <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3">
                     <KeyRound className="size-4 text-cyan-100/58" />
@@ -1971,7 +2105,7 @@ export function SettingsWorkspace() {
                   </div>
                 </label>
 
-                <label className="flex flex-col gap-2">
+                <label className="flex min-w-0 max-w-full flex-col gap-2">
                   <ParameterName label="向量接口密钥" />
                   <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3">
                     <KeyRound className="size-4 text-cyan-100/58" />
@@ -1996,7 +2130,7 @@ export function SettingsWorkspace() {
                 </label>
               </div>
               <div className="mt-4 grid gap-3 md:grid-cols-2">
-                <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
+                <label className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.025] px-4 py-3 text-sm text-white/70">
                   <input
                     type="checkbox"
                     checked={form.clear_chat_api_key}
@@ -2011,7 +2145,7 @@ export function SettingsWorkspace() {
                   />
                   <ParameterName label="清除当前聊天接口密钥" className="text-sm font-normal normal-case tracking-normal text-white/70" />
                 </label>
-                <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
+                <label className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.025] px-4 py-3 text-sm text-white/70">
                   <input
                     type="checkbox"
                     checked={form.clear_embedding_api_key}
@@ -2026,7 +2160,7 @@ export function SettingsWorkspace() {
                   />
                   <ParameterName label="清除当前向量接口密钥" className="text-sm font-normal normal-case tracking-normal text-white/70" />
                 </label>
-                <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
+                <label className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.025] px-4 py-3 text-sm text-white/70">
                   <input
                     type="checkbox"
                     checked={form.clear_graph_api_key}
@@ -2043,7 +2177,10 @@ export function SettingsWorkspace() {
                 </label>
               </div>
             </section>
+            ) : null}
 
+            {activeSettingsPage === "runtime" ? (
+            <>
             <section className={sectionClass}>
               <p className="text-sm font-semibold text-white">模型调用参数</p>
               <BoundaryNote title="生效边界：下一次请求或下一次模型调用">
@@ -2055,6 +2192,9 @@ export function SettingsWorkspace() {
                 <SettingField label="Chat JSON token 上限" type="number" min={256} max={32768} value={form.chat_json_max_tokens} onChange={(value) => updateForm("chat_json_max_tokens", value)} />
                 <SettingField label="模型超时秒数" type="number" min={5} max={600} value={form.model_request_timeout_seconds} onChange={(value) => updateForm("model_request_timeout_seconds", value)} />
                 <SettingField label="Embedding 批大小" type="number" min={1} max={10} value={form.embedding_batch_size} onChange={(value) => updateForm("embedding_batch_size", value)} />
+                <SettingField label="导入内存软水位" type="number" min={0.01} max={0.98} step={0.01} value={form.ingestion_memory_soft_limit_ratio} onChange={(value) => updateForm("ingestion_memory_soft_limit_ratio", value)} />
+                <SettingField label="导入内存硬水位" type="number" min={0.02} max={0.99} step={0.01} value={form.ingestion_memory_hard_limit_ratio} onChange={(value) => updateForm("ingestion_memory_hard_limit_ratio", value)} />
+                <SettingField label="导入内存临界水位" type="number" min={0.03} max={1} step={0.01} value={form.ingestion_memory_critical_limit_ratio} onChange={(value) => updateForm("ingestion_memory_critical_limit_ratio", value)} />
               </div>
             </section>
 
@@ -2069,7 +2209,52 @@ export function SettingsWorkspace() {
             />
 
             <UploadSecuritySettingsSection value={form.upload_max_bytes} onChange={(value) => updateForm("upload_max_bytes", value)} />
+            </>
+            ) : null}
 
+            {activeSettingsPage === "retrieval" ? (
+            <section className={sectionClass}>
+              <p className="text-sm font-semibold text-white">意图执行检索</p>
+              <BoundaryNote title="生效边界：下一次同步或流式检索问答">
+                模型逐请求选择 coarse、mid 或 chunk 入口及合法通道权重；以下数值只限定执行器预算，不创建产品模式。
+              </BoundaryNote>
+              <div className="mt-5">
+                <SwitchRow
+                  title="问答双语词面"
+                  description="开启后，同一次意图规划会为可翻译概念生成中英文检索面；标识符和编号保持原样，空词面仍可选择 Dense-only。"
+                  checked={form.query_facet_bilingual_enabled}
+                  onChange={() => updateForm("query_facet_bilingual_enabled", !form.query_facet_bilingual_enabled)}
+                  disabled={saveMutation.isPending}
+                  badge="热加载"
+                />
+              </div>
+              <div className="mt-5 grid gap-4 md:grid-cols-4">
+                <SettingField label="证据包 token 预算" type="number" min={256} max={20000} value={form.context_package_token_budget} onChange={(value) => updateForm("context_package_token_budget", value)} />
+                <SettingField label="结果 Top K 默认值" type="number" min={1} max={50} value={form.retrieval_result_top_k_default} onChange={(value) => updateForm("retrieval_result_top_k_default", value)} />
+                <SettingField label="Dense 候选预算" type="number" min={1} max={4096} value={form.retrieval_v1_dense_candidate_budget} onChange={(value) => updateForm("retrieval_v1_dense_candidate_budget", value)} />
+                <SettingField label="RQ 候选预算" type="number" min={1} max={4096} value={form.retrieval_v1_rq_candidate_budget} onChange={(value) => updateForm("retrieval_v1_rq_candidate_budget", value)} />
+                <SettingField label="BM25 候选预算" type="number" min={1} max={4096} value={form.retrieval_v1_bm25_candidate_budget} onChange={(value) => updateForm("retrieval_v1_bm25_candidate_budget", value)} />
+                <SettingField label="根入口预算" type="number" min={1} max={256} value={form.retrieval_v1_root_entry_budget} onChange={(value) => updateForm("retrieval_v1_root_entry_budget", value)} />
+                <SettingField label="逐父节点预算" type="number" min={1} max={256} value={form.retrieval_v1_per_parent_entry_budget} onChange={(value) => updateForm("retrieval_v1_per_parent_entry_budget", value)} />
+                <SettingField label="单层总预算" type="number" min={1} max={1024} value={form.retrieval_v1_layer_entry_budget} onChange={(value) => updateForm("retrieval_v1_layer_entry_budget", value)} />
+                <SettingField label="最大遍历深度" type="number" min={0} max={64} value={form.retrieval_v1_max_depth} onChange={(value) => updateForm("retrieval_v1_max_depth", value)} />
+                <SettingField label="每命中恢复预算" type="number" min={0} max={64} value={form.retrieval_v1_restore_per_hit} onChange={(value) => updateForm("retrieval_v1_restore_per_hit", value)} />
+              </div>
+              <div className="mt-6 rounded-2xl border border-white/8 bg-black/10 p-5">
+                <p className="text-xs uppercase tracking-[0.18em] text-cyan-100/48">原文 BM25 生命周期</p>
+                <p className="mt-2 text-xs leading-5 text-white/46">容量是构建硬上限；k1/b 变更必须通过 candidate、重建、发布和缓存失效后生效。</p>
+                <div className="mt-4 grid gap-4 md:grid-cols-5">
+                  <SettingField label="BM25 文档上限" type="number" min={1} max={1000000} value={form.lexical_index_max_documents} onChange={(value) => updateForm("lexical_index_max_documents", value)} />
+                  <SettingField label="BM25 postings 上限" type="number" min={1} max={20000000} value={form.lexical_index_max_postings} onChange={(value) => updateForm("lexical_index_max_postings", value)} />
+                  <SettingField label="BM25 原文字符上限" type="number" min={1} max={1000000000} value={form.lexical_index_max_characters} onChange={(value) => updateForm("lexical_index_max_characters", value)} />
+                  <SettingField label="BM25 k1" type="number" min={0.01} max={10} step={0.01} value={form.bm25_k1} onChange={(value) => updateForm("bm25_k1", value)} />
+                  <SettingField label="BM25 b" type="number" min={0} max={1} step={0.01} value={form.bm25_b} onChange={(value) => updateForm("bm25_b", value)} />
+                </div>
+              </div>
+            </section>
+            ) : null}
+
+            {activeSettingsPage === "graph" ? (
             <GraphProtocolSettingsSection
               values={{
                 edge_distance_protocol: form.edge_distance_protocol,
@@ -2080,7 +2265,10 @@ export function SettingsWorkspace() {
               }}
               onChange={(key, value) => updateForm(key, value)}
             />
+            ) : null}
 
+            {activeSettingsPage === "build" ? (
+            <>
             <section className={sectionClass}>
               <p className="text-sm font-semibold text-white">重建参数</p>
               <BoundaryNote title="生效边界：新任务会读取，但已有 active 数据不会改变">
@@ -2134,7 +2322,10 @@ export function SettingsWorkspace() {
               form={form}
               onError={(error) => setErrorDialog(errorDialogFromUnknown(error))}
             />
+            </>
+            ) : null}
 
+            {activeSettingsPage === "deployment" ? (
             <section className={sectionClass}>
               <p className="text-sm font-semibold text-white">服务重启参数</p>
               <BoundaryNote title="生效边界：必须重启或重建 worker 服务">
@@ -2144,10 +2335,11 @@ export function SettingsWorkspace() {
                 <SettingField label="工作进程并发" type="number" min={1} max={32} value={form.worker_concurrency} onChange={(value) => updateForm("worker_concurrency", value)} />
               </div>
             </section>
+            ) : null}
 
-            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/8 pt-5">
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/8 bg-white/[0.025] p-4">
               <p className="text-xs leading-6 text-white/42">
-                保存会立即写入仓库根 .env；热加载参数马上刷新，重建参数和服务参数分别保持待重建、待重启状态。回退开关不在页面开放开启。
+                保存会按键归属写入根 .env 或 settings.json；热加载参数马上刷新，重建参数和服务参数分别保持待重建、待重启状态。回退开关不在页面开放开启。
               </p>
               <div className="flex items-center gap-2">
                 {savedMessage ? <span className="text-sm text-emerald-100">{savedMessage}</span> : null}
