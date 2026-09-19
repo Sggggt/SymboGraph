@@ -878,6 +878,65 @@ class ChatProvider:
         )
         return self._parse_json_object(text)
 
+    def _bounded_text_payload(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        payload = self._structured_json_payload(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=max_tokens,
+        )
+        payload.pop("response_format", None)
+        return payload
+
+    async def complete_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        max_tokens: int,
+    ) -> str:
+        """Return one bounded native text completion without JSON coercion."""
+
+        if not self.api_key:
+            raise FallbackDisabledError(
+                f"{self.api_key_env_name} is required because live text generation has no fallback"
+            )
+        return await self._post_chat_text(
+            self._bounded_text_payload(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=max_tokens,
+            )
+        )
+
+    async def complete_text_streaming(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        max_tokens: int,
+        on_text_delta: Callable[[str], Awaitable[None]],
+    ) -> str:
+        """Stream one bounded native text completion and return the same text."""
+
+        if not self.api_key:
+            raise FallbackDisabledError(
+                f"{self.api_key_env_name} is required because live text streaming has no fallback"
+            )
+        return await self._post_chat_text_streaming(
+            self._bounded_text_payload(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=max_tokens,
+            ),
+            on_text_delta=on_text_delta,
+        )
+
     async def classify_json_bounded(
         self,
         system_prompt: str,

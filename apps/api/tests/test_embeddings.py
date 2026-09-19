@@ -11,6 +11,50 @@ import pytest
 
 
 @pytest.mark.asyncio
+async def test_native_text_completion_never_requests_json_response_format(
+    monkeypatch,
+    no_fallback_env,
+):
+    from app.services import embeddings
+
+    provider = embeddings.ChatProvider()
+    provider.api_key = "unit-test-key"
+    captured = []
+
+    async def fake_text(payload):
+        captured.append(payload)
+        return "Visible answer"
+
+    async def fake_stream(payload, *, on_text_delta):
+        captured.append(payload)
+        await on_text_delta("Visible answer")
+        return "Visible answer"
+
+    monkeypatch.setattr(provider, "_post_chat_text", fake_text)
+    assert await provider.complete_text(
+        "system",
+        "user",
+        max_tokens=512,
+    ) == "Visible answer"
+    monkeypatch.setattr(provider, "_post_chat_text_streaming", fake_stream)
+    deltas = []
+
+    async def on_delta(value):
+        deltas.append(value)
+
+    assert await provider.complete_text_streaming(
+        "system",
+        "user",
+        max_tokens=512,
+        on_text_delta=on_delta,
+    ) == "Visible answer"
+
+    assert deltas == ["Visible answer"]
+    assert all("response_format" not in payload for payload in captured)
+    assert all(payload["max_tokens"] == 512 for payload in captured)
+
+
+@pytest.mark.asyncio
 async def test_unified_question_perception_uses_production_budget(monkeypatch, no_fallback_env):
     from app.services import embeddings
     from app.services.agent_intent import QUESTION_PERCEPTION_PROTOCOL_VERSION

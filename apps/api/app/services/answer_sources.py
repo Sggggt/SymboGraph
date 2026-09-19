@@ -13,7 +13,12 @@ from sqlalchemy.orm import Session
 
 from app.models import AgentObservation, AgentRun, AnswerSession, AnswerSourceBinding, Chunk, ContextPackage, generate_uuid
 from app.reflection_contracts import SOURCE_BINDING_PROTOCOL, PATH_SUPPORT_PROTOCOL, AnswerDraft
-from app.retrieval_control_contracts import GroundedAnswerDraft, SourceGateAdmission, control_hash
+from app.retrieval_control_contracts import (
+    GroundedAnswerDraft,
+    GroundedMarkdownAnswerDraft,
+    SourceGateAdmission,
+    control_hash,
+)
 from app.services.agent_reflection import ReflectionContractError, reflection_hash, render_answer_units, source_path_metrics, validate_draft_sources
 from app.services.citation_provenance import audit_citation_provenance, replay_citation_provenance_for_persistence
 
@@ -288,7 +293,8 @@ def verify_sufficiency_owner(db, *, owner, retrieval_gate, required=False):
 
 def persist_answer_source_bindings(
     db: Session, *, answer_session: AnswerSession, package: ContextPackage, contexts: list[dict[str, Any]],
-    draft: AnswerDraft | GroundedAnswerDraft, evidence: AnswerEvidenceManifest, unit_limit: int,
+    draft: AnswerDraft | GroundedAnswerDraft | GroundedMarkdownAnswerDraft,
+    evidence: AnswerEvidenceManifest, unit_limit: int,
     reflection_audit_hash: str | None = None, retrieval_gate: AgentObservation | None = None,
     source_integrity_admission: AgentObservation | None = None,
 ) -> list[AnswerSourceBinding]:

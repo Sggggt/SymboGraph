@@ -7,7 +7,7 @@ import math
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator, model_serializer
-from app.reflection_contracts import AnswerUnit
+from app.reflection_contracts import AnswerUnit, SourceHandle
 
 
 UnitScore = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
@@ -713,6 +713,39 @@ class GroundedAnswerDraft(ControlContract):
         if len({unit.text.strip() for unit in self.answer_units}) != len(self.answer_units):
             raise ValueError("duplicate_answer_unit")
         return self
+
+
+class GroundedMarkdownAnswerUnit(ControlContract):
+    kind: Literal["factual"] = "factual"
+    text: str = Field(min_length=1, max_length=262_144)
+    source_handles: tuple[SourceHandle, ...] = Field(
+        min_length=1,
+        max_length=64,
+    )
+
+    @field_validator("text")
+    @classmethod
+    def valid_text(cls, value: str):
+        if not value.strip() or "\x00" in value:
+            raise ValueError("grounded_markdown_answer_text_invalid")
+        return value
+
+    @field_validator("source_handles")
+    @classmethod
+    def unique_sources(cls, value: tuple[str, ...]):
+        if len(set(value)) != len(value):
+            raise ValueError("grounded_markdown_sources_duplicate")
+        return value
+
+
+class GroundedMarkdownAnswerDraft(ControlContract):
+    protocol_version: Literal["grounded_markdown_inline_citations_v1"] = (
+        "grounded_markdown_inline_citations_v1"
+    )
+    answer_units: tuple[GroundedMarkdownAnswerUnit, ...] = Field(
+        min_length=1,
+        max_length=1,
+    )
 
 
 class SourceAddressedFacet(ControlContract):

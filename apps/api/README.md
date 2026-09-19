@@ -22,7 +22,7 @@ FastAPI 负责资料库、导入、四层图、检索、QA 和运行配置。Wor
 
 目标协议已成为当前运行入口：LLM 在一次规划中选择三个根入口并返回 `intent_execution_strategy_v2`；开启双语词面时，可翻译概念组同时携带中英文 surface，标识符和数值保持 neutral。空词面使用 Dense-only，混合计划按层执行 Dense/RQ/BM25 独立提名和图路径遍历。Context Package 经确定性来源准入后只生成一次回答。
 
-一次回答的闭合 JSON 在 `answer_units[].text` 中承载 GFM。生成提示明确要求结构化任务按需使用标题、列表、表格和代码块，数学表达使用 `$...$` 或 `$$...$$`，并禁止在外层 JSON 周围添加 Markdown fence。完整响应恰好是一层 `json` fence 时，解析器只剥离这一层兼容包装再执行同一闭合 schema；额外 prose 与非对象根仍失败关闭。普通段落仅在 schema 校验后增加展示用列表标记，不改写事实文字或来源。
+一次回答使用 `grounded_markdown_inline_citations_v1` 原生文本流。模型直接生成最终 GFM，不再返回外层 JSON，并可用 `⟦cite:src_n⟧` 标注原文来源；合法标记在流中确定性转换为序号链接，前端显示为浅灰胶囊，非法或未知标记原样输出而不使回答失败。标题、列表、表格、代码块和 `$...$`/`$$...$$` 都是最终正文的一部分，不经过完成后正文替换。正文完成后，服务端把本轮实际送入模型的已准入 Context Package 来源绑定到完整答案跨度，并单独发送引用列表。
 
 完整语义见[技术白皮书](../../docs/technical-spec.md)。`reflection_*` 中仍有当前来源恢复/重放依赖，兼容边界见[说明](../../docs/reference/compatibility.md)。
 
@@ -47,7 +47,7 @@ docker exec course-kg-api python /app/scripts/check_release_schema.py --help
 
 更新行为时同步 schema、shared types、相关 scripts 与 tests。来源写入保持显式事务；外部副作用先保存意图。出错时保留安全原因，不能吞掉关键审计或启用 fallback 伪装成功。
 
-`/qa/stream` 在长规划、图检索和生成等待期间发送 10 秒间隔的 SSE 注释保活，并关闭代理缓冲。保活帧不进入 Agent trace。请求接纳后由独立 run owner 持有数据库会话与租约，SSE 连接只是观察者；页面离开、刷新或网络断线只结束观察，不取消执行。显式取消才会设置取消信号。生成使用 provider 原生文本 delta，增量 JSON 投影器只发布 `answer_units[].text`，完成 schema/来源校验后以至多一个 `answer_replace` 收敛展示格式；不存在回答完成后的 256 字符伪流式切片。首个可见增量进入 `first_response_ms`/`first_token_ms`。所有完成、失败和取消终态都持久化，客户端可按 run 恢复。
+`/qa/stream` 在长规划、图检索和生成等待期间发送 10 秒间隔的 SSE 注释保活，并关闭代理缓冲。保活帧不进入 Agent trace。请求接纳后由独立 run owner 持有数据库会话与租约，SSE 连接只是观察者；页面离开、刷新或网络断线只结束观察，不取消执行。显式取消才会设置取消信号。目标生成使用 provider 原生文本 delta，并直接发布 append-only 可见正文；正文结束后单独发送由实际 Context Package 派生的引用列表与 final，不发送 `answer_replace`。首个可见增量进入 `first_response_ms`/`first_token_ms`。所有完成、失败和取消终态都持久化，客户端可按 run 恢复。
 
 问答请求接纳并创建 run 后，先将用户问题写入 PostgreSQL 会话，再开始规划、检索或模型调用。成功时追加回答；失败或取消时追加安全终态文案，因此已接纳的问题不会因执行异常丢失。会话列表逐条校验当前公共 schema，只返回兼容会话；一个旧协议或损坏会话只产生安全排除计数，不能使整个列表返回 500。被排除记录不删除、不改写，按 id 读取返回 409。历史来源的严格物理重放仍在 `verified_context_reuse` 前执行，失败时禁用复用并进入新的正式图检索。
 

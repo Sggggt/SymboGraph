@@ -760,7 +760,13 @@ def _validate_reference_provenance(
         )
         if (
             not answer_scope
-            and answer.prompt_protocol_version == "single_grounded_answer_v3"
+            and answer.prompt_protocol_version
+            in {
+                "single_grounded_answer_v3",
+                "single_grounded_answer_v4",
+                "single_grounded_answer_v5",
+                "single_grounded_answer_v6",
+            }
             and len(trace_scope) == 64
         ):
             # JSON ORM state can be expired by the source-binding flush. Read

@@ -101,22 +101,16 @@ async def test_retrieval_path_has_one_plan_one_generation_and_no_online_reward_o
             if "INTENT EXECUTION RETRIEVAL V1" in system_prompt:
                 calls.append("plan")
                 return proposal(layer="chunk")
-            if "SINGLE GROUNDED ANSWER V2" in system_prompt:
-                calls.append("answer")
-                assert "GitHub-Flavored Markdown" in system_prompt
-                assert "$...$" in system_prompt and "$$...$$" in system_prompt
-                packet = json.loads(user_prompt)
-                source = packet["evidence"][0]
-                return {
-                    "answer_units": [
-                        {
-                            "kind": "factual",
-                            "text": source["text"],
-                            "source_handles": [source["source_handle"]],
-                        }
-                    ]
-                }
             raise AssertionError("unexpected model call")
+
+        async def complete_text(self, system_prompt, user_prompt, *, max_tokens):
+            calls.append("answer")
+            assert "SINGLE GROUNDED MARKDOWN ANSWER V3" in system_prompt
+            assert "GitHub-Flavored Markdown" in system_prompt
+            assert "$...$" in system_prompt and "$$...$$" in system_prompt
+            packet = json.loads(user_prompt)
+            source = packet["evidence"][0]
+            return f"{source['text']}⟦cite:{source['source_handle']}⟧"
 
     monkeypatch.setattr(agent_graph, "ChatProvider", Model)
     monkeypatch.setattr(
@@ -159,7 +153,6 @@ async def test_generation_shape_failure_persists_content_free_diagnostics(
 ):
     from app.models import AgentRun
     from app.services import layered_execution_v1
-    from app.services.embeddings import ProviderJSONShapeError
     from app.services.reflection_models import AnswerReviewModelError
     from test_intent_contracts import proposal
     from agent_test_support import Admission
@@ -168,17 +161,10 @@ async def test_generation_shape_failure_persists_content_free_diagnostics(
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
             if "INTENT EXECUTION RETRIEVAL V1" in system_prompt:
                 return proposal(layer="chunk")
-            raise ProviderJSONShapeError(
-                {
-                    "error_code": "json_decode_error",
-                    "field_path": "$",
-                    "utf8_bytes": 127,
-                    "sha256": "f" * 64,
-                    "starts_with_object": True,
-                    "ends_with_object": False,
-                    "contains_code_fence": False,
-                }
-            )
+            raise AssertionError("unexpected model call")
+
+        async def complete_text(self, system_prompt, user_prompt, *, max_tokens):
+            return ""
 
     monkeypatch.setattr(agent_graph, "ChatProvider", Model)
     monkeypatch.setattr(
@@ -186,7 +172,10 @@ async def test_generation_shape_failure_persists_content_free_diagnostics(
         "EmbeddingProvider",
         fake_model_stack["EmbeddingProvider"],
     )
-    with pytest.raises(AnswerReviewModelError, match="generation_schema_invalid"):
+    with pytest.raises(
+        AnswerReviewModelError,
+        match="generation_answer_stream_invalid",
+    ):
         await agent_graph.run_agent(
             db_session,
             AgentRequest(
@@ -203,16 +192,11 @@ async def test_generation_shape_failure_persists_content_free_diagnostics(
     failure = run.metadata_json["technical_failure"]
     assert run.status == "failed"
     assert failure["stage"] == "generation"
-    assert failure["code"] == "schema_invalid"
+    assert failure["code"] == "answer_stream_invalid"
     assert failure["provider_shape"] == {
-        "error_code": "json_decode_error",
-        "field_path": "$",
-        "utf8_bytes": 127,
-        "starts_with_object": True,
-        "ends_with_object": False,
-        "contains_code_fence": False,
+        "error_code": "answer_stream_empty",
+        "provider_values_persisted": False,
     }
-    assert "sha256" not in json.dumps(failure)
 
 
 @pytest.mark.asyncio
@@ -342,20 +326,14 @@ async def test_verified_context_reuse_replays_same_session_sources_without_new_r
                 if planning_calls == 2:
                     raw["execution_strategy"]["route"] = "verified_context_reuse"
                 return raw
-            if "SINGLE GROUNDED ANSWER V2" in system_prompt:
-                answer_calls += 1
-                packet = json.loads(user_prompt)
-                source = packet["evidence"][0]
-                return {
-                    "answer_units": [
-                        {
-                            "kind": "factual",
-                            "text": source["text"],
-                            "source_handles": [source["source_handle"]],
-                        }
-                    ]
-                }
             raise AssertionError("unexpected model call")
+
+        async def complete_text(self, system_prompt, user_prompt, *, max_tokens):
+            nonlocal answer_calls
+            answer_calls += 1
+            packet = json.loads(user_prompt)
+            source = packet["evidence"][0]
+            return f"{source['text']}⟦cite:{source['source_handle']}⟧"
 
     monkeypatch.setattr(agent_graph, "ChatProvider", Model)
     monkeypatch.setattr(
@@ -415,6 +393,104 @@ async def test_verified_context_reuse_replays_same_session_sources_without_new_r
 
 
 @pytest.mark.asyncio
+async def test_grounded_sse_visible_text_is_the_persisted_answer_and_citations_follow(
+    db_session,
+    populated_context_graph,
+    fake_model_stack,
+    monkeypatch,
+):
+    from app.services import layered_execution_v1
+    from agent_test_support import Admission
+    from test_intent_contracts import proposal
+
+    class Model(fake_model_stack["ChatProvider"]):
+        async def classify_json(self, system_prompt, user_prompt, fallback=None):
+            if "INTENT EXECUTION RETRIEVAL V1" in system_prompt:
+                return proposal(layer="chunk")
+            raise AssertionError("unexpected model call")
+
+        async def complete_text_streaming(
+            self,
+            system_prompt,
+            user_prompt,
+            *,
+            max_tokens,
+            on_text_delta,
+        ):
+            packet = json.loads(user_prompt)
+            assert len(packet["evidence"]) >= 2
+            raw = (
+                "## Result\n\nFirst grounded point.⟦cite:src_1⟧\n\n"
+                "- Second grounded point.⟦cite:src_2⟧\n\n"
+                "Malformed stays visible: ⟦cite:src_999⟧"
+            )
+            for start in range(0, len(raw), 4):
+                await on_text_delta(raw[start : start + 4])
+            return raw
+
+    monkeypatch.setattr(agent_graph, "ChatProvider", Model)
+    monkeypatch.setattr(
+        layered_execution_v1,
+        "EmbeddingProvider",
+        fake_model_stack["EmbeddingProvider"],
+    )
+    events = [
+        event
+        async for event in agent_graph.stream_agent_events(
+            AgentRequest(
+                knowledge_base_id=populated_context_graph["knowledge_base"].id,
+                question="Summarize the topics.",
+                top_k=4,
+                stream_trace=True,
+            ),
+            admission=Admission(),
+        )
+    ]
+
+    visible = "".join(
+        event["token"] for event in events if event["type"] == "token"
+    )
+    final = next(event["response"] for event in events if event["type"] == "final")
+    citation_index = next(
+        index for index, event in enumerate(events) if event["type"] == "citations"
+    )
+    last_token_index = max(
+        index for index, event in enumerate(events) if event["type"] == "token"
+    )
+    persisted = db_session.scalar(
+        select(AnswerSession).order_by(AnswerSession.created_at.desc())
+    )
+
+    assert visible == final["answer"] == persisted.answer
+    assert visible == (
+        "## Result\n\nFirst grounded point.[1](#source-1)\n\n"
+        "- Second grounded point.[2](#source-2)\n\n"
+        "Malformed stays visible: ⟦cite:src_999⟧"
+    )
+    assert not [event for event in events if event["type"] == "answer_replace"]
+    assert citation_index > last_token_index
+    assert final["citations"]
+    expected_source_count = persisted.model_json["generation"]["model_audit"][
+        "answer_stream"
+    ]["source_handle_count"]
+    assert len(final["citations"]) == expected_source_count
+    assert persisted.model_json["source_binding_count"] == expected_source_count
+    assert len(persisted.diagnostics_json["answer_units"]) == 1
+    assert len(
+        persisted.diagnostics_json["answer_units"][0]["source_handles"]
+    ) == expected_source_count
+    assert persisted.model_json["generation"]["model_audit"]["answer_stream"][
+        "replace_count"
+    ] == 0
+    assert persisted.model_json["generation"]["model_audit"]["answer_stream"][
+        "citation_marker_count"
+    ] == 2
+    assert persisted.model_json["generation"]["model_audit"]["answer_stream"][
+        "invalid_marker_count"
+    ] == 1
+
+
+@pytest.mark.asyncio
 async def test_sse_and_sync_share_the_same_terminal_response_contract(
     db_session,
     sample_knowledge_base,
@@ -458,5 +534,3 @@ async def test_sse_and_sync_share_the_same_terminal_response_contract(
     terminal_meta = [event for event in events if event["type"] == "meta"][-1]
     assert terminal_meta["terminal_outcome"] == final.terminal_outcome
     assert terminal_meta["entry_layer"] == final.entry_layer
-
-

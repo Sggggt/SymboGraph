@@ -318,11 +318,11 @@ Context Package 是回答唯一事实输入，包含实际原文、chunk/版本/
 
 ### 回答与引用
 
-生成器只读当前 Task、意图、回答约束、完整 Context Package 及来源指引。事实单位携带包内 source handle；枚举不能把几个例子写成全集，比较不能混用版本和单位，分析中的推导要指明原文依据。
+生成器只读当前 Task、意图、回答约束、完整 Context Package 及来源指引。目标回答使用 `grounded_markdown_inline_citations_v1`：模型直接生成最终 GFM 文本，不返回 JSON，并在相关文字后使用 `⟦cite:src_n⟧` 或多 handle 形式标注原文来源。枚举不能把几个例子写成全集，比较不能混用版本和单位，分析中的推导要指明原文依据。
 
 允许回答已支持部分并明确剩余缺口，但不得将部分完成计为完整事实答案。完全缺乏支持时可返回闭合的 `insufficient_evidence` 结果，由本地模板呈现；该生成结果是终态，不再触发检索。
 
-生成后只做闭合输出、handle 归属、原文/答案跨度、FK/hash/版本和事务绑定检查。来源绑定是出处校验，不宣称逐句语义证明。无效来源、模型输出截断、取消和超时保持独立终态，不自动再生成。
+正文不再包裹在模型 JSON 中，也不在结束时接受第二份正文。流转换器仅把合法引用标记改成稳定序号链接；错误或未知格式按原字符进入 append-only 正文，不构成技术失败。持久答案必须与 SSE 已释放的转换后字符逐字相同。正文完成后，执行器把本轮实际 Context Package 中全部已准入来源绑定到完整答案跨度，并生成独立来源列表。该列表证明生成材料的身份和可重放性，不宣称逐句语义证明。模型输出截断、取消和超时保持独立终态，不自动再生成，也不把失败流提升为可复用事实。
 
 ### 直接路由
 
@@ -356,7 +356,7 @@ Search 在来源准入后返回检索结果。能力卡和澄清有独立终态�
 
 `partial_answer/insufficient_evidence` 与成功事实答案分开统计。技术错误不能显示成资料缺失。SSE 和同步终态含义一致，UI 不能在终态后重新进入加载。
 
-SSE 在等待规划、图检索或一次生成时，每 10 秒发送一次 `: keep-alive` 注释，并返回 `Cache-Control: no-cache, no-transform`、`Connection: keep-alive` 与 `X-Accel-Buffering: no`。该注释只维持传输连接，不是 Agent event，不进入 trace、Context Package、缓存身份、会话历史或模型上下文。执行 owner 与 SSE observer 分离：owner 持有数据库会话、并发租约、硬时限和终态责任；observer 关闭只取消订阅和传输等待，不调用 task cancel、不释放 owner lease、不把 run 写成 cancelled。客户端收到 run id 后若传输中断，必须继续读取 PostgreSQL 持久 run 状态，直到完成、澄清、失败或取消，不能把 EOF 直接猜成事实终态。
+SSE 在等待规划、图检索或一次生成时，每 10 秒发送一次 `: keep-alive` 注释，并返回 `Cache-Control: no-cache, no-transform`、`Connection: keep-alive` 与 `X-Accel-Buffering: no`。该注释只维持传输连接，不是 Agent event，不进入 trace、Context Package、缓存身份、会话历史或模型上下文。目标生成流只有 append-only 正文增量、引用列表和 final，不使用完成后的正文替换帧。执行 owner 与 SSE observer 分离：owner 持有数据库会话、并发租约、硬时限和终态责任；observer 关闭只取消订阅和传输等待，不调用 task cancel、不释放 owner lease、不把 run 写成 cancelled。客户端收到 run id 后若传输中断，必须继续读取 PostgreSQL 持久 run 状态，直到完成、澄清、失败或取消，不能把 EOF 直接猜成事实终态。
 
 浏览器显式取消通过独立 cancel endpoint 定位 run owner；迟到的旧取消响应不得覆盖新 run。服务进程退出时必须把不能继续的 owner 收敛为独立技术失败或取消终态，并保留已接纳问题；不能依赖观察者 finally 完成业务补偿。
 

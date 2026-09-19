@@ -9,7 +9,10 @@ import re
 from typing import Literal
 
 
-ANSWER_STREAM_PROTOCOL = "grounded_answer_provider_delta_v1"
+ANSWER_STREAM_PROTOCOL = "grounded_answer_provider_delta_v2"
+GROUNDED_MARKDOWN_INLINE_CITATIONS_PROTOCOL = (
+    "grounded_markdown_inline_citations_v1"
+)
 AnswerStreamUpdateKind = Literal["delta", "replace"]
 AnswerStreamSink = Callable[[dict[str, str]], Awaitable[None]]
 
@@ -234,3 +237,155 @@ class GroundedAnswerDeltaProjector:
             "rendered_characters": len(self.rendered_text),
             "provider_response_persisted": False,
         }
+
+
+class GroundedMarkdownStreamError(ValueError):
+    """Content-free failure for the native Markdown transport."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+_SOURCE_HANDLE = re.compile(r"^src_[1-9][0-9]*$")
+
+
+@dataclass(frozen=True)
+class GroundedMarkdownResult:
+    answer: str
+    final_delta: str
+    audit: dict[str, object]
+
+
+@dataclass
+class GroundedMarkdownAccumulator:
+    """Tolerantly convert valid inline citations and preserve every other byte."""
+
+    allowed_handles: frozenset[str]
+    max_characters: int = 262_144
+    _parts: list[str] | None = None
+    _pending: str = ""
+    _raw_characters: int = 0
+    _rendered_characters: int = 0
+    _delta_count: int = 0
+    _citation_marker_count: int = 0
+    _invalid_marker_count: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.allowed_handles:
+            raise GroundedMarkdownStreamError("answer_stream_sources_empty")
+        if self.max_characters < 1:
+            raise GroundedMarkdownStreamError("answer_stream_limit_invalid")
+        self._parts = []
+
+    @property
+    def parts(self) -> list[str]:
+        assert self._parts is not None
+        return self._parts
+
+    @staticmethod
+    def _partial_prefix_length(value: str) -> int:
+        prefix = "⟦cite:"
+        maximum = min(len(value), len(prefix) - 1)
+        for length in range(maximum, 0, -1):
+            if value.endswith(prefix[:length]):
+                return length
+        return 0
+
+    def _render_marker(self, raw_marker: str) -> str:
+        payload = raw_marker[len("⟦cite:") : -1]
+        handles = tuple(payload.split(",")) if payload else ()
+        if (
+            not handles
+            or len(handles) > 64
+            or len(set(handles)) != len(handles)
+            or any(_SOURCE_HANDLE.fullmatch(handle) is None for handle in handles)
+            or any(handle not in self.allowed_handles for handle in handles)
+        ):
+            self._invalid_marker_count += 1
+            return raw_marker
+        self._citation_marker_count += 1
+        return " ".join(
+            f"[{handle.removeprefix('src_')}](#source-{handle.removeprefix('src_')})"
+            for handle in handles
+        )
+
+    def _emit(self, value: str) -> str:
+        if value:
+            self.parts.append(value)
+            self._rendered_characters += len(value)
+        return value
+
+    def feed(self, raw_delta: str) -> str:
+        if not raw_delta:
+            return ""
+        if "\x00" in raw_delta:
+            raise GroundedMarkdownStreamError("answer_stream_contains_nul")
+        if self._raw_characters + len(raw_delta) > self.max_characters:
+            raise GroundedMarkdownStreamError("answer_stream_limit_exceeded")
+        self._raw_characters += len(raw_delta)
+        self._pending += raw_delta
+        emitted: list[str] = []
+        prefix = "⟦cite:"
+        while self._pending:
+            marker_start = self._pending.find(prefix)
+            if marker_start < 0:
+                hold = self._partial_prefix_length(self._pending)
+                visible = self._pending[:-hold] if hold else self._pending
+                self._pending = self._pending[-hold:] if hold else ""
+                if visible:
+                    emitted.append(self._emit(visible))
+                break
+            if marker_start > 0:
+                emitted.append(self._emit(self._pending[:marker_start]))
+                self._pending = self._pending[marker_start:]
+            marker_end = self._pending.find("⟧", len(prefix))
+            if marker_end < 0:
+                if len(self._pending) <= 512:
+                    break
+                self._invalid_marker_count += 1
+                emitted.append(self._emit(self._pending[0]))
+                self._pending = self._pending[1:]
+                continue
+            raw_marker = self._pending[: marker_end + 1]
+            emitted.append(self._emit(self._render_marker(raw_marker)))
+            self._pending = self._pending[marker_end + 1 :]
+        visible_delta = "".join(emitted)
+        if visible_delta:
+            self._delta_count += 1
+        return visible_delta
+
+    def finalize(
+        self,
+        *,
+        provider_stream_used: bool,
+        source_handle_count: int,
+    ) -> GroundedMarkdownResult:
+        final_delta = ""
+        if self._pending:
+            self._invalid_marker_count += int("⟦cite:" in self._pending)
+            final_delta = self._emit(self._pending)
+            if final_delta:
+                self._delta_count += 1
+            self._pending = ""
+        answer = "".join(self.parts)
+        if not answer.strip():
+            raise GroundedMarkdownStreamError("answer_stream_empty")
+        return GroundedMarkdownResult(
+            answer=answer,
+            final_delta=final_delta,
+            audit={
+                "protocol_version": GROUNDED_MARKDOWN_INLINE_CITATIONS_PROTOCOL,
+                "provider_stream_used": provider_stream_used,
+                "delta_count": self._delta_count,
+                "replace_count": 0,
+                "raw_response_characters": self._raw_characters,
+                "rendered_characters": self._rendered_characters,
+                "unit_count": 1,
+                "source_handle_count": source_handle_count,
+                "citation_marker_count": self._citation_marker_count,
+                "invalid_marker_count": self._invalid_marker_count,
+                "append_only": True,
+                "provider_response_persisted": False,
+            },
+        )

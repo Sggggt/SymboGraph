@@ -355,8 +355,8 @@ OpenAI-compatible base 后追加 `/chat/completions`，使用 Bearer Authorizati
 
 根 `.env` 与根 `settings.json` 通过受限 bind mount 提供给 API、worker 和 beat。文件身份审计必须分别以 canonical path、内容 SHA、size 和 protocol/version hash 为主，再形成组合 hash；不得因为 Docker 容器重建后的 mount/inode 差异制造另一份配置副本。更新事务必须有共享文件锁、两文件 expected hash、完整新字节校验、durable publication 和 before-image rollback；失败时恢复已替换文件并返回可行动错误，不得把临时文件或数据库 snapshot 提升为配置真值。
 
-`CHAT_JSON_MAX_TOKENS` 是 `hot_reloadable` 的有界完成预算，当前允许范围为
-256..32768；它用于 Anthropic 结构化输出的实际 token cap 为 `min(CHAT_JSON_MAX_TOKENS, component_cap)`，不改变路由、认证、schema 或 fallback 边界。
+`CHAT_JSON_MAX_TOKENS` 是保留历史名称的 `hot_reloadable` 有界完成预算，当前允许范围为
+256..32768；它用于规划等结构化输出，也作为 `grounded_markdown_inline_citations_v1` 最终文本流的实际 token cap，取 `min(CHAT_JSON_MAX_TOKENS, component_cap)`，不改变路由、认证、引用显示或 fallback 边界。
 
 目标 QA 只为规划、检索前来源定位和一次生成分配模型阶段预算，统一服从 `RETRIEVAL_TOTAL_TIMEOUT_SECONDS` 与 provider 全局上限。规划输出 Intent 与 ExecutionStrategy，词面可以为空；来源定位的字段和独立阶段参数随新 schema 定义，不继续用修正参数隐式代管。
 

@@ -82,12 +82,13 @@ async def test_generation_has_one_call_and_no_self_assessment_or_review(no_fallb
     calls = []
     class Provider:
         api_protocol, model = "anthropic", "unit-test-model"
-        async def classify_json_bounded(self, system_prompt, user_prompt, fallback, *, max_tokens):
+        async def complete_text(self, system_prompt, user_prompt, *, max_tokens):
             calls.append((system_prompt, user_prompt, max_tokens))
-            output = {"answer_units": [{"kind": "factual", "text": "The queued wait is bounded.", "source_handles": ["src_1"]}]}
-            if bad_shape:
-                output["self_assessment"] = {"needs_reflection": True}
-            return output
+            return (
+                ""
+                if bad_shape
+                else "The queued wait is bounded.⟦cite:src_1⟧"
+            )
         def provider_call_audit(self):
             return {}
     model = RetrievalModels(Provider)
@@ -102,6 +103,11 @@ async def test_generation_has_one_call_and_no_self_assessment_or_review(no_fallb
         draft, audit = await operation
         assert not hasattr(draft, "self_assessment")
         assert audit["model_call_count"] == 1
-        assert draft.protocol_version == "grounded_answer_units_v2"
+        assert audit["protocol_version"] == "grounded_markdown_inline_citations_v1"
+        assert draft.answer_units[0].text == (
+            "The queued wait is bounded.[1](#source-1)"
+        )
+        assert draft.protocol_version == "grounded_markdown_inline_citations_v1"
     assert len(calls) == 1 and calls[0][2] == 1024
+    assert "do not return JSON" in calls[0][0]
     assert not hasattr(model, "reflect")

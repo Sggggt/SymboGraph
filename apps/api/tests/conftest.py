@@ -424,6 +424,38 @@ def fake_model_stack(monkeypatch: pytest.MonkeyPatch):
                 }
             return fallback or {"label": "Unit concept", "definition": "Unit definition"}
 
+        async def complete_text(
+            self,
+            system_prompt: str,
+            user_prompt: str,
+            *,
+            max_tokens: int,
+        ) -> str:
+            import json
+
+            if "SINGLE GROUNDED MARKDOWN ANSWER V3" not in system_prompt:
+                raise AssertionError("Unexpected native text completion in unit test")
+            packet = json.loads(user_prompt)
+            source = packet["evidence"][0]
+            return f"{source['text']}⟦cite:{source['source_handle']}⟧"
+
+        async def complete_text_streaming(
+            self,
+            system_prompt: str,
+            user_prompt: str,
+            *,
+            max_tokens: int,
+            on_text_delta,
+        ) -> str:
+            text = await self.complete_text(
+                system_prompt,
+                user_prompt,
+                max_tokens=max_tokens,
+            )
+            for start in range(0, len(text), 7):
+                await on_text_delta(text[start : start + 7])
+            return text
+
         async def answer_question_with_meta(self, question: str, contexts: list[dict], history: list[dict] | None = None, context_quality: str = "normal", **_kwargs):
             from app.services.embeddings import (
                 ChatProvider as TrustedPromptProvider,

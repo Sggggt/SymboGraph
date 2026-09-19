@@ -358,11 +358,13 @@ $$
 
 通过来源准入后生成一次。模型只根据实际包回答支持的内容，明确部分完成或证据不足；不能把提案当定案、几个例子当全集，也不能把未检索到写成全库不存在。Search 在返回来源结果后结束。
 
-回答的事实单位引用当前 source handle，执行器确定性绑定答案跨度、chunk、文档版本和原文跨度。无效 handle、来源漂移、输出截断、超时和取消保持各自终态。来源绑定证明出处与身份，不声称已经证明每句话的语义。
+回答生成采用 `grounded_markdown_inline_citations_v1`。模型不再返回包裹正文的 JSON 对象，直接生成最终 GFM，并可在相关文字后写 `⟦cite:source_handle[,source_handle...]⟧` 原文引用标记。多步骤、比较和结构化回答按需使用标题、列表、表格或代码块；数学表达使用 `$...$` 行内或 `$$...$$` 块 LaTeX。前端不得根据普通字符模式把既有纯文本猜测改写为公式。
 
-`answer_units[].text` 保存模型实际生成的 GFM。多步骤、比较和结构化回答按需使用标题、列表、表格或代码块；数学表达使用 `$...$` 行内或 `$$...$$` 块 LaTeX。生成契约禁止在外层 JSON 周围添加 Markdown fence；传输解析器只允许确定性剥离“完整响应恰好是一层 `json` fence”的兼容包装，带额外 prose、嵌套内容或非对象根仍失败关闭。模型返回普通段落时，执行器可在完整 schema 校验后只增加列表标记作为展示投影，不改写事实文字、source handle 或答案 hash 的事实输入。前端不得根据普通字符模式把既有纯文本猜测改写为公式。
+本地流转换器只承担传输与显示职责：在有界缓冲内识别语法完整且 handle 属于本轮 Context Package 的引用标记，把每个 handle 转成稳定的 GFM 引用链接；前端将该链接渲染为浅灰色序号胶囊。格式错误、未知 handle、重复 handle、未闭合或过长的疑似标记不触发失败，而是按 provider 原字符输出。除这项有损于控制标记、无损于可见语义的确定性转换外，服务端不解析回答结构、不润色、不补写、不重排、不把普通段落改成列表，也不在生成结束后用另一份答案替换已发送正文。正常完成时，数据库 `AnswerSession.answer`、run `final_answer` 与浏览器依次收到的转换后 GFM 字符必须逐字相同；内部建立一个覆盖完整答案跨度的 response-level answer unit。
 
-SSE 与同步 QA 使用同一 run 和终态。SSE 连接只观察执行，不拥有执行任务：run 接纳、用户消息和执行所有权先持久化，执行任务自己持有数据库会话、并发租约、硬时限和终态责任；观察者只订阅持久 trace 与当前传输事件。生成阶段直接消费 provider 的文本 delta，从尚未完成的闭合 JSON 中只投影 `answer_units[].text`；source handle、provider 原始响应和其他控制字段不进入浏览器。投影保持 append-only，完整响应通过 JSON、Pydantic 和来源校验后才允许最终 `answer_replace` 归一化；服务端不在生成完成后把整段答案伪切成固定长度。`first_response_ms` 与 `first_token_ms` 记录首个可见回答增量的单调时钟延迟。长阶段通过纯传输 `keep-alive` 注释维持连接，该注释不进入 Agent 事件、图检索、Context Package 或模型上下文。
+来源列表在正文完成后从本轮已经通过 `source_integrity_admission_v1`、实际进入 Context Package 并提供给生成模型的来源确定性汇总，不以模型标记格式正确与否作为提交条件。合法标记中的 `src_n` 对应列表中的稳定序号胶囊；未被识别的原文标记不获得已核对样式。该列表表示“本回答生成时使用的已准入材料”，整个回答跨度绑定这些底层原文来源；来源绑定证明材料身份与可重放性，不声称每个来源逐句证明全部正文。失败流不得进入 `verified_context_reuse`。模型调用数仍为一次。
+
+SSE 与同步 QA 使用同一 run 和终态。SSE 连接只观察执行，不拥有执行任务：run 接纳、用户消息和执行所有权先持久化，执行任务自己持有数据库会话、并发租约、硬时限和终态责任；观察者只订阅持久 trace 与当前传输事件。目标生成链只发送 append-only 的可见正文增量，完成后发送引用列表与 final；不得为目标生成发送 `answer_replace`。`first_response_ms` 与 `first_token_ms` 记录首个可见回答增量的单调时钟延迟。长阶段通过纯传输 `keep-alive` 注释维持连接，该注释不进入 Agent 事件、图检索、Context Package 或模型上下文。
 
 ```mermaid
 sequenceDiagram

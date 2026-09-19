@@ -38,7 +38,7 @@ from app.services.source_integrity_admission import admit_context_package
 
 
 PROTOCOL = "intent_execution_retrieval_v1"
-GENERATION_CALL_PROTOCOL = "single_grounded_generation_call_v1"
+GENERATION_CALL_PROTOCOL = "single_grounded_generation_call_v4"
 
 
 def _prefers_chinese(text: str) -> bool:
@@ -517,7 +517,7 @@ async def _generate_once(
         question=request.question,
         answer=answer,
         chunk_ids_json=list(package.hit_chunk_ids_json or []),
-        prompt_protocol_version="single_grounded_answer_v3",
+        prompt_protocol_version="single_grounded_answer_v6",
         model_json={
             "protocol_version": PROTOCOL,
             "accepted_plan_hash": plan.identity,

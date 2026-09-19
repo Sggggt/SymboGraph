@@ -20,9 +20,27 @@ const components: Components = {
   h3: ({ className, ...props }) => <h3 className={cn("mt-4 text-lg font-semibold leading-tight text-white first:mt-0", className)} {...props} />,
   h4: ({ className, ...props }) => <h4 className={cn("mt-4 text-base font-semibold leading-tight text-white first:mt-0", className)} {...props} />,
   p: ({ className, ...props }) => <p className={cn("my-3 leading-8 first:mt-0 last:mb-0", className)} {...props} />,
-  a: ({ className, ...props }) => (
-    <a className={cn("text-cyan-100 underline decoration-cyan-200/35 underline-offset-4 transition hover:text-white", className)} target="_blank" rel="noreferrer" {...props} />
-  ),
+  a: ({ className, href, children, ...props }) => {
+    const source = /^#source-([1-9][0-9]*)$/.exec(href ?? "");
+    if (source) {
+      return (
+        <span
+          className={cn("mx-0.5 inline-flex min-w-5 items-center justify-center rounded-full border border-white/10 bg-white/[0.07] px-1.5 py-0.5 align-middle text-[0.68rem] font-medium leading-none text-white/55", className)}
+          data-source-citation-pill
+          data-source-index={source[1]}
+          aria-label={`来源 ${source[1]}`}
+          {...props}
+        >
+          {children}
+        </span>
+      );
+    }
+    return (
+      <a className={cn("text-cyan-100 underline decoration-cyan-200/35 underline-offset-4 transition hover:text-white", className)} href={href} target="_blank" rel="noreferrer" {...props}>
+        {children}
+      </a>
+    );
+  },
   strong: ({ className, ...props }) => <strong className={cn("font-semibold text-white", className)} {...props} />,
   em: ({ className, ...props }) => <em className={cn("text-cyan-50/85", className)} {...props} />,
   ul: ({ className, ...props }) => <ul className={cn("my-3 list-disc space-y-2 pl-5 marker:text-cyan-200/70", className)} {...props} />,
