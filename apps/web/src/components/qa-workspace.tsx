@@ -39,7 +39,7 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Textarea } from "@/components/ui/textarea";
 import { cancelAgentRun, deleteSession, fetchModelSettings, fetchSessionMessages, fetchSessions, fetchTaskStatus, streamAnswer, updateModelSettings } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { useLocalStorage } from "@/hooks/use-local-storage";
+import { cleanupLegacyQaPayloadStorage, useLocalStorage } from "@/hooks/use-local-storage";
 
 export type ChatTurn = {
   role: "user" | "assistant";
@@ -1099,10 +1099,8 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
     if (typeof window === "undefined") {
       return;
     }
-    for (const key of legacyQaPayloadStorageKeys(storageScope)) {
-      window.localStorage.removeItem(key);
-    }
-  }, [storageScope]);
+    cleanupLegacyQaPayloadStorage();
+  }, []);
 
   useEffect(() => () => {
     const controller = streamAbortControllerRef.current;
