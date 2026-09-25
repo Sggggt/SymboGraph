@@ -39,6 +39,9 @@ const traceNodeLabels: Record<AgentTraceNode, string> = {
   agent_admission: "Agent 准入",
   error: "错误",
   intent_planning: "理解任务并冻结计划",
+  planning_resource_titles: "查看粗节点标题",
+  planning_resource_details: "阅读粗节点摘要",
+  planning_schema_feedback: "修正规划格式",
   intent_execution_retrieval: "执行分层检索",
   source_integrity_admission: "核对来源完整性",
   verified_context_reuse: "复用已验证证据",
@@ -75,7 +78,7 @@ export function traceGroupForNode(node: string): TraceGroupKey {
   if (node === "answer_source_binding") {
     return "source_binding";
   }
-  if (node === "query_understanding" || node === "query_facet_extraction" || node === "agent_planner" || node === "typed_action_validation" || node === "replan_no_progress" || node === "entry_selection" || node === "direct_answer_route_gate" || node === "direct_answer_reuse_evaluator" || node === "direct_answer_fallback" || node === "intent_planning") {
+  if (node === "query_understanding" || node === "query_facet_extraction" || node === "agent_planner" || node === "typed_action_validation" || node === "replan_no_progress" || node === "entry_selection" || node === "direct_answer_route_gate" || node === "direct_answer_reuse_evaluator" || node === "direct_answer_fallback" || node === "intent_planning" || node === "planning_resource_titles" || node === "planning_resource_details" || node === "planning_schema_feedback") {
     return "entry";
   }
   if (node === "layer_drilldown" || node === "layered_retrieval" || node === "intent_execution_retrieval") {
@@ -136,6 +139,9 @@ export function traceNodeVariant(node: string): "success" | "info" | "warning" |
     node === "layered_retrieval" ||
     node === "context_package" ||
     node === "intent_planning" ||
+    node === "planning_resource_titles" ||
+    node === "planning_resource_details" ||
+    node === "planning_schema_feedback" ||
     node === "intent_execution_retrieval" ||
     node === "source_integrity_admission" ||
     node === "verified_context_reuse"
@@ -241,6 +247,11 @@ export function traceAuditSummary(scores: AgentTraceScores | undefined): string[
       break;
     case "intent_execution":
       entries = [
+        ["planning_round", "规划轮次", scores.planning_round],
+        ["coarse_node_count", "粗节点", scores.coarse_node_count],
+        ["model_duration_ms", "模型等待", scores.model_duration_ms == null ? undefined : `${scores.model_duration_ms} ms`],
+        ["local_read_duration_ms", "本地读取", scores.local_read_duration_ms == null ? undefined : `${scores.local_read_duration_ms} ms`],
+        ["schema_feedback_error_count", "格式问题", scores.schema_feedback_error_count],
         ["entry_layer", "入口层", scores.entry_layer],
         ["accepted_plan_hash", "计划", scores.accepted_plan_hash],
         ["model_call_count", "模型调用", scores.model_call_count],

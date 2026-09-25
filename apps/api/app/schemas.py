@@ -1970,6 +1970,13 @@ class IntentExecutionTraceScores(AgentTraceScoresBase):
     source_integrity_admission_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     entry_layer: Literal["coarse", "mid", "chunk"] | None = None
     model_call_count: int | None = Field(default=None, ge=0)
+    resource_read_count: int | None = Field(default=None, ge=0, le=2)
+    planning_round: int | None = Field(default=None, ge=1, le=4)
+    resource_mode: Literal["titles", "details"] | None = None
+    coarse_node_count: int | None = Field(default=None, ge=0)
+    model_duration_ms: int | None = Field(default=None, ge=0)
+    local_read_duration_ms: int | None = Field(default=None, ge=0)
+    schema_feedback_error_count: int | None = Field(default=None, ge=0, le=8)
     score_fields_used: list[str] = Field(default_factory=list)
     fallback_before_retrieval: bool | None = None
     retrieval_audit: dict[str, Any] | None = None
@@ -2056,6 +2063,9 @@ class AgentTraceEventPayload(ClosedContractModel):
         "agent_admission",
         "error",
         "intent_planning",
+        "planning_resource_titles",
+        "planning_resource_details",
+        "planning_schema_feedback",
         "intent_execution_retrieval",
         "source_integrity_admission",
         "verified_context_reuse",
@@ -2112,6 +2122,9 @@ class AgentTraceEventPayload(ClosedContractModel):
             "agent_admission": "status",
             "error": "status",
             "intent_planning": "intent_execution",
+            "planning_resource_titles": "intent_execution",
+            "planning_resource_details": "intent_execution",
+            "planning_schema_feedback": "intent_execution",
             "intent_execution_retrieval": "intent_execution",
             "source_integrity_admission": "intent_execution",
             "verified_context_reuse": "intent_execution",
@@ -6962,6 +6975,8 @@ class ContextStructureNativeMetadataAudit(ClosedContractModel):
     )
     image_size: list[float] | tuple[float, float] | None = None
     source_index: int | None = Field(default=None, ge=0)
+    source_block_index: int | None = Field(default=None, ge=0)
+    style: str | None = Field(default=None, max_length=1024)
     span_remap_method: str | None = None
     original_char_span: list[int] | tuple[int, int] | None = None
     section_index: int | None = Field(default=None, ge=0)
@@ -6999,6 +7014,7 @@ class ContextStructureLayoutAudit(ClosedContractModel):
     parser_path: str | None = None
     page_size: list[float] | tuple[float, float] | None = None
     native_layout_block_count: int | None = Field(default=None, ge=0)
+    native_structure_block_count: int | None = Field(default=None, ge=0)
     pdf_image_count: int | None = Field(default=None, ge=0)
     ocr_image_errors: list[str] = Field(default_factory=list)
     ocr_applied: bool | None = None

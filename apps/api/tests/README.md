@@ -21,7 +21,7 @@ docker exec course-kg-api python -m pytest tests
 | 配置/缓存/恢复 | `test_runtime_*`、`test_*runtime_settings*`、`test_cache_manager.py`、`test_qdrant_*` |
 | 脚本/发布 | `test_script_write_gates.py`、`test_*scripts.py`、`test_locked_runtime_image_contract.py`、迁移相关测试 |
 
-目标协议回归已覆盖 Intent/ExecutionStrategy、coarse/mid/chunk 根入口、空词面、Dense/RQ/BM25 独立提名与图内通道保留、同一 chunk 多路径后的稳定结果去重、索引发布、缓存身份与失效；包括负权重、空分词、零命中、不同统计域、跨语言、同分和父节点投影。历史测试仍按 fixture 显式隔离。
+目标协议回归已覆盖 Intent/ExecutionStrategy、可选粗层标题与详情读取及闭合状态机、coarse/mid/chunk 根入口、空词面、Dense/RQ/BM25 独立提名与图内通道保留、同一 chunk 多路径后的稳定结果去重、索引发布、缓存身份与失效；包括负权重、空分词、零命中、不同统计域、跨语言、同分和父节点投影。粗层读取用公开合成的多文档/语言标题检查权重排序、过滤、目录超预算、越权键和图身份漂移；流式完整 BM25 hash 与物化快照对照并覆盖篡改拒绝。历史测试仍按 fixture 显式隔离。
 
 目标 QA 验证确定性来源准入后一次生成、无额外结果判定调用、部分回答/不足与技术终态分列。SSE 回归验证保活注释不进入 trace、响应禁止缓存/缓冲、观察者关闭不取消 owner、显式取消才结束任务并释放租约，以及失败/取消会话状态只由最新 run 收敛。会话回归还覆盖 run 接纳后立即持久化用户问题、终态配对、空检索会话不进入问答历史，旧来源重放失败时历史仍可列出、阅读并继续正式检索，以及逆序多来源 UUID 必须先 canonicalize 再校验。历史协议测试保护已有记录可读；不能为保持旧测试通过而把旧执行机制带回新入口。真实 LLM 调权与全局覆盖需独立验收，mock 计划通过只能证明执行契约。
 

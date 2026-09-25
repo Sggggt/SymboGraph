@@ -446,7 +446,7 @@ class Settings(BaseSettings):
     agent_reflection_round_budget: int = Field(default=2, ge=0, le=10)
     agent_reflection_timeout_seconds: int = Field(default=90, ge=15, le=240)
     retrieval_repair_round_limit: int = Field(default=1, ge=0, le=2)
-    retrieval_total_timeout_seconds: int = Field(default=360, ge=15, le=600)
+    retrieval_total_timeout_seconds: int = Field(default=540, ge=15, le=600)
     retrieval_planning_timeout_seconds: int = Field(default=60, ge=5, le=120)
     retrieval_repair_timeout_seconds: int = Field(default=60, ge=5, le=60)
     retrieval_sufficiency_timeout_seconds: int = Field(default=60, ge=5, le=240)

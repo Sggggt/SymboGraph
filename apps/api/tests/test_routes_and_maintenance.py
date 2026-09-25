@@ -1209,6 +1209,47 @@ def test_runtime_refresh_syncs_model_bridge_after_version_change(monkeypatch):
     assert sync_calls == [{"enabled": True, "raise_on_error": True}]
 
 
+def test_runtime_refresh_detects_root_file_change_without_redis_broadcast(monkeypatch):
+    from app.services import runtime_settings
+
+    monkeypatch.setattr(runtime_settings, "_LAST_RUNTIME_SETTINGS_VERSION", "unit-version")
+    monkeypatch.setattr(runtime_settings, "_LAST_RUNTIME_CONFIGURATION_IDENTITY", "unit-old-file")
+    monkeypatch.setattr(runtime_settings, "_redis_client", lambda: SimpleNamespace(get=lambda _key: "unit-version"))
+    monkeypatch.setattr(runtime_settings, "runtime_configuration_identity", lambda: {"identity_hash": "unit-new-file"})
+    refreshes = []
+    bridge_syncs = []
+    monkeypatch.setattr(runtime_settings, "_local_runtime_refresh", lambda version, *, changed_keys, apply_rebuild: refreshes.append((version, changed_keys, apply_rebuild)))
+    monkeypatch.setattr(runtime_settings, "sync_model_bridge_runtime_config", lambda settings: bridge_syncs.append(True) or {"ok": True})
+
+    first = runtime_settings.refresh_runtime_settings_if_needed()
+    second = runtime_settings.refresh_runtime_settings_if_needed()
+
+    assert first["refreshed"] is True and first["configuration_file_changed"] is True
+    assert second["refreshed"] is False and second["configuration_file_changed"] is False
+    assert refreshes == [("unit-version", None, False)]
+    assert bridge_syncs == [True]
+
+
+def test_failed_bridge_sync_does_not_consume_root_file_change(monkeypatch):
+    from app.services import runtime_settings
+
+    monkeypatch.setattr(runtime_settings, "_LAST_RUNTIME_SETTINGS_VERSION", "unit-version")
+    monkeypatch.setattr(runtime_settings, "_LAST_RUNTIME_CONFIGURATION_IDENTITY", "unit-old-file")
+    monkeypatch.setattr(runtime_settings, "_redis_client", lambda: SimpleNamespace(get=lambda _key: "unit-version"))
+    monkeypatch.setattr(runtime_settings, "runtime_configuration_identity", lambda: {"identity_hash": "unit-new-file"})
+    refreshes = []
+    monkeypatch.setattr(runtime_settings, "_local_runtime_refresh", lambda *_args, **_kwargs: refreshes.append(True))
+    def fail_sync(*, settings):
+        raise RuntimeError("unit-bridge-failure")
+    monkeypatch.setattr(runtime_settings, "sync_model_bridge_runtime_config", fail_sync)
+
+    with pytest.raises(RuntimeError, match="unit-bridge-failure"):
+        runtime_settings.refresh_runtime_settings_if_needed()
+    assert runtime_settings._LAST_RUNTIME_CONFIGURATION_IDENTITY == "unit-old-file"
+    assert runtime_settings._LAST_RUNTIME_SETTINGS_VERSION == "unit-version"
+    assert len(refreshes) == 1
+
+
 def test_runtime_refresh_fails_fast_when_model_bridge_sync_fails(monkeypatch):
     from app.core.config import get_settings
     from app.services import runtime_settings

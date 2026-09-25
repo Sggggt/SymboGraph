@@ -242,6 +242,39 @@ def test_scope_target_cover_uses_interval_planner_and_respects_execution_budget(
     assert ids == () and audit['status'] == 'over_budget'
 
 
+def test_scope_targets_keep_version_boundaries_and_share_chunk_costs(monkeypatch):
+    from app.services import chunking
+    from app.services.evidence_scope import scope_target_plan
+
+    sources = (
+        CorpusSource('unit-target', 'unit-doc-a', 'unit-v1', 'Atlas manual', 'alpha', 0, 5, control_hash('alpha')),
+        CorpusSource('unit-other', 'unit-doc-b', 'unit-v2', 'Birch handbook', 'bravo', 0, 5, control_hash('bravo')),
+    )
+    corpus = SimpleNamespace(knowledge_base_id='unit-kb', sources=sources,
+        scope_hash=control_hash('two-public-guides'), by_id={source.chunk_id: source for source in sources})
+    nodes = tuple(SimpleNamespace(id=f'unit-node-{index}', knowledge_base_id='unit-kb',
+        document_id=source.document_id, document_version_id=source.document_version_id,
+        node_type='document', title=source.title, char_start=0, char_end=5,
+        parent_id=None, previous_sibling_id=None, next_sibling_id=None, layout_json={})
+        for index, source in enumerate(sources))
+    index = StructureScopeIndex(corpus=corpus, nodes=nodes)
+    target_scope = obligation(request('document', 'Atlas manual'))
+    fixed = TaskContract(knowledge_base_id='unit-kb', conversation_scope_hash='a'*64,
+        question='Summarize Atlas manual twice for two independent duties.',
+        requirements=(Requirement(id='f1', text='First duty', weight=.5, source_scope=target_scope),
+                      Requirement(id='f2', text='Second duty', weight=.5, source_scope=target_scope)))
+    calls = []
+    original = chunking.rough_token_count
+    def counted(text):
+        calls.append(text)
+        return original(text)
+    monkeypatch.setattr(chunking, 'rough_token_count', counted)
+    ids, audit = scope_target_plan(index=index, task=fixed, token_budget=1000, target_limit=2)
+    assert ids == ('unit-target',)
+    assert audit['status'] == 'proposed'
+    assert len(calls) == len(sources)
+
+
 def test_cell_number_and_wrong_caption_type_are_not_object_declarations():
     raw = 'Equation 3: unrelated\n3 17 28\n'
     split = raw.index('3 17')
@@ -278,4 +311,3 @@ def test_document_identity_can_use_a_nested_declared_bundle_heading():
     )
     assert binding.reason == 'resolved'
     assert binding.node_ids == ('unit-n0', 'unit-n1')
-

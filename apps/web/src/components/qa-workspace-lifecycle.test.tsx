@@ -154,6 +154,55 @@ describe("QA run terminal reconciliation", () => {
     expect(screen.queryByText("partial output")).toBeNull();
   });
 
+  it("shows the persisted current phase while waiting for a model response without trace events", async () => {
+    await mountWorkspace();
+    await submitQuestion();
+
+    await act(async () => {
+      queryClient.setQueryData(["agent-run", runId], { run_id: runId, status: "running", current_node: "intent_planning", trace: [] });
+    });
+    await waitFor(() => expect(screen.getByTestId("agent-trace-stream").textContent).toContain("当前阶段：理解问题并规划检索"));
+
+    await act(async () => {
+      queryClient.setQueryData(["agent-run", runId], { run_id: runId, status: "running", current_node: "generation", trace: [] });
+    });
+    await waitFor(() => expect(screen.getByTestId("agent-trace-stream").textContent).toContain("当前阶段：生成回答"));
+    expect(screen.getByTestId("agent-trace-stream").textContent).toContain("0 个步骤");
+  });
+
+  it("merges polled preplan steps with SSE without duplicates or losing them at final", async () => {
+    const titles: AgentTraceEventPayload = {
+      ...trace, id: "unit-test-titles", sequence_index: 0,
+      node: "planning_resource_titles", status: "completed",
+      output_summary: "已读取 3 个粗节点标题",
+      scores: { contract_version: "agent_trace_scores_public_v1", audit_kind: "intent_execution", coarse_node_count: 3 },
+    };
+    const plan: AgentTraceEventPayload = {
+      ...trace, id: "unit-test-plan", sequence_index: 1,
+      node: "intent_planning", status: "completed", output_summary: "规划已冻结",
+      scores: { contract_version: "agent_trace_scores_public_v1", audit_kind: "intent_execution", model_call_count: 2 },
+    };
+    await mountWorkspace();
+    await submitQuestion();
+
+    await act(async () => {
+      streams[0].handlers.onTrace?.(titles);
+      queryClient.setQueryData(["agent-run", runId], { run_id: runId, status: "running", current_node: "retrieval", trace: [titles, plan] });
+    });
+    await waitFor(() => expect(screen.getByTestId("agent-trace-stream").textContent).toContain("2 个步骤"));
+
+    await act(async () => {
+      streams[0].handlers.onTrace?.(plan);
+      streams[0].handlers.onFinal?.(finalResponse());
+    });
+    const stream = screen.getByTestId("agent-trace-stream");
+    expect(stream.textContent).toContain("2 个步骤");
+    fireEvent.click(stream.querySelector("button") as HTMLButtonElement);
+    expect(stream.querySelectorAll("ol li")).toHaveLength(2);
+    expect(stream.textContent).toContain("查看粗节点标题");
+    expect(stream.textContent).toContain("理解任务并冻结计划");
+  });
+
   it("stops at final despite a pending transport and ignores late metadata, tokens and duplicate finals", async () => {
     await mountWorkspace();
     await submitQuestion();

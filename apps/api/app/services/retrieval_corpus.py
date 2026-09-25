@@ -74,7 +74,7 @@ class RetrievalCorpus:
             "activation_generation": target.activation_generation,
             "schema_hash": target.vector_schema_hash,
         })
-        self._normalized_texts = tuple(normalized_surface(source.text) for source in sources)
+        self._normalized_texts: tuple[str, ...] | None = None
 
     @classmethod
     def load(cls, db, *, knowledge_base_id, filters):
@@ -158,6 +158,8 @@ class RetrievalCorpus:
         normalized = normalized_surface(surface)
         if not normalized:
             raise ValueError("literal_lookup_empty_surface")
+        if self._normalized_texts is None:
+            self._normalized_texts = tuple(normalized_surface(source.text) for source in self.sources)
         hits = tuple(source.chunk_id for source, text in zip(self.sources, self._normalized_texts) if normalized in text)
         # The view is a retrieval/ready-vector scope, not proof that all raw
         # PDFs (images, failed parses or other scopes) have been represented.

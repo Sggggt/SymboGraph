@@ -6,6 +6,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 import sys
 import time
@@ -234,6 +235,38 @@ def _write(path: Path, payload: dict) -> None:
     temporary.replace(path)
 
 
+def _interval_union_ms(intervals: list[tuple[float, float]]) -> float:
+    total = 0.0
+    end = 0.0
+    for start, stop in sorted(intervals):
+        if stop <= end:
+            continue
+        total += stop - max(start, end)
+        end = stop
+    return total
+
+
+def _timing_summary(response: dict | None) -> dict:
+    performance = ((response or {}).get("model_audit") or {}).get("qa_performance") or {}
+    elapsed = performance.get("elapsed_ms")
+    if not isinstance(elapsed, (int, float)):
+        return {"elapsed_ms": None, "provider_roundtrip_ms": None, "nonmodel_ms": None, "resource_read_ms": None}
+    spans = performance.get("spans") or []
+    def intervals(stage: str) -> list[tuple[float, float]]:
+        return [
+            (max(0.0, float(item["start_ms"])), min(float(elapsed), float(item["start_ms"]) + float(item["duration_ms"])))
+            for item in spans
+            if item.get("stage") == stage
+        ]
+    provider = _interval_union_ms(intervals("provider_roundtrip"))
+    return {
+        "elapsed_ms": round(float(elapsed), 3),
+        "provider_roundtrip_ms": round(provider, 3),
+        "nonmodel_ms": round(max(0.0, float(elapsed) - provider), 3),
+        "resource_read_ms": round(_interval_union_ms(intervals("resource_read")), 3),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Evaluate intent_execution_retrieval_v1 against five frozen cases."
@@ -320,6 +353,7 @@ def main() -> int:
             "persisted_audit": audit,
             "hard_gate_passed": audit["passed"],
             "elapsed_seconds": round(time.perf_counter() - case_started, 3),
+            "timing": _timing_summary(response),
             "human_score": None,
             "failure": failure,
         }
@@ -358,6 +392,15 @@ def main() -> int:
         "all_hard_gates_passed": all(item["hard_gate_passed"] for item in records),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "records": records,
+    }
+    nonmodel = sorted(
+        item["timing"]["nonmodel_ms"] for item in records
+        if item["timing"]["nonmodel_ms"] is not None
+    )
+    output["nonmodel_latency_ms"] = {
+        "n": len(nonmodel),
+        "p50": nonmodel[(len(nonmodel) - 1) // 2] if nonmodel else None,
+        "p95": nonmodel[max(0, math.ceil(0.95 * len(nonmodel)) - 1)] if nonmodel else None,
     }
     output["report_hash"] = _hash(output)
     _write(args.output.resolve(), output)

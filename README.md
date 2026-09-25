@@ -6,7 +6,7 @@
 
 SymboGraph 是本地文档知识库。它把资料解析成固定片段和四层上下文图，沿图寻找证据，再从实际原文证据包生成带引用的回答。
 
-当前架构使用 Chunk Structure、Chunk Relations/RQ、Mid Concepts 和 Coarse Concepts。LLM 分开确定问题意图与执行策略，选择粗层、中层或片段层入口；无词面走纯向量，有词面时可按 LLM 权重融合 Dense、RQ 和 BM25 分层入口。取得原文包后进行确定性来源校验、一次生成和引用绑定。
+当前架构使用 Chunk Structure、Chunk Relations/RQ、Mid Concepts 和 Coarse Concepts。LLM 可在规划前选择只读粗节点标题目录及少量摘要，也可直接提交计划；随后分开确定问题意图与执行策略，选择粗层、中层或片段层入口。无词面走纯向量，有词面时可按 LLM 权重融合 Dense、RQ 和 BM25 分层入口。取得原文包后进行确定性来源校验、一次生成和引用绑定。
 
 当前运行主链已迁移到该架构。Dense、RQ、BM25 只负责图入口提名与融合，最终证据必须经过图路径、结构恢复和来源准入；实现契约见[技术白皮书](docs/technical-spec.md)，设计依据见[检索调研](docs/reference/retrieval-research.md)。
 

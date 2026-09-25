@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 
 from app.models import (
     AgentObservation,
+    AgentTraceEvent,
     AnswerSession,
     ContextPackage,
     RetrievalLexicalReward,
@@ -20,6 +21,32 @@ from app.schemas import (
 )
 from app.services import agent_graph
 from app.services.intent_execution_agent import execute_intent_search
+
+
+@pytest.mark.asyncio
+async def test_prefetched_capability_is_rechecked_before_retrieval(monkeypatch):
+    import asyncio
+    from app.services import intent_execution_agent
+
+    manifest = SimpleNamespace(identity="unit-test-capability")
+    state = SimpleNamespace(id="unit-test-state")
+    plan = SimpleNamespace(capability_hash=manifest.identity)
+    monkeypatch.setattr(
+        intent_execution_agent,
+        "retrieval_capability_snapshot",
+        lambda _db, _kb, *, admit_graph: (manifest, state),
+    )
+    task = asyncio.create_task(asyncio.sleep(0, result=(manifest, state.id)))
+    result = await intent_execution_agent._admitted_capabilities_after_plan(
+        object(), knowledge_base_id="unit-test-kb", plan=plan, task=task,
+    )
+    assert result == (manifest, state)
+
+    drifted = asyncio.create_task(asyncio.sleep(0, result=(manifest, "unit-test-old-state")))
+    with pytest.raises(ValueError, match="strategy_capability_identity_changed"):
+        await intent_execution_agent._admitted_capabilities_after_plan(
+            object(), knowledge_base_id="unit-test-kb", plan=plan, task=drifted,
+        )
 
 
 def test_public_search_response_rejects_duplicate_chunk_results():
@@ -288,6 +315,9 @@ async def test_search_uses_the_same_plan_and_source_admission_without_generation
     assert payload["entry_layer"] == "mid"
     assert payload["terminal_outcome"] == "completed"
     assert payload["results"]
+    assert [event.node for event in db_session.scalars(
+        select(AgentTraceEvent).where(AgentTraceEvent.run_id == payload["run_id"]).order_by(AgentTraceEvent.sequence_index)
+    )][:1] == ["intent_planning"]
     assert db_session.scalar(select(func.count()).select_from(AnswerSession)) == 0
     assert not list(
         db_session.scalars(

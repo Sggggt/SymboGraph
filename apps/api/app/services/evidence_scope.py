@@ -481,6 +481,7 @@ def scope_target_plan(*, index, task, token_budget, target_limit, candidate_ids=
                 raise ValueError('scope_target_affinity_source_mismatch')
     bound = index.bind(task)
     plans, targets, packing_targets = [], set(), []
+    costs = {source.chunk_id: rough_token_count(source.text) for source in index.corpus.sources}
     for facet in task.requirements:
         if facet.source_scope is None:
             continue
@@ -501,7 +502,10 @@ def scope_target_plan(*, index, task, token_budget, target_limit, candidate_ids=
                 expression=EvidenceScopeExpression(op='scope',scope_id=item.fact.id),scopes=(item.fact,),packed=(),mode='complete')
             candidates = []
             spans = _merge_scope_intervals((part.knowledge_base_id,part.document_version_id,part.start,part.end) for part in item.fact.intervals)
+            span_versions = {version for _kb, version, _start, _end in spans}
             for source in index.corpus.sources:
+                if source.document_version_id not in span_versions:
+                    continue
                 if candidate_ids is not None and source.chunk_id not in candidate_ids:
                     continue
                 interval = (task.knowledge_base_id,source.document_version_id,source.char_start,source.char_end)
@@ -534,7 +538,6 @@ def scope_target_plan(*, index, task, token_budget, target_limit, candidate_ids=
             plans.append(plan.model_dump(mode='json'))
             packing_targets.extend(plan.selected_ids)
             return set(plan.selected_ids) if plan.status in {'ready','already_covered'} else None
-        costs = {source.chunk_id:rough_token_count(source.text) for source in index.corpus.sources}
         chosen = propose(facet.source_scope)
         if chosen is not None:
             targets.update(chosen)

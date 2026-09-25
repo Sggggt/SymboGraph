@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { AgentTraceEventPayload } from "@course-kg/shared";
@@ -78,8 +78,42 @@ describe("QA layered trace product surface", () => {
     render(<GeneratingBubble content="" trace={makeTrace()} />);
 
     const stream = screen.getByTestId("agent-trace-stream");
-    expect(stream.textContent).toContain("正在执行：动作执行");
-    expect(stream.textContent).toContain("实时");
+    expect(stream.textContent).toContain("已完成：动作执行");
+    expect(stream.textContent).not.toContain("实时");
+  });
+
+  it("shows the current run phase and elapsed time while a model call has no completed trace event", async () => {
+    render(<GeneratingBubble content="" trace={[]} currentNode="intent_planning" startedAt={new Date(Date.now() - 65_000).toISOString()} />);
+
+    const stream = screen.getByTestId("agent-trace-stream");
+    expect(stream.textContent).toContain("当前阶段：理解问题并规划检索");
+    await waitFor(() => expect(stream.textContent).toContain("已运行 1 分"), { timeout: 2000 });
+    expect(stream.textContent).toContain("0 个步骤");
+    expect(stream.textContent).toContain("当前阶段完成后会显示第一条轨迹事件");
+  });
+
+  it("shows actual coarse reads and schema feedback before the completed plan", () => {
+    const stages = [
+      { node: "planning_resource_titles", output_summary: "已读取 3 个粗节点标题", scores: { audit_kind: "intent_execution", planning_round: 1, resource_mode: "titles", coarse_node_count: 3, model_duration_ms: 1200, local_read_duration_ms: 23 } },
+      { node: "planning_resource_details", output_summary: "已阅读 2 个粗节点详情", scores: { audit_kind: "intent_execution", planning_round: 2, resource_mode: "details", coarse_node_count: 2, model_duration_ms: 900, local_read_duration_ms: 14 } },
+      { node: "planning_schema_feedback", output_summary: "计划格式未通过校验，已请求模型重提", scores: { audit_kind: "intent_execution", planning_round: 3, schema_feedback_error_count: 1 } },
+      { node: "intent_planning", output_summary: "规划已冻结", scores: { audit_kind: "intent_execution", model_call_count: 4 } },
+    ] as const;
+    const events = stages.map((item, index) => ({
+      contract_version: "agent_trace_event_public_v1", type: "trace", id: `unit-test-step-${index}`,
+      run_id: "unit-test-run", sequence_index: index, status: "completed",
+      input_summary: "", document_ids: [], duration_ms: 10,
+      ...item,
+      scores: { contract_version: "agent_trace_scores_public_v1", ...item.scores },
+    })) as AgentTraceEventPayload[];
+
+    render(<AgentTraceStream trace={events} defaultExpanded compact />);
+    const stream = screen.getByTestId("agent-trace-stream");
+    const visible = stream.querySelector("ol")?.textContent ?? "";
+    expect(visible.indexOf("查看粗节点标题")).toBeLessThan(visible.indexOf("阅读粗节点摘要"));
+    expect(visible.indexOf("阅读粗节点摘要")).toBeLessThan(visible.indexOf("修正规划格式"));
+    expect(visible.indexOf("修正规划格式")).toBeLessThan(visible.indexOf("理解任务并冻结计划"));
+    expect(stream.textContent).toContain("4 个步骤");
   });
 
   it("sanitizes ids, hashes, and storage paths in summaries", () => {

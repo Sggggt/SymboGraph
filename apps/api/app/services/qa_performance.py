@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 Stage = Literal[
     "request", "admission_queue", "conversation_prepare", "task_planning",
-    "history_projection", "capability_manifest", "intent_planning", "context_reuse",
+    "history_projection", "capability_manifest", "intent_planning", "resource_read", "context_reuse",
     "graph_admission", "embedding", "retrieval", "candidate_discovery",
     "path_features", "feature_preparation", "lexical_repair", "evidence_sufficiency", "packing", "context_package", "source_admission", "generation", "source_binding",
     "database_commit", "audit_persistence", "model_call", "model_queue",

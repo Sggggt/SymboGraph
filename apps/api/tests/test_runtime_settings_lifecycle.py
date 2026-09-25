@@ -1,10 +1,57 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, select, update
+
+
+def test_direct_root_protocol_change_refreshes_effective_chat_provider(
+    no_fallback_env, monkeypatch,
+):
+    from app.core.config import get_settings
+    from app.services import runtime_settings
+
+    root_env = no_fallback_env.parent / ".env"
+    original = root_env.read_text(encoding="utf-8")
+    root_env.write_text(
+        original.replace("CHAT_API_PROTOCOL=openai", "CHAT_API_PROTOCOL=anthropic"),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CHAT_API_PROTOCOL", "anthropic")
+    monkeypatch.setattr(
+        runtime_settings, "_RUNTIME_ENV_PROCESS_APPLIED_VALUES",
+        {"CHAT_API_PROTOCOL": "anthropic"},
+    )
+    monkeypatch.setattr(runtime_settings, "HOT_RELOAD_SETTINGS", {"chat_api_protocol"})
+    monkeypatch.setattr(runtime_settings, "_LAST_RUNTIME_SETTINGS_VERSION", "unit-stable")
+    monkeypatch.setattr(
+        runtime_settings,
+        "_LAST_RUNTIME_CONFIGURATION_IDENTITY",
+        runtime_settings.runtime_configuration_identity()["identity_hash"],
+    )
+    monkeypatch.setattr(
+        runtime_settings, "_redis_client",
+        lambda: SimpleNamespace(get=lambda _key: "unit-stable"),
+    )
+    bridge_protocols = []
+    monkeypatch.setattr(
+        runtime_settings,
+        "sync_model_bridge_runtime_config",
+        lambda settings: bridge_protocols.append(settings.chat_api_protocol) or {"ok": True},
+    )
+    root_env.write_text(original, encoding="utf-8")
+
+    result = runtime_settings.refresh_runtime_settings_if_needed()
+
+    assert result["refreshed"] is True
+    assert result["configuration_file_changed"] is True
+    assert os.environ["CHAT_API_PROTOCOL"] == "openai"
+    assert get_settings().chat_api_protocol == "openai"
+    assert bridge_protocols == ["openai"]
 
 
 def _bind_current_bridge_identity(candidate, overrides: dict) -> None:

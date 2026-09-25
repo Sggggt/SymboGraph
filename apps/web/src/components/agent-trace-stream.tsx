@@ -17,7 +17,7 @@ import {
   Search,
   XCircle,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { traceAuditSummary, traceGroupForNode, traceGroupLabels, traceNodeLabel } from "@/lib/agent-trace";
@@ -26,9 +26,25 @@ import { cn } from "@/lib/utils";
 interface AgentTraceStreamProps {
   trace: AgentTraceEventPayload[];
   isRunning?: boolean;
+  currentNode?: string | null;
+  startedAt?: string | null;
   defaultExpanded?: boolean;
   compact?: boolean;
   className?: string;
+}
+
+const activePhaseLabels: Record<string, string> = {
+  intent_planning: "理解问题并规划检索",
+  retrieval: "检索资料",
+  generation: "生成回答",
+};
+
+function elapsedLabel(startedAt: string | null | undefined, now: number): string | null {
+  if (!startedAt || now <= 0) return null;
+  const start = Date.parse(startedAt);
+  if (!Number.isFinite(start)) return null;
+  const seconds = Math.max(0, Math.floor((now - start) / 1000));
+  return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
 }
 
 function formatScalar(value: unknown): string {
@@ -315,10 +331,22 @@ function TraceEventItem({
   );
 }
 
-export function AgentTraceStream({ trace, isRunning = false, defaultExpanded = false, compact = false, className }: AgentTraceStreamProps) {
+export function AgentTraceStream({ trace, isRunning = false, currentNode, startedAt, defaultExpanded = false, compact = false, className }: AgentTraceStreamProps) {
   const [expanded, setExpanded] = useState(defaultExpanded || isRunning);
+  const [now, setNow] = useState(0);
+  useEffect(() => {
+    if (!isRunning) return undefined;
+    const initialTimer = window.setTimeout(() => setNow(Date.now()), 0);
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => {
+      window.clearTimeout(initialTimer);
+      window.clearInterval(timer);
+    };
+  }, [isRunning]);
   const events = useMemo<AgentTraceEventPayload[]>(() => trace, [trace]);
   const latest = events.at(-1);
+  const phase = currentNode ? activePhaseLabels[currentNode] : null;
+  const elapsed = isRunning ? elapsedLabel(startedAt, now) : null;
 
   if (!events.length && !isRunning) {
     return null;
@@ -334,7 +362,9 @@ export function AgentTraceStream({ trace, isRunning = false, defaultExpanded = f
             <span className="text-[11px] text-white/38">{events.length} 个步骤</span>
           </span>
           <span className="mt-1 block truncate text-xs text-white/42">
-            {latest ? `${isRunning ? "正在执行" : "最新事件"}：${traceNodeLabel(latest.node)}` : "等待事件"}
+            {isRunning
+              ? `${phase ? `当前阶段：${phase}` : latest ? `已完成：${traceNodeLabel(latest.node)}` : "等待第一个阶段完成"}${elapsed ? ` · 已运行 ${elapsed}` : ""}`
+              : latest ? `最新事件：${traceNodeLabel(latest.node)}` : "等待事件"}
           </span>
         </span>
         <span className="inline-flex shrink-0 items-center gap-1 text-xs text-cyan-100/62 transition group-hover:text-cyan-100">
@@ -358,7 +388,7 @@ export function AgentTraceStream({ trace, isRunning = false, defaultExpanded = f
                   key={event.id ?? `${event.node}-${index}-${event.created_at ?? "pending"}`}
                   event={event}
                   index={index}
-                  isLatest={isRunning && index === events.length - 1}
+                  isLatest={isRunning && event.status === "running" && index === events.length - 1}
                 />
               ))
             ) : (
@@ -367,7 +397,7 @@ export function AgentTraceStream({ trace, isRunning = false, defaultExpanded = f
                 animate={{ opacity: 1, y: 0 }}
                 className="border-l border-white/10 py-3 pl-4 text-xs text-white/44"
               >
-                正在等待后端推送第一个轨迹事件...
+                当前阶段完成后会显示第一条轨迹事件。
               </motion.li>
             )}
           </motion.ol>

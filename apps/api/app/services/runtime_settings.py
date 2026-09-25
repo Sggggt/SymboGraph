@@ -162,6 +162,7 @@ DEPRECATED_ENV_KEYS: set[str] = {
     "AGENT_REFLECTION_CONTEXT_THRESHOLD",
 }
 _LAST_RUNTIME_SETTINGS_VERSION: str | None = None
+_LAST_RUNTIME_CONFIGURATION_IDENTITY: str | None = None
 _RUNTIME_ENV_PROCESS_APPLIED_VALUES: dict[str, str | None] = {}
 SECRET_RUNTIME_SETTING_KEYS = frozenset(
     {"chat_api_key", "graph_api_key", "embedding_api_key"}
@@ -2690,7 +2691,7 @@ def refresh_runtime_settings_if_needed(
     *,
     sync_bridge: bool = True,
 ) -> dict:
-    global _LAST_RUNTIME_SETTINGS_VERSION
+    global _LAST_RUNTIME_SETTINGS_VERSION, _LAST_RUNTIME_CONFIGURATION_IDENTITY
     version: str | None = None
     redis_error: str | None = None
     bridge_sync: dict | None = None
@@ -2699,11 +2700,16 @@ def refresh_runtime_settings_if_needed(
     except Exception as exc:  # pragma: no cover - exercised by integration/runtime checks
         redis_error = str(exc)
 
-    should_refresh = force or (version is not None and version != _LAST_RUNTIME_SETTINGS_VERSION)
+    file_identity = str(runtime_configuration_identity()["identity_hash"])
+    file_changed = file_identity != _LAST_RUNTIME_CONFIGURATION_IDENTITY
+    version_changed = version is not None and version != _LAST_RUNTIME_SETTINGS_VERSION
+    should_refresh = force or file_changed or version_changed
     if should_refresh:
+        previous_version = _LAST_RUNTIME_SETTINGS_VERSION
+        previous_file_identity = _LAST_RUNTIME_CONFIGURATION_IDENTITY
         changed_keys: list[str] | None = None
         apply_rebuild = False
-        if version is not None:
+        if version is not None and (version_changed or not file_changed):
             with suppress(Exception):
                 from app.db import SessionLocal
                 from app.models import RuntimeSettingsVersion
@@ -2715,21 +2721,34 @@ def refresh_runtime_settings_if_needed(
                         )
                     )
                     if row is not None:
-                        changed_keys = list(row.changed_keys_json or [])
+                        # A changed root file may include hot keys outside the
+                        # published row. Refresh all hot keys in that case,
+                        # while retaining the row's rebuild lifecycle flag.
+                        if not file_changed:
+                            changed_keys = list(row.changed_keys_json or [])
                         apply_rebuild = str(row.source or "").startswith(
                             "runtime_settings_"
                         )
-        _local_runtime_refresh(
-            version,
-            changed_keys=changed_keys,
-            apply_rebuild=apply_rebuild,
-        )
-        if sync_bridge:
-            bridge_sync = sync_model_bridge_runtime_config(settings=get_settings())
+        try:
+            _local_runtime_refresh(
+                version,
+                changed_keys=changed_keys,
+                apply_rebuild=apply_rebuild,
+            )
+            if sync_bridge:
+                bridge_sync = sync_model_bridge_runtime_config(settings=get_settings())
+        except Exception:
+            _LAST_RUNTIME_SETTINGS_VERSION = previous_version
+            _LAST_RUNTIME_CONFIGURATION_IDENTITY = previous_file_identity
+            raise
+        # If files changed during the refresh, the next boundary retries.
+        if str(runtime_configuration_identity()["identity_hash"]) == file_identity:
+            _LAST_RUNTIME_CONFIGURATION_IDENTITY = file_identity
     elif version is not None:
         _LAST_RUNTIME_SETTINGS_VERSION = version
     result = {
         "refreshed": should_refresh,
+        "configuration_file_changed": file_changed,
         "runtime_settings_version": version or _LAST_RUNTIME_SETTINGS_VERSION,
         "redis_error": redis_error,
     }
@@ -4786,6 +4805,8 @@ def initialize_runtime_configuration_from_root_files() -> dict[str, Any]:
     explicit operator action and is never performed by a service import.
     """
 
+    global _LAST_RUNTIME_CONFIGURATION_IDENTITY
+
     identity = runtime_env_file_identity(ENV_PATH)
     if not identity.get("exists"):
         raise RuntimeError(
@@ -4801,6 +4822,7 @@ def initialize_runtime_configuration_from_root_files() -> dict[str, Any]:
     _apply_runtime_env_file_to_process_environment()
     get_settings.cache_clear()
     combined = runtime_configuration_identity()
+    _LAST_RUNTIME_CONFIGURATION_IDENTITY = str(combined["identity_hash"])
     return {
         "initialized": True,
         "reason": "root_runtime_configuration_applied",

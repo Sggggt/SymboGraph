@@ -11,7 +11,7 @@ FastAPI 负责资料库、导入、四层图、检索、QA 和运行配置。Wor
 | `app/core/config.py`、`app/core/runtime_config.py`、`services/runtime_settings.py` | 双文件配置解析、原子更新和三级生命周期 |
 | `services/ingestion.py`、`parsers.py`、`source_parse_pipeline.py` | 文件解析、版本和补偿 |
 | `services/context_graph.py`、`auto_tpe.py`、`graph_build_workspace.py` | 四层图和构建计算 |
-| `services/intent_execution_agent.py`、`intent_planning.py`、`layered_execution_v1.py` | 当前 Search/QA/SSE 规划、图执行与终态 |
+| `services/intent_execution_agent.py`、`intent_planning.py`、`coarse_resource_read.py`、`layered_execution_v1.py` | 当前 Search/QA/SSE 的可选粗层只读观察、规划、图执行与终态 |
 | `services/retrieval_agent.py`、`retrieval_fsm.py`、`reflection_*` | 历史记录重放与兼容测试，不是目标 serving 主链 |
 | `services/evidence_scope.py`、`source_location.py`、`source_use.py` | 原文范围、位置和用途 |
 | `services/answer_sources.py`、`citation_provenance.py`、`agent_pe_audit.py` | 来源绑定与审计 |

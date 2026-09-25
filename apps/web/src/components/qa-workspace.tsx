@@ -318,6 +318,19 @@ export function preserveTurnTraces(nextTurns: ChatTurn[], currentTurns: ChatTurn
   }));
 }
 
+function mergeRunTrace(existing: AgentTraceEventPayload[], incoming: AgentTraceEventPayload[]): AgentTraceEventPayload[] {
+  if (!incoming.length) return existing;
+  const runId = incoming[0].run_id;
+  const bySequence = new Map<number, AgentTraceEventPayload>();
+  for (const event of existing) {
+    if (event.run_id === runId) bySequence.set(event.sequence_index, event);
+  }
+  for (const event of incoming) {
+    if (event.run_id === runId) bySequence.set(event.sequence_index, event);
+  }
+  return [...bySequence.values()].sort((left, right) => left.sequence_index - right.sequence_index);
+}
+
 function ChatHeader({
   latestRun,
   configuredChatModel,
@@ -688,7 +701,7 @@ export function MessageBubble({
   );
 }
 
-export function GeneratingBubble({ content, trace }: { content: string; trace: AgentTraceEventPayload[] }) {
+export function GeneratingBubble({ content, trace, currentNode, startedAt }: { content: string; trace: AgentTraceEventPayload[]; currentNode?: string | null; startedAt?: string | null }) {
   return (
     <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="flex justify-start">
       <div className="w-full max-w-[min(860px,92%)] border-l border-cyan-200/18 px-5 py-4 text-white">
@@ -696,7 +709,7 @@ export function GeneratingBubble({ content, trace }: { content: string; trace: A
           <Loader2 className="size-4 animate-spin" />
           {content ? "正在输出" : "智能体运行中"}
         </div>
-        {!content ? <AgentTraceStream trace={trace} isRunning defaultExpanded compact className="mb-5" /> : null}
+        {!content ? <AgentTraceStream trace={trace} isRunning currentNode={currentNode} startedAt={startedAt} defaultExpanded compact className="mb-5" /> : null}
         {content ? (
           <div className="relative">
             <MarkdownRenderer content={content} className="pr-3 text-white/76" />
@@ -719,6 +732,8 @@ export function MessageList({
   isGenerating,
   draftAnswer,
   trace,
+  currentNode,
+  startedAt,
   onOpenCitations,
 }: {
   turns: ChatTurn[];
@@ -726,6 +741,8 @@ export function MessageList({
   isGenerating: boolean;
   draftAnswer: string;
   trace: AgentTraceEventPayload[];
+  currentNode?: string | null;
+  startedAt?: string | null;
   onOpenCitations: (citations: Citation[]) => void;
 }) {
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -772,7 +789,7 @@ export function MessageList({
               onOpenCitations={onOpenCitations}
             />
           ))}
-          {isGenerating ? <GeneratingBubble content={draftAnswer} trace={trace} /> : null}
+          {isGenerating ? <GeneratingBubble content={draftAnswer} trace={trace} currentNode={currentNode} startedAt={startedAt} /> : null}
           <div ref={bottomRef} className="h-52 shrink-0 md:h-56" />
         </div>
       )}
@@ -1228,7 +1245,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
     setDraftAnswer("");
     setActiveStream(null);
     if (status.trace?.length) {
-      setTrace(status.trace);
+      setTrace((current) => mergeRunTrace(current, status.trace ?? []));
     }
     const runState = status.status ?? status.state;
     if (runState === "completed" || runState === "needs_clarification") {
@@ -1324,8 +1341,9 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
           {
             onTrace: (event) => {
               if (!isCurrentStream()) return;
-              nextTraceEvents.push(event);
-              setTrace((current) => [...current, event]);
+              const merged = mergeRunTrace(nextTraceEvents, [event]);
+              nextTraceEvents.splice(0, nextTraceEvents.length, ...merged);
+              setTrace((current) => mergeRunTrace(current, [event]));
             },
             onToken: (token) => {
               if (isCurrentStream()) setDraftAnswer((current) => `${current}${token}`);
@@ -1354,7 +1372,8 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
             onFinal: (response) => {
               if (!isCurrentStream()) return;
               streamAbortControllerRef.current = null;
-              const finalTrace = response.trace.length ? response.trace : nextTraceEvents;
+              const polledTrace = queryClient.getQueryData<TaskStatusResponse>(["agent-run", response.run_id])?.trace ?? [];
+              const finalTrace = mergeRunTrace(mergeRunTrace(nextTraceEvents, polledTrace), response.trace);
               setLatestRun(response);
               setConversationState(response.conversation_state ?? null);
               setAutoResumeSuppressed(false);
@@ -1455,7 +1474,7 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
           setActiveStream((current) => (current ? { ...current, sessionId: status.session_id } : current));
         }
       }
-      if (status.trace?.length) setTrace(status.trace);
+      if (status.trace?.length) setTrace((current) => mergeRunTrace(current, status.trace ?? []));
     });
     return () => { cancelled = true; };
   }, [
@@ -1561,6 +1580,8 @@ function QAWorkspaceContent({ selectedKnowledgeBaseId }: { selectedKnowledgeBase
             isGenerating={isGenerating}
             draftAnswer={draftAnswer}
             trace={trace}
+            currentNode={runStatusQuery.data?.run_id === activeRunId ? runStatusQuery.data.current_node : null}
+            startedAt={activeStream?.startedAt}
             onOpenCitations={openCitationDrawer}
           />
         </main>

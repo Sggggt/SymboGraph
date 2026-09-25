@@ -26,6 +26,7 @@ from app.services.context_graph import (
 )
 from app.services.intent_planning import (
     plan_intent_execution,
+    read_admitted_capability_snapshot,
     retrieval_capability_snapshot,
 )
 from app.services.layered_execution_v1 import (
@@ -43,6 +44,43 @@ GENERATION_CALL_PROTOCOL = "single_grounded_generation_call_v4"
 
 def _prefers_chinese(text: str) -> bool:
     return bool(re.search(r"[\u3400-\u9fff]", text))
+
+
+def _planning_call_count(run) -> int:
+    return int(((run.metadata_json or {}).get("intent_execution_plan") or {}).get("planning_model_call_count") or 1)
+
+
+async def _prefetch_capability_snapshot(knowledge_base_id: str):
+    from app.services import agent_graph
+
+    with qa_stage("graph_admission"):
+        return await agent_graph.run_bounded_source_io(
+            read_admitted_capability_snapshot, knowledge_base_id,
+        )
+
+
+async def _discard_capability_prefetch(task: asyncio.Task) -> None:
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except BaseException:
+        # Direct routes and failed plans never use a speculative corpus read.
+        pass
+
+
+async def _admitted_capabilities_after_plan(db, *, knowledge_base_id: str, plan, task: asyncio.Task):
+    admitted_capabilities, state_id = await task
+    current_capabilities, current_state = retrieval_capability_snapshot(
+        db, knowledge_base_id, admit_graph=False,
+    )
+    if (
+        admitted_capabilities.identity != plan.capability_hash
+        or current_capabilities.identity != admitted_capabilities.identity
+        or (current_state.id if current_state is not None else None) != state_id
+    ):
+        raise ValueError("strategy_capability_identity_changed")
+    return admitted_capabilities, current_state
 
 
 def _trace_payloads(db, run_id: str, agent_graph) -> list[dict]:
@@ -123,7 +161,7 @@ def _finish_direct(
         model_json={
             "protocol_version": PROTOCOL,
             "accepted_plan_hash": plan.identity,
-            "planning_model_call_count": 1,
+            "planning_model_call_count": _planning_call_count(run),
             "generation_model_call_count": 0,
             "answer_model_called": False,
             "tool_call_count": 0,
@@ -354,7 +392,7 @@ def _finish_gap(
         model_json={
             "protocol_version": PROTOCOL,
             "accepted_plan_hash": plan.identity,
-            "planning_model_call_count": 1,
+            "planning_model_call_count": _planning_call_count(run),
             "generation_model_call_count": 0,
             "source_admission_model_call_count": 0,
             "terminal_outcome": outcome,
@@ -521,7 +559,7 @@ async def _generate_once(
         model_json={
             "protocol_version": PROTOCOL,
             "accepted_plan_hash": plan.identity,
-            "planning_model_call_count": 1,
+            "planning_model_call_count": _planning_call_count(run),
             "generation_model_call_count": 1,
             "post_generation_model_call_count": 0,
             "source_admission_model_call_count": 0,
@@ -684,19 +722,28 @@ async def _execute(db, request, session, run) -> dict:
             knowledge_base_id=run.knowledge_base_id,
             conversation_planner_context=conversation_planner_context,
         )
+    capability_prefetch = asyncio.create_task(
+        _prefetch_capability_snapshot(run.knowledge_base_id)
+    )
     planning_started = time.monotonic()
-    with qa_stage("intent_planning"):
-        plan, planning_audit = await plan_intent_execution(
-            db,
-            run=run,
-            question=request.question,
-            conversation_scope_hash=run.metadata_json["conversation_state_scope_hash"],
-            filter_scope_hash=filter_scope_hash,
-            history_summary=history_summary,
-            capabilities=capabilities,
-            verified_context_reuse_available=reuse_candidate is not None,
-            provider_factory=agent_graph.ChatProvider,
-        )
+    try:
+        with qa_stage("intent_planning"):
+            plan, planning_audit = await plan_intent_execution(
+                db,
+                run=run,
+                question=request.question,
+                conversation_scope_hash=run.metadata_json["conversation_state_scope_hash"],
+                filter_scope_hash=filter_scope_hash,
+                history_summary=history_summary,
+                capabilities=capabilities,
+                filters=request.filters,
+                verified_context_reuse_available=reuse_candidate is not None,
+                provider_factory=agent_graph.ChatProvider,
+                on_trace=lambda node, kwargs: agent_graph.trace(db, run.id, node, **kwargs),
+            )
+    except BaseException:
+        await _discard_capability_prefetch(capability_prefetch)
+        raise
     run.metadata_json = {
         **dict(run.metadata_json or {}),
         "history_summary": history_summary,
@@ -720,11 +767,13 @@ async def _execute(db, request, session, run) -> dict:
             "protocol_version": PROTOCOL,
             "accepted_plan_hash": plan.identity,
             "capability_hash": plan.capability_hash,
-            "model_call_count": 1,
+            "model_call_count": planning_audit["model_call_count"],
+            "resource_read_count": planning_audit["resource_read_count"],
         },
         duration_ms=int(round((time.monotonic() - planning_started) * 1000)),
     )
     if plan.strategy.route == "system_capability":
+        await _discard_capability_prefetch(capability_prefetch)
         card = system_capability_card()
         answer = card["localized_answers"]["zh" if _prefers_chinese(request.question) else "en"]["capabilities"]
         return _finish_direct(
@@ -740,6 +789,7 @@ async def _execute(db, request, session, run) -> dict:
             capability_card=card,
         )
     if plan.strategy.route == "clarify":
+        await _discard_capability_prefetch(capability_prefetch)
         return _finish_direct(
             db,
             agent_graph=agent_graph,
@@ -767,6 +817,7 @@ async def _execute(db, request, session, run) -> dict:
                     remaining_seconds=settings.retrieval_total_timeout_seconds - (time.monotonic() - started),
                 )
             if admission.passed:
+                await _discard_capability_prefetch(capability_prefetch)
                 agent_graph.trace(
                     db,
                     run.id,
@@ -798,13 +849,12 @@ async def _execute(db, request, session, run) -> dict:
     run.current_node = "retrieval"
     with qa_stage("database_commit"):
         db.commit()
-    admitted_capabilities, admitted_context_state = retrieval_capability_snapshot(
+    admitted_capabilities, admitted_context_state = await _admitted_capabilities_after_plan(
         db,
-        run.knowledge_base_id,
-        admit_graph=True,
+        knowledge_base_id=run.knowledge_base_id,
+        plan=plan,
+        task=capability_prefetch,
     )
-    if admitted_capabilities.identity != plan.capability_hash:
-        raise ValueError("strategy_capability_identity_changed")
     retrieval_started = time.monotonic()
     with qa_stage("retrieval"):
         execution = await execute_layered_retrieval(
@@ -1042,17 +1092,42 @@ async def execute_intent_search(db, request) -> dict:
         run.knowledge_base_id,
         admit_graph=False,
     )
-    plan, planning_audit = await plan_intent_execution(
+    capability_prefetch = asyncio.create_task(
+        _prefetch_capability_snapshot(run.knowledge_base_id)
+    )
+    planning_started = time.monotonic()
+    try:
+        plan, planning_audit = await plan_intent_execution(
+            db,
+            run=run,
+            question=agent_request.question,
+            conversation_scope_hash=run.metadata_json["conversation_state_scope_hash"],
+            filter_scope_hash=control_hash(agent_request.filters.model_dump(mode="json")),
+            history_summary=history_summary,
+            capabilities=capabilities,
+            filters=agent_request.filters,
+            provider_factory=agent_graph.ChatProvider,
+            on_trace=lambda node, kwargs: agent_graph.trace(db, run.id, node, **kwargs),
+        )
+    except BaseException:
+        await _discard_capability_prefetch(capability_prefetch)
+        raise
+    agent_graph.trace(
         db,
-        run=run,
-        question=agent_request.question,
-        conversation_scope_hash=run.metadata_json["conversation_state_scope_hash"],
-        filter_scope_hash=control_hash(agent_request.filters.model_dump(mode="json")),
-        history_summary=history_summary,
-        capabilities=capabilities,
-        provider_factory=agent_graph.ChatProvider,
+        run.id,
+        "intent_planning",
+        output_summary=f"route={plan.strategy.route}, entry={plan.strategy.entry_layer or 'none'}",
+        scores={
+            "protocol_version": PROTOCOL,
+            "accepted_plan_hash": plan.identity,
+            "capability_hash": plan.capability_hash,
+            "model_call_count": planning_audit["model_call_count"],
+            "resource_read_count": planning_audit["resource_read_count"],
+        },
+        duration_ms=int(round((time.monotonic() - planning_started) * 1000)),
     )
     if plan.strategy.route in {"system_capability", "clarify"}:
+        await _discard_capability_prefetch(capability_prefetch)
         run.status = "needs_clarification" if plan.strategy.route == "clarify" else "completed"
         run.current_node = None
         run.completed_at = datetime.utcnow()
@@ -1078,13 +1153,12 @@ async def execute_intent_search(db, request) -> dict:
             "accepted_plan_hash": plan.identity,
             "conversation_state": conversation.public_payload(),
         }
-    admitted_capabilities, admitted_context_state = retrieval_capability_snapshot(
+    admitted_capabilities, admitted_context_state = await _admitted_capabilities_after_plan(
         db,
-        run.knowledge_base_id,
-        admit_graph=True,
+        knowledge_base_id=run.knowledge_base_id,
+        plan=plan,
+        task=capability_prefetch,
     )
-    if admitted_capabilities.identity != plan.capability_hash:
-        raise ValueError("strategy_capability_identity_changed")
     execution = await execute_layered_retrieval(
         db,
         plan=plan,

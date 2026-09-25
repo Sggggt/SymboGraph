@@ -1,7 +1,7 @@
 import pytest
 from sqlalchemy import func, select
 
-from app.models import IngestionBatch, LexicalDocument, LexicalIndexJob, LexicalIndexState, LexicalTermRecord
+from app.models import IngestionBatch, LexicalDocument, LexicalIndexJob, LexicalIndexState, LexicalPosting, LexicalTermRecord
 from app.services.ingestion_resource_lock import knowledge_base_ingestion_resource_lock
 from app.services.lexical_index import prepare_bm25_snapshot
 from app.services.cancellation import IngestionCancelled
@@ -9,6 +9,7 @@ from app.services.lexical_storage import (
     active_lexical_sources,
     build_and_publish_lexical_index,
     load_lexical_snapshot,
+    verify_lexical_snapshot_streaming,
     materialize_lexical_index_job,
     prepare_lexical_index_job,
     publish_lexical_index,
@@ -32,6 +33,36 @@ def test_candidate_creation_requires_shared_kb_resource_lock(db_session, indexed
     with pytest.raises(ValueError, match="resource_lock_required"):
         stage_lexical_index(db_session, indexed_material[2])
     assert db_session.scalar(select(func.count()).select_from(LexicalIndexState)) == 0
+
+
+@pytest.mark.asyncio
+async def test_streaming_snapshot_verifies_exact_published_identity(db_session, indexed_material):
+    import copy
+
+    kb, chunks, snapshot = indexed_material
+    async with knowledge_base_ingestion_resource_lock(db_session, kb.id, operation="lexical_index_build"):
+        job = stage_lexical_index(db_session, snapshot)
+        assert verify_lexical_snapshot_streaming(db_session, job.target_state_id) == snapshot.identity
+        posting = db_session.scalar(select(LexicalPosting).where(LexicalPosting.index_state_id == job.target_state_id).limit(1))
+        original_positions = copy.deepcopy(posting.positions_json)
+        posting.positions_json = [[999, 1000]]
+        db_session.commit()
+        with pytest.raises(ValueError, match="identity_changed"):
+            verify_lexical_snapshot_streaming(db_session, job.target_state_id)
+        posting.positions_json = original_positions
+        db_session.commit()
+        term = db_session.scalar(select(LexicalTermRecord).where(LexicalTermRecord.index_state_id == job.target_state_id).limit(1))
+        term.document_frequency += 1
+        db_session.commit()
+        with pytest.raises(ValueError, match="identity_changed"):
+            verify_lexical_snapshot_streaming(db_session, job.target_state_id)
+        term.document_frequency -= 1
+        db_session.commit()
+        chunks[0].text = "Source changed outside index"
+        chunks[0].char_end = chunks[0].char_start + len(chunks[0].text)
+        db_session.commit()
+        with pytest.raises(ValueError, match="source_scope_changed"):
+            verify_lexical_snapshot_streaming(db_session, job.target_state_id)
 
 
 @pytest.mark.asyncio

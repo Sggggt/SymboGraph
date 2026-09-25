@@ -2,7 +2,7 @@
 
 [中文](README.md)
 
-SymboGraph is a local document knowledge base. It builds four connected layers: source structure, chunk relations with RQ membership, mid-level concepts, and coarse concepts. The target architecture separates task intent from execution strategy. An LLM chooses a coarse, mid, or chunk entry layer. Queries without lexical terms use dense-only entry selection; hybrid plans combine dense, RQ-cluster, and BM25 rankings with per-layer LLM-selected weights. Graph traversal restores raw evidence, followed by deterministic source admission, one answer generation, and citation binding.
+SymboGraph is a local document knowledge base. It builds four connected layers: source structure, chunk relations with RQ membership, mid-level concepts, and coarse concepts. Before planning, the LLM may read a complete coarse-node title directory and then a few selected summaries, or plan directly. The architecture separates task intent from execution strategy. The LLM chooses a coarse, mid, or chunk entry layer. Queries without lexical terms use dense-only entry selection; hybrid plans combine dense, RQ-cluster, and BM25 rankings with per-layer LLM-selected weights. Graph traversal restores raw evidence, followed by deterministic source admission, one answer generation, and citation binding.
 
 The active serving path now uses this architecture. Dense, RQ, and BM25 only nominate and fuse graph entries; final evidence must pass graph traversal, structure restoration, and source admission. See the [technical specification](docs/technical-spec.md) for the implementation contract and the [research](docs/reference/retrieval-research.md) for design tradeoffs.
 

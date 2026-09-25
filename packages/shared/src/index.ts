@@ -1322,6 +1322,9 @@ export interface QAPerformanceSummary {
 
 export type AgentTraceNode =
   | "intent_planning"
+  | "planning_resource_titles"
+  | "planning_resource_details"
+  | "planning_schema_feedback"
   | "intent_execution_retrieval"
   | "source_integrity_admission"
   | "verified_context_reuse"
@@ -1524,6 +1527,13 @@ export type AgentTraceScores = AgentTraceScoresFields &
         source_integrity_admission_hash?: string | null;
         entry_layer?: import("./intent-retrieval").RetrievalEntryLayer | null;
         model_call_count?: number | null;
+        resource_read_count?: number | null;
+        planning_round?: number | null;
+        resource_mode?: "titles" | "details" | null;
+        coarse_node_count?: number | null;
+        model_duration_ms?: number | null;
+        local_read_duration_ms?: number | null;
+        schema_feedback_error_count?: number | null;
         score_fields_used?: string[];
         fallback_before_retrieval?: boolean | null;
         retrieval_audit?: Record<string, unknown> | null;
@@ -4362,6 +4372,8 @@ export interface ContextStructureNativeMetadataAudit {
   ocr_layout_items: ContextStructureOCRLayoutItemAudit[];
   image_size?: [number, number] | number[] | null;
   source_index?: number | null;
+  source_block_index?: number | null;
+  style?: string | null;
   span_remap_method?: string | null;
   original_char_span?: [number, number] | number[] | null;
   section_index?: number | null;
@@ -4393,6 +4405,7 @@ export interface ContextStructureLayoutAudit {
   parser_path?: string | null;
   page_size?: [number, number] | number[] | null;
   native_layout_block_count?: number | null;
+  native_structure_block_count?: number | null;
   pdf_image_count?: number | null;
   ocr_image_errors?: string[];
   ocr_applied?: boolean | null;

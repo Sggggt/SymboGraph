@@ -6,10 +6,11 @@ from datetime import datetime, timezone
 import hashlib
 import math
 import unicodedata
+import orjson
 from dataclasses import dataclass
 from typing import Sequence
 
-from sqlalchemy import func, insert, select
+from sqlalchemy import Text, cast, func, insert, select
 
 from app.models import (Chunk, Document, DocumentVersion, IngestionBatch, KnowledgeBase, LexicalDocument,
     LexicalIndexJob, LexicalIndexState, LexicalPosting, LexicalTermRecord)
@@ -385,6 +386,125 @@ def load_lexical_snapshot(db, index_id, *, verify_sources=False):
     if verify_sources:
         _verify_current_sources(snapshot, active_lexical_sources(db, state.knowledge_base_id))
     return snapshot
+
+
+def verify_lexical_snapshot_streaming(db, index_id, *, verify_sources=True):
+    """Replay the complete published BM25 identity without materializing postings.
+
+    The posting digest is byte-for-byte the canonical ``control_hash`` used by
+    ``verify_snapshot``. Published snapshots already passed field-level checks;
+    an exact digest match proves the persisted posting sequence is unchanged.
+    """
+
+    state = db.get(LexicalIndexState, index_id)
+    if (state is None or state.protocol_version != PROTOCOL
+            or state.scoring_protocol != SCORING_PROTOCOL
+            or state.tokenizer_protocol != TOKENIZER_PROTOCOL):
+        raise ValueError("lexical_index_protocol_invalid")
+    facts = list(db.execute(
+        select(
+            LexicalDocument.chunk_id,
+            LexicalDocument.document_version_id,
+            LexicalDocument.char_start,
+            LexicalDocument.char_end,
+            LexicalDocument.raw_text_hash,
+            LexicalDocument.token_length,
+        ).where(LexicalDocument.index_state_id == index_id)
+        .order_by(LexicalDocument.chunk_id)
+    ))
+    if len(facts) != state.document_count or len({row.chunk_id for row in facts}) != len(facts):
+        raise ValueError("lexical_persisted_inventory_changed")
+    source_hash = control_hash({"kb": state.knowledge_base_id, "documents": [tuple(row) for row in facts]})
+    if sum(row.token_length for row in facts) != state.total_length:
+        raise ValueError("lexical_snapshot_statistics_invalid")
+    terms = list(db.execute(
+        select(LexicalTermRecord.term_key, LexicalTermRecord.term, LexicalTermRecord.document_frequency)
+        .where(LexicalTermRecord.index_state_id == index_id)
+    ))
+    if len(terms) != state.term_count or any(
+        not term or df < 1 or hashlib.sha256(term.encode()).hexdigest() != key
+        for key, term, df in terms
+    ):
+        raise ValueError("lexical_persisted_term_invalid")
+    stats_hash = control_hash({
+        "N": state.document_count,
+        "total_length": state.total_length,
+        "df": tuple(sorted((term, df) for _key, term, df in terms)),
+    })
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    posting_count = 0
+    term_order = (
+        LexicalTermRecord.term.collate("C")
+        if db.get_bind().dialect.name == "postgresql"
+        else LexicalTermRecord.term
+    )
+    chunk_order = (
+        LexicalPosting.chunk_id.collate("C")
+        if db.get_bind().dialect.name == "postgresql"
+        else LexicalPosting.chunk_id
+    )
+    rows = db.execute(
+        select(
+            LexicalTermRecord.term,
+            LexicalPosting.chunk_id,
+            cast(LexicalPosting.positions_json, Text),
+        )
+        .join(
+            LexicalTermRecord,
+            (LexicalTermRecord.term_key == LexicalPosting.term_key)
+            & (LexicalTermRecord.index_state_id == LexicalPosting.index_state_id),
+        )
+        .where(LexicalPosting.index_state_id == index_id)
+        .order_by(term_order, chunk_order)
+        .execution_options(yield_per=8192)
+    )
+    for term, chunk_id, positions in rows:
+        raise_if_source_io_cancelled()
+        if not isinstance(positions, str) or set(positions) - set("[]0123456789,- "):
+            raise ValueError("lexical_persisted_posting_invalid")
+        if posting_count:
+            digest.update(b",")
+        digest.update(orjson.dumps((term, chunk_id))[:-1])
+        digest.update(b",")
+        digest.update(positions.replace(" ", "").encode())
+        digest.update(b"]")
+        posting_count += 1
+    digest.update(b"]")
+    posting_hash = digest.hexdigest()
+    if posting_count != state.posting_count:
+        raise ValueError("lexical_persisted_inventory_changed")
+    scoring_hash = scoring_identity(k1=state.bm25_k1, b=state.bm25_b)
+    if (
+        source_hash != state.source_scope_hash
+        or stats_hash != state.statistics_hash
+        or posting_hash != state.postings_hash
+        or state.scoring_hash != scoring_hash
+        or state.tokenizer_hash != tokenizer_identity()
+        or state.state_hash != control_hash({
+            "protocol": PROTOCOL,
+            "scoring_protocol": SCORING_PROTOCOL,
+            "scoring_hash": scoring_hash,
+            "source_scope": source_hash,
+            "tokenizer": state.tokenizer_hash,
+            "statistics": stats_hash,
+            "postings": posting_hash,
+        })
+    ):
+        raise ValueError("lexical_snapshot_identity_changed")
+    if verify_sources:
+        sources = active_lexical_sources(db, state.knowledge_base_id)
+        indexed = {row.chunk_id: row for row in facts}
+        if len(sources) != len(facts) or any(
+            (row := indexed.get(source.chunk_id)) is None
+            or row.document_version_id != source.document_version_id
+            or row.char_start != source.char_start
+            or row.char_end != source.char_start + len(source.text)
+            or row.raw_text_hash != hashlib.sha256(source.text.encode()).hexdigest()
+            for source in sources
+        ):
+            raise ValueError("lexical_source_scope_changed")
+    return state.state_hash
 
 
 def request_lexical_index_cancel(db, job_id: str) -> LexicalIndexJob:

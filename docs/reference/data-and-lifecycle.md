@@ -596,6 +596,8 @@ $$
 
 本地刷新会清理 settings cache、cache manager、retriever 与 lexical index reader 等运行时单例。
 
+边界刷新同时比较两份根文件的组合身份和 Redis version。根文件经原子替换后即使 Redis 广播延迟或缺失，热加载字段也必须从权威文件重新读入并同步模型桥；同身份不得重复清理单例。连接/端口等 `service_recreate_required` 字段仍待显式重建，不得因文件检测而偷偷热应用。
+
 ### 资料库 Profile
 
 目标 profile 是资料库级 prompt registry 与交互偏好配置：
@@ -661,7 +663,7 @@ Provider 侧 system-prompt cache 使用 `provider_system_prompt_cache_v1`。Anth
 
 ### 请求策略与审计
 
-Task、Intent 与 ExecutionStrategy 属于一次请求的数据。LLM 提出入口层、词面和逐层混合权重，本地校验后冻结，执行器不可根据未授权的历史状态替换权重、改变意图或追加模式默认值。策略包含版本、完整任务身份、capability manifest、词面/语义查询身份、启用通道、逐层权重和生效预算。
+Task、Intent 与 ExecutionStrategy 属于一次请求的数据。可选的 `coarse_resource_read_v1` 在冻结计划前把目录/详情动作、图与过滤身份、返回 hash、条数、耗时和模型调用数写入 `AgentObservation`；导航文本不进入 Context Package 或检索缓存结果。LLM 随后提出入口层、词面和逐层混合权重，本地校验后冻结，执行器不可根据未授权的历史状态替换权重、改变意图或追加模式默认值。策略包含版本、完整任务身份、capability manifest、词面/语义查询身份、启用通道、逐层权重和生效预算。
 
 服务器 Runtime Settings 定义协议、硬预算和索引生命周期，Profile 只提供兼容的提示词与文案。请求策略不回写根配置，不触发后续请求的学习更新；当前只保存行为、耗时、来源与失败观察。
 
@@ -762,6 +764,8 @@ runtime / Profile / source manifest and representation
 计划缓存绑定原问题与可用层/索引清单，检索缓存还绑定已接纳的具体策略；不能先命中一个旧结果再伪造本轮 LLM 计划。纯向量无需 BM25 readiness，混合索引变化必须使对应缓存失效。
 
 同一融合权重在不同候选列表上不具有同一数值含义，通道预取、过滤及投影协议必须进入键。源文、代码本、分词、文档版本或快照发布变化时重验来源与 freshness。返回缓存结果仍需确定性来源准入；缓存不存在时执行同一正确路径。
+
+BM25 在线可用性检查允许以只读流式重放核验发布时的**同一** `source_scope_hash`、`statistics_hash`、`postings_hash` 和复合 `state_hash`，并核对 active 原文与完整 posting 条数。流式排序和 JSON 字节必须与构建时规范化序列逐值等价；不能用计数或抽样替代完整 posting 身份，也不能在 mismatch 时把混合请求改成 Dense-only。离线构建与历史重放仍可物化完整快照进行字段级诊断。
 
 旧请求模式与旧控制状态不进入新缓存命名空间，历史 replay 使用原冻结身份。Cache identity 记录于 retrieval trace，且与模型计划及 active 索引来自同一次冻结快照。
 

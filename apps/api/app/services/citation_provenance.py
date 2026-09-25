@@ -266,9 +266,10 @@ def _neighbor_proof(
     hit_chunk_ids: set[str],
     restored_chunk_id: str,
     for_update: bool,
+    load_chunk=None,
 ) -> bool:
     for hit_id in sorted(hit_chunk_ids):
-        hit = _load(db, Chunk, hit_id, for_update=for_update)
+        hit = load_chunk(hit_id) if load_chunk is not None else _load(db, Chunk, hit_id, for_update=for_update)
         if hit is not None and restored_chunk_id in {
             hit.previous_chunk_id,
             hit.next_chunk_id,
@@ -313,25 +314,22 @@ def audit_citation_provenance(
         raise ReflectionContractError("reflection_retention_ancestry_invalid")
     if for_update:
         db.flush()
-    persisted_package = _load(
-        db,
-        ContextPackage,
-        str(getattr(package, "id", "") or ""),
-        for_update=for_update,
+    row_cache: dict[tuple[type[Any], str], Any | None] = {}
+
+    def load_row(model: type[Any], object_id: str | None) -> Any | None:
+        if not object_id:
+            return None
+        key = (model, str(object_id))
+        if key not in row_cache:
+            row_cache[key] = _load(db, model, str(object_id), for_update=for_update)
+        return row_cache[key]
+
+    persisted_package = load_row(
+        ContextPackage, str(getattr(package, "id", "") or "")
     )
     package_row = persisted_package or package
-    knowledge_base = _load(
-        db,
-        KnowledgeBase,
-        knowledge_base_id,
-        for_update=for_update,
-    )
-    trace = _load(
-        db,
-        RetrievalTrace,
-        str(getattr(package_row, "retrieval_trace_id", "") or ""),
-        for_update=for_update,
-    )
+    knowledge_base = load_row(KnowledgeBase, knowledge_base_id)
+    trace = load_row(RetrievalTrace, str(getattr(package_row, "retrieval_trace_id", "") or ""))
     retrieval_steps = _retrieval_steps(
         db,
         package=package_row,
@@ -447,6 +445,16 @@ def audit_citation_provenance(
     from app.services.context_packing import PACKING_PROTOCOL, audit_context_packing
     packing_v3 = (package_row.diagnostics_json or {}).get("token_budget_audit", {}).get("packing_protocol") == PACKING_PROTOCOL
     restoration_anchor_ids = trace_result_ids if packing_v3 else hit_ids
+    bridge_proof_cache: dict[str, bool] = {}
+
+    def bridge_proof(bridge_chunk_id: str) -> bool:
+        if bridge_chunk_id not in bridge_proof_cache:
+            bridge_proof_cache[bridge_chunk_id] = _active_bridge_proof(
+                db, knowledge_base_id=knowledge_base_id,
+                hit_chunk_ids=restoration_anchor_ids,
+                bridge_chunk_id=bridge_chunk_id, for_update=for_update,
+            )
+        return bridge_proof_cache[bridge_chunk_id]
     retention_citations = [*citations, *({"chunk_id": item["chunk_id"]} for item in (package_row.package_json or {}).get("chunks", []))] if packing_v3 else citations
     retained_supports, retention_reasons = audit_retained_sources(
         db, package=package_row, citations=retention_citations, for_update=for_update, ancestors=_retention_ancestors)
@@ -494,7 +502,7 @@ def audit_citation_provenance(
         context = contexts_by_chunk.get(chunk_id)
         _append(reasons, "citation_chunk_outside_context_package", package_item is None)
         _append(reasons, "citation_chunk_outside_context_input", context is None)
-        chunk = _load(db, Chunk, chunk_id, for_update=for_update)
+        chunk = load_row(Chunk, chunk_id)
         _append(reasons, "citation_chunk_missing", chunk is None)
 
         canonical_source_span: dict[str, Any] = {}
@@ -502,13 +510,8 @@ def audit_citation_provenance(
         expected_text = ""
         structure_support: dict[str, Any] = {}
         if chunk is not None:
-            document = _load(db, Document, chunk.document_id, for_update=for_update)
-            version = _load(
-                db,
-                DocumentVersion,
-                chunk.document_version_id,
-                for_update=for_update,
-            )
+            document = load_row(Document, chunk.document_id)
+            version = load_row(DocumentVersion, chunk.document_version_id)
             _append(
                 reasons,
                 "citation_chunk_knowledge_base_mismatch",
@@ -815,12 +818,7 @@ def audit_citation_provenance(
                 ):
                     if neighbor_id is None:
                         continue
-                    neighbor = _load(
-                        db,
-                        Chunk,
-                        neighbor_id,
-                        for_update=for_update,
-                    )
+                    neighbor = load_row(Chunk, neighbor_id)
                     _append(
                         reasons,
                         f"context_package_{neighbor_field}_closure_invalid",
@@ -846,25 +844,14 @@ def audit_citation_provenance(
                     != bridge_ids,
                 )
                 for bridge_chunk_id in sorted(bridge_ids):
-                    bridge_chunk = _load(
-                        db,
-                        Chunk,
-                        bridge_chunk_id,
-                        for_update=for_update,
-                    )
+                    bridge_chunk = load_row(Chunk, bridge_chunk_id)
                     _append(
                         reasons,
                         "context_package_bridge_closure_invalid",
                         bridge_chunk is None
                         or bridge_chunk.state != "active"
                         or bridge_chunk.knowledge_base_id != knowledge_base_id
-                        or not _active_bridge_proof(
-                            db,
-                            knowledge_base_id=knowledge_base_id,
-                            hit_chunk_ids=restoration_anchor_ids,
-                            bridge_chunk_id=bridge_chunk_id,
-                            for_update=for_update,
-                        ),
+                        or not bridge_proof(bridge_chunk_id),
                     )
                 for closure_field, allowed_types in (
                     ("same_page_region", {"page", "region"}),
@@ -987,13 +974,7 @@ def audit_citation_provenance(
                 _append(
                     reasons,
                     "citation_bridge_support_missing",
-                    not _active_bridge_proof(
-                        db,
-                        knowledge_base_id=knowledge_base_id,
-                        hit_chunk_ids=restoration_anchor_ids,
-                        bridge_chunk_id=chunk_id,
-                        for_update=for_update,
-                    ),
+                    not bridge_proof(chunk_id),
                 )
             elif role == "graph_path":
                 _append(
@@ -1030,6 +1011,7 @@ def audit_citation_provenance(
                         hit_chunk_ids=restoration_anchor_ids,
                         restored_chunk_id=chunk_id,
                         for_update=for_update,
+                        load_chunk=lambda hit_id: load_row(Chunk, hit_id),
                     ),
                 )
             elif role == "source_scope":
