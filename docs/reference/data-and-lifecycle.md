@@ -665,6 +665,12 @@ Provider 侧 system-prompt cache 使用 `provider_system_prompt_cache_v1`。Anth
 
 Task、Intent 与 ExecutionStrategy 属于一次请求的数据。可选的 `coarse_resource_read_v1` 在冻结计划前把目录/详情动作、图与过滤身份、返回 hash、条数、耗时和模型调用数写入 `AgentObservation`；导航文本不进入 Context Package 或检索缓存结果。LLM 随后提出入口层、词面和逐层混合权重，本地校验后冻结，执行器不可根据未授权的历史状态替换权重、改变意图或追加模式默认值。策略包含版本、完整任务身份、capability manifest、词面/语义查询身份、启用通道、逐层权重和生效预算。
 
+来源准入后的 `evidence_read_loop_v2` 复用一个 `AgentObservation` 保存 `prepared|reading|finalized|failed|cancelled` 状态。它绑定 run、Task、完整 Context Package、retrieval trace、source admission、active Mid state、Mid 目录身份、`remaining_mid/read_mid/read_source/committed/mandatory` 集合、最小工具事件引用、context plan、动作计数和阶段耗时；禁止复制原文、目录语义文本、问题、provider 原始响应或自由格式理由。每次模型调用前提交 context plan 与调用意图，返回后在同一事务锁定 run、重核身份并同时写状态转换和 `AgentTraceEvent`。进程恢复从最后提交事件继续，从 Context Package 与 active Mid 目录重建 tool call/result；未提交响应不能推进集合。
+
+`agent_context_plan_v1` 是每次模型调用的非正文审计。它记录 P0–P4 单元计数、pinned/working/compressed/evicted 集合、token 计量方式与成本、预留输出、稳定前缀 hash、完整语义单元的压缩/截断及原因；`ContextEventLog` 只记录 `user_task/tool_call/tool_result_ref/context_compacted/context_evicted/evidence_committed/final_generation` 顺序、最小参数、handle 和权威对象引用。两者都不能复制 Context Package 原文或成为回答事实源。
+
+`generation_evidence_view_v1` 是冻结工作集的身份投影，不是新的事实源或数据库表。它保存选择顺序、完整包 handle 到连续生成 handle 的映射、每项原文/span/版本 hash、coverage、package/trace/admission identity 和完整 view hash。最终生成、AnswerSession、AnswerSourceBinding 与历史复用重放都必须验证该 view；完整 Context Package 保留所有已准入来源，历史复用对新问题重新运行 evidence loop，不能复用旧工作集选择。
+
 服务器 Runtime Settings 定义协议、硬预算和索引生命周期，Profile 只提供兼容的提示词与文案。请求策略不回写根配置，不触发后续请求的学习更新；当前只保存行为、耗时、来源与失败观察。
 
 `agent_trace_events.sequence_index` 在每个 run 内从0连续递增，由唯一/非负约束和 AgentRun 行锁保护。所有读取按该序号排序，不用可能相同的 created_at 推断先后。调用意图、策略接纳、入口提名、路径/装包和完成绑定保持同 run/同 scope 外键。
@@ -1005,7 +1011,7 @@ $$
 
 ### 检索、问答与策略表
 
-目标审计链：`agent_run → Task/Intent/ExecutionStrategy → retrieval_trace → context_package → source_integrity_admission → answer_session → answer_source_bindings`。Search 在来源准入后返回；能力卡路由独立记录卡片身份。
+目标审计链：`agent_run → Task/Intent/ExecutionStrategy → retrieval_trace → context_package → source_integrity_admission → evidence_read_loop/generation_evidence_view → answer_session → answer_source_bindings`。Search 在来源准入后返回；能力卡路由独立记录卡片身份。
 
 以下是目标逻辑字段契约，实际表名/迁移与现有 JSON 列的映射须在实现阶段冻结；新逻辑字段不能被写成数据库已存在。
 
@@ -1016,6 +1022,7 @@ $$
 | graph retrieval step | layer/parent、候选/入列/合并结果、三通道 raw score/rank/contribution、fusion score、RQ/BM25 映射见证、路径标签、灰区决定和硬预算 |
 | context package | 实际完整 chunk 原文、版本/span、来源角色、结构恢复、来源谱系、未装入范围、估算 token 与实际模型输入计量 |
 | source admission | Task/Strategy/trace/package/manifest 关联，原文/版本/范围/路径/预算核验结果及 hash |
+| context plan / evidence read / view | P0–P4 与 pinned/working/compressed/evicted 计数、稳定前缀及 token 成本、原子压缩/截断记录、Mid/source 单调集合、工具事件引用、状态迁移、模型/本地读取耗时、完整包到生成局部 handle 映射及重放 hash；不保存原文 |
 | answer session/bindings | 完整或部分回答/不足终态、生成调用、事实单元、handle、答案和原文跨度、文档版本、准入关联及事务审计 |
 | runtime / prompt versions | 配置版本与 changed keys、生命周期、提示及 schema 身份；不保存另一份工程参数值 |
 

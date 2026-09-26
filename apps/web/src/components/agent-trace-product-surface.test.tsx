@@ -92,6 +92,14 @@ describe("QA layered trace product surface", () => {
     expect(stream.textContent).toContain("当前阶段完成后会显示第一条轨迹事件");
   });
 
+  it("shows evidence reading as the active phase without inventing a completed step", () => {
+    render(<GeneratingBubble content="" trace={[]} currentNode="evidence_read" startedAt={new Date().toISOString()} />);
+
+    const stream = screen.getByTestId("agent-trace-stream");
+    expect(stream.textContent).toContain("当前阶段：阅读并筛选原文");
+    expect(stream.textContent).toContain("0 个步骤");
+  });
+
   it("shows actual coarse reads and schema feedback before the completed plan", () => {
     const stages = [
       { node: "planning_resource_titles", output_summary: "已读取 3 个粗节点标题", scores: { audit_kind: "intent_execution", planning_round: 1, resource_mode: "titles", coarse_node_count: 3, model_duration_ms: 1200, local_read_duration_ms: 23 } },

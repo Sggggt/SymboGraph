@@ -79,7 +79,6 @@
     "retrieval_generation_max_tokens": 32768,
     "retrieval_generation_timeout_seconds": 240,
     "retrieval_planning_max_tokens": 8192,
-    "retrieval_planning_timeout_seconds": 60,
     "retrieval_result_top_k_default": 12,
     "retrieval_total_timeout_seconds": 540,
     "retrieval_v1_bm25_candidate_budget": 64,

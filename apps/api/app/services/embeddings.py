@@ -853,6 +853,101 @@ class ChatProvider:
                 raise
             return fallback
 
+    async def classify_json_messages(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, str]],
+        fallback: dict[str, Any] | None = None,
+        *,
+        max_tokens: int | None = None,
+        compatibility_user_prompt: str | None = None,
+        response_schema: dict[str, Any] | None = None,
+        native_tools: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Run structured generation over one continuous user/assistant history.
+
+        Test providers historically override ``classify_json``.  The bounded
+        compatibility prompt keeps those providers usable without weakening
+        the production message-history path.
+        """
+
+        if self.__class__.classify_json is not ChatProvider.classify_json:
+            return await self.classify_json(
+                system_prompt,
+                compatibility_user_prompt
+                or json.dumps(
+                    {"messages": messages},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                fallback,
+                max_tokens=max_tokens,
+            )
+        if not messages or messages[0].get("role") != "user":
+            raise ValueError("Structured conversation must begin with a user message")
+        normalized: list[dict[str, str]] = []
+        previous_role = None
+        for message in messages:
+            if not isinstance(message, dict) or set(message) != {"role", "content"}:
+                raise ValueError("Structured conversation message shape is invalid")
+            role = message.get("role")
+            content = message.get("content")
+            if role not in {"user", "assistant"} or not isinstance(content, str) or not content.strip():
+                raise ValueError("Structured conversation message is invalid")
+            if role == previous_role:
+                raise ValueError("Structured conversation roles must alternate")
+            normalized.append({"role": role, "content": content})
+            previous_role = role
+        if not self.api_key:
+            if not self.settings.enable_model_fallback:
+                raise FallbackDisabledError(
+                    f"{self.api_key_env_name} is required because ENABLE_MODEL_FALLBACK is false"
+                )
+            if fallback is None:
+                raise FallbackDisabledError(
+                    f"{self.api_key_env_name} is required (no fallback provided)"
+                )
+            return fallback
+        payload = self._structured_json_payload(
+            system_prompt=system_prompt,
+            user_prompt=normalized[0]["content"],
+            max_tokens=max_tokens,
+        )
+        payload["messages"] = [
+            {"role": "system", "content": system_prompt},
+            *normalized,
+        ]
+        if response_schema is not None:
+            if not isinstance(response_schema, dict) or not response_schema:
+                raise ValueError("Structured conversation schema is invalid")
+            if self.api_protocol == "anthropic":
+                return await self._post_anthropic_sdk_tool(
+                    self._anthropic_messages_payload(payload),
+                    native_tools
+                    or [
+                        {
+                            "name": "submit",
+                            "result_tool": "submit",
+                            "description": "Submit the required closed object.",
+                            "input_schema": response_schema,
+                        }
+                    ],
+                )
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "structured_response",
+                    "strict": True,
+                    "schema": response_schema,
+                },
+            }
+        try:
+            return await self._post_chat_json_with_response_format_fallback(payload)
+        except Exception:
+            if not self.settings.enable_model_fallback or fallback is None:
+                raise
+            return fallback
+
     async def classify_json_streaming(
         self,
         system_prompt: str,
@@ -1262,6 +1357,106 @@ class ChatProvider:
         self,
         payload: dict[str, Any],
     ) -> str:
+        response_payload = await self._post_anthropic_sdk_response(
+            payload,
+            phase="sdk_messages",
+        )
+        stop_reason = response_payload.get("stop_reason")
+        if stop_reason not in {"end_turn", "stop_sequence"}:
+            error_code = {
+                "max_tokens": "incomplete_max_tokens",
+                "refusal": "provider_refusal",
+            }.get(stop_reason, "invalid_stop_reason")
+            raise ExternalServiceError(
+                service="anthropic",
+                phase="sdk_messages_completion",
+                error_code=error_code,
+                retryable=False,
+            )
+        return self._normalize_anthropic_content(response_payload)
+
+    async def _post_anthropic_sdk_tool(
+        self,
+        payload: dict[str, Any],
+        native_tools: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not native_tools:
+            raise ValueError("Anthropic native tools must not be empty")
+        names = [str(item.get("name") or "") for item in native_tools]
+        if len(set(names)) != len(names) or any(not name for name in names):
+            raise ValueError("Anthropic native tool names are invalid")
+        result_names = {
+            name: str(item.get("result_tool") or name)
+            for name, item in zip(names, native_tools, strict=True)
+        }
+        passthrough = {
+            name: bool(item.get("passthrough"))
+            for name, item in zip(names, native_tools, strict=True)
+        }
+        response_payload = await self._post_anthropic_sdk_response(
+            {
+                **payload,
+                "tools": [
+                    {
+                        "name": name,
+                        "description": str(item.get("description") or "Submit this action."),
+                        "input_schema": item.get("input_schema"),
+                    }
+                    for name, item in zip(names, native_tools, strict=True)
+                ],
+                "tool_choice": (
+                    {"type": "tool", "name": names[0]}
+                    if len(names) == 1
+                    else {"type": "any"}
+                ),
+            },
+            phase="sdk_tool",
+        )
+        blocks = [
+            item
+            for item in response_payload.get("content") or []
+            if isinstance(item, dict)
+            and item.get("type") == "tool_use"
+            and item.get("name") in result_names
+        ]
+        if response_payload.get("stop_reason") != "tool_use":
+            if response_payload.get("stop_reason") == "end_turn" and not blocks:
+                return self._parse_json_object(
+                    self._normalize_anthropic_content(response_payload)
+                )
+            raise ExternalServiceError(
+                service="anthropic",
+                phase="sdk_tool_completion",
+                error_code="tool_stop_reason_invalid",
+                retryable=False,
+            )
+        if len(blocks) != 1:
+            raise ExternalServiceError(
+                service="anthropic",
+                phase="sdk_tool_completion",
+                error_code="tool_count_invalid",
+                retryable=False,
+            )
+        if not isinstance(blocks[0].get("input"), dict):
+            raise ExternalServiceError(
+                service="anthropic",
+                phase="sdk_tool_completion",
+                error_code="tool_input_invalid",
+                retryable=False,
+            )
+        if passthrough[str(blocks[0]["name"])]:
+            return dict(blocks[0]["input"])
+        return {
+            "tool": result_names[str(blocks[0]["name"])],
+            "arguments": dict(blocks[0]["input"]),
+        }
+
+    async def _post_anthropic_sdk_response(
+        self,
+        payload: dict[str, Any],
+        *,
+        phase: str,
+    ) -> dict[str, Any]:
         normalized_resolve_ip = str(self.resolve_ip or "").strip().lower()
         if normalized_resolve_ip not in {"", "none", "null", "__none__"}:
             raise RuntimeError(
@@ -1303,7 +1498,7 @@ class ChatProvider:
                 )
                 external_error = ExternalServiceError(
                     service="anthropic",
-                    phase="sdk_messages",
+                    phase=phase,
                     status_code=safe_status,
                     error_code=type(exc).__name__.lower()[:80],
                     retryable=retryable,
@@ -1332,19 +1527,7 @@ class ChatProvider:
             response_payload.get("usage"),
             protocol="anthropic",
         )
-        stop_reason = response_payload.get("stop_reason")
-        if stop_reason not in {"end_turn", "stop_sequence"}:
-            error_code = {
-                "max_tokens": "incomplete_max_tokens",
-                "refusal": "provider_refusal",
-            }.get(stop_reason, "invalid_stop_reason")
-            raise ExternalServiceError(
-                service="anthropic",
-                phase="sdk_messages_completion",
-                error_code=error_code,
-                retryable=False,
-            )
-        return self._normalize_anthropic_content(response_payload)
+        return response_payload
 
     async def _post_anthropic_sdk_text_streaming(
         self,

@@ -879,6 +879,9 @@ export interface AnswerModelAudit extends ModelAuditFields {
   generation_model_call_count?: number | null;
   post_generation_model_call_count?: number | null;
   source_admission_model_call_count?: number | null;
+  evidence_decision_model_call_count?: number | null;
+  evidence_read_action_count?: number | null;
+  generation_evidence_source_count?: number | null;
   capability_card_hash?: string | null;
   generation?: Record<string, unknown> | null;
   source_binding_count?: number | null;
@@ -1328,6 +1331,9 @@ export type AgentTraceNode =
   | "intent_execution_retrieval"
   | "source_integrity_admission"
   | "verified_context_reuse"
+  | "evidence_directory_ready"
+  | "evidence_read"
+  | "evidence_finalized"
   | "retrieval_control"
   | "query_understanding"
   | "query_facet_extraction"
@@ -1537,6 +1543,22 @@ export type AgentTraceScores = AgentTraceScoresFields &
         score_fields_used?: string[];
         fallback_before_retrieval?: boolean | null;
         retrieval_audit?: Record<string, unknown> | null;
+        source_count?: number | null;
+        document_count?: number | null;
+        requirement_count?: number | null;
+        read_count?: number | null;
+        selected_count?: number | null;
+        remaining_count?: number | null;
+        coverage_count?: number | null;
+        decision_call_count?: number | null;
+        read_action_count?: number | null;
+        mid_count?: number | null;
+        mandatory_source_count?: number | null;
+        estimated_input_tokens?: number | null;
+        input_token_count?: number | null;
+        compression_applied?: boolean | null;
+        truncation_applied?: boolean | null;
+        deterministic_direct?: boolean | null;
       }
   );
 
@@ -2194,7 +2216,6 @@ export interface RuntimeSettingsLifecycle {
 
 export interface ModelSettingsResponse {
   retrieval_total_timeout_seconds?: number | null;
-  retrieval_planning_timeout_seconds?: number | null;
   retrieval_generation_timeout_seconds?: number | null;
   retrieval_planning_max_tokens?: number | null;
   retrieval_generation_max_tokens?: number | null;
@@ -2437,7 +2458,6 @@ export interface ModelBridgeStatus {
 
 export interface ModelSettingsUpdate {
   retrieval_total_timeout_seconds?: number | null;
-  retrieval_planning_timeout_seconds?: number | null;
   retrieval_generation_timeout_seconds?: number | null;
   retrieval_planning_max_tokens?: number | null;
   retrieval_generation_max_tokens?: number | null;

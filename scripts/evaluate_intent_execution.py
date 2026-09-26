@@ -160,6 +160,23 @@ def _persisted_audit(response: dict, *, knowledge_base_id: str) -> dict:
             for item in observations
             if item.observation_type == "single_grounded_generation"
         ]
+        planning = [
+            item
+            for item in observations
+            if item.observation_type == "intent_execution_plan"
+        ]
+        evidence_loops = [
+            item
+            for item in observations
+            if item.observation_type == "evidence_read_loop"
+        ]
+        evidence_payload = (
+            dict(evidence_loops[0].observation_json or {})
+            if len(evidence_loops) == 1
+            else {}
+        )
+        evidence_state = dict(evidence_payload.get("state") or {})
+        evidence_events = list(evidence_state.get("events") or [])
         checks = {
             "run_completed": run is not None and run.status == "completed",
             "target_route": run is not None
@@ -179,6 +196,20 @@ def _persisted_audit(response: dict, *, knowledge_base_id: str) -> dict:
             "single_generation": len(generation) == 1
             and generation[0].verdict == "completed"
             and generation[0].observation_json.get("model_call_count") == 1,
+            "evidence_loop_v2_finalized": len(evidence_loops) == 1
+            and evidence_loops[0].verdict == "finalized"
+            and evidence_payload.get("protocol_version") == "evidence_read_loop_v2"
+            and evidence_payload.get("source_text_persisted") is False
+            and evidence_payload.get("directory_text_persisted") is False
+            and evidence_state.get("phase") == "finalized"
+            and any(
+                item.get("event_type") == "evidence_committed"
+                for item in evidence_events
+            )
+            and any(
+                item.get("event_type") == "final_generation"
+                for item in evidence_events
+            ),
             "citations_present": bool(response.get("citations")),
             "source_bindings_complete": bool(bindings)
             and len(bindings) == len(response.get("citations") or [])
@@ -222,6 +253,44 @@ def _persisted_audit(response: dict, *, knowledge_base_id: str) -> dict:
                 if trace is not None
                 else None
             ),
+            "evidence_context": {
+                "protocol_version": evidence_payload.get("protocol_version"),
+                "mid_count": evidence_payload.get("mid_count"),
+                "source_count": evidence_payload.get("source_count"),
+                "mandatory_source_count": evidence_payload.get(
+                    "mandatory_source_count"
+                ),
+                "deterministic_direct": evidence_state.get(
+                    "deterministic_direct"
+                ),
+                "decision_call_count": evidence_state.get(
+                    "decision_call_count"
+                ),
+                "read_action_count": evidence_state.get("read_action_count"),
+                "committed_source_count": len(
+                    evidence_state.get("committed_source_handles") or []
+                ),
+                "context_plans": list(evidence_state.get("context_plans") or []),
+            },
+            "generation_context_plan": (
+                ((generation[0].observation_json or {}).get("model_audit") or {}).get(
+                    "context_plan"
+                )
+                if len(generation) == 1
+                else None
+            ),
+            "planning_context_plans": (
+                [
+                    dict(step["context_plan"])
+                    for step in (
+                        (planning[0].observation_json or {}).get("steps") or []
+                    )
+                    if isinstance(step, dict)
+                    and isinstance(step.get("context_plan"), dict)
+                ]
+                if len(planning) == 1
+                else []
+            ),
         }
 
 
@@ -250,7 +319,14 @@ def _timing_summary(response: dict | None) -> dict:
     performance = ((response or {}).get("model_audit") or {}).get("qa_performance") or {}
     elapsed = performance.get("elapsed_ms")
     if not isinstance(elapsed, (int, float)):
-        return {"elapsed_ms": None, "provider_roundtrip_ms": None, "nonmodel_ms": None, "resource_read_ms": None}
+        return {
+            "elapsed_ms": None,
+            "provider_roundtrip_ms": None,
+            "nonmodel_ms": None,
+            "first_response_ms": None,
+            "first_token_ms": None,
+            "stages": {},
+        }
     spans = performance.get("spans") or []
     def intervals(stage: str) -> list[tuple[float, float]]:
         return [
@@ -259,11 +335,67 @@ def _timing_summary(response: dict | None) -> dict:
             if item.get("stage") == stage
         ]
     provider = _interval_union_ms(intervals("provider_roundtrip"))
+    stages = {
+        str(stage): {
+            key: value
+            for key, value in dict(summary).items()
+            if key
+            in {
+                "count",
+                "success_count",
+                "error_count",
+                "cancelled_count",
+                "total_ms",
+                "active_wall_ms",
+                "exclusive_ms",
+                "p50_ms",
+                "p95_ms",
+            }
+        }
+        for stage, summary in dict(performance.get("stages") or {}).items()
+    }
     return {
         "elapsed_ms": round(float(elapsed), 3),
         "provider_roundtrip_ms": round(provider, 3),
         "nonmodel_ms": round(max(0.0, float(elapsed) - provider), 3),
-        "resource_read_ms": round(_interval_union_ms(intervals("resource_read")), 3),
+        "first_response_ms": performance.get("first_response_ms"),
+        "first_token_ms": performance.get("first_token_ms"),
+        "stages": stages,
+    }
+
+
+def _token_summary(audit: dict) -> dict:
+    plans = []
+    for item in audit.get("planning_context_plans") or []:
+        plans.append({"stage": "intent_planning", **dict(item)})
+    for item in ((audit.get("evidence_context") or {}).get("context_plans") or []):
+        plans.append({"stage": "evidence_decision", **dict(item)})
+    generation = audit.get("generation_context_plan")
+    if isinstance(generation, dict):
+        plans.append({"stage": "generation", **generation})
+    totals = {
+        key: sum(
+            int(item.get(key) or 0)
+            for item in plans
+            if type(item.get(key)) is int
+        )
+        for key in (
+            "input_token_count",
+            "output_token_count",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "total_token_count",
+        )
+    }
+    return {
+        "call_count": len(plans),
+        "calls": plans,
+        "totals": totals,
+        "provider_usage_complete": bool(plans)
+        and all(
+            item.get("token_accounting_mode") == "provider_actual"
+            for item in plans
+        ),
     }
 
 
@@ -354,6 +486,7 @@ def main() -> int:
             "hard_gate_passed": audit["passed"],
             "elapsed_seconds": round(time.perf_counter() - case_started, 3),
             "timing": _timing_summary(response),
+            "tokens": _token_summary(audit),
             "human_score": None,
             "failure": failure,
         }

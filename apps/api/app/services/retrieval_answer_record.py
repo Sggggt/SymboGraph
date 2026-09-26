@@ -4,7 +4,14 @@ from sqlalchemy import select
 from app.models import AgentObservation, AgentRun, AnswerSourceBinding
 from app.retrieval_control_contracts import GroundedAnswerDraft, control_hash
 from app.services.agent_reflection import render_answer_units, reflection_hash
-from app.services.answer_sources import source_binding_citations, verify_sufficiency_owner
+from app.services.answer_sources import (
+    build_answer_evidence_manifest,
+    project_answer_evidence_manifest,
+    replay_generation_evidence_view,
+    source_binding_citations,
+    verify_sufficiency_owner,
+)
+from app.services.context_graph import context_package_to_contexts
 
 
 def replay_answer_bindings(db, *, answer, package):
@@ -34,11 +41,45 @@ def replay_answer_bindings(db, *, answer, package):
             or observation.observation_json != source_admission
         ):
             raise ValueError("source_integrity_answer_observation_missing")
+        generation_view = diagnostics.get("generation_evidence_view")
+        if generation_view is not None:
+            loop_observation = db.get(
+                AgentObservation,
+                diagnostics.get("evidence_read_loop_observation_id"),
+            )
+            if (
+                loop_observation is None
+                or loop_observation.observation_type != "evidence_read_loop"
+                or loop_observation.verdict != "finalized"
+                or (loop_observation.observation_json or {}).get(
+                    "protocol_version"
+                )
+                != "evidence_read_loop_v2"
+                or (loop_observation.observation_json or {}).get(
+                    "generation_evidence_view"
+                )
+                != generation_view
+            ):
+                raise ValueError("generation_evidence_answer_observation_missing")
+            admitted_evidence = build_answer_evidence_manifest(
+                package,
+                context_package_to_contexts(package),
+            )
+            generation_evidence = project_answer_evidence_manifest(
+                admitted_evidence,
+                generation_view.get("selected_package_handles") or [],
+            )
+            replay_generation_evidence_view(
+                admitted_evidence,
+                generation_evidence,
+                generation_view,
+            )
         return source_binding_citations(
             answer_session=answer,
             package=package,
             rows=rows,
             source_integrity_admission=observation,
+            generation_evidence_view=generation_view,
         )
     current = diagnostics.get("retrieval_control")
     if current:

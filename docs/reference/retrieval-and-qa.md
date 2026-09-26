@@ -8,9 +8,9 @@
 
 后端 Search、同步 QA 和 SSE QA 共用同一规划与分层检索契约。Search 在结果与来源返回后结束，QA 再生成一次回答。前端不提供独立 Search 产品页，也不提供普通/摘要模式选择；问答仍使用后端共享检索契约，回答风格不控制图入口。
 
-LLM 可直接在一次规划输出中分别返回 `intent` 与 `execution_strategy`；也可先通过下述有界只读观察，再在最后一次输出中同时返回两者。它只能使用原问题、用户明确的会话约束、非事实性会话摘要、服务器提供的有界 capability manifest 和本轮获准的粗层导航材料。manifest 包含可用层、版本、索引状态、文档/语言数量、可用范围与预算上限，不包含旧答案或旧模型判决。
+LLM 在连续规划会话中直接调用 `plan.commit` 提交 `intent` 与 `execution_strategy`，或先调用下述有界 `resource.read` 再提交。assistant tool call 与 tool result 按顺序保留，不把已读材料复制进下一轮无状态 packet。它只能使用原问题、用户明确的会话约束、非事实性会话摘要、服务器提供的有界 capability manifest 和本轮获准的粗层导航材料。manifest 包含可用层、版本、索引状态、文档/语言数量、可用范围与预算上限，不包含旧答案或旧模型判决。
 
-计划必须在检索前通过闭合 schema、本地权限和预算校验并持久化。模型仅能声明 `resource/read` 的两个受控动作；服务端执行读取。模型不能调用其他工具、选择不存在的字段、修改图边、放宽用户范围或直接提交数据库 ID。执行器依据声明式字段行动。
+计划必须在检索前通过闭合 schema、本地权限和预算校验并持久化。模型仅能调用当前阶段暴露的 `resource.read` 与 `plan.commit`；服务端执行读取和提交。模型不能调用其他工具、选择不存在的字段、修改图边、放宽用户范围或直接提交数据库 ID。执行器依据最小工具参数行动。
 
 资料型 active 图/BM25 可用性核验与规划模型往返彼此独立时可以并行：核验使用单独只读数据库会话和有界 I/O 槽，正式检索前必须 join 并核对当前 active 身份。系统能力、澄清及已通过来源重放的复用路由不以该资料型核验授权；并行失败不能静默改通道或权重。
 
@@ -20,7 +20,7 @@ LLM 可直接在一次规划输出中分别返回 `intent` 与 `execution_strate
 
 `coarse_resource_read_v1` 的初始响应是完整计划或 `{action:"resource_read",mode:"titles"}`。标题目录返回后，响应是完整计划或 `{action:"resource_read",mode:"details",keys:[...]}`；详情返回后只能是完整计划。`keys` 为本轮目录临时键、1–4 个、不重复，不能使用数据库 ID。最多两次读，正常路径最多三次规划模型调用；无粗层时只能直接规划。仅当最终完整计划未通过闭合 schema 时，服务端可再给模型一次不含原始响应的安全字段路径/错误码反馈，要求重提**完整计划**，总调用上限为四次。该重试不读取检索结果、不生成词面、不代改策略；第二次仍非法则在正式检索前失败。无效读动作、越权键、图身份漂移或资源预算超限不进入格式重试。
 
-总硬时限覆盖上述最坏四次规划、一次回答生成和非模型检索/准入余量。当前默认值为 540 秒，规划每次最多 60 秒、生成最多 240 秒；各调用的预算不能简单相加超过总时限后仍声称循环可完成。SSE/同步共享执行 owner 与超时终态。
+请求硬时限覆盖上述规划、非模型检索/准入、有限证据读取和一次最终生成，取自 `retrieval_total_timeout_seconds`。规划与证据工具模型调用受 `model_request_timeout_seconds` 和整链剩余时间约束，不再设置独立规划时限；最终生成取模型单次时限、生成阶段时限和整链剩余时间三者中的最小值。单次模型时限与整链总时限分别审计；各调用的理论上限不能简单相加后绕过总时限。Runtime Settings 暴露整链与生成时限、规划/生成输出 token 预算；最终生成阶段时限允许 10–600 秒。SSE/同步共享执行 owner 与超时终态。
 
 目录只查询同 KB 且同 active 图的粗节点，按 `node_weight DESC, id ASC` 返回全部标题、临时键、权重、置信度及支持计数等有界元信息。输入超过上限时显式失败并报告条数/大小，不能以部分目录作为完整目录。详情只返回所选节点的摘要、定义、范围、包含/排除条件等有界导航文本；字段截断明确标记并限制总输入。用户过滤后，只有节点的全部支撑 chunk 均可见才返回该节点，避免聚合摘要夹带范围外材料；无法证明映射时拒绝读取。每次动作、snapshot hash、目录和选中项 hash、耗时、模型调用数都进入 run 审计；正式检索前重核 active 图身份。目录和详情都不是事实来源，不能进入 Context Package、来源引用或历史复用包。
 
@@ -328,15 +328,29 @@ Context Package 是回答唯一事实输入，包含实际原文、chunk/版本/
 
 该准入不把 cosine、RQ、BM25、融合排名或旧覆盖阈值解释为答案充分性。若必需物理来源未确认、包为空或整体范围装不下，返回有界缺口；资料合法且进入实际包则可进入一次生成，由生成器根据原文回答能支持的内容并说明不足。
 
+### Mid 语义目录与连续 `evidence` 工具会话
+
+`evidence_read_loop_v2` 只在 QA 的 `source_integrity_admission_v1` 通过后运行；Search 不运行。目录构造绑定同 KB、同 retrieval trace 和同 active MidConcept state。chunk 先采用实际 path label 的 Mid parent；没有 Mid path 的直接 chunk 入口，仅在唯一 primary RQ L3 prefix 能映射到真实支撑该 chunk 的 active MidConcept 时投影。多条合法 Mid path 可形成多对多映射，返回原文时按 package source handle 去重。结构恢复伴随块跟随 anchor；仍无法映射的来源进入服务端 mandatory 集合，禁止伪造语义节点。
+
+模型初始上下文只含原始问题、冻结 requirements、回答约束和完整 `{mid_handle,title,summary}` 目录。标题与摘要来自当前 active MidConcept，目录不含 source handle、Document.title/上传文件名、页码、字符数、角色、分数、UUID、hash 或路径。实际原文不超过 2,048 估算 token 的小包、单一 Mid 和全 mandatory 包走版本化确定性直达；其余情况只暴露 `evidence.read` 与 `evidence.commit`。
+
+`evidence.read` 接收非空、无重复且尚未读取的 `mid_handles`，可一次批量展开多个节点。工具结果按节点返回当前 Context Package 交集内的 source handle 与完整原文；同一 source 正文在活动上下文只装入一次。每个合法 read 必须消费至少一个未读 Mid，所以读取次数不超过目录节点数。`evidence.commit` 只接受已经读到的 source handles，空集合合法并收敛为证据不足；mandatory handles 由服务端确定性合并。模型不再输出 coverage、自评分、自由理由或服务端已知集合副本。
+
+每轮 assistant tool call 与 tool result 成对追加到同一消息历史。下一轮看到原始目录、所有尚未压缩的已读完整原文、既有调用/结果和最近安全错误。普通空、重复、越权或未读 handle 错误不执行动作，只返回 `{error,field}`，并在模型调用预算和共享总时限内允许有界修正；越权、跨域、身份漂移、provider 故障、取消和超时保持技术终态。恢复从持久 `ContextEventLog` 与权威 Context Package 重建相同消息顺序，正文不在 observation 中复制。
+
+每次模型调用前保存 `agent_context_plan_v1`：P0/P1 固定集合、working/compressed/evicted 数量、估算或实际 token、预留输出、稳定前缀 hash、压缩/截断和被排除语义单元。压缩先去除 P4 与重复目录，再压旧 P2 控制历史，最后整单元淘汰未选 P3；最近工具对、当前问题、未满足 requirement、合法工具和已提交原文不可有损压缩。若必要 P0/P1 仍超窗，返回容量技术失败。
+
+冻结阶段重放完整 Context Package 和 source admission，验证提交及 mandatory handle 非重复且都属于包，并逐项核对原文 hash、span、文档版本、package 和 retrieval trace。结果写为 `generation_evidence_view_v1`，保存完整包 handle 到连续生成局部 `src_n` 的映射及身份，不保存正文。最终生成另建干净上下文，只包含 Task、回答约束和冻结工作集原文；Mid 目录、导航历史和未提交原文不进入事实输入。
+
 ## 一次回答、直接路由与会话
 
 ### 回答与引用
 
-生成器只读当前 Task、意图、回答约束、完整 Context Package 及来源指引。目标回答使用 `grounded_markdown_inline_citations_v1`：模型直接生成最终 GFM 文本，不返回 JSON，并在相关文字后使用 `⟦cite:src_n⟧` 或多 handle 形式标注原文来源。枚举不能把几个例子写成全集，比较不能混用版本和单位，分析中的推导要指明原文依据。
+生成器只读当前 Task、意图、回答约束、冻结 `generation_evidence_view_v1` 对应的完整原文及来源指引。完整 Context Package 仍是事实和重放权威，目录与 coverage 不进入回答事实。目标回答使用 `grounded_markdown_inline_citations_v1`：模型直接生成最终 GFM 文本，不返回 JSON，并在相关文字后使用 generation view 中连续的 `⟦cite:src_n⟧` 或多 handle 形式标注原文来源。枚举不能把几个例子写成全集，比较不能混用版本和单位，分析中的推导要指明原文依据。
 
 允许回答已支持部分并明确剩余缺口，但不得将部分完成计为完整事实答案。完全缺乏支持时可返回闭合的 `insufficient_evidence` 结果，由本地模板呈现；该生成结果是终态，不再触发检索。
 
-正文不再包裹在模型 JSON 中，也不在结束时接受第二份正文。流转换器仅把合法引用标记改成稳定序号链接；错误或未知格式按原字符进入 append-only 正文，不构成技术失败。持久答案必须与 SSE 已释放的转换后字符逐字相同。正文完成后，执行器把本轮实际 Context Package 中全部已准入来源绑定到完整答案跨度，并生成独立来源列表。该列表证明生成材料的身份和可重放性，不宣称逐句语义证明。模型输出截断、取消和超时保持独立终态，不自动再生成，也不把失败流提升为可复用事实。
+正文不再包裹在模型 JSON 中，也不在结束时接受第二份正文。流转换器仅把合法引用标记改成稳定序号链接；错误或未知格式按原字符进入 append-only 正文，不构成技术失败。持久答案必须与 SSE 已释放的转换后字符逐字相同。正文完成后，执行器只把本轮 generation view 中实际提供给模型的已准入来源绑定到完整答案跨度，并生成独立来源列表；绑定时重放完整包、generation view 与来源准入身份。该列表证明生成材料的身份和可重放性，不声称逐句语义证明。模型输出截断、取消和超时保持独立终态，不自动再生成，也不把失败流提升为可复用事实。
 
 ### 直接路由
 
@@ -349,7 +363,7 @@ Context Package 是回答唯一事实输入，包含实际原文、chunk/版本/
 ```text
 接纳 → 可选粗层 resource/read → 最终规划 → 本地策略校验 → 来源定位/复用检查
     → 分层入口与遍历 → 结构恢复及装包 → 确定性来源准入
-    → 一次生成 → 来源绑定 → 完成
+    → evidence 目录/按需读取 → 冻结生成工作集 → 一次最终生成 → 来源绑定 → 完成
 ```
 
 Search 在来源准入后返回检索结果。能力卡和澄清有独立终态。每阶段可以失败或取消；生成后没有返回检索的边。新 run 使用独立协议版本，不复用旧 FSM 的含义。

@@ -111,7 +111,7 @@ async def test_system_capability_uses_one_plan_and_zero_retrieval_or_sources(
 
 
 @pytest.mark.asyncio
-async def test_retrieval_path_has_one_plan_one_generation_and_no_online_reward_or_sufficiency(
+async def test_retrieval_path_has_one_plan_finite_evidence_selection_one_generation_and_no_online_reward(
     db_session,
     populated_context_graph,
     fake_model_stack,
@@ -128,7 +128,9 @@ async def test_retrieval_path_has_one_plan_one_generation_and_no_online_reward_o
             if "INTENT EXECUTION RETRIEVAL V1" in system_prompt:
                 calls.append("plan")
                 return proposal(layer="chunk")
-            raise AssertionError("unexpected model call")
+            if "EVIDENCE TOOL SESSION V1" in system_prompt:
+                calls.append("evidence")
+            return await super().classify_json(system_prompt, user_prompt, fallback)
 
         async def complete_text(self, system_prompt, user_prompt, *, max_tokens):
             calls.append("answer")
@@ -162,6 +164,10 @@ async def test_retrieval_path_has_one_plan_one_generation_and_no_online_reward_o
     observations = list(db_session.scalars(select(AgentObservation)))
     assert [row.verdict for row in observations if row.observation_type == "intent_execution_plan"] == ["completed"]
     assert [row.verdict for row in observations if row.observation_type == "source_integrity_admission"] == ["passed"]
+    assert [row.verdict for row in observations if row.observation_type == "evidence_read_loop"] == ["finalized"]
+    loop = next(row for row in observations if row.observation_type == "evidence_read_loop")
+    assert loop.observation_json["state"]["deterministic_direct"] is True
+    assert loop.observation_json["state"]["decision_call_count"] == 0
     assert [row.verdict for row in observations if row.observation_type == "single_grounded_generation"] == ["completed"]
     assert not [row for row in observations if row.observation_type in {"retrieval_sufficiency", "retrieval_lexical_patch"}]
     assert db_session.scalar(select(func.count()).select_from(RetrievalLexicalReward)) == 0
@@ -188,7 +194,7 @@ async def test_generation_shape_failure_persists_content_free_diagnostics(
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
             if "INTENT EXECUTION RETRIEVAL V1" in system_prompt:
                 return proposal(layer="chunk")
-            raise AssertionError("unexpected model call")
+            return await super().classify_json(system_prompt, user_prompt, fallback)
 
         async def complete_text(self, system_prompt, user_prompt, *, max_tokens):
             return ""
@@ -356,7 +362,7 @@ async def test_verified_context_reuse_replays_same_session_sources_without_new_r
                 if planning_calls == 2:
                     raw["execution_strategy"]["route"] = "verified_context_reuse"
                 return raw
-            raise AssertionError("unexpected model call")
+            return await super().classify_json(system_prompt, user_prompt, fallback)
 
         async def complete_text(self, system_prompt, user_prompt, *, max_tokens):
             nonlocal answer_calls
@@ -437,7 +443,7 @@ async def test_grounded_sse_visible_text_is_the_persisted_answer_and_citations_f
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
             if "INTENT EXECUTION RETRIEVAL V1" in system_prompt:
                 return proposal(layer="chunk")
-            raise AssertionError("unexpected model call")
+            return await super().classify_json(system_prompt, user_prompt, fallback)
 
         async def complete_text_streaming(
             self,

@@ -43,6 +43,9 @@ describe("agent trace helpers", () => {
     expect(traceNodeLabel("layer_drilldown")).toBe("逐父下钻");
     expect(traceNodeLabel("frontier_traversal")).toBe("队列遍历");
     expect(traceNodeLabel("structure_context_restoration")).toBe("结构上下文恢复");
+    expect(traceNodeLabel("evidence_directory_ready")).toBe("准备证据目录");
+    expect(traceNodeLabel("evidence_read")).toBe("读取候选原文");
+    expect(traceNodeLabel("evidence_finalized")).toBe("冻结回答证据");
     expect(traceNodeLabel("retrievers")).toBe("片段召回");
   });
 
@@ -87,5 +90,34 @@ describe("agent trace helpers", () => {
     });
     expect(summary).toContain("入口层: 粗概念");
     expect(summary).toContain("模型调用: 1");
+  });
+
+  it("summarizes finite evidence selection without exposing handles", () => {
+    const summary = traceAuditSummary({
+      contract_version: "agent_trace_scores_public_v1",
+      audit_kind: "intent_execution",
+      source_count: 12,
+      read_count: 2,
+      selected_count: 1,
+      remaining_count: 10,
+      decision_call_count: 2,
+      read_action_count: 1,
+      mid_count: 4,
+      mandatory_source_count: 1,
+      estimated_input_tokens: 900,
+      input_token_count: 850,
+    });
+    expect(summary).toEqual([
+      "候选来源: 12",
+      "本轮读取: 2",
+      "已选来源: 1",
+      "剩余节点: 10",
+      "证据决策: 2",
+      "读取动作: 1",
+      "语义节点: 4",
+      "必带来源: 1",
+      "估算输入 token: 900",
+      "实际输入 token: 850",
+    ]);
   });
 });

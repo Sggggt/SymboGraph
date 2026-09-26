@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-import hashlib
+import json
 import re
 import time
 
@@ -13,6 +13,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.core.config import get_settings
 from app.models import AgentObservation, AgentTraceEvent, AnswerSession, Chunk, RetrievalTrace
 from app.retrieval_control_contracts import control_hash
+from app.services.agent_context import ContextUnit, plan_context
 from app.services.agent_reflection import history_summary_projection, render_answer_units
 from app.services.answer_sources import (
     build_answer_evidence_manifest,
@@ -29,6 +30,11 @@ from app.services.intent_planning import (
     read_admitted_capability_snapshot,
     retrieval_capability_snapshot,
 )
+from app.services.evidence_read_loop import (
+    mark_evidence_loop_terminal,
+    record_final_generation_event,
+    run_evidence_read_loop,
+)
 from app.services.layered_execution_v1 import (
     execute_layered_retrieval,
     publish_intent_retrieval_cache,
@@ -39,7 +45,8 @@ from app.services.source_integrity_admission import admit_context_package
 
 
 PROTOCOL = "intent_execution_retrieval_v1"
-GENERATION_CALL_PROTOCOL = "single_grounded_generation_call_v4"
+GENERATION_CALL_PROTOCOL = "single_grounded_generation_call_v6"
+AGENT_DEADLINE_SAFETY_SECONDS = 1.0
 
 
 def _prefers_chinese(text: str) -> bool:
@@ -48,6 +55,23 @@ def _prefers_chinese(text: str) -> bool:
 
 def _planning_call_count(run) -> int:
     return int(((run.metadata_json or {}).get("intent_execution_plan") or {}).get("planning_model_call_count") or 1)
+
+
+def _agent_total_timeout_seconds(settings=None) -> float:
+    settings = settings or get_settings()
+    return float(settings.retrieval_total_timeout_seconds)
+
+
+def _remaining_agent_seconds(settings=None) -> float:
+    settings = settings or get_settings()
+    performance = current_qa_performance()
+    elapsed = performance.snapshot().elapsed_ms / 1000 if performance is not None else 0.0
+    return max(
+        0.0,
+        _agent_total_timeout_seconds(settings)
+        - AGENT_DEADLINE_SAFETY_SECONDS
+        - elapsed,
+    )
 
 
 async def _prefetch_capability_snapshot(knowledge_base_id: str):
@@ -468,10 +492,98 @@ async def _generate_once(
 ) -> dict:
     settings = get_settings()
     with qa_stage("generation_packing"):
-        contexts = context_package_to_contexts(package)
-        evidence = build_answer_evidence_manifest(package, contexts)
-    if admission.audit.get("evidence_manifest_hash") != evidence.manifest_hash:
+        admitted_contexts = context_package_to_contexts(package)
+        admitted_evidence = build_answer_evidence_manifest(package, admitted_contexts)
+    if admission.audit.get("evidence_manifest_hash") != admitted_evidence.manifest_hash:
         raise ValueError("source_admission_evidence_manifest_changed")
+    model = RetrievalModels(agent_graph.ChatProvider)
+    try:
+        evidence_result = await run_evidence_read_loop(
+            db,
+            agent_graph=agent_graph,
+            run=run,
+            plan=plan,
+            package=package,
+            trace=trace,
+            admission=admission,
+            evidence=admitted_evidence,
+            model=model,
+            remaining_seconds=lambda: _remaining_agent_seconds(settings),
+            per_call_timeout_seconds=float(settings.model_request_timeout_seconds),
+            max_tokens=min(
+                settings.chat_json_max_tokens,
+                settings.retrieval_planning_max_tokens,
+            ),
+        )
+    except BaseException as exc:
+        try:
+            mark_evidence_loop_terminal(
+                db,
+                run_id=run.id,
+                cancelled=isinstance(exc, asyncio.CancelledError),
+                error_code=str(getattr(exc, "code", None) or type(exc).__name__),
+            )
+        except Exception:
+            db.rollback()
+        raise
+    if not evidence_result.generation_evidence.sources:
+        return _finish_gap(
+            db,
+            agent_graph=agent_graph,
+            request=request,
+            session=session,
+            run=run,
+            plan=plan,
+            outcome="insufficient_evidence",
+            package=package,
+            trace=trace,
+            admission=admission,
+        )
+    evidence = evidence_result.generation_evidence
+    generation_view = evidence_result.generation_view
+    contexts = list(evidence_result.selected_contexts)
+    generation_context_plan = plan_context(
+        [
+            ContextUnit(
+                "generation:task",
+                "user_task",
+                "P0",
+                json.dumps(
+                    {
+                        "question": plan.task.question,
+                        "requirements": [
+                            item.model_dump(mode="json")
+                            for item in plan.task.requirements
+                        ],
+                        "response_constraints": [
+                            item.model_dump(mode="json")
+                            for item in plan.task.response_constraints
+                        ],
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                set_name="pinned",
+            ),
+            *[
+                ContextUnit(
+                    f"generation:{source['source_handle']}",
+                    "committed_raw_source",
+                    "P1",
+                    source["text"],
+                    set_name="working",
+                    handle=source["source_handle"],
+                )
+                for source in evidence.sources
+            ],
+        ],
+        input_token_budget=max(int(package.token_budget or 0) + 4096, 4096),
+        reserved_output_tokens=min(
+            settings.chat_json_max_tokens,
+            settings.retrieval_generation_max_tokens,
+        ),
+        stable_prefix="SINGLE GROUNDED MARKDOWN ANSWER V3",
+    ).audit
     prepared = {
         "protocol_version": GENERATION_CALL_PROTOCOL,
         "status": "prepared",
@@ -479,13 +591,17 @@ async def _generate_once(
         "accepted_plan_hash": plan.identity,
         "source_integrity_admission_hash": admission.audit["audit_hash"],
         "context_package_id": package.id,
-        "evidence_manifest_hash": evidence.manifest_hash,
+        "admitted_evidence_manifest_hash": admitted_evidence.manifest_hash,
+        "generation_evidence_manifest_hash": evidence.manifest_hash,
+        "generation_evidence_view_hash": generation_view["audit_hash"],
+        "evidence_read_loop_observation_id": evidence_result.observation.id,
+        "context_plan": generation_context_plan,
         "input_hash": control_hash(
             {
                 "task": plan.task.model_dump(mode="json"),
                 "intent": plan.intent.model_dump(mode="json"),
-                "evidence_manifest_hash": evidence.manifest_hash,
-                "history_summary_hash": hashlib.sha256(history_summary.encode()).hexdigest(),
+                "generation_evidence_manifest_hash": evidence.manifest_hash,
+                "generation_evidence_view_hash": generation_view["audit_hash"],
             }
         ),
         "provider_response_persisted": False,
@@ -495,21 +611,24 @@ async def _generate_once(
         observation_type="single_grounded_generation",
         verdict="prepared",
         observation_json=prepared,
-        evidence_chunk_ids_json=list(package.hit_chunk_ids_json or []),
+        evidence_chunk_ids_json=[source["chunk_id"] for source in evidence.sources],
     )
     db.add(call)
     with qa_stage("audit_persistence"):
         db.commit()
-    model = RetrievalModels(agent_graph.ChatProvider)
+    generation_timeout = min(
+        settings.model_request_timeout_seconds,
+        settings.retrieval_generation_timeout_seconds,
+        _remaining_agent_seconds(settings),
+    )
+    if generation_timeout <= 0:
+        raise TimeoutError("agent_deadline_exhausted")
     draft, model_audit = await model.generate(
         task=plan.task,
         evidence=evidence,
         history_summary=history_summary,
         missing_facets=(),
-        timeout_seconds=min(
-            settings.model_request_timeout_seconds,
-            settings.retrieval_generation_timeout_seconds,
-        ),
+        timeout_seconds=generation_timeout,
         max_tokens=min(
             settings.chat_json_max_tokens,
             settings.retrieval_generation_max_tokens,
@@ -530,6 +649,12 @@ async def _generate_once(
     completed["audit_hash"] = control_hash(completed)
     call.verdict = "completed"
     call.observation_json = completed
+    record_final_generation_event(
+        db,
+        observation_id=evidence_result.observation.id,
+        generation_view_hash=generation_view["audit_hash"],
+        context_plan_hash=model_audit["context_plan"]["plan_hash"],
+    )
     bound_trace = db.get(RetrievalTrace, package.retrieval_trace_id)
     authoritative_conversation_scope = str(
         bound_trace.conversation_state_scope_hash if bound_trace is not None else ""
@@ -554,8 +679,8 @@ async def _generate_once(
         context_package_id=package.id,
         question=request.question,
         answer=answer,
-        chunk_ids_json=list(package.hit_chunk_ids_json or []),
-        prompt_protocol_version="single_grounded_answer_v6",
+        chunk_ids_json=[source["chunk_id"] for source in evidence.sources],
+        prompt_protocol_version="single_grounded_answer_v7",
         model_json={
             "protocol_version": PROTOCOL,
             "accepted_plan_hash": plan.identity,
@@ -563,6 +688,19 @@ async def _generate_once(
             "generation_model_call_count": 1,
             "post_generation_model_call_count": 0,
             "source_admission_model_call_count": 0,
+            "evidence_decision_model_call_count": int(
+                ((evidence_result.observation.observation_json or {}).get("state") or {}).get(
+                    "decision_call_count"
+                )
+                or 0
+            ),
+            "evidence_read_action_count": int(
+                ((evidence_result.observation.observation_json or {}).get("state") or {}).get(
+                    "read_action_count"
+                )
+                or 0
+            ),
+            "generation_evidence_source_count": len(evidence.sources),
             "generation": completed,
             "conversation_state_scope_hash": authoritative_conversation_scope,
             "policy_update_eligible": False,
@@ -572,6 +710,8 @@ async def _generate_once(
             "agent_run_id": run.id,
             "answer_units": units,
             "source_integrity_admission": admission.audit,
+            "evidence_read_loop_observation_id": evidence_result.observation.id,
+            "generation_evidence_view": generation_view,
             "conversation_state_scope_hash": authoritative_conversation_scope,
         },
     )
@@ -583,17 +723,20 @@ async def _generate_once(
             db,
             answer_session=answer_row,
             package=package,
-            contexts=contexts,
+            contexts=admitted_contexts,
             draft=draft,
             evidence=evidence,
             unit_limit=settings.agent_answer_unit_limit,
             source_integrity_admission=admission_row,
+            admitted_evidence=admitted_evidence,
+            generation_evidence_view=generation_view,
         )
         citations = source_binding_citations(
             answer_session=answer_row,
             package=package,
             rows=bindings,
             source_integrity_admission=admission_row,
+            generation_evidence_view=generation_view,
         )
     answer_row.citation_ids_json = [binding.id for binding in bindings]
     answer_row.model_json = {
@@ -664,6 +807,12 @@ async def _generate_once(
         "answer_session_id": answer_row.id,
         "terminal_outcome": "completed",
         "generation_model_call_count": 1,
+        "evidence_decision_model_call_count": int(
+            ((evidence_result.observation.observation_json or {}).get("state") or {}).get(
+                "decision_call_count"
+            )
+            or 0
+        ),
         "post_generation_model_call_count": 0,
         "policy_update_eligible": False,
     }
@@ -801,7 +950,6 @@ async def _execute(db, request, session, run) -> dict:
             route="clarify",
             terminal_outcome="scope_ambiguous",
         )
-    started = time.monotonic()
     if plan.strategy.route == "verified_context_reuse":
         candidate = reuse_candidate
         if candidate is not None:
@@ -814,7 +962,7 @@ async def _execute(db, request, session, run) -> dict:
                     plan=plan,
                     package=package,
                     filters=request.filters,
-                    remaining_seconds=settings.retrieval_total_timeout_seconds - (time.monotonic() - started),
+                    remaining_seconds=_remaining_agent_seconds(settings),
                 )
             if admission.passed:
                 await _discard_capability_prefetch(capability_prefetch)
@@ -913,7 +1061,7 @@ async def _execute(db, request, session, run) -> dict:
             plan=plan,
             package=package,
             filters=request.filters,
-            remaining_seconds=settings.retrieval_total_timeout_seconds - (time.monotonic() - started),
+            remaining_seconds=_remaining_agent_seconds(settings),
         )
     with qa_stage("database_commit"):
         db.commit()
@@ -973,10 +1121,7 @@ async def execute_intent_execution_agent(db, request, session, run) -> dict:
     response = None
     with performance.activate():
         try:
-            remaining = (
-                get_settings().retrieval_total_timeout_seconds
-                - performance.snapshot().elapsed_ms / 1000
-            )
+            remaining = _remaining_agent_seconds(get_settings())
             async with asyncio.timeout(max(0.001, remaining)):
                 with qa_stage("request"):
                     response = await _execute(db, request, session, run)

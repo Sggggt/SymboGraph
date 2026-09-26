@@ -387,6 +387,32 @@ def fake_model_stack(monkeypatch: pytest.MonkeyPatch):
                     {'facet_id':item['id'],'status':'covered','reason':'supported',
                      'source_handles':[(scoped.get(item['id']) or packet['evidence'])[0]['source_handle']]}
                     for item in packet['requirements']]}
+            if 'EVIDENCE TOOL SESSION V1' in system_prompt:
+                import json
+                packet = json.loads(user_prompt)
+                if packet['remaining_mid_handles']:
+                    return {
+                        'protocol_version': 'evidence_tool_call_v1',
+                        'tool': 'evidence.read',
+                        'arguments': {'mid_handles': packet['remaining_mid_handles']},
+                    }
+                source_handles = []
+                for message in packet.get('messages') or []:
+                    if message.get('role') != 'user':
+                        continue
+                    content = json.loads(message['content'])
+                    if content.get('tool') != 'evidence.read' or content.get('status') != 'ok':
+                        continue
+                    source_handles.extend(
+                        source['source_handle']
+                        for group in content.get('groups') or []
+                        for source in group.get('sources') or []
+                    )
+                return {
+                    'protocol_version': 'evidence_tool_call_v1',
+                    'tool': 'evidence.commit',
+                    'arguments': {'source_handles': list(dict.fromkeys(source_handles))},
+                }
             if 'RETRIEVAL TASK PLANNING V2' in system_prompt:
                 return {'source_references':[], 'perception':{'intent':'definition','direct_answer_kind':'none','entities':['Bayesian']},
                     'requirements':[{'facet':'Bayesian network','lexical_role':'domain','aliases':['Bayesian networks']},

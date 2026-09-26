@@ -2002,3 +2002,120 @@ def test_pinned_connection_connects_to_ip_while_retaining_tls_hostname(monkeypat
         "timeout": 3.0,
         "source_address": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_continuous_anthropic_json_uses_forced_native_tool(monkeypatch, no_fallback_env):
+    from app.services import embeddings
+
+    provider = embeddings.ChatProvider()
+    provider.api_key = "unit-test-key"
+    provider.api_protocol = "anthropic"
+    captured = {}
+
+    async def fake_tool(payload, native_tools):
+        captured["payload"] = payload
+        captured["tools"] = native_tools
+        return {"tool": "done", "arguments": {"tool": "done"}}
+
+    monkeypatch.setattr(provider, "_post_anthropic_sdk_tool", fake_tool)
+    schema = {
+        "type": "object",
+        "properties": {"tool": {"type": "string"}},
+        "required": ["tool"],
+        "additionalProperties": False,
+    }
+    result = await provider.classify_json_messages(
+        "stable system",
+        [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": '{"tool":"read"}'},
+            {"role": "user", "content": '{"status":"ok"}'},
+        ],
+        max_tokens=512,
+        response_schema=schema,
+        native_tools=[
+            {
+                "name": "done",
+                "result_tool": "done",
+                "description": "done",
+                "input_schema": schema,
+            }
+        ],
+    )
+    assert result == {"tool": "done", "arguments": {"tool": "done"}}
+    assert captured["tools"][0]["input_schema"] == schema
+    assert [item["role"] for item in captured["payload"]["messages"]] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_native_tool_accepts_only_one_forced_submit(monkeypatch, no_fallback_env):
+    from app.services import embeddings
+
+    provider = embeddings.ChatProvider()
+    captured = {}
+
+    async def fake_response(payload, *, phase):
+        captured.update(payload=payload, phase=phase)
+        return {
+            "stop_reason": "tool_use",
+            "content": [
+                {"type": "tool_use", "name": "submit", "input": {"tool": "done"}}
+            ],
+        }
+
+    monkeypatch.setattr(provider, "_post_anthropic_sdk_response", fake_response)
+    result = await provider._post_anthropic_sdk_tool(
+        {"model": "unit", "messages": [{"role": "user", "content": "task"}], "max_tokens": 512},
+        [
+            {
+                "name": "submit",
+                "result_tool": "done",
+                "description": "submit",
+                "input_schema": {"type": "object"},
+            }
+        ],
+    )
+    assert result == {"tool": "done", "arguments": {"tool": "done"}}
+    assert captured["phase"] == "sdk_tool"
+    assert captured["payload"]["tool_choice"] == {"type": "tool", "name": "submit"}
+    assert captured["payload"]["tools"][0]["input_schema"] == {"type": "object"}
+
+
+@pytest.mark.asyncio
+async def test_anthropic_tool_gateway_end_turn_json_is_parsed(monkeypatch, no_fallback_env):
+    from app.services import embeddings
+
+    provider = embeddings.ChatProvider()
+
+    async def fake_response(payload, *, phase):
+        return {
+            "type": "message",
+            "role": "assistant",
+            "stop_reason": "end_turn",
+            "content": [
+                {
+                    "type": "text",
+                    "text": '{"tool":"plan.commit","arguments":{"value":1}}',
+                }
+            ],
+        }
+
+    monkeypatch.setattr(provider, "_post_anthropic_sdk_response", fake_response)
+    result = await provider._post_anthropic_sdk_tool(
+        {"model": "unit", "messages": [{"role": "user", "content": "task"}], "max_tokens": 512},
+        [
+            {
+                "name": "planning_action",
+                "result_tool": "planning_action",
+                "passthrough": True,
+                "description": "submit",
+                "input_schema": {"type": "object"},
+            }
+        ],
+    )
+    assert result == {"tool": "plan.commit", "arguments": {"value": 1}}

@@ -766,6 +766,7 @@ def _validate_reference_provenance(
                 "single_grounded_answer_v4",
                 "single_grounded_answer_v5",
                 "single_grounded_answer_v6",
+                "single_grounded_answer_v7",
             }
             and len(trace_scope) == 64
         ):

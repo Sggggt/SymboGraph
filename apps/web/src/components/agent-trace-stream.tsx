@@ -36,6 +36,8 @@ interface AgentTraceStreamProps {
 const activePhaseLabels: Record<string, string> = {
   intent_planning: "理解问题并规划检索",
   retrieval: "检索资料",
+  evidence_directory: "准备回答证据",
+  evidence_read: "阅读并筛选原文",
   generation: "生成回答",
 };
 
@@ -106,6 +108,9 @@ function eventProgressCount(event: AgentTraceEventPayload): { count: number; nou
   if (scores.audit_kind === "citation_verification") {
     return { count: metricNumber(scores.returned_citation_count), noun: "引用" };
   }
+  if (scores.audit_kind === "intent_execution" && event.node.startsWith("evidence_")) {
+    return { count: metricNumber(scores.read_count, scores.selected_count, scores.source_count), noun: "来源" };
+  }
   return { count: event.document_ids.length, noun: "证据" };
 }
 
@@ -126,7 +131,7 @@ function renderEventIcon(event: AgentTraceEventPayload) {
   if (event.status === "failed" || event.node === "error") return <XCircle className="size-4" />;
   if (event.status === "pending") return <Activity className="size-4" />;
   if (event.node === "frontier_traversal" || event.node === "layered_retrieval") return <Search className="size-4" />;
-  if (event.node === "context_package" || event.node === "structure_context_restoration") return <Database className="size-4" />;
+  if (event.node === "context_package" || event.node === "structure_context_restoration" || event.node.startsWith("evidence_")) return <Database className="size-4" />;
   if (event.node === "citation_verification") return <FileText className="size-4" />;
   return <CheckCircle2 className="size-4" />;
 }

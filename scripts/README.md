@@ -62,7 +62,7 @@
 | `check_technical_spec_compliance.py` | 扫描静态边界并核对持久图/协议不变量。 |
 | `evaluate_layered_retrieval.py` | 重放已有检索，或显式执行新的检索。 |
 | `evaluate_agent_trace.py` | 按记录版本重放目标或历史执行、上下文和来源审计。 |
-| `evaluate_intent_execution.py` | 目标协议五题冻结 gold 验收；默认 dry-run，`--execute` 顺序调用 QA 并重放持久硬门禁，记录 provider 往返区间、非模型墙钟及可选粗层读取耗时。 |
+| `evaluate_intent_execution.py` | 目标协议五题冻结 gold 验收；默认 dry-run，`--execute` 顺序调用 QA 并重放持久硬门禁，记录 v2 evidence/context plan、逐模型调用 input/output/cache token、TTFT、各阶段、provider 往返区间与非模型墙钟。 |
 | `evaluate_intent_conversations.py` | 目标协议十轮会话验收，覆盖能力卡、同会话复用、安全转检索、跨来源、证据不足与结构题。 |
 | `probe_embedding_provider.py` | 脱敏的真实 embedding 连通性探测。 |
 | `docker_smoke.py` | 默认 GET-only 计划；显式执行 Search/QA 并核对契约。 |

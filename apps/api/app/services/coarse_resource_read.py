@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import math
 import time
 from typing import Literal
 
@@ -144,19 +143,11 @@ def read_coarse_titles(db, *, knowledge_base_id: str, graph_identity: str, filte
         nodes = []
         key_to_id = {}
         for index, item in enumerate(concepts, 1):
-            weight = float(item.node_weight)
-            confidence = float(item.confidence)
-            if not (math.isfinite(weight) and math.isfinite(confidence)):
-                raise ValueError("resource_read_node_metadata_invalid")
             key = f"c{index}"
             key_to_id[key] = item.id
             nodes.append({
                 "key": key,
                 "title": item.canonical_label,
-                "node_weight": weight,
-                "confidence": confidence,
-                "mid_count": len(item.included_mid_concept_ids_json or []),
-                "support_chunk_count": len(item.support_chunk_ids_json or []),
             })
         payload = {"protocol_version": PROTOCOL, "mode": "titles", "complete": True, "nodes": nodes, "is_answer_evidence": False}
         size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))

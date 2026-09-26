@@ -427,7 +427,7 @@ async def _execute(db, request, session, run):
                                            max_characters=settings.agent_history_summary_max_chars)
     model = RetrievalModels(ag.ChatProvider)
     proposal, planning_audit = await model.plan(question=request.question, history_summary=history,
-        timeout_seconds=min(settings.model_request_timeout_seconds, settings.retrieval_planning_timeout_seconds),
+        timeout_seconds=settings.model_request_timeout_seconds,
         max_tokens=min(settings.chat_json_max_tokens, settings.retrieval_planning_max_tokens))
     _, perception_projection = project_task_perception(proposal, request.question)
     planning_audit = {**planning_audit, 'perception_projection': perception_projection}

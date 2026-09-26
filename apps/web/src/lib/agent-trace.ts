@@ -45,6 +45,9 @@ const traceNodeLabels: Record<AgentTraceNode, string> = {
   intent_execution_retrieval: "执行分层检索",
   source_integrity_admission: "核对来源完整性",
   verified_context_reuse: "复用已验证证据",
+  evidence_directory_ready: "准备证据目录",
+  evidence_read: "读取候选原文",
+  evidence_finalized: "冻结回答证据",
 };
 
 export const traceGroupLabels = {
@@ -90,7 +93,7 @@ export function traceGroupForNode(node: string): TraceGroupKey {
   if (node === "structure_context_restoration") {
     return "restoration";
   }
-  if (node === "context_package") {
+  if (node === "context_package" || node === "evidence_directory_ready" || node === "evidence_read" || node === "evidence_finalized") {
     return "package";
   }
   if (node === "citation_verification" || node === "source_integrity_admission") {
@@ -144,7 +147,10 @@ export function traceNodeVariant(node: string): "success" | "info" | "warning" |
     node === "planning_schema_feedback" ||
     node === "intent_execution_retrieval" ||
     node === "source_integrity_admission" ||
-    node === "verified_context_reuse"
+    node === "verified_context_reuse" ||
+    node === "evidence_directory_ready" ||
+    node === "evidence_read" ||
+    node === "evidence_finalized"
   ) {
     return "info";
   }
@@ -255,6 +261,17 @@ export function traceAuditSummary(scores: AgentTraceScores | undefined): string[
         ["entry_layer", "入口层", scores.entry_layer],
         ["accepted_plan_hash", "计划", scores.accepted_plan_hash],
         ["model_call_count", "模型调用", scores.model_call_count],
+        ["source_count", "候选来源", scores.source_count],
+        ["read_count", "本轮读取", scores.read_count],
+        ["selected_count", "已选来源", scores.selected_count],
+        ["remaining_count", "剩余节点", scores.remaining_count],
+        ["coverage_count", "已覆盖要求", scores.coverage_count],
+        ["decision_call_count", "证据决策", scores.decision_call_count],
+        ["read_action_count", "读取动作", scores.read_action_count],
+        ["mid_count", "语义节点", scores.mid_count],
+        ["mandatory_source_count", "必带来源", scores.mandatory_source_count],
+        ["estimated_input_tokens", "估算输入 token", scores.estimated_input_tokens],
+        ["input_token_count", "实际输入 token", scores.input_token_count],
       ];
       break;
     case "citation_verification":

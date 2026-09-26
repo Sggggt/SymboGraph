@@ -6,6 +6,8 @@ import type { ModelSettingsUpdate } from "@course-kg/shared";
 
 import {
   AgentAdmissionSettingsSection,
+  AgentTimeBudgetFields,
+  AgentTokenBudgetFields,
   bindEmbeddingProtocolToCandidateSettings,
   buildRuntimeSettingsPayload,
   buildHotReloadSettingsPayload,
@@ -118,6 +120,10 @@ describe("settings parameter help", () => {
       worker_concurrency: "3",
       model_request_concurrency: "3",
       model_request_timeout_seconds: "240",
+      retrieval_total_timeout_seconds: "640",
+      retrieval_generation_timeout_seconds: "600",
+      retrieval_planning_max_tokens: "8192",
+      retrieval_generation_max_tokens: "24000",
       chat_json_max_tokens: "12000",
       agent_request_concurrency: "4",
       source_io_concurrency: "4",
@@ -157,6 +163,9 @@ describe("settings parameter help", () => {
       chat_base_url: "https://chat.example.test",
       embedding_batch_size: 10,
       chat_json_max_tokens: 12000,
+      retrieval_total_timeout_seconds: 640,
+      retrieval_generation_timeout_seconds: 600,
+      retrieval_generation_max_tokens: 24000,
       model_bridge_enabled: true,
     });
     for (const forbiddenField of [
@@ -193,6 +202,10 @@ describe("settings parameter help", () => {
       worker_concurrency: "4",
       model_request_concurrency: "3",
       model_request_timeout_seconds: "240",
+      retrieval_total_timeout_seconds: "640",
+      retrieval_generation_timeout_seconds: "600",
+      retrieval_planning_max_tokens: "8192",
+      retrieval_generation_max_tokens: "24000",
       chat_json_max_tokens: "12000",
       agent_request_concurrency: "4",
       source_io_concurrency: "4",
@@ -265,6 +278,7 @@ describe("settings parameter help", () => {
       embedding_model: "embedding-v2",
       fixed_chunk_size_tokens: 640,
       worker_concurrency: 4,
+      retrieval_planning_max_tokens: 8192,
       model_bridge_enabled: true,
     });
   });
@@ -351,7 +365,7 @@ describe("settings parameter help", () => {
   });
 
   it("documents the target runtime, graph, and versioned BM25 controls", () => {
-    for (const label of ["模型请求并发", "源文件 I/O 并发", "Agent 请求并发", "Agent 等待队列上限", "Agent 排队超时秒数", "Agent 租约 TTL 秒数", "单文件上传上限（字节）", "中粗层双语派生", "Dense 候选预算", "RQ 候选预算", "BM25 候选预算", "根入口预算", "逐父节点预算", "单层总预算", "最大遍历深度", "每命中恢复预算", "BM25 k1", "BM25 b", "跨文档桥最小配额", "工作进程并发"]) {
+    for (const label of ["模型请求并发", "源文件 I/O 并发", "Agent 整链总时限（秒）", "最终生成时限（秒）", "Agent 请求并发", "Agent 等待队列上限", "Agent 排队超时秒数", "Agent 租约 TTL 秒数", "单文件上传上限（字节）", "规划输出 token 上限", "最终生成 token 上限", "中粗层双语派生", "Dense 候选预算", "RQ 候选预算", "BM25 候选预算", "根入口预算", "逐父节点预算", "单层总预算", "最大遍历深度", "每命中恢复预算", "BM25 k1", "BM25 b", "跨文档桥最小配额", "工作进程并发"]) {
       expect(SETTINGS_PARAMETER_HELP[label]).toBeTruthy();
     }
 
@@ -367,6 +381,46 @@ describe("settings parameter help", () => {
     expect(SETTINGS_PARAMETER_HELP["最大遍历深度"]).toContain("循环只用于剪枝");
     expect(SETTINGS_PARAMETER_HELP["BM25 候选预算"]).toContain("纯向量策略不依赖");
     expect(SETTINGS_PARAMETER_HELP["逐父节点预算"]).toContain("每个父节点");
+  });
+
+  it("renders the Agent timeout controls with the backend limits", () => {
+    const onChange = vi.fn();
+    render(
+      <AgentTimeBudgetFields
+        values={{
+          retrieval_total_timeout_seconds: "640",
+          retrieval_generation_timeout_seconds: "600",
+        }}
+        onChange={onChange}
+      />,
+    );
+
+    const generationTimeout = screen.getByRole("spinbutton", { name: /最终生成时限/ }) as HTMLInputElement;
+    expect(generationTimeout.valueAsNumber).toBe(600);
+    expect(generationTimeout.min).toBe("10");
+    expect(generationTimeout.max).toBe("600");
+    expect((screen.getByRole("spinbutton", { name: /Agent 整链总时限/ }) as HTMLInputElement).max).toBe("3600");
+
+    fireEvent.change(generationTimeout, { target: { value: "480" } });
+    expect(onChange).toHaveBeenCalledWith("retrieval_generation_timeout_seconds", "480");
+  });
+
+  it("renders planning and generation token budgets on the retrieval page", () => {
+    const onChange = vi.fn();
+    render(
+      <AgentTokenBudgetFields
+        values={{
+          retrieval_planning_max_tokens: "8192",
+          retrieval_generation_max_tokens: "24000",
+        }}
+        onChange={onChange}
+      />,
+    );
+
+    expect((screen.getByRole("spinbutton", { name: /规划输出 token 上限/ }) as HTMLInputElement).max).toBe("8192");
+    const generationBudget = screen.getByRole("spinbutton", { name: /最终生成 token 上限/ }) as HTMLInputElement;
+    expect(generationBudget.valueAsNumber).toBe(24000);
+    expect(generationBudget.max).toBe("32768");
   });
 
   it("renders and updates the hot-reloadable upload byte limit", () => {

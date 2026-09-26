@@ -78,6 +78,114 @@ class AnswerEvidenceManifest:
         return reflection_hash(sorted(facts, key=lambda value: (value["chunk_id"], value["char_span"])))
 
 
+def project_answer_evidence_manifest(
+    evidence: AnswerEvidenceManifest,
+    package_source_handles: list[str] | tuple[str, ...],
+) -> AnswerEvidenceManifest:
+    """Project admitted package sources into a compact generation-local view."""
+
+    sources = evidence.by_handle()
+    selected = tuple(package_source_handles)
+    if len(set(selected)) != len(selected) or any(handle not in sources for handle in selected):
+        raise ReflectionContractError("generation_evidence_selection_invalid")
+    projected: list[dict[str, Any]] = []
+    for index, package_handle in enumerate(selected, start=1):
+        source = _clone(sources[package_handle])
+        source["package_source_handle"] = package_handle
+        source["source_handle"] = f"src_{index}"
+        projected.append(source)
+    identity = _manifest_identity(evidence.package_id, evidence.retrieval_trace_id, projected)
+    return AnswerEvidenceManifest(
+        evidence.package_id,
+        evidence.retrieval_trace_id,
+        tuple(projected),
+        reflection_hash(identity),
+    )
+
+
+def build_generation_evidence_view(
+    evidence: AnswerEvidenceManifest,
+    package_source_handles: list[str] | tuple[str, ...],
+    *,
+    coverage: dict[str, list[str]],
+    source_integrity_admission_hash: str,
+) -> tuple[AnswerEvidenceManifest, dict[str, Any]]:
+    """Freeze a replayable projection without copying source text."""
+
+    projected = project_answer_evidence_manifest(evidence, package_source_handles)
+    by_package_handle = evidence.by_handle()
+    selected = tuple(package_source_handles)
+    selected_set = set(selected)
+    if any(
+        not isinstance(requirement_id, str)
+        or not requirement_id
+        or len(set(handles)) != len(handles)
+        or any(handle not in selected_set for handle in handles)
+        for requirement_id, handles in coverage.items()
+    ):
+        raise ReflectionContractError("generation_evidence_coverage_invalid")
+    source_cards = []
+    for generation_source, package_handle in zip(projected.sources, selected, strict=True):
+        package_source = by_package_handle[package_handle]
+        span = package_source["source_span"]
+        source_cards.append({
+            "package_source_handle": package_handle,
+            "generation_source_handle": generation_source["source_handle"],
+            "chunk_id": package_source["chunk_id"],
+            "document_version_id": span["document_version_id"],
+            "char_span": list(span["char_span"]),
+            "text_hash": hashlib.sha256(package_source["text"].encode("utf-8")).hexdigest(),
+            "source_span_hash": control_hash(span),
+        })
+    payload = {
+        "protocol_version": "generation_evidence_view_v1",
+        "context_package_id": evidence.package_id,
+        "retrieval_trace_id": evidence.retrieval_trace_id,
+        "source_integrity_admission_hash": source_integrity_admission_hash,
+        "admitted_evidence_manifest_hash": evidence.manifest_hash,
+        "generation_evidence_manifest_hash": projected.manifest_hash,
+        "selected_package_handles": list(selected),
+        "coverage": {key: list(value) for key, value in sorted(coverage.items())},
+        "sources": source_cards,
+        "source_text_persisted": False,
+    }
+    return projected, {**payload, "audit_hash": control_hash(payload)}
+
+
+def replay_generation_evidence_view(
+    admitted_evidence: AnswerEvidenceManifest,
+    generation_evidence: AnswerEvidenceManifest,
+    view: dict[str, Any],
+) -> None:
+    """Verify the selected view against the complete admitted manifest."""
+
+    if not isinstance(view, dict):
+        raise ReflectionContractError("generation_evidence_view_missing")
+    unsigned = {key: value for key, value in view.items() if key != "audit_hash"}
+    selected = view.get("selected_package_handles")
+    coverage = view.get("coverage")
+    if (
+        view.get("protocol_version") != "generation_evidence_view_v1"
+        or view.get("context_package_id") != admitted_evidence.package_id
+        or view.get("retrieval_trace_id") != admitted_evidence.retrieval_trace_id
+        or view.get("admitted_evidence_manifest_hash") != admitted_evidence.manifest_hash
+        or view.get("generation_evidence_manifest_hash") != generation_evidence.manifest_hash
+        or view.get("source_text_persisted") is not False
+        or not isinstance(selected, list)
+        or not isinstance(coverage, dict)
+        or view.get("audit_hash") != control_hash(unsigned)
+    ):
+        raise ReflectionContractError("generation_evidence_view_identity_invalid")
+    replayed, expected = build_generation_evidence_view(
+        admitted_evidence,
+        selected,
+        coverage={str(key): list(value) for key, value in coverage.items()},
+        source_integrity_admission_hash=str(view.get("source_integrity_admission_hash") or ""),
+    )
+    if replayed.manifest_hash != generation_evidence.manifest_hash or expected != view:
+        raise ReflectionContractError("generation_evidence_view_replay_failed")
+
+
 def build_answer_evidence_manifest(package: ContextPackage, contexts: list[dict[str, Any]]) -> AnswerEvidenceManifest:
     if not package.id or not package.retrieval_trace_id:
         raise ReflectionContractError("evidence_package_identity_missing")
@@ -145,10 +253,21 @@ def draft_source_candidates(
 def audit_answer_sources(
     db: Session, *, knowledge_base_id: str, package: ContextPackage, contexts: list[dict[str, Any]],
     draft: AnswerDraft, evidence: AnswerEvidenceManifest, unit_limit: int,
+    admitted_evidence: AnswerEvidenceManifest | None = None,
+    generation_evidence_view: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     replayed_manifest = build_answer_evidence_manifest(package, contexts)
-    if replayed_manifest.manifest_hash != evidence.manifest_hash:
-        raise ReflectionContractError("evidence_manifest_changed")
+    if admitted_evidence is None:
+        if replayed_manifest.manifest_hash != evidence.manifest_hash:
+            raise ReflectionContractError("evidence_manifest_changed")
+    else:
+        if replayed_manifest.manifest_hash != admitted_evidence.manifest_hash:
+            raise ReflectionContractError("admitted_evidence_manifest_changed")
+        replay_generation_evidence_view(
+            admitted_evidence,
+            evidence,
+            generation_evidence_view or {},
+        )
     candidates = draft_source_candidates(draft, evidence, unit_limit=unit_limit)
     if not candidates:
         return [], {"all_valid": True, "valid_count": 0, "invalid_count": 0, "nonfactual_only": True}
@@ -297,6 +416,8 @@ def persist_answer_source_bindings(
     evidence: AnswerEvidenceManifest, unit_limit: int,
     reflection_audit_hash: str | None = None, retrieval_gate: AgentObservation | None = None,
     source_integrity_admission: AgentObservation | None = None,
+    admitted_evidence: AnswerEvidenceManifest | None = None,
+    generation_evidence_view: dict[str, Any] | None = None,
 ) -> list[AnswerSourceBinding]:
     """Flush inside the caller's answer/run transaction; never commit a half-answer."""
     answer, _units = render_answer_units(draft)
@@ -313,6 +434,19 @@ def persist_answer_source_bindings(
         package=package,
         source_integrity_admission=source_integrity_admission,
     )
+    generation_identity: dict[str, Any] = {}
+    if generation_evidence_view is not None:
+        if admitted_evidence is None:
+            raise ReflectionContractError("generation_evidence_admitted_manifest_missing")
+        replay_generation_evidence_view(
+            admitted_evidence,
+            evidence,
+            generation_evidence_view,
+        )
+        generation_identity = {
+            "generation_evidence_view_hash": generation_evidence_view["audit_hash"],
+            "generation_evidence_manifest_hash": evidence.manifest_hash,
+        }
     if admission is not None:
         owner = db.get(AgentRun, admission.run_id)
         verify_sufficiency_owner(db,owner=owner,retrieval_gate=retrieval_gate)
@@ -320,7 +454,9 @@ def persist_answer_source_bindings(
             or owner.status != "running" or owner.question != answer_session.question
             or owner.session_id != answer_session.qa_session_id
             or ((owner.metadata_json or {}).get("retrieval_control") or {}).get("task_hash") != admission.task_hash
-            or admission.evidence_manifest_hash != evidence.manifest_hash):
+            or admission.evidence_manifest_hash != (
+                admitted_evidence.manifest_hash if admitted_evidence is not None else evidence.manifest_hash
+            )):
             raise ReflectionContractError("retrieval_source_gate_scope_changed")
         inputs = retrieval_gate.observation_json.get('feature_input') or {}
         if inputs.get('parameters',{}).get('protocol_version') == 'canonical_task_path_quality_v4':
@@ -331,6 +467,8 @@ def persist_answer_source_bindings(
     candidates, preflight = audit_answer_sources(
         db, knowledge_base_id=answer_session.knowledge_base_id, package=package, contexts=contexts,
         draft=draft, evidence=evidence, unit_limit=unit_limit,
+        admitted_evidence=admitted_evidence,
+        generation_evidence_view=generation_evidence_view,
     )
     if admission is not None:
         from app.services.source_addressed_assessment import validate_bound_source_addresses
@@ -350,7 +488,7 @@ def persist_answer_source_bindings(
     for candidate in candidates:
         start, end = candidate["answer_char_span"]
         identity = {
-            **authority,
+            **authority, **generation_identity,
             "knowledge_base_id": answer_session.knowledge_base_id, "answer_session_id": answer_session.id,
             "question_hash": hashlib.sha256(answer_session.question.encode("utf-8")).hexdigest(),
             "evidence_manifest_hash": evidence.manifest_hash,
@@ -370,7 +508,7 @@ def persist_answer_source_bindings(
             diagnostics_json={
                 "status": "source_bound", "semantic_entailment_claimed": False,
                 "citation_index": candidate["citation_index"], "source_handle": candidate["source_handle"],
-                "evidence_manifest_hash": evidence.manifest_hash, **authority,
+                "evidence_manifest_hash": evidence.manifest_hash, **authority, **generation_identity,
                 "provenance_session_hash": replay["provenance_session_hash"],
                 "transactional_replay": replay["transactional_replay"], "rows_locked": replay["rows_locked"],
                 "binding_identity": identity,
@@ -388,6 +526,7 @@ def source_binding_citations(
     rows: list[AnswerSourceBinding], reflection_audit_hash: str | None = None,
     retrieval_gate: AgentObservation | None = None,
     source_integrity_admission: AgentObservation | None = None,
+    generation_evidence_view: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     from app.schemas import Citation
 
@@ -401,6 +540,21 @@ def source_binding_citations(
         from app.services.source_addressed_assessment import validate_bound_source_addresses
         validate_bound_source_addresses(retrieval_gate.observation_json,
             ((row.chunk_id,row.source_span_json['char_span']) for row in rows))
+    generation_identity = (
+        {
+            "generation_evidence_view_hash": generation_evidence_view["audit_hash"],
+            "generation_evidence_manifest_hash": generation_evidence_view[
+                "generation_evidence_manifest_hash"
+            ],
+        }
+        if generation_evidence_view is not None
+        else {}
+    )
+    if generation_evidence_view is None and any(
+        (row.diagnostics_json or {}).get("generation_evidence_view_hash")
+        for row in rows
+    ):
+        raise ReflectionContractError("generation_evidence_view_required")
     items = {item["chunk_id"]: item for item in (package.package_json or {}).get("chunks", [])}
     citations: list[dict[str, Any]] = []
     for row in sorted(rows, key=lambda value: int(value.diagnostics_json["citation_index"])):
@@ -414,6 +568,7 @@ def source_binding_citations(
             "answer_hash": row.answer_hash, "chunk_id": row.chunk_id,
             "answer_char_span": [row.answer_char_start, row.answer_char_end],
             "source_span": row.source_span_json,
+            **generation_identity,
         }
         if (
             row.chunk_id not in items or reflection_hash(identity) != row.binding_hash
@@ -425,6 +580,10 @@ def source_binding_citations(
             or answer_session.answer[row.answer_char_start:row.answer_char_end] != row.unit_text
             or any((key != "protocol_version" and row.diagnostics_json.get(key) != value) or identity.get(key) != value
                    for key, value in authority.items())
+            or any(
+                row.diagnostics_json.get(key) != value or identity.get(key) != value
+                for key, value in generation_identity.items()
+            )
             or row.protocol_version != authority["protocol_version"]
                 or row.retrieval_gate_observation_id != (
                     authority.get("retrieval_gate_observation_id")

@@ -15,6 +15,7 @@ from app.retrieval_control_contracts import (
 )
 from app.services.agent_intent import validate_question_perception_output
 from app.services.agent_reflection import PROMPT_PRIORITY_RULES, validate_draft_sources
+from app.services.agent_context import ContextUnit, apply_provider_usage, plan_context
 from app.services.answer_stream import (
     GroundedAnswerDeltaProjector,
     GROUNDED_MARKDOWN_INLINE_CITATIONS_PROTOCOL,
@@ -338,6 +339,12 @@ class RetrievalModels:
             raise ValueError("retrieval_model_deadline_exhausted")
         provider = self.provider_factory()
         body = json.dumps(packet, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        context_plan = plan_context(
+            [ContextUnit("request", "model_request", "P0", body, set_name="pinned")],
+            input_token_budget=65_536,
+            reserved_output_tokens=max_tokens,
+            stable_prefix=system,
+        ).audit
         source_enforcement = None
         gfm_projection = None
         stream_projector: GroundedAnswerDeltaProjector | None = None
@@ -404,6 +411,8 @@ class RetrievalModels:
                 error.provider_shape = safe_task_schema_errors(exc, output_type)
             error.model_call_count = 1
             raise error from None
+        provider_call = provider.provider_call_audit()
+        context_plan = apply_provider_usage(context_plan, provider_call)
         return parsed, {"protocol_version": output_type.model_fields["protocol_version"].default,
             "prompt_protocol_hash": control_hash({"system": system, "schema": output_type.model_json_schema()}),
             "input_hash": control_hash(packet), "model_call_count": 1,
@@ -420,7 +429,96 @@ class RetrievalModels:
                 else {}
             ),
             "provider": provider.api_protocol, "model": provider.model,
-            "provider_call": provider.provider_call_audit()}
+            "provider_call": provider_call, "context_plan": context_plan}
+
+    async def _call_messages(
+        self,
+        *,
+        stage,
+        system,
+        messages,
+        compatibility_packet,
+        output_type,
+        timeout_seconds,
+        max_tokens,
+        native_tools=None,
+    ):
+        if timeout_seconds <= 0:
+            raise ValueError("retrieval_model_deadline_exhausted")
+        provider = self.provider_factory()
+        serialized = json.dumps(
+            messages,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        context_plan = plan_context(
+            [ContextUnit("conversation", "tool_session", "P0", serialized, set_name="pinned")],
+            input_token_budget=65_536,
+            reserved_output_tokens=max_tokens,
+            stable_prefix=system,
+        ).audit
+        try:
+            with qa_stage(
+                stage,
+                input_characters=len(serialized),
+                output_token_budget=max_tokens,
+            ):
+                async with asyncio.timeout(timeout_seconds):
+                    continuous = getattr(provider, "classify_json_messages", None)
+                    if callable(continuous):
+                        raw = await continuous(
+                            system_prompt=system,
+                            messages=messages,
+                            fallback=None,
+                            max_tokens=max_tokens,
+                            compatibility_user_prompt=json.dumps(
+                                compatibility_packet,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                allow_nan=False,
+                            ),
+                            response_schema=output_type.model_json_schema(),
+                            native_tools=native_tools,
+                        )
+                    else:
+                        raw = await classify_json_with_budget(
+                            provider,
+                            system_prompt=system,
+                            user_prompt=json.dumps(
+                                compatibility_packet,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                allow_nan=False,
+                            ),
+                            fallback=None,
+                            max_tokens=max_tokens,
+                        )
+                    parsed = output_type.model_validate(raw)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = classify_answer_model_error(stage, exc)
+            if isinstance(exc, ValidationError):
+                error.provider_shape = safe_task_schema_errors(exc, output_type)
+            error.model_call_count = 1
+            raise error from None
+        provider_call = provider.provider_call_audit()
+        context_plan = apply_provider_usage(context_plan, provider_call)
+        return parsed, {
+            "protocol_version": output_type.model_fields["protocol_version"].default,
+            "prompt_protocol_hash": control_hash(
+                {"system": system, "schema": output_type.model_json_schema()}
+            ),
+            "input_hash": control_hash(messages),
+            "model_call_count": 1,
+            "output_token_budget": max_tokens,
+            "provider_response_persisted": False,
+            "provider": provider.api_protocol,
+            "model": provider.model,
+            "provider_call": provider_call,
+            "context_plan": context_plan,
+        }
 
     async def _call_grounded_markdown(
         self,
@@ -441,6 +539,12 @@ class RetrievalModels:
             separators=(",", ":"),
             allow_nan=False,
         )
+        context_plan = plan_context(
+            [ContextUnit("generation", "clean_generation_context", "P0", body, set_name="pinned")],
+            input_token_budget=65_536,
+            reserved_output_tokens=max_tokens,
+            stable_prefix=system,
+        ).audit
         source_handles = tuple(evidence.by_handle())
         if not source_handles:
             raise ValueError("grounded_markdown_sources_empty")
@@ -519,6 +623,8 @@ class RetrievalModels:
             error = classify_answer_model_error("generation", exc)
             error.model_call_count = 1
             raise error from None
+        provider_call = provider.provider_call_audit()
+        context_plan = apply_provider_usage(context_plan, provider_call)
         return draft, {
             "protocol_version": GROUNDED_MARKDOWN_INLINE_CITATIONS_PROTOCOL,
             "prompt_protocol_hash": control_hash(
@@ -534,7 +640,8 @@ class RetrievalModels:
             "answer_stream": result.audit,
             "provider": provider.api_protocol,
             "model": provider.model,
-            "provider_call": provider.provider_call_audit(),
+            "provider_call": provider_call,
+            "context_plan": context_plan,
         }
 
     async def plan(self, *, question, history_summary, timeout_seconds, max_tokens):
@@ -701,6 +808,50 @@ class RetrievalModels:
         return await self._call(stage='source_location_model',system=system,packet=location_packet(task,request),
             output_type=output_type,timeout_seconds=timeout_seconds,max_tokens=max_tokens)
 
+    async def call_evidence_tool(
+        self,
+        *,
+        messages,
+        compatibility_packet,
+        timeout_seconds,
+        max_tokens,
+    ):
+        from app.services.evidence_read_loop import (
+            EvidenceCommitArguments,
+            EvidenceReadArguments,
+            EvidenceToolCall,
+            evidence_tool_system_prompt,
+        )
+
+        native_tools = [
+            {
+                "name": "evidence_commit",
+                "result_tool": "evidence.commit",
+                "description": "Commit only source handles returned by earlier reads.",
+                "input_schema": EvidenceCommitArguments.model_json_schema(),
+            }
+        ]
+        if compatibility_packet.get("remaining_mid_handles"):
+            native_tools.insert(
+                0,
+                {
+                    "name": "evidence_read",
+                    "result_tool": "evidence.read",
+                    "description": "Read one or more unread semantic nodes.",
+                    "input_schema": EvidenceReadArguments.model_json_schema(),
+                },
+            )
+        return await self._call_messages(
+            stage="evidence_decision",
+            system=evidence_tool_system_prompt(),
+            messages=messages,
+            compatibility_packet=compatibility_packet,
+            output_type=EvidenceToolCall,
+            timeout_seconds=timeout_seconds,
+            max_tokens=max_tokens,
+            native_tools=native_tools,
+        )
+
     async def generate(self, *, task: TaskContract, evidence, history_summary, missing_facets,
                        timeout_seconds, max_tokens, unit_limit, source_scopes=None):
         profile = active_profile_json()
@@ -715,7 +866,7 @@ class RetrievalModels:
             "Use only the supplied current evidence; do not invent a source or use historical answer prose as evidence. "
             "After a factual statement, cite its raw source with exactly ⟦cite:src_1⟧ or, when multiple sources support the same statement, "
             "⟦cite:src_1,src_2⟧ using only handles present in the supplied evidence. Do not place spaces inside the marker. "
-            "The server separately submits the full admitted source list. Do not emit JSON control fields, self-scores, review decisions, "
+            "The server separately submits the complete frozen generation source list. Do not emit JSON control fields, self-scores, review decisions, "
             "tool calls, or private reasoning. "
             "If a required item is missing, state that bounded gap; do not claim the entire library lacks it. "
             "Do not return self-scores, review decisions, tool calls, or private reasoning.",
@@ -736,7 +887,6 @@ class RetrievalModels:
             packet={"current_user": {"question": task.question,
                 "response_constraints": [item.model_dump(mode='json') for item in task.response_constraints]}, "requirements": [
                 item.model_dump(mode="json") for item in task.requirements],
-                "history_summary": {"text": history_summary, "instruction_priority": 3, "is_evidence": False},
                 "evidence": evidence.model_sources(), "known_uncovered_requirements": list(missing_facets),
                 **({'source_scopes':source_scopes.model_dump(mode='json')} if source_scopes else {})},
             evidence=evidence, unit_limit=unit_limit,

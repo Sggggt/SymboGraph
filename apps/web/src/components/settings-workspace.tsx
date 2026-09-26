@@ -80,6 +80,10 @@ type SettingsForm = {
   worker_concurrency: string;
   model_request_concurrency: string;
   model_request_timeout_seconds: string;
+  retrieval_total_timeout_seconds: string;
+  retrieval_generation_timeout_seconds: string;
+  retrieval_planning_max_tokens: string;
+  retrieval_generation_max_tokens: string;
   chat_json_max_tokens: string;
   agent_request_concurrency: string;
   source_io_concurrency: string;
@@ -156,6 +160,16 @@ type ErrorDialogState = {
 type AgentAdmissionSettingsValues = Pick<
   SettingsForm,
   "agent_request_concurrency" | "agent_request_queue_limit" | "agent_request_queue_timeout_seconds" | "agent_request_lease_ttl_seconds"
+>;
+
+type AgentTimeBudgetSettingsValues = Pick<
+  SettingsForm,
+  "retrieval_total_timeout_seconds" | "retrieval_generation_timeout_seconds"
+>;
+
+type AgentTokenBudgetSettingsValues = Pick<
+  SettingsForm,
+  "retrieval_planning_max_tokens" | "retrieval_generation_max_tokens"
 >;
 
 type GraphProtocolSettingsValues = Pick<
@@ -291,6 +305,10 @@ export const SETTINGS_PARAMETER_HELP: Record<string, string> = {
   清除当前向量接口密钥: "勾选后保存会删除当前向量密钥；删除后解析、重嵌入和检索向量生成会因缺少凭据而失败。",
   模型请求并发: "限制同时发起的模型请求数量，用于控制概念生成、意图规划和回答生成的吞吐与外部端点压力。",
   模型超时秒数: "单次模型请求等待上限；超过该时间会快速失败并进入可诊断错误，不做静默降级。",
+  "Agent 整链总时限（秒）": "从请求接纳到最终终态的总墙钟上限，覆盖规划、检索、证据读取、最终生成和提交；它不会扩大任一单次模型调用的上限。",
+  "最终生成时限（秒）": "一次最终回答生成的阶段上限，允许 10–600 秒；实际等待取该值、单次模型时限和整链剩余时间中的最小值。",
+  "规划输出 token 上限": "意图规划和证据决策单次模型响应的最大 token 数；提高它会增加潜在生成时间和成本。",
+  "最终生成 token 上限": "最终回答单次模型响应的最大 token 数；这是可用上限，不要求模型必须生成到该长度。",
   "源文件 I/O 并发": "限制解析、校验和持久化源文件时同时运行的阻塞 I/O 数量；通过有界 semaphore 热加载，防止文件线程无界扩张。",
   "Agent 请求并发": "普通 Agent 与 SSE 请求共用的全局并发上限；Redis 租约跨 API 进程协调，不以进程内任务表作为正确性边界。",
   "Agent 等待队列上限": "全局并发已满时允许进入 Redis FIFO 等待队列的请求数；队列满后立即返回可重试的 429 诊断。",
@@ -575,6 +593,36 @@ export function SourceIoConcurrencyField({
       value={value}
       onChange={onChange}
     />
+  );
+}
+
+export function AgentTimeBudgetFields({
+  values,
+  onChange,
+}: {
+  values: AgentTimeBudgetSettingsValues;
+  onChange: (key: keyof AgentTimeBudgetSettingsValues, value: string) => void;
+}) {
+  return (
+    <>
+      <SettingField label="Agent 整链总时限（秒）" type="number" min={15} max={3600} value={values.retrieval_total_timeout_seconds} onChange={(value) => onChange("retrieval_total_timeout_seconds", value)} />
+      <SettingField label="最终生成时限（秒）" type="number" min={10} max={600} value={values.retrieval_generation_timeout_seconds} onChange={(value) => onChange("retrieval_generation_timeout_seconds", value)} />
+    </>
+  );
+}
+
+export function AgentTokenBudgetFields({
+  values,
+  onChange,
+}: {
+  values: AgentTokenBudgetSettingsValues;
+  onChange: (key: keyof AgentTokenBudgetSettingsValues, value: string) => void;
+}) {
+  return (
+    <>
+      <SettingField label="规划输出 token 上限" type="number" min={256} max={8192} value={values.retrieval_planning_max_tokens} onChange={(value) => onChange("retrieval_planning_max_tokens", value)} />
+      <SettingField label="最终生成 token 上限" type="number" min={256} max={32768} value={values.retrieval_generation_max_tokens} onChange={(value) => onChange("retrieval_generation_max_tokens", value)} />
+    </>
   );
 }
 
@@ -1368,6 +1416,10 @@ type HotReloadSettingsForm = Pick<
   | "worker_concurrency"
   | "model_request_concurrency"
   | "model_request_timeout_seconds"
+  | "retrieval_total_timeout_seconds"
+  | "retrieval_generation_timeout_seconds"
+  | "retrieval_planning_max_tokens"
+  | "retrieval_generation_max_tokens"
   | "chat_json_max_tokens"
   | "agent_request_concurrency"
   | "source_io_concurrency"
@@ -1414,6 +1466,10 @@ export function buildHotReloadSettingsPayload(
     worker_concurrency: parseIntField(form.worker_concurrency),
     model_request_concurrency: parseIntField(form.model_request_concurrency),
     model_request_timeout_seconds: parseIntField(form.model_request_timeout_seconds),
+    retrieval_total_timeout_seconds: parseIntField(form.retrieval_total_timeout_seconds),
+    retrieval_generation_timeout_seconds: parseIntField(form.retrieval_generation_timeout_seconds),
+    retrieval_planning_max_tokens: parseIntField(form.retrieval_planning_max_tokens),
+    retrieval_generation_max_tokens: parseIntField(form.retrieval_generation_max_tokens),
     chat_json_max_tokens: parseIntField(form.chat_json_max_tokens),
     agent_request_concurrency: parseIntField(form.agent_request_concurrency),
     source_io_concurrency: parseIntField(form.source_io_concurrency),
@@ -1759,6 +1815,10 @@ export function SettingsWorkspace() {
       worker_concurrency: String(displayedSettings.worker_concurrency ?? 3),
       model_request_concurrency: String(displayedSettings.model_request_concurrency ?? 3),
       model_request_timeout_seconds: String(displayedSettings.model_request_timeout_seconds ?? 240),
+      retrieval_total_timeout_seconds: String(displayedSettings.retrieval_total_timeout_seconds ?? 540),
+      retrieval_generation_timeout_seconds: String(displayedSettings.retrieval_generation_timeout_seconds ?? 240),
+      retrieval_planning_max_tokens: String(displayedSettings.retrieval_planning_max_tokens ?? 8192),
+      retrieval_generation_max_tokens: String(displayedSettings.retrieval_generation_max_tokens ?? 32768),
       chat_json_max_tokens: String(displayedSettings.chat_json_max_tokens ?? 12000),
       agent_request_concurrency: String(displayedSettings.agent_request_concurrency ?? 4),
       source_io_concurrency: String(displayedSettings.source_io_concurrency ?? 4),
@@ -2191,6 +2251,13 @@ export function SettingsWorkspace() {
                 <SourceIoConcurrencyField value={form.source_io_concurrency} onChange={(value) => updateForm("source_io_concurrency", value)} />
                 <SettingField label="Chat JSON token 上限" type="number" min={256} max={32768} value={form.chat_json_max_tokens} onChange={(value) => updateForm("chat_json_max_tokens", value)} />
                 <SettingField label="模型超时秒数" type="number" min={5} max={600} value={form.model_request_timeout_seconds} onChange={(value) => updateForm("model_request_timeout_seconds", value)} />
+                <AgentTimeBudgetFields
+                  values={{
+                    retrieval_total_timeout_seconds: form.retrieval_total_timeout_seconds,
+                    retrieval_generation_timeout_seconds: form.retrieval_generation_timeout_seconds,
+                  }}
+                  onChange={(key, value) => updateForm(key, value)}
+                />
                 <SettingField label="Embedding 批大小" type="number" min={1} max={10} value={form.embedding_batch_size} onChange={(value) => updateForm("embedding_batch_size", value)} />
                 <SettingField label="导入内存软水位" type="number" min={0.01} max={0.98} step={0.01} value={form.ingestion_memory_soft_limit_ratio} onChange={(value) => updateForm("ingestion_memory_soft_limit_ratio", value)} />
                 <SettingField label="导入内存硬水位" type="number" min={0.02} max={0.99} step={0.01} value={form.ingestion_memory_hard_limit_ratio} onChange={(value) => updateForm("ingestion_memory_hard_limit_ratio", value)} />
@@ -2230,6 +2297,13 @@ export function SettingsWorkspace() {
               </div>
               <div className="mt-5 grid gap-4 md:grid-cols-4">
                 <SettingField label="证据包 token 预算" type="number" min={256} max={20000} value={form.context_package_token_budget} onChange={(value) => updateForm("context_package_token_budget", value)} />
+                <AgentTokenBudgetFields
+                  values={{
+                    retrieval_planning_max_tokens: form.retrieval_planning_max_tokens,
+                    retrieval_generation_max_tokens: form.retrieval_generation_max_tokens,
+                  }}
+                  onChange={(key, value) => updateForm(key, value)}
+                />
                 <SettingField label="结果 Top K 默认值" type="number" min={1} max={50} value={form.retrieval_result_top_k_default} onChange={(value) => updateForm("retrieval_result_top_k_default", value)} />
                 <SettingField label="Dense 候选预算" type="number" min={1} max={4096} value={form.retrieval_v1_dense_candidate_budget} onChange={(value) => updateForm("retrieval_v1_dense_candidate_budget", value)} />
                 <SettingField label="RQ 候选预算" type="number" min={1} max={4096} value={form.retrieval_v1_rq_candidate_budget} onChange={(value) => updateForm("retrieval_v1_rq_candidate_budget", value)} />

@@ -20,10 +20,40 @@ def test_nonmodel_wall_excludes_provider_interval_union():
             {"stage": "provider_roundtrip", "start_ms": 30, "duration_ms": 40},
             {"stage": "resource_read", "start_ms": 3, "duration_ms": 4},
         ],
+        "first_response_ms": 75,
+        "first_token_ms": 80,
+        "stages": {
+            "resource_read": {
+                "count": 1,
+                "success_count": 1,
+                "error_count": 0,
+                "cancelled_count": 0,
+                "total_ms": 4,
+                "active_wall_ms": 4,
+                "exclusive_ms": 4,
+                "p50_ms": 4,
+                "p95_ms": 4,
+                "p99_ms": 4,
+            }
+        },
     }}}
     assert _module()._timing_summary(response) == {
         "elapsed_ms": 100.0,
         "provider_roundtrip_ms": 60.0,
         "nonmodel_ms": 40.0,
-        "resource_read_ms": 4.0,
+        "first_response_ms": 75,
+        "first_token_ms": 80,
+        "stages": {
+            "resource_read": {
+                "count": 1,
+                "success_count": 1,
+                "error_count": 0,
+                "cancelled_count": 0,
+                "total_ms": 4,
+                "active_wall_ms": 4,
+                "exclusive_ms": 4,
+                "p50_ms": 4,
+                "p95_ms": 4,
+            }
+        },
     }

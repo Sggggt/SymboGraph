@@ -65,8 +65,10 @@ def test_complete_titles_weight_order_details_and_key_gate(db_session, coarse_ca
     )
     assert titles["complete"] is True
     assert len(titles["nodes"]) == len(concepts)
-    assert [node["node_weight"] for node in titles["nodes"]] == [0.9, 0.9, 0.4]
+    assert {node["title"] for node in titles["nodes"][:2]} == {"水文循环", "Energy systems"}
+    assert titles["nodes"][2]["title"] == "Ecosystem dynamics"
     assert [node["key"] for node in titles["nodes"]] == ["c1", "c2", "c3"]
+    assert all(set(node) == {"key", "title"} for node in titles["nodes"])
     assert "summary" not in titles["nodes"][0]
     assert audit["node_count"] == 3 and audit["local_duration_ms"] >= 0
     details, detail_audit = read_coarse_details(
@@ -194,6 +196,68 @@ async def test_model_controls_titles_details_then_plan_with_audited_count(db_ses
 
 
 @pytest.mark.asyncio
+async def test_production_shape_keeps_continuous_resource_tool_history(db_session, coarse_catalog):
+    from test_intent_contracts import proposal
+
+    kb, _, _ = coarse_catalog
+    request = AgentRequest(knowledge_base_id=kb.id, question="Explain the topic relationships.")
+    _, run = agent_graph.create_agent_run_context(db_session, request)
+    capabilities, _ = retrieval_capability_snapshot(db_session, kb.id, admit_graph=False)
+    seen_messages = []
+
+    class Provider:
+        async def classify_json_messages(
+            self,
+            *,
+            system_prompt,
+            messages,
+            fallback,
+            max_tokens,
+            compatibility_user_prompt,
+            response_schema,
+            native_tools,
+        ):
+            seen_messages.append(messages)
+            initial = json.loads(messages[0]["content"])
+            assert "knowledge_base_id" not in initial["capabilities"]
+            assert "graph_identity" not in initial["capabilities"]
+            assert "filter_scope_hash" not in initial
+            assert response_schema["additionalProperties"] is False
+            assert native_tools[0]["name"] == "planning_action"
+            assert native_tools[0]["passthrough"] is True
+            if len(messages) == 1:
+                return {
+                    "protocol_version": "planning_tool_call_v1",
+                    "tool": "resource.read",
+                    "arguments": {"mode": "titles", "keys": []},
+                }
+            result = json.loads(messages[-1]["content"])
+            assert result["tool"] == "resource.read"
+            assert all(set(node) == {"key", "title"} for node in result["observation"]["nodes"])
+            return {
+                "protocol_version": "planning_tool_call_v1",
+                "tool": "plan.commit",
+                "arguments": proposal(layer="chunk"),
+            }
+
+    plan, audit = await plan_intent_execution(
+        db_session,
+        run=run,
+        question=request.question,
+        conversation_scope_hash=run.metadata_json["conversation_state_scope_hash"],
+        filter_scope_hash=control_hash(request.filters.model_dump(mode="json")),
+        history_summary="",
+        capabilities=capabilities,
+        filters=request.filters,
+        provider_factory=Provider,
+    )
+    assert plan.strategy.entry_layer == "chunk"
+    assert [len(messages) for messages in seen_messages] == [1, 3]
+    assert audit["steps"][0]["continuous_messages"] is True
+    assert audit["steps"][1]["context_plan"]["atomic_groups_preserved"] is True
+
+
+@pytest.mark.asyncio
 async def test_live_stream_replays_preplan_read_before_final_plan(
     db_session, coarse_catalog, fake_model_stack, monkeypatch,
 ):
@@ -240,7 +304,7 @@ async def test_live_stream_replays_preplan_read_before_final_plan(
     {"action": "resource_read", "mode": "titles", "keys": ["c1"]},
     {"action": "resource_read", "mode": "titles", "unknown": True},
 ])
-async def test_invalid_first_read_fails_before_plan(db_session, coarse_catalog, bad_action):
+async def test_repeated_invalid_read_exhausts_bounded_planning_calls(db_session, coarse_catalog, bad_action):
     kb, _, _ = coarse_catalog
     request = AgentRequest(knowledge_base_id=kb.id, question="What is covered?")
     _, run = agent_graph.create_agent_run_context(db_session, request)
@@ -260,7 +324,102 @@ async def test_invalid_first_read_fails_before_plan(db_session, coarse_catalog, 
         )
     observation = db_session.scalar(select(AgentObservation).where(AgentObservation.run_id == run.id))
     assert observation.verdict == "failed"
-    assert observation.observation_json["model_call_count"] == 1
+    assert observation.observation_json["model_call_count"] == 4
+    assert all(
+        item["action"] == "resource_read_invalid"
+        for item in observation.observation_json["steps"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_resource_tool_arguments_are_repaired_in_same_history(db_session, coarse_catalog):
+    from test_intent_contracts import proposal
+
+    kb, _, _ = coarse_catalog
+    request = AgentRequest(knowledge_base_id=kb.id, question="Explain the topics.")
+    _, run = agent_graph.create_agent_run_context(db_session, request)
+    capabilities, _ = retrieval_capability_snapshot(db_session, kb.id, admit_graph=False)
+    seen = []
+
+    class Provider:
+        async def classify_json_messages(self, **kwargs):
+            messages = kwargs["messages"]
+            seen.append(messages)
+            if len(seen) == 1:
+                return {
+                    "tool": "resource.read",
+                    "arguments": proposal(layer="chunk"),
+                }
+            result = json.loads(messages[-1]["content"])
+            assert result == {
+                "protocol_version": "planning_tool_result_v1",
+                "tool": "resource.read",
+                "status": "error",
+                "error": "resource_read_arguments_invalid",
+                "field": "arguments",
+            }
+            return {"tool": "plan.commit", "arguments": proposal(layer="chunk")}
+
+    plan, audit = await plan_intent_execution(
+        db_session,
+        run=run,
+        question=request.question,
+        conversation_scope_hash=run.metadata_json["conversation_state_scope_hash"],
+        filter_scope_hash=control_hash(request.filters.model_dump(mode="json")),
+        history_summary="",
+        capabilities=capabilities,
+        provider_factory=Provider,
+    )
+    assert plan.strategy.entry_layer == "chunk"
+    assert [len(messages) for messages in seen] == [1, 3]
+    assert [item["action"] for item in audit["steps"]] == [
+        "resource_read_invalid",
+        "plan",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_malformed_provider_tool_output_gets_one_safe_retry(db_session, coarse_catalog):
+    from app.services.embeddings import ProviderJSONShapeError
+    from test_intent_contracts import proposal
+
+    kb, _, _ = coarse_catalog
+    request = AgentRequest(knowledge_base_id=kb.id, question="Explain the topics.")
+    _, run = agent_graph.create_agent_run_context(db_session, request)
+    capabilities, _ = retrieval_capability_snapshot(db_session, kb.id, admit_graph=False)
+    seen = []
+
+    class Provider:
+        async def classify_json_messages(self, **kwargs):
+            messages = kwargs["messages"]
+            seen.append(messages)
+            if len(seen) == 1:
+                raise ProviderJSONShapeError(
+                    {"error_code": "invalid_object_key", "field_path": "$"}
+                )
+            result = json.loads(messages[-1]["content"])
+            assert result["validation_feedback"]["raw_response_included"] is False
+            assert result["validation_feedback"]["errors"] == [
+                {"path": "$", "code": "provider_json_shape"}
+            ]
+            return {"tool": "plan.commit", "arguments": proposal(layer="chunk")}
+
+    plan, audit = await plan_intent_execution(
+        db_session,
+        run=run,
+        question=request.question,
+        conversation_scope_hash=run.metadata_json["conversation_state_scope_hash"],
+        filter_scope_hash=control_hash(request.filters.model_dump(mode="json")),
+        history_summary="",
+        capabilities=capabilities,
+        provider_factory=Provider,
+    )
+    assert plan.strategy.entry_layer == "chunk"
+    assert [len(messages) for messages in seen] == [1, 3]
+    assert [item["action"] for item in audit["steps"]] == [
+        "planning_output_invalid",
+        "plan",
+    ]
 
 
 @pytest.mark.asyncio

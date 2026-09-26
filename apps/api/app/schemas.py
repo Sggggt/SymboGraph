@@ -1500,6 +1500,9 @@ class AnswerModelAudit(ModelAudit):
     generation_model_call_count: int | None = Field(default=None, ge=0)
     post_generation_model_call_count: int | None = Field(default=None, ge=0)
     source_admission_model_call_count: int | None = Field(default=None, ge=0)
+    evidence_decision_model_call_count: int | None = Field(default=None, ge=0)
+    evidence_read_action_count: int | None = Field(default=None, ge=0)
+    generation_evidence_source_count: int | None = Field(default=None, ge=0)
     terminal_outcome: Literal[
         "completed",
         "partial_answer",
@@ -1980,6 +1983,22 @@ class IntentExecutionTraceScores(AgentTraceScoresBase):
     score_fields_used: list[str] = Field(default_factory=list)
     fallback_before_retrieval: bool | None = None
     retrieval_audit: dict[str, Any] | None = None
+    source_count: int | None = Field(default=None, ge=0)
+    document_count: int | None = Field(default=None, ge=0)
+    requirement_count: int | None = Field(default=None, ge=0)
+    read_count: int | None = Field(default=None, ge=0)
+    selected_count: int | None = Field(default=None, ge=0)
+    remaining_count: int | None = Field(default=None, ge=0)
+    coverage_count: int | None = Field(default=None, ge=0)
+    decision_call_count: int | None = Field(default=None, ge=0)
+    read_action_count: int | None = Field(default=None, ge=0)
+    mid_count: int | None = Field(default=None, ge=0)
+    mandatory_source_count: int | None = Field(default=None, ge=0)
+    estimated_input_tokens: int | None = Field(default=None, ge=0)
+    input_token_count: int | None = Field(default=None, ge=0)
+    compression_applied: bool | None = None
+    truncation_applied: bool | None = None
+    deterministic_direct: bool | None = None
 
 
 AgentTraceScores = Annotated[
@@ -2069,6 +2088,9 @@ class AgentTraceEventPayload(ClosedContractModel):
         "intent_execution_retrieval",
         "source_integrity_admission",
         "verified_context_reuse",
+        "evidence_directory_ready",
+        "evidence_read",
+        "evidence_finalized",
     ]
     status: str
     input_summary: str = ""
@@ -2128,6 +2150,9 @@ class AgentTraceEventPayload(ClosedContractModel):
             "intent_execution_retrieval": "intent_execution",
             "source_integrity_admission": "intent_execution",
             "verified_context_reuse": "intent_execution",
+            "evidence_directory_ready": "intent_execution",
+            "evidence_read": "intent_execution",
+            "evidence_finalized": "intent_execution",
         }
         audit_kind = kind_by_node.get(node)
         if audit_kind is None:
@@ -8017,9 +8042,8 @@ class RuntimeSettingsLifecycle(ClosedContractModel):
 
 
 class ModelSettingsResponse(PublicResponseModel):
-    retrieval_total_timeout_seconds: int | None = Field(default=None, ge=15, le=600)
-    retrieval_planning_timeout_seconds: int | None = Field(default=None, ge=5, le=120)
-    retrieval_generation_timeout_seconds: int | None = Field(default=None, ge=10, le=240)
+    retrieval_total_timeout_seconds: int | None = Field(default=None, ge=15, le=3600)
+    retrieval_generation_timeout_seconds: int | None = Field(default=None, ge=10, le=600)
     retrieval_planning_max_tokens: int | None = Field(default=None, ge=256, le=8192)
     retrieval_generation_max_tokens: int | None = Field(default=None, ge=256, le=32768)
     provider: str | None = None
@@ -8183,9 +8207,8 @@ class ModelSettingsResponse(PublicResponseModel):
 
 
 class ModelSettingsUpdate(APIModel):
-    retrieval_total_timeout_seconds: int | None = Field(default=None, strict=True, ge=15, le=600)
-    retrieval_planning_timeout_seconds: int | None = Field(default=None, strict=True, ge=5, le=120)
-    retrieval_generation_timeout_seconds: int | None = Field(default=None, strict=True, ge=10, le=240)
+    retrieval_total_timeout_seconds: int | None = Field(default=None, strict=True, ge=15, le=3600)
+    retrieval_generation_timeout_seconds: int | None = Field(default=None, strict=True, ge=10, le=600)
     retrieval_planning_max_tokens: int | None = Field(default=None, strict=True, ge=256, le=8192)
     retrieval_generation_max_tokens: int | None = Field(default=None, strict=True, ge=256, le=32768)
     @model_validator(mode="before")

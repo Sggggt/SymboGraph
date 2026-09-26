@@ -57,7 +57,11 @@ def test_schema_feedback_does_not_echo_untrusted_extra_field_names():
 
 def test_planning_prompt_keeps_contract_constraints_with_a_smaller_payload():
     from app.intent_contracts import IntentPlanningOutput
-    from app.services.intent_planning import _compact_planning_schema, _planning_system_prompt
+    from app.services.intent_planning import (
+        _compact_planning_schema,
+        _planning_system_prompt,
+        _planning_tool_schema,
+    )
 
     original = IntentPlanningOutput.model_json_schema()
     compact = _compact_planning_schema(original)
@@ -69,8 +73,12 @@ def test_planning_prompt_keeps_contract_constraints_with_a_smaller_payload():
     assert compact["additionalProperties"] is False
     assert compact["properties"]["execution_strategy"] == original["properties"]["execution_strategy"]
     assert compact["$defs"]["ChannelWeights"]["properties"]["dense"]["minimum"] == 0
-    assert "resource_read" in prompt and "validation_feedback" in prompt
+    assert "resource.read" in prompt and "plan.commit" in prompt
+    assert "validation_feedback" in prompt
     assert "complete corrected plan" in prompt
+    tool_schema = _planning_tool_schema()
+    assert tool_schema["additionalProperties"] is False
+    assert len(tool_schema["properties"]["arguments"]["oneOf"]) == 2
 
 
 def test_local_normalization_removes_only_closed_schema_noise():

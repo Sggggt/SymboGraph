@@ -36,7 +36,6 @@ QUERY_FACET_POSTERIOR_ROUND_BUDGET_MAX = 2
 MODEL_API_PROTOCOL_ALLOWLIST = frozenset({"openai", "anthropic"})
 EMBEDDING_API_PROTOCOL_ALLOWLIST = frozenset({"openai"})
 RETRIEVAL_CONTROL_INT_SETTINGS = frozenset({
-    "retrieval_planning_timeout_seconds",
     "retrieval_generation_timeout_seconds",
     "retrieval_planning_max_tokens",
     "retrieval_generation_max_tokens",
@@ -446,11 +445,10 @@ class Settings(BaseSettings):
     agent_reflection_round_budget: int = Field(default=2, ge=0, le=10)
     agent_reflection_timeout_seconds: int = Field(default=90, ge=15, le=240)
     retrieval_repair_round_limit: int = Field(default=1, ge=0, le=2)
-    retrieval_total_timeout_seconds: int = Field(default=540, ge=15, le=600)
-    retrieval_planning_timeout_seconds: int = Field(default=60, ge=5, le=120)
+    retrieval_total_timeout_seconds: int = Field(default=540, ge=15, le=3600)
     retrieval_repair_timeout_seconds: int = Field(default=60, ge=5, le=60)
     retrieval_sufficiency_timeout_seconds: int = Field(default=60, ge=5, le=240)
-    retrieval_generation_timeout_seconds: int = Field(default=240, ge=10, le=240)
+    retrieval_generation_timeout_seconds: int = Field(default=240, ge=10, le=600)
     retrieval_planning_max_tokens: int = Field(default=8192, ge=256, le=8192)
     retrieval_repair_max_tokens: int = Field(default=8192, ge=256, le=32768)
     retrieval_sufficiency_max_tokens: int = Field(default=8192, ge=256, le=32768)
