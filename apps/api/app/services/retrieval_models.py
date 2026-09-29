@@ -333,6 +333,7 @@ def lexical_repair_packet(*, task, strategy, candidates, diagnosis):
 class RetrievalModels:
     def __init__(self, provider_factory=ChatProvider):
         self.provider_factory = provider_factory
+        self._tool_session_provider = None
 
     async def _call(self, *, stage, system, packet, output_type, timeout_seconds, max_tokens):
         if timeout_seconds <= 0:
@@ -445,7 +446,9 @@ class RetrievalModels:
     ):
         if timeout_seconds <= 0:
             raise ValueError("retrieval_model_deadline_exhausted")
-        provider = self.provider_factory()
+        if self._tool_session_provider is None:
+            self._tool_session_provider = self.provider_factory()
+        provider = self._tool_session_provider
         serialized = json.dumps(
             messages,
             ensure_ascii=False,

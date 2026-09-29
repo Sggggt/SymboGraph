@@ -93,7 +93,7 @@ python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
 
 目标五题 QA 使用 `evaluate_intent_execution.py`，输入必须在执行前冻结且恰好包含五题。先运行默认 dry-run，再使用 `--execute`、目标资料库和 `output/` 新报告路径。脚本继续记录单题失败并核对 run、target trace、Context Package、零模型来源准入、一次生成、来源绑定和零在线奖励。
 
-目标十轮会话使用 `evaluate_intent_conversations.py`，输入必须在执行前冻结且恰好包含十例。`session_from` 只能引用前序用例，用于构造同会话链。普通检索题必须完成来源绑定，只有 insufficient 类允许有界 gap。评分依据是独立 gold 和真实原文，不是模型自评分。私有 gold 放忽略的数据目录，不能成为公共 fixture。
+目标十轮会话使用 `evaluate_intent_conversations.py`，输入必须在执行前冻结且恰好包含十例。`session_from` 只能引用前序用例，用于构造同会话链。规划硬门禁要求 `model_call_count = resource_read_count + 1`、最多两次有进展的导航读取且零 schema repair，不再把合法 `read_titles → read_details → plan` 误判为多余规划。普通检索题必须完成来源绑定，只有 insufficient 类允许有界 gap。评分依据是独立 gold 和真实原文，不是模型自评分。私有 gold 放忽略的数据目录，不能成为公共 fixture。
 
 冷构建使用 `benchmark_build_pipeline.py`：默认只读；执行需要目标资料库、`--execute`、`--cold`、全量重解析标记及截止秒数。是否通过还取决于全量成功、图/来源/向量/freshness 和资源检查，不只看计算结束时间。
 

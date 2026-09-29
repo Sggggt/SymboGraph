@@ -275,17 +275,23 @@ $$
 
 ### 意图与执行策略
 
-取消普通模式和摘要模式；用户不再通过界面模式决定粗层或中层入口。LLM 在正式检索前可直接调用 `plan.commit`，或先调用 `resource.read` 顺序读取只读粗层资源，再提交计划。每轮 assistant tool call 与 tool result 追加到同一规划会话；执行器校验工具参数、执行读取，并只在 `plan.commit` 通过闭合策略校验后行动。服务端不再把已返回的导航材料复制进新的无状态分类 packet。
+取消普通模式和摘要模式；用户不再通过界面模式决定粗层或中层入口。规划协议为 `intent_execution_planning_call_v5`：LLM 在正式检索前调用按状态暴露的真实小工具 `resource.read_titles`、`resource.read_details`、`plan.retrieve`、条件可用的 `plan.reuse`、`plan.system_capability` 或 `plan.clarify`。工具名表达动作，禁止再用一个 `planning_action` 包装器让模型在开放 `arguments` 中重复选择动作。每轮 assistant tool call 与 tool result 追加到同一规划会话；执行器校验最小工具参数、执行读取或把最小计划确定性编译为完整 `IntentPlanningOutput`，只有完整契约通过权限、组合与预算校验后才行动。服务端不再把已返回的导航材料复制进新的无状态分类 packet。
 
 ### 规划前粗层资源读取
 
-`coarse_resource_read_v1` 是规划阶段 `resource.read` 工具的只读执行协议，不是图检索、答案上下文或通用工具权限。首个模型动作可直接提交完整 Intent/ExecutionStrategy，也可请求当前资料库 active 粗节点的**全部标题目录**。目录按持久 `node_weight` 降序、稳定节点键破平；排序值留在服务端，模型只看到临时选择键、语义标题与有界语义说明。目录读取后，模型可以直接规划，或按临时键选择至多四个节点读取摘要、定义、范围与边界信息，然后必须调用 `plan.commit`。模型不能跳过目录直接索取详情，也不能重复读、跨资料库读或在检索结果出来后再读。无可用粗层时只暴露 `plan.commit`。若提交参数首次违反闭合 schema，工具结果只返回安全字段路径和版本化错误码，允许在同一会话中重提一次完整计划；执行器不自动修补词面，失败计划不进入正式检索。
+`coarse_resource_read_v1` 继续定义规划阶段的只读粗层导航语义，不是图检索、答案上下文或通用工具权限。初始状态只有存在 coarse 能力时才暴露无参数的 `resource.read_titles`；调用后返回当前资料库 active 粗节点的**全部标题目录**。目录按持久 `node_weight` 降序、稳定节点键破平；排序值留在服务端，模型只看到临时选择键、语义标题与有界语义说明。标题状态只暴露 `resource.read_details(keys)` 和合法计划工具，`keys` 为1–4个不重复的本轮临时键；详情状态与格式修正状态不再暴露任何读取工具。模型不能跳过目录索取详情、重复读、跨资料库读或在检索结果出来后再读。无 coarse 能力时从首轮起只暴露计划工具。
+
+`plan.retrieve` 只接收具有语义选择空间的最小计划：扁平的 `intent_primary/intent_secondary`、requirements、entities、入口层、semantic query、模型提出的 lexical groups、权重数组、selection scope、可选预算标量和 reason code。已知当前 provider 会把工具参数的嵌套 object 字段字符串化，因此模型契约禁止用 `intent={...}`、`layer_weights={...}`、`budget_request={...}` 或递归 `source_scope={...}` 这类可避免的嵌套 object；需要多项结构时使用有界、带判别字段的对象数组，由本地编译器检查唯一性并还原完整对象。权重数组可提交入口层一个 shared profile，编译器把同一组模型值复制到所有必需下游层；若提交多个 layer item 则必须完整覆盖入口及下游层，禁止补不同权重或丢弃多余层。预算使用 `budget_<registered_key>` 扁平可选标量，provider schema 的 maximum 由当轮 capability 动态收紧，编译器再以完整 `ExecutionBudget` 复核。每个 requirement 的来源责任使用 `source_selectors[] + source_scope_operator=all|any + source_scope_mode=overlap|complete`，服务端把 selector 叶子编译成现有 `SourceScopeRequest` 的 intersection/union，并包成 coverage obligation；不让模型生成递归 children。`plan.reuse` 仅在同会话 verified context 可用时暴露，接收同一份完整检索后备计划，工具名确定完整契约中的 `verified_context_reuse` route。`plan.system_capability` 与 `plan.clarify` 为无参数工具；它们的 route、空检索字段和 direct Intent 由工具身份确定。协议版本、route、`generate_lexical`、`hybrid`、稳定 group id、surface provenance 和其他可由原问题、工具身份或字段组合唯一确定的值不要求模型重复输出，由版本化本地编译器生成；编译器不得解析模型塞入字符串的 JSON、翻译词面、改变模型给出的权重数值、补造 requirement 或扩大来源范围。
+
+没有 source selector 时，operator/mode 不产生执行语义，作为无价值附加字段忽略并记录安全计数，不能仅因此丢弃同一最小计划中的其他有效字段。
+
+若最小计划首次违反闭合 schema 或编译后的完整契约，工具结果只返回安全字段路径和版本化错误码，并在同一连续会话中仅暴露对应计划工具重提一次；原始响应、自由理由和旧错误堆栈不回传。原生工具请求必须以且仅以一个匹配的 `tool_use` 完成；强制工具调用后的 `end_turn` 文本不再作为 JSON 兼容输入，避免把附加 prose、多对象或内部推理误解析为计划。provider 不满足这一能力时返回明确技术失败，不降级成抽取式、本地假计划或另一套无状态分类请求。
 
 每次读取绑定同 KB、用户请求过滤和 active 粗层/上下文图身份；选择键只对本轮目录有效。服务端在读前和提交计划前重核图身份；过滤后只返回全部支撑 chunk 均在授权范围内的粗节点，不以一个命中暴露混合来源摘要。目录必须完整；若其大小超过规划输入上限，返回显式技术失败和计数，不能以截断目录伪称已看全库。详情文本可在版本化字符预算内截断并标明截断，且总输入有硬上限；原文仍由正式检索提供。模型只利用目录/详情决定如何检索，不能以摘要回答或让它们进入 Context Package。循环及额外模型往返均有硬上限、逐步审计和非模型耗时计量。
 
 规划轨迹在每个模型批准且执行器完成的粗层读取后分别持久化“标题目录读取”和“选定节点详情读取”节点；若完整计划第一次违反闭合 schema，则在重提前持久化“规划格式反馈”节点。最终 `intent_planning` 节点仍只在计划通过校验并冻结后写入。前置节点只公开动作模式、轮次、节点数与模型/本地耗时，不包含目录标题、摘要、私有节点 ID 或原始模型响应。直接规划不生成虚假的读取节点。SSE、run 状态轮询和历史重放使用相同的有序持久轨迹，断线后能够恢复已发生的前置步骤。
 
-规划模型的提示使用从闭合 Pydantic 契约确定性派生的紧凑工具 schema：保留字段、类型、枚举、必填、结构引用及校验边界，去掉给人阅读的标题、描述、默认值和示例注解；执行器仍以原始完整契约校验模型输出。系统说明只保留行动顺序、来源边界和合法权重等不可由字段结构表达的规则。稳定 system、Task 与 capability 前缀保持字节一致，逐轮 tool result 只追加一次。提示大小按 system、Task、能力清单、工具历史和预留输出分项计量；不能为了减少字符数丢失原问题、过滤范围、完整已读语义内容或来源约束。
+每轮只发送当前状态可调用的小工具 schema；`resource.read_titles` 为空对象，`resource.read_details` 只有有界 keys，direct 工具为空对象，`plan.retrieve/plan.reuse` 使用同一最小闭合计划 schema。系统说明只保留行动顺序、来源边界、词面语义和合法权重等不能由字段结构表达的规则，不再复制完整计划 schema、协议默认值或大段 JSON 示例。provider schema 与执行器模型必须从同一契约构造并有等价测试；任何只存在于 Pydantic `model_validator`、却不进入 provider schema 的模型可选条件，都必须改成判别联合或移出模型输出。稳定 system、Task 与 capability 前缀保持字节一致，逐轮 tool result 只追加一次。提示大小按 system、Task、能力清单、活动工具、工具历史和预留输出分项计量；不能为了减少字符数丢失原问题、过滤范围、完整已读语义内容或来源约束。
 
 ### Agent 上下文计划
 
@@ -305,11 +311,11 @@ $$
 
 ### 当前 Agent 的双语词面
 
-双语词面属于同一次 Intent/ExecutionStrategy 规划，不是第二个 query-facet 模型步骤。active 协议 `bilingual_lexical_groups_v1` 将词面组织为有界 group：每组绑定 requirement ids、`concept|identifier|number_unit|quoted_literal` 类型，并携带至多四个 `{text, language, provenance}` surface；所有 group 展平后仍不超过 24 个词面。
+双语词面属于同一次 Intent/ExecutionStrategy 规划，不是第二个 query-facet 模型步骤。`plan.retrieve/plan.reuse` 的模型可见 `minimal_lexical_groups_v1` 使用判别联合：`concept` 组携带 requirement ids 与至多四个 `{text, language=zh|en}` surface；`identifier`、`number_unit` 与 `quoted_literal` 组只携带 requirement ids 与至多四个 `texts`，不要求模型为确定性中立字段输出 `language`、`provenance` 或 group id。所有组展平后仍不超过24个词面。
 
-开启双语开关时，`concept` 组必须同时包含经本地 Unicode/script 门禁核验的中文和英文 surface。标识符、编号、数值单位和用户逐字引用可标为 language-neutral，不强造不存在的翻译。关闭开关时模型仍可提出标准技术别名，但不承担双语成对责任。模型提出的翻译只是检索表达，不成为实体事实、文档别名、图边或回答证据。
+开启双语开关时，`concept` 组必须同时包含经本地 Unicode/script 门禁核验的中文和英文 surface。编译器把 identifier 和 number/unit text 确定性投影为 `language=neutral`；quoted literal 按本地版本化 Unicode/script 规则投影为 `zh|en|neutral`。surface 在原问题中有精确规范化见证时 provenance 为 `user_text`，否则为 `model_query`；这只标记检索表达来源，不证明别名。关闭开关时模型仍可提出标准技术别名，但不承担双语成对责任。模型提出的翻译只是检索表达，不成为实体事实、文档别名、图边或回答证据。
 
-本地执行器核验 group id、requirement 归属、语言、类型、数量、重复项和总预算，再按稳定 group/surface 顺序展平给版本化 tokenizer 与 BM25。最终计划仍在一次模型响应中同时产生这些字段；可选的规划前读取会增加模型往返，但不得调用遗留 query-facet 链补齐翻译。任何 bilingual 计划字段进入计划 hash、检索 cache、trace 与审计。若模型选择不生成词面，则下面的空词面规则优先，不能因为开关开启而补造词面。
+本地编译器按模型数组顺序生成 `l1..l12` group id，投影 language/provenance 后由完整执行器核验 requirement 归属、脚本、类型、数量、重复项和总预算，再按稳定 group/surface 顺序展平给版本化 tokenizer 与 BM25。`generate_lexical` 由组是否非空确定，`hybrid` 由完整逐层权重是否启用 BM25 确定；存在任意 BM25 权重时仍须满足所有 active 层的混合门禁。最终计划仍在一次模型响应中产生全部语义选择；可选的规划前读取会增加模型往返，但不得调用遗留 query-facet 链补齐翻译。模型最小字段及编译后的完整 bilingual 字段都进入计划 hash、检索 cache、trace 与审计。若模型不提交词面组，则下面的空词面规则优先，不能因为开关开启而补造词面。
 
 ### 合法的空词面
 

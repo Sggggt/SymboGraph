@@ -223,7 +223,7 @@ async def test_continuous_mid_read_freezes_only_committed_raw_source(
     class Model(fake_model_stack["ChatProvider"]):
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
             nonlocal decision_calls
-            if "INTENT EXECUTION RETRIEVAL V1" in system_prompt:
+            if "INTENT EXECUTION PLANNING V5" in system_prompt:
                 return proposal(layer="chunk")
             if "EVIDENCE TOOL SESSION V1" in system_prompt:
                 decision_calls += 1
@@ -354,7 +354,7 @@ async def test_invalid_mid_read_returns_tool_error_then_allows_empty_commit(
     class Model(fake_model_stack["ChatProvider"]):
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
             nonlocal calls
-            if "INTENT EXECUTION RETRIEVAL V1" in system_prompt:
+            if "INTENT EXECUTION PLANNING V5" in system_prompt:
                 return proposal(layer="chunk")
             if "EVIDENCE TOOL SESSION V1" in system_prompt:
                 calls += 1
@@ -421,7 +421,7 @@ async def test_evidence_provider_failure_persists_body_free_terminal_state(
 
     class Model(fake_model_stack["ChatProvider"]):
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
-            if "INTENT EXECUTION RETRIEVAL V1" in system_prompt:
+            if "INTENT EXECUTION PLANNING V5" in system_prompt:
                 return proposal(layer="chunk")
             if "EVIDENCE TOOL SESSION V1" in system_prompt:
                 raise RuntimeError("unit-test-provider-failure")

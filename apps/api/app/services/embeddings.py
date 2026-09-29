@@ -547,6 +547,10 @@ class ChatProvider:
         self.resolve_ip = self.settings.graph_resolve_ip if purpose == "graph" else self.settings.chat_resolve_ip
         self.model = self.settings.graph_model if purpose == "graph" else self.settings.chat_model
         self.api_key_env_name = "GRAPH_API_KEY" if purpose == "graph" else "CHAT_API_KEY"
+        # Request-local native tool history. It is never persisted and only
+        # carries provider tool-use ids long enough to send the matching
+        # tool_result in the same continuous session.
+        self._native_tool_calls: list[dict[str, Any]] = []
         self.last_usage_audit: dict[str, Any] = self._empty_usage_audit()
         self.last_prompt_cache_audit: dict[str, Any] = {
             "protocol_version": PROVIDER_PROMPT_CACHE_PROTOCOL_VERSION,
@@ -921,8 +925,12 @@ class ChatProvider:
             if not isinstance(response_schema, dict) or not response_schema:
                 raise ValueError("Structured conversation schema is invalid")
             if self.api_protocol == "anthropic":
+                anthropic_payload = self._anthropic_messages_payload(payload)
+                anthropic_payload["messages"] = self._anthropic_native_tool_history(
+                    normalized
+                )
                 return await self._post_anthropic_sdk_tool(
-                    self._anthropic_messages_payload(payload),
+                    anthropic_payload,
                     native_tools
                     or [
                         {
@@ -947,6 +955,71 @@ class ChatProvider:
             if not self.settings.enable_model_fallback or fallback is None:
                 raise
             return fallback
+
+    def _anthropic_native_tool_history(
+        self,
+        messages: list[dict[str, str]],
+    ) -> list[dict[str, Any]]:
+        """Rebuild native tool_use/tool_result pairs from bounded text audit history."""
+
+        if not messages or messages[0].get("role") != "user":
+            raise ValueError("Anthropic tool history must begin with a user message")
+        if (len(messages) - 1) % 2:
+            raise ValueError("Anthropic tool history pairs are incomplete")
+        pair_count = (len(messages) - 1) // 2
+        if pair_count > len(self._native_tool_calls):
+            raise ValueError("Anthropic native tool history is unavailable")
+        calls = self._native_tool_calls[-pair_count:] if pair_count else []
+        result: list[dict[str, Any]] = [
+            {"role": "user", "content": messages[0]["content"]}
+        ]
+        for index, call in enumerate(calls):
+            assistant_message = messages[1 + index * 2]
+            result_message = messages[2 + index * 2]
+            if (
+                assistant_message.get("role") != "assistant"
+                or result_message.get("role") != "user"
+            ):
+                raise ValueError("Anthropic tool history roles are invalid")
+            try:
+                assistant_payload = json.loads(assistant_message["content"])
+                tool_result_payload = json.loads(result_message["content"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                raise ValueError("Anthropic tool history JSON is invalid") from None
+            if (
+                not isinstance(assistant_payload, dict)
+                or assistant_payload.get("tool") != call["result_tool"]
+                or assistant_payload.get("arguments") != call["input"]
+                or not isinstance(tool_result_payload, dict)
+                or tool_result_payload.get("tool") != call["result_tool"]
+            ):
+                raise ValueError("Anthropic tool history identity changed")
+            result.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": call["id"],
+                                "name": call["name"],
+                                "input": call["input"],
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": call["id"],
+                                "content": result_message["content"],
+                            }
+                        ],
+                    },
+                ]
+            )
+        return result
 
     async def classify_json_streaming(
         self,
@@ -1420,10 +1493,6 @@ class ChatProvider:
             and item.get("name") in result_names
         ]
         if response_payload.get("stop_reason") != "tool_use":
-            if response_payload.get("stop_reason") == "end_turn" and not blocks:
-                return self._parse_json_object(
-                    self._normalize_anthropic_content(response_payload)
-                )
             raise ExternalServiceError(
                 service="anthropic",
                 phase="sdk_tool_completion",
@@ -1444,6 +1513,22 @@ class ChatProvider:
                 error_code="tool_input_invalid",
                 retryable=False,
             )
+        tool_use_id = blocks[0].get("id")
+        if not isinstance(tool_use_id, str) or not tool_use_id:
+            raise ExternalServiceError(
+                service="anthropic",
+                phase="sdk_tool_completion",
+                error_code="tool_use_id_invalid",
+                retryable=False,
+            )
+        self._native_tool_calls.append(
+            {
+                "id": tool_use_id,
+                "name": str(blocks[0]["name"]),
+                "result_tool": result_names[str(blocks[0]["name"])],
+                "input": dict(blocks[0]["input"]),
+            }
+        )
         if passthrough[str(blocks[0]["name"])]:
             return dict(blocks[0]["input"])
         return {

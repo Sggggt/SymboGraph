@@ -198,6 +198,7 @@ async def test_model_controls_titles_details_then_plan_with_audited_count(db_ses
 @pytest.mark.asyncio
 async def test_production_shape_keeps_continuous_resource_tool_history(db_session, coarse_catalog):
     from test_intent_contracts import proposal
+    from app.services.intent_planning import _minimal_from_legacy_plan
 
     kb, _, _ = coarse_catalog
     request = AgentRequest(knowledge_base_id=kb.id, question="Explain the topic relationships.")
@@ -222,22 +223,27 @@ async def test_production_shape_keeps_continuous_resource_tool_history(db_sessio
             assert "knowledge_base_id" not in initial["capabilities"]
             assert "graph_identity" not in initial["capabilities"]
             assert "filter_scope_hash" not in initial
-            assert response_schema["additionalProperties"] is False
-            assert native_tools[0]["name"] == "planning_action"
-            assert native_tools[0]["passthrough"] is True
+            assert "oneOf" in response_schema
+            assert all("passthrough" not in item for item in native_tools)
             if len(messages) == 1:
+                assert native_tools[0]["name"] == "resource_read_titles"
+                assert native_tools[0]["result_tool"] == "resource.read_titles"
                 return {
-                    "protocol_version": "planning_tool_call_v1",
-                    "tool": "resource.read",
-                    "arguments": {"mode": "titles", "keys": []},
+                    "protocol_version": "planning_tool_call_v2",
+                    "tool": "resource.read_titles",
+                    "arguments": {},
                 }
+            assert native_tools[0]["name"] == "resource_read_details"
+            assert native_tools[0]["result_tool"] == "resource.read_details"
             result = json.loads(messages[-1]["content"])
-            assert result["tool"] == "resource.read"
+            assert result["tool"] == "resource.read_titles"
             assert all(set(node) == {"key", "title"} for node in result["observation"]["nodes"])
             return {
-                "protocol_version": "planning_tool_call_v1",
-                "tool": "plan.commit",
-                "arguments": proposal(layer="chunk"),
+                "protocol_version": "planning_tool_call_v2",
+                "tool": "plan.retrieve",
+                "arguments": _minimal_from_legacy_plan(
+                    proposal(layer="chunk")
+                ).model_dump(mode="json"),
             }
 
     plan, audit = await plan_intent_execution(
@@ -300,9 +306,9 @@ async def test_live_stream_replays_preplan_read_before_final_plan(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bad_action", [
-    {"action": "resource_read", "mode": "details", "keys": ["c1"]},
-    {"action": "resource_read", "mode": "titles", "keys": ["c1"]},
-    {"action": "resource_read", "mode": "titles", "unknown": True},
+    {"tool": "resource.read_details", "arguments": {"keys": ["c1"]}},
+    {"tool": "resource.read_titles", "arguments": {"keys": ["c1"]}},
+    {"tool": "resource.read_titles", "arguments": {"unknown": True}},
 ])
 async def test_repeated_invalid_read_exhausts_bounded_planning_calls(db_session, coarse_catalog, bad_action):
     kb, _, _ = coarse_catalog
@@ -324,16 +330,18 @@ async def test_repeated_invalid_read_exhausts_bounded_planning_calls(db_session,
         )
     observation = db_session.scalar(select(AgentObservation).where(AgentObservation.run_id == run.id))
     assert observation.verdict == "failed"
-    assert observation.observation_json["model_call_count"] == 4
-    assert all(
-        item["action"] == "resource_read_invalid"
-        for item in observation.observation_json["steps"]
-    )
+    assert observation.observation_json["model_call_count"] == 2
+    assert observation.observation_json["steps"][-1]["action"] == "planning_output_invalid"
+    assert observation.observation_json["steps"][0]["action"] in {
+        "resource_read_invalid",
+        "planning_output_invalid",
+    }
 
 
 @pytest.mark.asyncio
 async def test_invalid_resource_tool_arguments_are_repaired_in_same_history(db_session, coarse_catalog):
     from test_intent_contracts import proposal
+    from app.services.intent_planning import _minimal_from_legacy_plan
 
     kb, _, _ = coarse_catalog
     request = AgentRequest(knowledge_base_id=kb.id, question="Explain the topics.")
@@ -347,18 +355,20 @@ async def test_invalid_resource_tool_arguments_are_repaired_in_same_history(db_s
             seen.append(messages)
             if len(seen) == 1:
                 return {
-                    "tool": "resource.read",
+                    "tool": "resource.read_titles",
                     "arguments": proposal(layer="chunk"),
                 }
             result = json.loads(messages[-1]["content"])
-            assert result == {
-                "protocol_version": "planning_tool_result_v1",
-                "tool": "resource.read",
-                "status": "error",
-                "error": "resource_read_arguments_invalid",
-                "field": "arguments",
+            assert result["protocol_version"] == "planning_tool_result_v2"
+            assert result["tool"] == "resource.read_titles"
+            assert result["status"] == "error"
+            assert result["validation_feedback"]["raw_response_included"] is False
+            return {
+                "tool": "plan.retrieve",
+                "arguments": _minimal_from_legacy_plan(
+                    proposal(layer="chunk")
+                ).model_dump(mode="json"),
             }
-            return {"tool": "plan.commit", "arguments": proposal(layer="chunk")}
 
     plan, audit = await plan_intent_execution(
         db_session,
@@ -379,10 +389,8 @@ async def test_invalid_resource_tool_arguments_are_repaired_in_same_history(db_s
 
 
 @pytest.mark.asyncio
-async def test_malformed_provider_tool_output_gets_one_safe_retry(db_session, coarse_catalog):
+async def test_malformed_provider_tool_output_fails_without_text_compatibility(db_session, coarse_catalog):
     from app.services.embeddings import ProviderJSONShapeError
-    from test_intent_contracts import proposal
-
     kb, _, _ = coarse_catalog
     request = AgentRequest(knowledge_base_id=kb.id, question="Explain the topics.")
     _, run = agent_graph.create_agent_run_context(db_session, request)
@@ -393,33 +401,27 @@ async def test_malformed_provider_tool_output_gets_one_safe_retry(db_session, co
         async def classify_json_messages(self, **kwargs):
             messages = kwargs["messages"]
             seen.append(messages)
-            if len(seen) == 1:
-                raise ProviderJSONShapeError(
-                    {"error_code": "invalid_object_key", "field_path": "$"}
-                )
-            result = json.loads(messages[-1]["content"])
-            assert result["validation_feedback"]["raw_response_included"] is False
-            assert result["validation_feedback"]["errors"] == [
-                {"path": "$", "code": "provider_json_shape"}
-            ]
-            return {"tool": "plan.commit", "arguments": proposal(layer="chunk")}
+            raise ProviderJSONShapeError(
+                {"error_code": "invalid_object_key", "field_path": "$"}
+            )
 
-    plan, audit = await plan_intent_execution(
-        db_session,
-        run=run,
-        question=request.question,
-        conversation_scope_hash=run.metadata_json["conversation_state_scope_hash"],
-        filter_scope_hash=control_hash(request.filters.model_dump(mode="json")),
-        history_summary="",
-        capabilities=capabilities,
-        provider_factory=Provider,
+    with pytest.raises(ProviderJSONShapeError):
+        await plan_intent_execution(
+            db_session,
+            run=run,
+            question=request.question,
+            conversation_scope_hash=run.metadata_json["conversation_state_scope_hash"],
+            filter_scope_hash=control_hash(request.filters.model_dump(mode="json")),
+            history_summary="",
+            capabilities=capabilities,
+            provider_factory=Provider,
+        )
+    assert [len(messages) for messages in seen] == [1]
+    observation = db_session.scalar(
+        select(AgentObservation).where(AgentObservation.run_id == run.id)
     )
-    assert plan.strategy.entry_layer == "chunk"
-    assert [len(messages) for messages in seen] == [1, 3]
-    assert [item["action"] for item in audit["steps"]] == [
-        "planning_output_invalid",
-        "plan",
-    ]
+    assert observation.verdict == "failed"
+    assert observation.observation_json["failure_class"] == "provider_json_shape"
 
 
 @pytest.mark.asyncio
@@ -468,9 +470,10 @@ async def test_schema_feedback_allows_one_model_owned_full_plan_retry(
     _, run = agent_graph.create_agent_run_context(db_session, request)
     capabilities, _ = retrieval_capability_snapshot(db_session, kb.id, admit_graph=False)
     invalid = proposal(layer="chunk", hybrid=True, lexical=True)
-    invalid["execution_strategy"]["lexical_groups"][0]["kind"] = "identifier"
-    invalid["execution_strategy"]["lexical_groups"][0]["surfaces"][0] = {
-        "text": "unit-test-key", "language": "en", "provenance": "model_query",
+    invalid["execution_strategy"]["layer_weights"]["chunk"] = {
+        "dense": 0.7,
+        "rq": 0.2,
+        "bm25": 0.2,
     }
     calls = []
 
@@ -481,10 +484,9 @@ async def test_schema_feedback_allows_one_model_owned_full_plan_retry(
             if len(calls) == 1:
                 return invalid
             feedback = packet["validation_feedback"]
-            assert packet["navigation"]["allowed_actions"] == ["plan"]
+            assert packet["navigation"]["allowed_tools"] == ["plan.retrieve"]
             assert feedback["raw_response_included"] is False
-            assert feedback["errors"][0]["code"] == "strategy_identifier_surface_must_be_neutral"
-            assert "unit-test-key" not in user_prompt
+            assert feedback["errors"][0]["code"] == "strategy_weights_must_sum_to_one"
             return proposal(layer="chunk") if repair_succeeds else invalid
 
     kwargs = dict(

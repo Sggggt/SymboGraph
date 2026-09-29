@@ -56,29 +56,260 @@ def test_schema_feedback_does_not_echo_untrusted_extra_field_names():
 
 
 def test_planning_prompt_keeps_contract_constraints_with_a_smaller_payload():
-    from app.intent_contracts import IntentPlanningOutput
+    from app.intent_contracts import CapabilityManifest, ExecutionBudget
     from app.services.intent_planning import (
-        _compact_planning_schema,
+        MinimalRetrievalPlan,
+        _active_planning_tools,
+        _planning_response_schema,
         _planning_system_prompt,
-        _planning_tool_schema,
     )
 
-    original = IntentPlanningOutput.model_json_schema()
-    compact = _compact_planning_schema(original)
     prompt = _planning_system_prompt()
+    capabilities = CapabilityManifest(
+        knowledge_base_id="unit-kb",
+        available_layers=("coarse", "mid", "chunk"),
+        available_channels=("dense", "rq", "bm25"),
+        graph_identity="a" * 64,
+        lexical_identity="b" * 64,
+        bilingual_lexical_enabled=True,
+        budget_limits=ExecutionBudget(
+            dense_candidates=10,
+            rq_candidates=10,
+            bm25_candidates=10,
+            root_entries=4,
+            per_parent_entries=4,
+            layer_entries=8,
+            max_depth=3,
+            restore_per_hit=2,
+        ),
+    )
+    tools = _active_planning_tools(
+        stage="initial",
+        capabilities=capabilities,
+        verified_context_reuse_available=True,
+    )
 
-    assert len(prompt) < 10_000
-    assert len(json.dumps(compact, ensure_ascii=False)) < len(json.dumps(original, ensure_ascii=False))
-    assert compact["required"] == original["required"]
-    assert compact["additionalProperties"] is False
-    assert compact["properties"]["execution_strategy"] == original["properties"]["execution_strategy"]
-    assert compact["$defs"]["ChannelWeights"]["properties"]["dense"]["minimum"] == 0
-    assert "resource.read" in prompt and "plan.commit" in prompt
+    assert len(prompt) < 4_000
+    assert "resource.read_titles" in prompt and "plan.retrieve" in prompt
     assert "validation_feedback" in prompt
-    assert "complete corrected plan" in prompt
-    tool_schema = _planning_tool_schema()
-    assert tool_schema["additionalProperties"] is False
-    assert len(tool_schema["properties"]["arguments"]["oneOf"]) == 2
+    assert "complete corrected minimal plan" in prompt
+    assert "plan.commit arguments schema" not in prompt
+    assert "planning_action" not in str(tools)
+    assert [item["result_tool"] for item in tools] == [
+        "resource.read_titles",
+        "plan.retrieve",
+        "plan.reuse",
+        "plan.system_capability",
+        "plan.clarify",
+    ]
+    assert tools[0]["input_schema"] == {
+        "additionalProperties": False,
+        "properties": {},
+        "type": "object",
+    }
+    plan_schema = next(
+        item["input_schema"]
+        for item in tools
+        if item["result_tool"] == "plan.retrieve"
+    )
+    root_budget = next(
+        item
+        for item in plan_schema["properties"]["budget_root_entries"]["anyOf"]
+        if item.get("type") == "integer"
+    )
+    assert root_budget["maximum"] == 4
+    assert plan_schema["properties"]["entry_layer"]["enum"] == [
+        "coarse",
+        "mid",
+        "chunk",
+    ]
+    minimal_schema = MinimalRetrievalPlan.model_json_schema()
+    identifier = minimal_schema["$defs"]["MinimalIdentifierLexicalGroup"]
+    assert "texts" in identifier["properties"]
+    assert "language" not in json.dumps(identifier)
+    strict_schema = _planning_response_schema(tools)
+    assert len(strict_schema["oneOf"]) == 5
+    assert {
+        branch["properties"]["tool"]["const"]
+        for branch in strict_schema["oneOf"]
+    } == {item["result_tool"] for item in tools}
+
+
+def test_minimal_identifier_compiles_neutral_fields_without_model_language():
+    from app.services.intent_planning import (
+        MinimalRetrievalPlan,
+        compile_minimal_retrieval_plan,
+    )
+
+    minimal = MinimalRetrievalPlan.model_validate(
+        {
+            "intent_primary": "fact_lookup",
+            "intent_secondary": [],
+            "requirements": [
+                {
+                    "id": "f1",
+                    "text": "Explain queue_limit",
+                    "protected_literals": ["queue_limit"],
+                }
+            ],
+            "entities": ["queue_limit"],
+            "entry_layer": "chunk",
+            "semantic_query": "queue_limit definition",
+            "lexical_groups": [
+                {
+                    "kind": "identifier",
+                    "requirement_ids": ["f1"],
+                    "texts": ["queue_limit"],
+                }
+            ],
+            "layer_weights": [
+                {"layer": "chunk", "dense": 0.6, "rq": 0.0, "bm25": 0.4}
+            ],
+            "selection_scope": "focused",
+            "reason_code": "precise_terms",
+        }
+    )
+    proposal, audit = compile_minimal_retrieval_plan(
+        minimal,
+        route="retrieve",
+        question="Explain queue_limit precisely.",
+    )
+    group = proposal.execution_strategy.lexical_groups[0]
+    assert group.group_id == "l1"
+    assert group.surfaces[0].language == "neutral"
+    assert group.surfaces[0].provenance == "user_text"
+    assert proposal.execution_strategy.generate_lexical is True
+    assert proposal.execution_strategy.hybrid is True
+    assert audit["texts_generated"] is False
+    assert audit["weights_modified"] is False
+
+
+def test_minimal_requirement_compiles_flat_source_selectors():
+    from app.services.intent_planning import (
+        MinimalRetrievalPlan,
+        compile_minimal_retrieval_plan,
+    )
+
+    minimal = MinimalRetrievalPlan.model_validate(
+        {
+            "intent_primary": "source_lookup",
+            "requirements": [
+                {
+                    "id": "f1",
+                    "text": "Locate summary or detail",
+                    "role": "source_role",
+                    "source_roles": ["summary", "detail"],
+                    "source_selectors": [
+                        {
+                            "kind": "section",
+                            "reference": "summary",
+                            "match": "role",
+                        },
+                        {
+                            "kind": "section",
+                            "reference": "detail",
+                            "match": "role",
+                        },
+                    ],
+                    "source_scope_operator": "any",
+                }
+            ],
+            "entry_layer": "chunk",
+            "semantic_query": "summary detail",
+            "layer_weights": [
+                {"layer": "chunk", "dense": 1.0, "rq": 0.0, "bm25": 0.0}
+            ],
+            "reason_code": "source_locality",
+        }
+    )
+    proposal, _audit = compile_minimal_retrieval_plan(
+        minimal,
+        route="retrieve",
+        question="Locate summary or detail.",
+    )
+    scope = proposal.requirements[0].source_scope
+    assert scope is not None and scope.mode == "overlap"
+    assert scope.scope.op == "union"
+    assert [child.selector.role for child in scope.scope.children] == [
+        "summary",
+        "detail",
+    ]
+    schema_text = json.dumps(
+        MinimalRetrievalPlan.model_json_schema(), ensure_ascii=False
+    )
+    assert '"source_selectors"' in schema_text
+    assert '"source_scope":' not in schema_text
+
+
+def test_single_entry_weight_profile_expands_without_changing_values():
+    from app.services.intent_planning import (
+        MinimalRetrievalPlan,
+        compile_minimal_retrieval_plan,
+    )
+
+    minimal = MinimalRetrievalPlan.model_validate(
+        {
+            "intent_primary": "overview",
+            "requirements": [{"id": "f1", "text": "Overview"}],
+            "entry_layer": "coarse",
+            "semantic_query": "overview",
+            "layer_weights": [
+                {"layer": "coarse", "dense": 1.0, "rq": 0.0, "bm25": 0.0}
+            ],
+            "reason_code": "broad_scope",
+        }
+    )
+    proposal, audit = compile_minimal_retrieval_plan(
+        minimal,
+        route="retrieve",
+        question="Give an overview.",
+    )
+    assert proposal.execution_strategy.layer_weights.enabled_layers() == (
+        "coarse",
+        "mid",
+        "chunk",
+    )
+    assert all(
+        proposal.execution_strategy.layer_weights.for_layer(layer).effective()
+        == {"dense": 1.0, "rq": 0.0, "bm25": 0.0}
+        for layer in ("coarse", "mid", "chunk")
+    )
+    assert audit["layer_weight_mode"] == "shared_entry_profile"
+    assert audit["weights_modified"] is False
+
+
+def test_source_scope_controls_without_selectors_are_ignored_as_noop():
+    from app.services.intent_planning import (
+        MinimalRetrievalPlan,
+        compile_minimal_retrieval_plan,
+    )
+
+    minimal = MinimalRetrievalPlan.model_validate(
+        {
+            "intent_primary": "fact_lookup",
+            "requirements": [
+                {
+                    "id": "f1",
+                    "text": "Synthetic fact",
+                    "source_scope_operator": "all",
+                    "source_scope_mode": "complete",
+                }
+            ],
+            "entry_layer": "chunk",
+            "semantic_query": "synthetic fact",
+            "layer_weights": [
+                {"layer": "chunk", "dense": 1.0, "rq": 0.0, "bm25": 0.0}
+            ],
+            "reason_code": "semantic_paraphrase",
+        }
+    )
+    proposal, audit = compile_minimal_retrieval_plan(
+        minimal,
+        route="retrieve",
+        question="Find the synthetic fact.",
+    )
+    assert proposal.requirements[0].source_scope is None
+    assert audit["ignored_source_scope_control_count"] == 1
 
 
 def test_local_normalization_removes_only_closed_schema_noise():
@@ -213,6 +444,60 @@ def test_local_normalization_removes_obligation_shape_noise():
     normalized, audit = normalize_planning_output(raw)
     assert normalized["requirements"][0]["source_scope"]["children"] == []
     assert audit["scope_shape_noise_removed"] == 1
+
+
+def test_local_normalization_closes_role_selector_kind():
+    raw = {
+        "requirements": [
+            {
+                "source_scope": {
+                    "op": "coverage",
+                    "scope": {
+                        "op": "scope",
+                        "selector": {
+                            "kind": "document",
+                            "reference": "summary",
+                            "match": "role",
+                            "role": "summary",
+                        },
+                        "children": [],
+                    },
+                    "mode": "overlap",
+                    "children": [],
+                }
+            }
+        ]
+    }
+    normalized, audit = normalize_planning_output(raw)
+    selector = normalized["requirements"][0]["source_scope"]["scope"]["selector"]
+    assert selector["kind"] == "section"
+    assert selector["match"] == "role" and selector["role"] == "summary"
+    assert audit["role_selector_kinds_normalized"] == 1
+
+    missing_role = {
+        "requirements": [
+            {
+                "source_scope": {
+                    "op": "coverage",
+                    "scope": {
+                        "op": "scope",
+                        "selector": {
+                            "kind": "section",
+                            "reference": "摘要",
+                            "match": "role",
+                        },
+                        "children": [],
+                    },
+                    "mode": "overlap",
+                    "children": [],
+                }
+            }
+        ]
+    }
+    normalized, audit = normalize_planning_output(missing_role)
+    selector = normalized["requirements"][0]["source_scope"]["scope"]["selector"]
+    assert selector["role"] == "summary"
+    assert audit["section_role_selectors_normalized"] == 1
 
     misplaced_selector = {
         "requirements": [
@@ -368,7 +653,7 @@ async def test_one_shot_plan_persists_prepared_and_completed_audit(
     assert accepted.strategy.route == "system_capability"
     assert observation.verdict == "completed"
     assert observation.observation_json == audit
-    assert audit["prompt_protocol_version"] == "constraint_preserving_compact_schema_v1"
+    assert audit["prompt_protocol_version"] == "stage_scoped_minimal_tools_v1"
     assert audit["system_prompt_characters"] == len(calls[0][0])
     assert run.metadata_json["intent_execution_plan"]["accepted_plan_hash"] == accepted.identity
     assert db_session.scalar(select(AgentRun).where(AgentRun.id == run.id)) is run

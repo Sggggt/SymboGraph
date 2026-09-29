@@ -212,7 +212,6 @@ def _persisted_audit(
         "capability_manifest",
         "intent_planning",
         "database_commit",
-        "model_call",
         "provider_roundtrip",
     }
     if category == "verified_reuse":
@@ -227,8 +226,11 @@ def _persisted_audit(
         and answer.knowledge_base_id == knowledge_base_id
         and answer.qa_session_id == response.get("session_id"),
         "one_plan": len(plan_rows) == 1 and plan_rows[0].verdict == "completed",
-        "one_planning_model_call": len(plan_rows) == 1
-        and plan_rows[0].observation_json.get("model_call_count") == 1,
+        "bounded_progressing_planning_calls": len(plan_rows) == 1
+        and int(plan_rows[0].observation_json.get("resource_read_count") or 0) <= 2
+        and plan_rows[0].observation_json.get("schema_repair_count") == 0
+        and plan_rows[0].observation_json.get("model_call_count")
+        == int(plan_rows[0].observation_json.get("resource_read_count") or 0) + 1,
         "no_online_reward": reward_count == 0 and lexical_reward_count == 0,
         "step_timing_complete": performance["protocol_version"]
         == "qa_stage_timing_v1"

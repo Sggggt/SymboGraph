@@ -309,7 +309,7 @@ async def test_system_capability_route_bypasses_graph_models_tools_and_policy(
 
     class PlanningOnlyChatProvider:
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
-            assert "INTENT EXECUTION RETRIEVAL V1" in system_prompt
+            assert "INTENT EXECUTION PLANNING V5" in system_prompt
             planning_calls.append(question)
             return {
                 "intent": {"primary": "system_capability"},
@@ -598,7 +598,7 @@ async def test_system_capability_sse_terminal_meta_matches_final_route(
     from app.services import agent_graph
     class PlanningProvider:
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
-            assert "INTENT EXECUTION RETRIEVAL V1" in system_prompt
+            assert "INTENT EXECUTION PLANNING V5" in system_prompt
             return {
                 "intent": {"primary": "system_capability"},
                 "execution_strategy": {

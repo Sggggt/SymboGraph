@@ -2011,6 +2011,14 @@ async def test_continuous_anthropic_json_uses_forced_native_tool(monkeypatch, no
     provider = embeddings.ChatProvider()
     provider.api_key = "unit-test-key"
     provider.api_protocol = "anthropic"
+    provider._native_tool_calls = [
+        {
+            "id": "toolu_unit_1",
+            "name": "done",
+            "result_tool": "done",
+            "input": {"tool": "read"},
+        }
+    ]
     captured = {}
 
     async def fake_tool(payload, native_tools):
@@ -2029,8 +2037,8 @@ async def test_continuous_anthropic_json_uses_forced_native_tool(monkeypatch, no
         "stable system",
         [
             {"role": "user", "content": "task"},
-            {"role": "assistant", "content": '{"tool":"read"}'},
-            {"role": "user", "content": '{"status":"ok"}'},
+            {"role": "assistant", "content": '{"tool":"done","arguments":{"tool":"read"}}'},
+            {"role": "user", "content": '{"tool":"done","status":"ok"}'},
         ],
         max_tokens=512,
         response_schema=schema,
@@ -2050,6 +2058,8 @@ async def test_continuous_anthropic_json_uses_forced_native_tool(monkeypatch, no
         "assistant",
         "user",
     ]
+    assert captured["payload"]["messages"][1]["content"][0]["type"] == "tool_use"
+    assert captured["payload"]["messages"][2]["content"][0]["type"] == "tool_result"
 
 
 @pytest.mark.asyncio
@@ -2064,7 +2074,12 @@ async def test_anthropic_native_tool_accepts_only_one_forced_submit(monkeypatch,
         return {
             "stop_reason": "tool_use",
             "content": [
-                {"type": "tool_use", "name": "submit", "input": {"tool": "done"}}
+                {
+                    "type": "tool_use",
+                    "id": "toolu_unit_1",
+                    "name": "submit",
+                    "input": {"tool": "done"},
+                }
             ],
         }
 
@@ -2087,8 +2102,9 @@ async def test_anthropic_native_tool_accepts_only_one_forced_submit(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_anthropic_tool_gateway_end_turn_json_is_parsed(monkeypatch, no_fallback_env):
+async def test_anthropic_tool_gateway_end_turn_json_is_rejected(monkeypatch, no_fallback_env):
     from app.services import embeddings
+    from app.services.error_sanitizer import ExternalServiceError
 
     provider = embeddings.ChatProvider()
 
@@ -2106,16 +2122,16 @@ async def test_anthropic_tool_gateway_end_turn_json_is_parsed(monkeypatch, no_fa
         }
 
     monkeypatch.setattr(provider, "_post_anthropic_sdk_response", fake_response)
-    result = await provider._post_anthropic_sdk_tool(
-        {"model": "unit", "messages": [{"role": "user", "content": "task"}], "max_tokens": 512},
-        [
-            {
-                "name": "planning_action",
-                "result_tool": "planning_action",
-                "passthrough": True,
-                "description": "submit",
-                "input_schema": {"type": "object"},
-            }
-        ],
-    )
-    assert result == {"tool": "plan.commit", "arguments": {"value": 1}}
+    with pytest.raises(ExternalServiceError) as caught:
+        await provider._post_anthropic_sdk_tool(
+            {"model": "unit", "messages": [{"role": "user", "content": "task"}], "max_tokens": 512},
+            [
+                {
+                    "name": "plan_retrieve",
+                    "result_tool": "plan.retrieve",
+                    "description": "submit",
+                    "input_schema": {"type": "object"},
+                }
+            ],
+        )
+    assert caught.value.error_code == "tool_stop_reason_invalid"

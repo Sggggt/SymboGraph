@@ -8,17 +8,48 @@
 
 后端 Search、同步 QA 和 SSE QA 共用同一规划与分层检索契约。Search 在结果与来源返回后结束，QA 再生成一次回答。前端不提供独立 Search 产品页，也不提供普通/摘要模式选择；问答仍使用后端共享检索契约，回答风格不控制图入口。
 
-LLM 在连续规划会话中直接调用 `plan.commit` 提交 `intent` 与 `execution_strategy`，或先调用下述有界 `resource.read` 再提交。assistant tool call 与 tool result 按顺序保留，不把已读材料复制进下一轮无状态 packet。它只能使用原问题、用户明确的会话约束、非事实性会话摘要、服务器提供的有界 capability manifest 和本轮获准的粗层导航材料。manifest 包含可用层、版本、索引状态、文档/语言数量、可用范围与预算上限，不包含旧答案或旧模型判决。
+LLM 在 `intent_execution_planning_call_v5` 连续规划会话中直接调用 `plan.retrieve`、条件可用的 `plan.reuse`、`plan.system_capability` 或 `plan.clarify`，也可先调用有界的 `resource.read_titles` 与 `resource.read_details`。assistant tool call 与 tool result 按顺序保留，不把已读材料复制进下一轮无状态 packet。它只能使用原问题、用户明确的会话约束、非事实性会话摘要、服务器提供的有界 capability manifest 和本轮获准的粗层导航材料。manifest 只包含会改变合法动作的层、通道、双语开关与预算上限，不包含数据库身份、旧答案或旧模型判决。
 
-计划必须在检索前通过闭合 schema、本地权限和预算校验并持久化。模型仅能调用当前阶段暴露的 `resource.read` 与 `plan.commit`；服务端执行读取和提交。模型不能调用其他工具、选择不存在的字段、修改图边、放宽用户范围或直接提交数据库 ID。执行器依据最小工具参数行动。
+计划必须在检索前通过最小工具 schema、确定性编译后的完整 `IntentPlanningOutput`、本地权限和预算校验并持久化。模型只能调用当前状态实际暴露的工具；服务端执行读取和提交。工具名固定动作和 route，模型不能在开放参数对象中再选一次工具，不能调用未暴露动作、选择不存在的字段、修改图边、放宽用户范围或直接提交数据库 ID。执行器依据最小工具参数行动。
 
 资料型 active 图/BM25 可用性核验与规划模型往返彼此独立时可以并行：核验使用单独只读数据库会话和有界 I/O 槽，正式检索前必须 join 并核对当前 active 身份。系统能力、澄清及已通过来源重放的复用路由不以该资料型核验授权；并行失败不能静默改通道或权重。
 
-### `resource/read` 状态机
+### 规划工具状态机
 
 执行器把实际完成的标题目录、详情读取和一次格式反馈按发生顺序写入 Agent run 轨迹，最终 plan 校验通过后再写规划完成事件。轨迹仅提供有限动作/计数/耗时审计；原文目录与摘要只进入本轮有界规划输入，不作为公开轨迹事实或回答证据。直接 plan 无读取事件；历史与断线恢复从同一持久事件序列读取。
 
-`coarse_resource_read_v1` 的初始响应是完整计划或 `{action:"resource_read",mode:"titles"}`。标题目录返回后，响应是完整计划或 `{action:"resource_read",mode:"details",keys:[...]}`；详情返回后只能是完整计划。`keys` 为本轮目录临时键、1–4 个、不重复，不能使用数据库 ID。最多两次读，正常路径最多三次规划模型调用；无粗层时只能直接规划。仅当最终完整计划未通过闭合 schema 时，服务端可再给模型一次不含原始响应的安全字段路径/错误码反馈，要求重提**完整计划**，总调用上限为四次。该重试不读取检索结果、不生成词面、不代改策略；第二次仍非法则在正式检索前失败。无效读动作、越权键、图身份漂移或资源预算超限不进入格式重试。
+初始状态在 coarse 可用时暴露无参数 `resource.read_titles`；否则不暴露读取工具。标题目录返回后才暴露 `resource.read_details(keys)`，其中 keys 为本轮目录临时键、1–4个、不重复，不能使用数据库 ID；详情返回后不再暴露读取工具。各状态同时暴露合法计划工具：`plan.retrieve`，同会话复用可用时的 `plan.reuse`，以及无参数的 `plan.system_capability/plan.clarify`。最多两次读，正常路径最多三次规划模型调用。仅当计划参数或编译后的完整契约首次非法时，服务端返回不含原始响应的安全字段路径/错误码，并只暴露对应计划工具要求重提一次，总调用上限为四次。第二次仍非法则在正式检索前失败。
+
+Anthropic 等原生工具路径必须返回且只返回一个当前允许的 `tool_use`；`end_turn` 文本、多个工具、未知工具或非对象参数均为 provider capability/shape 技术失败，不再提取文本 JSON。OpenAI-compatible 严格 JSON 路径使用与当前工具集合等价的闭合判别联合，但不会伪装成原生工具结果。两条 provider 路径最终投影到同一内部工具调用与同一执行校验。
+
+### 最小检索计划
+
+`plan.retrieve` 与 `plan.reuse` 的 active 模型输出为 `minimal_retrieval_plan_v1`：
+
+```text
+intent_primary = one intent enum
+intent_secondary = bounded intent enum array
+requirements = bounded array of {
+  id, text, role, protected_literals, source_roles,
+  source_selectors[{kind, reference, match, role?}],
+  source_scope_operator = all | any | null,
+  source_scope_mode = overlap | complete | null
+}
+entities = bounded strings
+entry_layer = coarse | mid | chunk
+semantic_query = nonempty text
+lexical_groups = bounded discriminated array of
+  concept {requirement_ids, surfaces[{text, language=zh|en}]}
+  identifier {requirement_ids, texts[]}
+  number_unit {requirement_ids, texts[]}
+  quoted_literal {requirement_ids, texts[]}
+layer_weights = one shared entry profile or a complete bounded array of {layer, dense, rq, bm25}
+selection_scope = focused | broad
+budget_<registered_key> = optional scalar bounded by the current capability
+reason_code = closed reason enum
+```
+
+模型不输出 protocol、route、`generate_lexical`、`hybrid`、group id 或 provenance，也不输出可避免的嵌套或递归 object。编译器验证 layer 唯一：一个入口层 item 表示 shared profile并原值复制到全部下游层；多个 item 必须与所需层集合完全相等。扁平预算字段由 capability-specialized provider schema 先限制 maximum，再构造完整 `StrategyBudgetRequest`。验证 selector/operator/mode 组合后，把一个 selector 编译为 scope leaf，把多个 selector 按 all/any 编译为 intersection/union，再生成 coverage obligation。存在 selector 而省略 operator/mode 时使用保守默认 `all + overlap`；没有 selector 时 operator/mode 没有执行语义，编译器忽略并记录安全计数，不能仅因这类无价值附加字段丢弃其余有效计划。不接受把对象或 children 编码成字符串的兼容形式。编译器按 lexical 数组顺序分配 `l1..l12`；identifier 与 number/unit 编译为 neutral，quoted literal 按版本化脚本规则分类；原问题中有精确规范化见证的 surface 标为 `user_text`，其余为 `model_query`。组是否为空决定 `generate_lexical`，逐层 BM25 权重是否启用决定 `hybrid`。这些是同一最小计划的确定性投影，不得补造文本、翻译概念或修改模型给出的权重数值。
 
 请求硬时限覆盖上述规划、非模型检索/准入、有限证据读取和一次最终生成，取自 `retrieval_total_timeout_seconds`。规划与证据工具模型调用受 `model_request_timeout_seconds` 和整链剩余时间约束，不再设置独立规划时限；最终生成取模型单次时限、生成阶段时限和整链剩余时间三者中的最小值。单次模型时限与整链总时限分别审计；各调用的理论上限不能简单相加后绕过总时限。Runtime Settings 暴露整链与生成时限、规划/生成输出 token 预算；最终生成阶段时限允许 10–600 秒。SSE/同步共享执行 owner 与超时终态。
 
@@ -75,7 +106,7 @@ active 容量：semantic_query 为1–4000字符；lexical groups 至多12组，
 
 `provenance=user_text|model_query` 区分用户原词与模型提出的查询表达；后者只是检索假设，不是已证实别名。`language` 是检索面的语言审计，不是文档语言事实。保留用户原始实体、否定、数值和时间；模型不得根据记忆生成答案词或伪装成原文见证。空 group 数组是一等合法结果。
 
-`bilingual_lexical_groups_v1` 在同一次规划内控制双语：开关开启时，kind=`concept` 的每组必须同时包含至少一个 `zh` 和一个 `en` surface，并通过本地 Unicode/script、空白、控制字符和重复项校验。`identifier/number_unit/quoted_literal` 允许 neutral surface，不为代码标识符、编号、单位或逐字引用强造翻译。开关关闭时不要求成对，但仍允许标准技术别名。执行器按 group 顺序和组内 surface 顺序稳定展平，再交给 tokenizer；group、surface、语言、开关与展平 hash 全部进入计划/trace/cache。不得为双语另发模型请求，也不得调用遗留 query-facet 链。
+`minimal_lexical_groups_v1` 在同一次规划内控制双语：开关开启时，kind=`concept` 的每组必须同时包含至少一个 `zh` 和一个 `en` surface，并通过本地 Unicode/script、空白、控制字符和重复项校验。`identifier/number_unit/quoted_literal` 不包含模型可选 language；本地编译器按上述规则生成完整 surface，不为代码标识符、编号、单位或逐字引用强造翻译。关闭开关时 concept 不要求成对，但仍允许标准技术别名。执行器按编译后的 group 顺序和组内 surface 顺序稳定展平，再交给 tokenizer；最小字段、完整 group/surface、语言、开关与展平 hash 全部进入计划/trace/cache。不得为双语另发模型请求，也不得调用遗留 query-facet 链。
 
 服务器的 capability manifest 列明 `coarse/mid/chunk` 中真实可用的层。首版只选择一个根入口层；向下的入口属于同次分层检索。RQ 是地址与评分信号，结构图是地址恢复层，均不是可选择的第四或第五个语义入口。
 
