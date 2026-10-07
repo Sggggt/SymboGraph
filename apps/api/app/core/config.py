@@ -119,6 +119,7 @@ HOT_RELOAD_SETTINGS = {
     "context_path_summary_budget",
     "agent_answer_unit_limit",
     "agent_history_summary_max_chars",
+    "agent_context_window_tokens",
 }
 
 REBUILD_REQUIRED_SETTINGS = {
@@ -304,6 +305,7 @@ class Settings(BaseSettings):
     worker_concurrency: int = Field(default=3, ge=1, le=32)
     model_request_concurrency: int = Field(default=3, ge=1, le=16)
     model_request_timeout_seconds: int = Field(default=240, ge=5, le=600)
+    agent_context_window_tokens: int = Field(default=65536, ge=16384, le=1048576)
     chat_json_max_tokens: int = Field(default=12000, ge=256, le=32768)
     agent_request_concurrency: int = Field(default=4, ge=1, le=128)
     source_io_concurrency: int = Field(default=4, ge=1, le=64)
@@ -863,6 +865,7 @@ def _apply_hot_reload_env(settings: Settings, env_entries: dict[str, str]) -> No
         "agent_reflection_round_budget",
         "agent_reflection_timeout_seconds",
         "agent_history_summary_max_chars",
+        "agent_context_window_tokens",
         "gray_zone_observation_cadence",
         "traversal_observation_budget",
         "query_facet_posterior_observation_budget",

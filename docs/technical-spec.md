@@ -275,7 +275,7 @@ $$
 
 ### 意图与执行策略
 
-取消普通模式和摘要模式；用户不再通过界面模式决定粗层或中层入口。规划协议为 `intent_execution_planning_call_v5`：LLM 在正式检索前调用按状态暴露的真实小工具 `resource.read_titles`、`resource.read_details`、`plan.retrieve`、条件可用的 `plan.reuse`、`plan.system_capability` 或 `plan.clarify`。工具名表达动作，禁止再用一个 `planning_action` 包装器让模型在开放 `arguments` 中重复选择动作。每轮 assistant tool call 与 tool result 追加到同一规划会话；执行器校验最小工具参数、执行读取或把最小计划确定性编译为完整 `IntentPlanningOutput`，只有完整契约通过权限、组合与预算校验后才行动。服务端不再把已返回的导航材料复制进新的无状态分类 packet。
+取消普通模式和摘要模式；用户不再通过界面模式决定粗层或中层入口。规划协议为 `intent_execution_planning_call_v6`：LLM 在正式检索前调用按状态暴露的真实小工具 `resource.read_titles`、`resource.read_details`、`plan.retrieve`、条件可用的 `plan.reuse`、`plan.system_capability` 或 `plan.clarify`。工具名表达动作，禁止再用一个 `planning_action` 包装器让模型在开放 `arguments` 中重复选择动作。每轮 assistant tool call 与 tool result 追加到同一规划会话；执行器校验最小工具参数、执行读取或把最小计划确定性编译为完整 `IntentPlanningOutput`，只有完整契约通过权限、组合与预算校验后才行动。服务端不再把已返回的导航材料复制进新的无状态分类 packet。
 
 ### 规划前粗层资源读取
 
@@ -295,13 +295,21 @@ $$
 
 ### Agent 上下文计划
 
-所有规划、证据导航与最终生成调用在发送前都形成 `agent_context_plan_v1`。模型工作内存按 `P0` 当前问题、Task、权限/来源范围、工具契约与总时限，`P1` 活动语义分支、最近完整 tool call/result、已选原文与合法下一步，`P2` 可重建控制历史，`P3` 按需语义资源，`P4` 诊断/内部地址划分。每份计划记录各层语义单元数、估算或 provider 实际 token、预留输出、稳定前缀 hash、压缩/截断动作及被排除单元的类型和原因，不记录正文。
+`agent_context_plan_v2` 统一规划、会话检查点、证据工具与最终生成的输入组装。窗口由 Runtime Settings `agent_context_window_tokens` 声明；system、活动工具 schema、完整 Task、会话与工具消息共同计量，扣除输出预留及版本化安全余量后形成输入预算。发送前使用版本化估算，调用后回填 provider 实际 usage 与缓存计量；cache token 不从窗口占用中扣除，不把旧请求的 usage 当作变化后请求的精确输入量。分项费用、保留/替换/淘汰原因与原子工具对写入 body-free 审计。小输入直接保留。
+
+`conversation_context_v1` 从同会话完整 transcript 派生。当前原问题及明确持久约束为 P0，最近完整问答对为 P1，较早对话为可恢复 P2。完整 history 不再经过固定尾部与六个话题/最后回答前缀投影。压力下 `conversation.checkpoint` 选择原消息中的关键语义片段；服务端验证原文见证，只持久化消息位置/跨度与前缀身份，从原 transcript 重建。检查点保留目标、指代、修正、约束、决定及未完成要求，归档问答仍通过临时 turn handle 的 `conversation.read(keys)` 有界恢复。检查点不成为回答证据，不保存隐藏思维链。
+
+规划协议 `intent_execution_planning_call_v6` 在存在尚未展开的历史问答时暴露 `conversation.read`，每次消费至少一个未读 turn，允许批量完整读取。调用数受有限未读集合和绝对总时限限制。`minimal_retrieval_plan_v2` 增加可选 `context_turn_keys`，模型只选择对当前任务仍有效的历史用户要求；服务端检查同 session 与原文身份，编译到 `intent_task_v2.conversation_context`。实体/requirements 解析指代，当前用户显式要求优先。最终生成只输入完整 Task（含见证会话控制信息）、回答约束和本轮冻结原文，历史 assistant prose 不进入事实输入。
+
+旧工具控制历史以确定性闭合状态替代，成功原文读取和最后工具对完整保留。删除、见证片段提炼和淘汰分别记录，无替代删除不能称作压缩。全部模型调用采用单次绝对截止，provider I/O timeout 与 retry 不延长截止。历史消息/来源身份按原版本读取，不就地改写旧记录。
+
+所有规划、证据导航与最终生成调用在发送前都形成 `agent_context_plan_v2`。模型工作内存按 `P0` 当前问题、Task、权限/来源范围、工具契约与总时限，`P1` 活动语义分支、最近完整 tool call/result、已选原文与合法下一步，`P2` 可重建控制历史，`P3` 按需语义资源，`P4` 诊断/内部地址划分。每份计划记录各层语义单元数、估算或 provider 实际 token、预留输出、稳定前缀 hash、压缩/截断动作及被排除单元的类型和原因，不记录正文。
 
 上下文以 `Task → requirement → Mid semantic node → admitted source handle → raw chunk` 组织；待加载节点由服务端稳定优先队列按用户明确来源责任、未覆盖 requirement、活动分支、检索顺序、近期依赖、预计 token 成本和稳定业务键排序。正文集合区分 pinned、working、compressed 与 evicted；相同 source handle 在活动输入中只出现一次。`ContextEventLog` 只保存 `user_task/tool_call/tool_result_ref/context_compacted/context_evicted/evidence_committed/final_generation` 的顺序、最小参数、handle 和权威对象引用，恢复时从 Context Package 重建，不复制正文为第二事实源。
 
 超过输入预算时先删除 P4 和重复目录，再将较早 P2 压成闭合状态快照，最后按完整语义单元淘汰未选择 P3。工具调用和结果成对处理，禁止从 JSON、UTF-8 或 source 原文中间裁剪。当前问题、未满足 requirement、活动工具契约、最近工具对和已提交工作集原文不可有损压缩；它们与必要输出仍无法装入时返回容量技术终态。实际原文不超过 2,048 估算 token、没有选择空间或单一 Mid 时走确定性直达，不支付证据决策模型往返。
 
-最多四次规划响应（含一次格式重提）与一次生成均受有界时限约束；整体 QA 硬时限还必须为非模型阶段预留时间。规划和证据工具模型调用只读取当轮冻结的单次模型时限并受整链剩余时间约束，不设置语义重复且容易漂移的独立规划时限；最终生成另受生成阶段时限约束。总时限不是额外模型调用许可，任一阶段超时仍单独报告技术失败。
+规划响应受有限未读历史、导航动作与一次格式重提约束，最终生成仍只有一次，全部调用受绝对时限约束；整体 QA 硬时限还必须为非模型阶段预留时间。规划和证据工具模型调用只读取当轮冻结的单次模型时限并受整链剩余时间约束，不设置语义重复且容易漂移的独立规划时限；最终生成另受生成阶段时限约束。总时限不是额外模型调用许可，任一阶段超时仍单独报告技术失败。
 
 意图包括总结、全局浏览、定义、事实查询、列举、比较、解释、步骤、分析、关系查询和来源定位，也包括能力卡与澄清。意图描述“要完成什么”，执行策略描述“怎样检索”；总结可以从中层开始，事实问题也可以先从粗层定位，不能用意图枚举重新硬编码两种模式。
 

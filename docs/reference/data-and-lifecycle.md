@@ -4,6 +4,10 @@
 
 ## 跨层对象协议
 
+`conversation_context_v1` 的事实源仍是 `QASession.transcript`，不新增原文数据库或隐藏思维存储。压力触发的 `conversation_checkpoint_v1` 使用现有 AgentObservation 保存同 session 前缀身份、turn/消息位置和逐项原文跨度；重放必须核验全部引用，前缀漂移时重新投影，不能改写 transcript。模型临时 turn handle 由服务端顺序映射，不把 session UUID 或内部 hash 送入模型。
+
+`intent_task_v2` 的会话控制信息只复制模型选择且服务端核验的历史 user 消息；它不是原文证据或历史事实授权。新 Task 身份包含这些语义输入，相关检索缓存按新身份失效。旧 `intent_task_v1` 仍按原始序列化计算身份；可选字段为空时不改变旧 replay hash。同步 QA、SSE、Search、恢复与历史使用同一会话投影和上下文预算契约。
+
 ### 关系
 
 跨层对象协议将每层关系表示为稀疏 membership 矩阵：

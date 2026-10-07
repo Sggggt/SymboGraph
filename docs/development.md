@@ -55,12 +55,14 @@ python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
 
 ## 回归矩阵
 
+统一上下文变更验证完整 envelope 成本、输出预留、原子消息对、无压力直达、见证检查点与归档读取、前缀漂移/重启重建、历史指代和用户约束继承、当前要求覆盖、同 session 隔离、干净生成事实输入及单次/总绝对截止。私有真实验收材料和临时运行器位于 Git 工作树之外；真实验收覆盖五个独立会话的多轮问题，分列每轮规划、检索、来源、证据、生成、提交、provider 区间并集与非模型墙钟，不以 completed 代替事实质量。
+
 | 范围 | 应检查的行为 |
 |---|---|
 | 解析/结构 | 控制字符、标题与正文清洗、span remap、PDF 原生表格、未确定表示、失败回滚 |
 | 构建 | TPE 试验/选中候选身份、数值边界、内存/映射路径、RQ 唯一主链、前缀/贡献/压缩及 grounding |
 | 生命周期 | 版本推进、取消边界、before-image、Worker fork、outbox、缓存发布和可重试补偿 |
-| 规划 | `intent_execution_planning_call_v5` 的真实分阶段工具集合、无参数 titles 与有界 details、direct/retrieve/reuse 工具身份、连续工具历史、最小计划到完整契约的确定性编译、identifier 不接收 language、稳定 group/provenance 投影、首次合法率、一次安全计划重提、原生工具拒绝 `end_turn` 文本、OpenAI 严格 JSON 等价、读取/反馈/最终计划的持久轨迹与 SSE/轮询/历史一致、稳定缓存前缀、context plan、完整目录排序/超限、过滤与图身份、越权键、额外模型调用数、三个根入口、空词面合法性、权重/通道矛盾、能力清单与硬预算 |
+| 规划 | `intent_execution_planning_call_v6` 的真实分阶段工具集合、无参数 titles 与有界 details、direct/retrieve/reuse 工具身份、连续工具历史、最小计划到完整契约的确定性编译、identifier 不接收 language、稳定 group/provenance 投影、首次合法率、一次安全计划重提、原生工具拒绝 `end_turn` 文本、OpenAI 严格 JSON 等价、读取/反馈/最终计划的持久轨迹与 SSE/轮询/历史一致、稳定缓存前缀、context plan、完整目录排序/超限、过滤与图身份、越权键、额外模型调用数、三个根入口、空词面合法性、权重/通道矛盾、能力清单与硬预算 |
 | 检索 | 纯向量与混合、独立候选提名、RQ 重构、BM25 统计与父域投影、RRF 通道首候选保留、逐父探索、图 path label、空词面灰区与去重 |
 | 索引 | BM25 分词/df/长度/统计域、流式完整 posting hash 与物化快照等价、跨语言排序、篡改 fail-closed、版本发布、取消/删除、旧索引隔离与通道依赖缓存 |
 | 来源范围 | 文档族与具体文档、all/any/交并、标题/编号/角色定位、歧义/截断/跨版本、原文跨度、版本内目标扫描与跨版本结果等价 |

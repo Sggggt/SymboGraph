@@ -10,11 +10,11 @@ import time
 from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.core.config import get_settings
+from app.core.config import get_settings, runtime_settings_read_scope
 from app.models import AgentObservation, AgentTraceEvent, AnswerSession, Chunk, RetrievalTrace
 from app.retrieval_control_contracts import control_hash
 from app.services.agent_context import ContextUnit, plan_context
-from app.services.agent_reflection import history_summary_projection, render_answer_units
+from app.services.agent_reflection import render_answer_units
 from app.services.answer_sources import (
     build_answer_evidence_manifest,
     persist_answer_source_bindings,
@@ -54,7 +54,8 @@ def _prefers_chinese(text: str) -> bool:
 
 
 def _planning_call_count(run) -> int:
-    return int(((run.metadata_json or {}).get("intent_execution_plan") or {}).get("planning_model_call_count") or 1)
+    planning = (run.metadata_json or {}).get("intent_execution_plan") or {}
+    return int(planning.get("planning_model_call_count") or 1) + int(planning.get("checkpoint_model_call_count") or 0)
 
 
 def _agent_total_timeout_seconds(settings=None) -> float:
@@ -542,6 +543,7 @@ async def _generate_once(
     evidence = evidence_result.generation_evidence
     generation_view = evidence_result.generation_view
     contexts = list(evidence_result.selected_contexts)
+    generation_system, generation_packet, _ = model.generation_request(task=plan.task, evidence=evidence)
     generation_context_plan = plan_context(
         [
             ContextUnit(
@@ -549,17 +551,7 @@ async def _generate_once(
                 "user_task",
                 "P0",
                 json.dumps(
-                    {
-                        "question": plan.task.question,
-                        "requirements": [
-                            item.model_dump(mode="json")
-                            for item in plan.task.requirements
-                        ],
-                        "response_constraints": [
-                            item.model_dump(mode="json")
-                            for item in plan.task.response_constraints
-                        ],
-                    },
+                    {key: value for key, value in generation_packet.items() if key != "evidence"},
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
@@ -570,19 +562,21 @@ async def _generate_once(
                     f"generation:{source['source_handle']}",
                     "committed_raw_source",
                     "P1",
-                    source["text"],
+                    json.dumps(source, ensure_ascii=False, separators=(",", ":")),
                     set_name="working",
                     handle=source["source_handle"],
                 )
-                for source in evidence.sources
+                for source in generation_packet["evidence"]
             ],
         ],
-        input_token_budget=max(int(package.token_budget or 0) + 4096, 4096),
+        input_token_budget=settings.agent_context_window_tokens,
         reserved_output_tokens=min(
             settings.chat_json_max_tokens,
             settings.retrieval_generation_max_tokens,
         ),
         stable_prefix="SINGLE GROUNDED MARKDOWN ANSWER V3",
+        system_prompt=generation_system,
+        context_window_tokens=settings.agent_context_window_tokens,
     ).audit
     prepared = {
         "protocol_version": GENERATION_CALL_PROTOCOL,
@@ -849,10 +843,7 @@ async def _execute(db, request, session, run) -> dict:
     with qa_stage("database_commit"):
         db.commit()
     with qa_stage("history_projection"):
-        history_summary, history_audit = history_summary_projection(
-            [item.model_dump() for item in request.history],
-            max_characters=settings.agent_history_summary_max_chars,
-        )
+        history_summary, history_audit = "", {"protocol_version": "conversation_context_v1", "evidence_authority": False}
     with qa_stage("capability_manifest"):
         capabilities, _provisional_context_state = retrieval_capability_snapshot(
             db,
@@ -888,6 +879,7 @@ async def _execute(db, request, session, run) -> dict:
                 filters=request.filters,
                 verified_context_reuse_available=reuse_candidate is not None,
                 provider_factory=agent_graph.ChatProvider,
+                remaining_seconds=lambda: _remaining_agent_seconds(settings),
                 on_trace=lambda node, kwargs: agent_graph.trace(db, run.id, node, **kwargs),
             )
     except BaseException:
@@ -1119,7 +1111,7 @@ async def execute_intent_execution_agent(db, request, session, run) -> dict:
 
     performance = current_qa_performance() or QAPerformance()
     response = None
-    with performance.activate():
+    with performance.activate(), runtime_settings_read_scope():
         try:
             remaining = _remaining_agent_seconds(get_settings())
             async with asyncio.timeout(max(0.001, remaining)):
@@ -1228,10 +1220,7 @@ async def execute_intent_search(db, request) -> dict:
     run.current_node = "intent_planning"
     run.started_at = datetime.utcnow()
     db.commit()
-    history_summary, _history_audit = history_summary_projection(
-        [item.model_dump() for item in agent_request.history],
-        max_characters=get_settings().agent_history_summary_max_chars,
-    )
+    history_summary = ""
     capabilities, _provisional_context_state = retrieval_capability_snapshot(
         db,
         run.knowledge_base_id,
@@ -1252,6 +1241,7 @@ async def execute_intent_search(db, request) -> dict:
             capabilities=capabilities,
             filters=agent_request.filters,
             provider_factory=agent_graph.ChatProvider,
+            remaining_seconds=lambda: _remaining_agent_seconds(),
             on_trace=lambda node, kwargs: agent_graph.trace(db, run.id, node, **kwargs),
         )
     except BaseException:

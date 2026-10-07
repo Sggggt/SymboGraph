@@ -1327,6 +1327,7 @@ export type AgentTraceNode =
   | "intent_planning"
   | "planning_resource_titles"
   | "planning_resource_details"
+  | "planning_conversation_read"
   | "planning_schema_feedback"
   | "intent_execution_retrieval"
   | "source_integrity_admission"
@@ -1535,6 +1536,7 @@ export type AgentTraceScores = AgentTraceScoresFields &
         model_call_count?: number | null;
         resource_read_count?: number | null;
         planning_round?: number | null;
+        history_turn_count?: number | null;
         resource_mode?: "titles" | "details" | null;
         coarse_node_count?: number | null;
         model_duration_ms?: number | null;
@@ -2337,6 +2339,7 @@ export interface ModelSettingsResponse {
   context_path_summary_budget?: number;
   agent_answer_unit_limit?: number;
   agent_history_summary_max_chars?: number;
+  agent_context_window_tokens?: number;
   enable_model_fallback?: boolean;
   enable_database_fallback?: boolean;
   has_chat_api_key?: boolean;
@@ -2577,6 +2580,7 @@ export interface ModelSettingsUpdate {
   context_path_summary_budget?: number | null;
   agent_answer_unit_limit?: number | null;
   agent_history_summary_max_chars?: number | null;
+  agent_context_window_tokens?: number | null;
   embedding_api_key?: string | null;
   clear_embedding_api_key?: boolean;
 }

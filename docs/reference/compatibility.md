@@ -4,6 +4,8 @@
 
 | 旧对象或字段族 | 保留用途 | 新协议边界 |
 |---|---|---|
+| `layered_distance_traversal_v2` | 原始图路径与来源审计重放 | 新遍历 v3 在每一跳显式核验过滤域；缓存身份按新版本隔离，图边数值不变 |
+| `intent_task_v1`、规划 v5、`agent_context_plan_v1` | 按原始可选字段与 hash 读取既有记录 | 新规划使用 v6 与完整 envelope；旧 Task 空会话字段不参与序列化，不回填历史 |
 | `retrieval_granularity` 及旧 coarse/mid 请求 | 重放旧请求与 UI 历史 | 新请求不接收或默默映射为 LLM 策略；旧接口必须显式版本隔离 |
 | 旧 Task/词面规划与 `retrieval_fsm_v1` | 保持原字段、hash 与事件顺序 | 新 run 使用 Intent/ExecutionStrategy 和新状态版本 |
 | `intent_execution_strategy_v1.lexical_terms` | 只读重放已经持久化的目标主链早期计划 | 新 run 使用 `intent_execution_strategy_v2` 的双语 lexical groups；不得把旧 term 数组补写成伪造语言或翻译事实 |

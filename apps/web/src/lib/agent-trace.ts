@@ -5,6 +5,7 @@ export const contextGraphTraceFallbackSteps: AgentTraceNode[] = [
 ];
 
 const traceNodeLabels: Record<AgentTraceNode, string> = {
+  planning_conversation_read: "读取相关前文",
   retrieval_control: "检索与回答进度",
   query_understanding: "查询意图",
   query_facet_extraction: "查询 facets",
@@ -75,6 +76,7 @@ export function traceNodeLabel(node: string): string {
 }
 
 export function traceGroupForNode(node: string): TraceGroupKey {
+  if (node === "planning_conversation_read") return "entry";
   if (["reflection_gate", "answer_reflection", "reflection_backtrack", "reflection_action_validation"].includes(node)) {
     return "reflection";
   }
@@ -144,6 +146,7 @@ export function traceNodeVariant(node: string): "success" | "info" | "warning" |
     node === "intent_planning" ||
     node === "planning_resource_titles" ||
     node === "planning_resource_details" ||
+    node === "planning_conversation_read" ||
     node === "planning_schema_feedback" ||
     node === "intent_execution_retrieval" ||
     node === "source_integrity_admission" ||
@@ -254,6 +257,7 @@ export function traceAuditSummary(scores: AgentTraceScores | undefined): string[
     case "intent_execution":
       entries = [
         ["planning_round", "规划轮次", scores.planning_round],
+        ["history_turn_count", "前文轮数", scores.history_turn_count],
         ["coarse_node_count", "粗节点", scores.coarse_node_count],
         ["model_duration_ms", "模型等待", scores.model_duration_ms == null ? undefined : `${scores.model_duration_ms} ms`],
         ["local_read_duration_ms", "本地读取", scores.local_read_duration_ms == null ? undefined : `${scores.local_read_duration_ms} ms`],

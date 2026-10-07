@@ -2745,7 +2745,7 @@ def _validate_intent_execution_trace_path_facts(
         or scores.get("reward_call_count") != 0
         or trace.policy_state_hash is not None
         or not isinstance(traversal_identity, dict)
-        or traversal_identity.get("protocol_version") != "layered_distance_traversal_v2"
+        or traversal_identity.get("protocol_version") not in {"layered_distance_traversal_v2", "layered_distance_traversal_v3"}
         or control_hash(traversal_identity) != trace.traversal_protocol_hash
         or diagnostics.get("gray_zone_model_call_count") != 0
         or diagnostics.get("result_reflection_enabled") is not False
@@ -3831,7 +3831,7 @@ def _intent_execution_retrieval_trace_steps(
     if (
         diagnostics.get("protocol_version") != "intent_execution_retrieval_v1"
         or entry_layer not in {"coarse", "mid", "chunk"}
-        or convergence.get("protocol_version") != "layered_distance_traversal_v2"
+        or convergence.get("protocol_version") not in {"layered_distance_traversal_v2", "layered_distance_traversal_v3"}
         or convergence.get("model_call_count") != 0
         or convergence.get("gray_zone_model_call_count") != 0
         or convergence.get("cycle_reward") != 0

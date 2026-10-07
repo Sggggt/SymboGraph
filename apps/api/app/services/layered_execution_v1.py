@@ -36,7 +36,7 @@ from app.services.retrieval_corpus import RetrievalCorpus
 
 
 PROTOCOL = "intent_execution_retrieval_v1"
-TRAVERSAL_PROTOCOL = "layered_distance_traversal_v2"
+TRAVERSAL_PROTOCOL = "layered_distance_traversal_v3"
 GRAY_ZONE_PROTOCOL = "deterministic_support_progress_v2"
 
 
@@ -409,12 +409,16 @@ def _traverse(
     roots: Sequence[FusedEntry],
     edges: Sequence[Any] = (),
     adjacency_reader: CompleteChunkAdjacency | None = None,
+    allowed_node_ids: Iterable[str] | None = None,
     limit: int,
     max_depth: int,
     green: float,
     gray: float,
     hard: float,
 ) -> tuple[tuple[TraversedNode, ...], dict[str, Any]]:
+    domain = frozenset(allowed_node_ids) if allowed_node_ids is not None else None
+    if domain is not None and any(root.candidate_id not in domain for root in roots):
+        raise ValueError("traversal_root_outside_scope")
     adjacency: dict[str, list[tuple[str, Any]]] = defaultdict(list)
     for edge in edges:
         left, right = _edge_endpoints(edge, layer)
@@ -444,6 +448,7 @@ def _traverse(
     best: dict[tuple[str, str], tuple[float, int, tuple[str, ...]]] = {}
     decisions: list[dict[str, Any]] = []
     pruned = 0
+    domain_pruned = 0
     while queue and len(accepted) < limit:
         _distance, _depth, _path, state = heapq.heappop(queue)
         key = (state.root_node_id, state.node_id)
@@ -476,6 +481,9 @@ def _traverse(
             incident,
             key=lambda item: (float(item[1].distance), str(item[1].id), item[0]),
         ):
+            if domain is not None and neighbor not in domain:
+                domain_pruned += 1
+                continue
             if neighbor in state.node_path:
                 pruned += 1
                 continue
@@ -520,6 +528,7 @@ def _traverse(
         "visited_count": len(accepted),
         "frontier_remaining": len(queue),
         "dominance_or_cycle_pruned_count": pruned,
+        "domain_pruned_count": domain_pruned,
         "gray_zone_decisions": decisions,
         "stop_reason": "layer_budget_hit" if queue else "frontier_exhausted",
         "adjacency_query_count": (
@@ -879,7 +888,7 @@ def _replay_cached_execution(
             "evidence_roles": list(label.get("evidence_roles") or ["retrieval_hit"]),
             "support_refs": dict(label.get("support_refs") or {}),
             "entry_parent_refs": list(label.get("entry_parent_refs") or []),
-            "why_selected": "accepted_by_layered_distance_traversal_v2",
+            "why_selected": "accepted_by_layered_distance_traversal_v3",
         }
         results.append(
             search_payload_for_chunk(
@@ -905,7 +914,7 @@ def _replay_cached_execution(
                         if item.get("parent_node_id")
                     ],
                     "traversal": traversal,
-                    "why_selected": "layered_distance_traversal_v2_cache_replay",
+                    "why_selected": "layered_distance_traversal_v3_cache_replay",
                 },
             )
         )
@@ -1430,6 +1439,7 @@ async def execute_layered_retrieval(
             layer="coarse",
             roots=coarse_roots,
             edges=coarse_edges,
+            allowed_node_ids=coarse_concepts,
             limit=budget.layer_entries,
             max_depth=budget.max_depth,
             green=green,
@@ -1488,6 +1498,7 @@ async def execute_layered_retrieval(
             layer="mid",
             roots=mid_roots,
             edges=mid_edges,
+            allowed_node_ids=mid_concepts,
             limit=budget.layer_entries,
             max_depth=budget.max_depth,
             green=green,
@@ -1533,6 +1544,7 @@ async def execute_layered_retrieval(
         layer="chunk",
         roots=chunk_roots,
         adjacency_reader=chunk_adjacency,
+        allowed_node_ids=chunk_rows,
         limit=budget.layer_entries,
         max_depth=budget.max_depth,
         green=green,
@@ -1848,7 +1860,7 @@ async def execute_layered_retrieval(
                 {"parent_layer": "mid", "parent_node_id": parent_id}
                 for parent_id in dict.fromkeys(parent_refs.get(item.node_id, ()))
             ],
-            "why_selected": "accepted_by_layered_distance_traversal_v2",
+            "why_selected": "accepted_by_layered_distance_traversal_v3",
         }
         results.append(
             search_payload_for_chunk(
@@ -1866,7 +1878,7 @@ async def execute_layered_retrieval(
                     "support_ids": list(item.support_ids),
                     "parent_node_ids": list(dict.fromkeys(parent_refs.get(item.node_id, ()))),
                     "traversal": traversal,
-                    "why_selected": "layered_distance_traversal_v2",
+                    "why_selected": "layered_distance_traversal_v3",
                 },
             )
         )

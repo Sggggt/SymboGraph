@@ -1974,7 +1974,8 @@ class IntentExecutionTraceScores(AgentTraceScoresBase):
     entry_layer: Literal["coarse", "mid", "chunk"] | None = None
     model_call_count: int | None = Field(default=None, ge=0)
     resource_read_count: int | None = Field(default=None, ge=0, le=2)
-    planning_round: int | None = Field(default=None, ge=1, le=4)
+    planning_round: int | None = Field(default=None, ge=1)
+    history_turn_count: int | None = Field(default=None, ge=0)
     resource_mode: Literal["titles", "details"] | None = None
     coarse_node_count: int | None = Field(default=None, ge=0)
     model_duration_ms: int | None = Field(default=None, ge=0)
@@ -2084,6 +2085,7 @@ class AgentTraceEventPayload(ClosedContractModel):
         "intent_planning",
         "planning_resource_titles",
         "planning_resource_details",
+        "planning_conversation_read",
         "planning_schema_feedback",
         "intent_execution_retrieval",
         "source_integrity_admission",
@@ -2146,6 +2148,7 @@ class AgentTraceEventPayload(ClosedContractModel):
             "intent_planning": "intent_execution",
             "planning_resource_titles": "intent_execution",
             "planning_resource_details": "intent_execution",
+            "planning_conversation_read": "intent_execution",
             "planning_schema_feedback": "intent_execution",
             "intent_execution_retrieval": "intent_execution",
             "source_integrity_admission": "intent_execution",
@@ -8175,6 +8178,8 @@ class ModelSettingsResponse(PublicResponseModel):
     context_path_summary_budget: int | None = None
     agent_answer_unit_limit: int | None = Field(default=None, strict=True, ge=1, le=32)
     agent_history_summary_max_chars: int | None = Field(default=None, strict=True, ge=512, le=12000)
+
+    agent_context_window_tokens: int | None = Field(default=None, strict=True, ge=16384, le=1048576)
     enable_model_fallback: bool | None = None
     enable_database_fallback: bool | None = None
     has_chat_api_key: bool | None = None
@@ -8207,6 +8212,7 @@ class ModelSettingsResponse(PublicResponseModel):
 
 
 class ModelSettingsUpdate(APIModel):
+    agent_context_window_tokens: int | None = Field(default=None, strict=True, ge=16384, le=1048576)
     retrieval_total_timeout_seconds: int | None = Field(default=None, strict=True, ge=15, le=3600)
     retrieval_generation_timeout_seconds: int | None = Field(default=None, strict=True, ge=10, le=600)
     retrieval_planning_max_tokens: int | None = Field(default=None, strict=True, ge=256, le=8192)

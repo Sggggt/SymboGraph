@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import time
 from typing import Any, Callable, Literal
+from app.core.config import get_settings
 
 from pydantic import Field, model_validator
 from sqlalchemy import select
@@ -118,6 +119,17 @@ class EvidenceDecisionStateError(ValueError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+def evidence_tool_schemas(allow_read: bool) -> list[dict[str, Any]]:
+    tools = [{"name": "evidence_commit", "result_tool": "evidence.commit",
+              "description": "Commit only source handles returned by earlier reads.",
+              "input_schema": EvidenceCommitArguments.model_json_schema()}]
+    if allow_read:
+        tools.insert(0, {"name": "evidence_read", "result_tool": "evidence.read",
+                        "description": "Read one or more unread semantic nodes.",
+                        "input_schema": EvidenceReadArguments.model_json_schema()})
+    return tools
 
 
 @dataclass(frozen=True)
@@ -241,7 +253,7 @@ def _validate_state(
     plans = list(state.get("context_plans") or ())
     if any(
         not isinstance(item, dict)
-        or item.get("protocol_version") != "agent_context_plan_v1"
+        or item.get("protocol_version") not in {"agent_context_plan_v1", "agent_context_plan_v2"}
         or item.get("body_persisted") is not False
         or item.get("plan_hash")
         != control_hash({key: value for key, value in item.items() if key != "plan_hash"})
@@ -989,9 +1001,12 @@ async def run_evidence_read_loop(
         )
         context_plan = plan_context(
             units,
-            input_token_budget=max(int(package.token_budget or 0) + 8192, 8192),
+            input_token_budget=get_settings().agent_context_window_tokens,
             reserved_output_tokens=max_tokens,
             stable_prefix=evidence_tool_system_prompt(),
+            system_prompt=evidence_tool_system_prompt(),
+            tools=evidence_tool_schemas(bool(state["remaining_mid_handles"])),
+            context_window_tokens=get_settings().agent_context_window_tokens,
         )
         kept = set(context_plan.kept_keys)
         messages = [message for index, message in enumerate(messages) if f"message:{index}" in kept]

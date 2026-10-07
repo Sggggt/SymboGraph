@@ -69,7 +69,7 @@ async def test_system_capability_uses_one_plan_and_zero_retrieval_or_sources(
 
     class Model(fake_model_stack["ChatProvider"]):
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
-            assert "INTENT EXECUTION PLANNING V5" in system_prompt
+            assert "INTENT EXECUTION PLANNING V6" in system_prompt
             calls.append("plan")
             return {
                 "intent": {"primary": "system_capability"},
@@ -125,7 +125,7 @@ async def test_retrieval_path_has_one_plan_finite_evidence_selection_one_generat
 
     class Model(fake_model_stack["ChatProvider"]):
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
-            if "INTENT EXECUTION PLANNING V5" in system_prompt:
+            if "INTENT EXECUTION PLANNING V6" in system_prompt:
                 calls.append("plan")
                 return proposal(layer="chunk")
             if "EVIDENCE TOOL SESSION V1" in system_prompt:
@@ -192,7 +192,7 @@ async def test_generation_shape_failure_persists_content_free_diagnostics(
 
     class Model(fake_model_stack["ChatProvider"]):
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
-            if "INTENT EXECUTION PLANNING V5" in system_prompt:
+            if "INTENT EXECUTION PLANNING V6" in system_prompt:
                 return proposal(layer="chunk")
             return await super().classify_json(system_prompt, user_prompt, fallback)
 
@@ -245,7 +245,7 @@ async def test_failed_source_admission_terminal_is_not_persisted_as_reusable_evi
 
     class Model(fake_model_stack["ChatProvider"]):
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
-            assert "INTENT EXECUTION PLANNING V5" in system_prompt
+            assert "INTENT EXECUTION PLANNING V6" in system_prompt
             return proposal(layer="chunk")
 
     def reject_package(*_args, **_kwargs):
@@ -299,7 +299,7 @@ async def test_search_uses_the_same_plan_and_source_admission_without_generation
 
     class Model(fake_model_stack["ChatProvider"]):
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
-            assert "INTENT EXECUTION PLANNING V5" in system_prompt
+            assert "INTENT EXECUTION PLANNING V6" in system_prompt
             calls.append("plan")
             return proposal(layer="mid")
 
@@ -356,7 +356,7 @@ async def test_verified_context_reuse_replays_same_session_sources_without_new_r
     class Model(fake_model_stack["ChatProvider"]):
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
             nonlocal planning_calls, answer_calls
-            if "INTENT EXECUTION PLANNING V5" in system_prompt:
+            if "INTENT EXECUTION PLANNING V6" in system_prompt:
                 planning_calls += 1
                 raw = proposal(layer="chunk")
                 if planning_calls == 2:
@@ -441,7 +441,7 @@ async def test_grounded_sse_visible_text_is_the_persisted_answer_and_citations_f
 
     class Model(fake_model_stack["ChatProvider"]):
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
-            if "INTENT EXECUTION PLANNING V5" in system_prompt:
+            if "INTENT EXECUTION PLANNING V6" in system_prompt:
                 return proposal(layer="chunk")
             return await super().classify_json(system_prompt, user_prompt, fallback)
 
@@ -537,7 +537,7 @@ async def test_sse_and_sync_share_the_same_terminal_response_contract(
 
     class Model(fake_model_stack["ChatProvider"]):
         async def classify_json(self, system_prompt, user_prompt, fallback=None):
-            assert "INTENT EXECUTION PLANNING V5" in system_prompt
+            assert "INTENT EXECUTION PLANNING V6" in system_prompt
             return {
                 "intent": {"primary": "system_capability"},
                 "execution_strategy": {

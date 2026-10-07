@@ -867,6 +867,7 @@ class ChatProvider:
         compatibility_user_prompt: str | None = None,
         response_schema: dict[str, Any] | None = None,
         native_tools: list[dict[str, Any]] | None = None,
+        history_messages: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Run structured generation over one continuous user/assistant history.
 
@@ -919,6 +920,7 @@ class ChatProvider:
         )
         payload["messages"] = [
             {"role": "system", "content": system_prompt},
+            *(history_messages or []),
             *normalized,
         ]
         if response_schema is not None:
@@ -929,6 +931,7 @@ class ChatProvider:
                 anthropic_payload["messages"] = self._anthropic_native_tool_history(
                     normalized
                 )
+                anthropic_payload["messages"] = [*(history_messages or []), *anthropic_payload["messages"]]
                 return await self._post_anthropic_sdk_tool(
                     anthropic_payload,
                     native_tools

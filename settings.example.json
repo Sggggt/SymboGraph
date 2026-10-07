@@ -9,6 +9,7 @@
     "agent_coarse_initial_budget": 3,
     "agent_coarse_top_k": 5,
     "agent_history_summary_max_chars": 4000,
+    "agent_context_window_tokens": 65536,
     "agent_max_depth_per_layer": 3,
     "agent_max_edge_reuse": 2,
     "agent_max_labels_per_node": 3,

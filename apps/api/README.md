@@ -4,6 +4,8 @@ FastAPI 负责资料库、导入、四层图、检索、QA 和运行配置。Wor
 
 ## 入口
 
+统一上下文使用 `agent_context_plan_v2`，同 session 的历史由 `conversation_context_v1` 按完整消息与可重放检查点投影。规划 `intent_execution_planning_call_v6` 支持有界 `conversation.read`，`context_turn_keys` 编译为见证用户要求；最终生成只收到完整 Task 控制信息和冻结原文。无预算压力不增加检查点模型调用。完整 schema 与生命周期以白皮书和协议参考为准。
+
 | 文件或模块 | 职责 |
 |---|---|
 | `app/main.py`、`app/api.py`、`app/routers/` | 应用启动、中间件和路由 |
@@ -20,7 +22,7 @@ FastAPI 负责资料库、导入、四层图、检索、QA 和运行配置。Wor
 | `services/qa_performance.py`、`build_performance.py` | 阶段计时 |
 | `services/qdrant_outbox.py`、`maintenance.py` | 派生状态、恢复与维护 |
 
-目标协议已成为当前运行入口：`intent_execution_planning_call_v5` 按状态暴露 `resource.read_titles/details` 与 `plan.retrieve/reuse/system_capability/clarify` 真实小工具；模型提交 `minimal_retrieval_plan_v1`，本地编译为完整 `intent_execution_strategy_v2`。可翻译 concept 组携带中英文 surface，identifier/number-unit 不向模型暴露 language 并确定性编译为 neutral。空词面使用 Dense-only，混合计划按层执行 Dense/RQ/BM25 独立提名和图路径遍历。Context Package 经确定性来源准入后只生成一次回答。
+目标协议已成为当前运行入口：`intent_execution_planning_call_v6` 按状态暴露 `resource.read_titles/details` 与 `plan.retrieve/reuse/system_capability/clarify` 真实小工具；模型提交 `minimal_retrieval_plan_v2`，本地编译为完整 `intent_execution_strategy_v2`。可翻译 concept 组携带中英文 surface，identifier/number-unit 不向模型暴露 language 并确定性编译为 neutral。空词面使用 Dense-only，混合计划按层执行 Dense/RQ/BM25 独立提名和图路径遍历。Context Package 经确定性来源准入后只生成一次回答。
 
 一次回答使用 `grounded_markdown_inline_citations_v1` 原生文本流。模型直接生成最终 GFM，不再返回外层 JSON，并可用 `⟦cite:src_n⟧` 标注原文来源；合法标记在流中确定性转换为序号链接，前端显示为浅灰胶囊，非法或未知标记原样输出而不使回答失败。标题、列表、表格、代码块和 `$...$`/`$$...$$` 都是最终正文的一部分，不经过完成后正文替换。正文完成后，服务端把本轮实际送入模型的已准入 Context Package 来源绑定到完整答案跨度，并单独发送引用列表。
 

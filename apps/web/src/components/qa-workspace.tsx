@@ -78,6 +78,7 @@ type AgentSettingsForm = {
   agent_path_distance_hard_threshold: string;
   agent_answer_unit_limit: string;
   agent_history_summary_max_chars: string;
+  agent_context_window_tokens: string;
 };
 
 type AgentNumberSettingKey = keyof AgentSettingsForm;
@@ -162,7 +163,8 @@ const agentControlFields: AgentNumberField[] = [
   { key: "agent_path_distance_gray_threshold", label: "路径灰区阈值", min: 0, max: 20, step: 0.01 },
   { key: "agent_path_distance_hard_threshold", label: "路径硬中断阈值", min: 0, max: 40, step: 0.01 },
   { key: "agent_answer_unit_limit", label: "回答单元上限", min: 1, max: 32 },
-  { key: "agent_history_summary_max_chars", label: "前文摘要字数上限", min: 512, max: 12000 },
+  { key: "agent_history_summary_max_chars", label: "前文检查点字数上限", min: 512, max: 12000 },
+  { key: "agent_context_window_tokens", label: "模型上下文窗口（token）", min: 16384, max: 1048576 },
 ];
 
 function isAbortError(error: unknown): boolean {
@@ -200,6 +202,7 @@ function agentSettingsFormFromSettings(settings?: ModelSettingsResponse | null):
     agent_path_distance_hard_threshold: stringSetting(settings?.agent_path_distance_hard_threshold, 2.4),
     agent_answer_unit_limit: stringSetting(settings?.agent_answer_unit_limit, 12),
     agent_history_summary_max_chars: stringSetting(settings?.agent_history_summary_max_chars, 4000),
+    agent_context_window_tokens: stringSetting(settings?.agent_context_window_tokens, 65536),
   };
 }
 
@@ -220,6 +223,7 @@ function buildAgentSettingsPayload(form: AgentSettingsForm): ModelSettingsUpdate
     agent_path_distance_hard_threshold: parseFloatField(form.agent_path_distance_hard_threshold),
     agent_answer_unit_limit: parseIntField(form.agent_answer_unit_limit),
     agent_history_summary_max_chars: parseIntField(form.agent_history_summary_max_chars),
+    agent_context_window_tokens: parseIntField(form.agent_context_window_tokens),
   };
 }
 

@@ -6,7 +6,7 @@ Context Package or the corresponding navigation resource.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from typing import Any, Iterable, Literal, Sequence
@@ -14,7 +14,7 @@ from typing import Any, Iterable, Literal, Sequence
 from app.retrieval_control_contracts import control_hash
 
 
-CONTEXT_PLAN_PROTOCOL = "agent_context_plan_v1"
+CONTEXT_PLAN_PROTOCOL = "agent_context_plan_v2"
 CONTEXT_EVENT_PROTOCOL = "context_event_log_v1"
 Priority = Literal["P0", "P1", "P2", "P3", "P4"]
 _PRIORITY_ORDER: dict[Priority, int] = {
@@ -102,6 +102,7 @@ class ContextUnit:
     set_name: Literal["pinned", "working", "compressed", "evicted"] = "working"
     dedupe_key: str | None = None
     handle: str | None = None
+    replacement: str | None = None
 
     @property
     def estimated_tokens(self) -> int:
@@ -112,6 +113,7 @@ class ContextUnit:
 class ContextPlanResult:
     kept_keys: tuple[str, ...]
     audit: dict[str, Any]
+    units: tuple[ContextUnit, ...] = ()
 
 
 def estimate_tokens(text: str) -> int:
@@ -143,6 +145,9 @@ def plan_context(
     reserved_output_tokens: int,
     stable_prefix: str,
     input_token_count: int | None = None,
+    system_prompt: str | None = None,
+    tools: Sequence[dict[str, Any]] = (),
+    context_window_tokens: int | None = None,
 ) -> ContextPlanResult:
     """Select complete semantic units without splitting atomic tool pairs."""
 
@@ -151,6 +156,16 @@ def plan_context(
     if len({unit.key for unit in units}) != len(units):
         raise ValueError("context_unit_key_duplicate")
 
+    complete_envelope = system_prompt is not None or context_window_tokens is not None
+    system_tokens = estimate_tokens(system_prompt or "")
+    tool_tokens = estimate_tokens(json.dumps(tools, ensure_ascii=False, separators=(",", ":"))) if tools else 0
+    overhead = system_tokens + tool_tokens
+    safety_tokens = 256 if complete_envelope else 0
+    if context_window_tokens is not None:
+        input_token_budget = min(input_token_budget, context_window_tokens - reserved_output_tokens - safety_tokens)
+    body_budget = input_token_budget - overhead
+    if body_budget <= 0:
+        raise ContextCapacityError("context_envelope_capacity_exceeded")
     kept = list(units)
     removed: list[dict[str, Any]] = []
     seen_dedupe: set[str] = set()
@@ -202,7 +217,7 @@ def plan_context(
     ]
 
     for priority, reason in (("P2", "compressed_control_history"), ("P3", "evicted_on_budget")):
-        if total_tokens(kept) <= input_token_budget:
+        if total_tokens(kept) <= body_budget:
             break
         groups = _grouped(kept)
         candidates = [
@@ -212,8 +227,17 @@ def plan_context(
             and any(unit.priority == priority for unit in group)
         ]
         for index, group in candidates:
-            if total_tokens(kept) <= input_token_budget:
+            if total_tokens(kept) <= body_budget:
                 break
+            if priority == "P2" and complete_envelope:
+                replacements = [replace(unit, content=unit.replacement, set_name="compressed") if unit.replacement is not None else unit for unit in group]
+                if total_tokens(replacements) >= total_tokens(group):
+                    continue
+                by_key = {unit.key: unit for unit in replacements}
+                kept = [by_key.get(unit.key, unit) for unit in kept]
+                removed.extend({"key": unit.key, "kind": unit.kind, "handle": unit.handle,
+                                "priority": unit.priority, "reason": reason} for unit in group if by_key[unit.key].content != unit.content)
+                continue
             group_keys = {unit.key for unit in group}
             kept = [unit for unit in kept if unit.key not in group_keys]
             for unit in group:
@@ -227,7 +251,7 @@ def plan_context(
                     }
                 )
 
-    estimated = total_tokens(kept)
+    estimated = total_tokens(kept) + overhead
     if estimated > input_token_budget:
         raise ContextCapacityError("context_p0_p1_capacity_exceeded")
 
@@ -244,7 +268,7 @@ def plan_context(
         for item in removed
     )
     audit = {
-        "protocol_version": CONTEXT_PLAN_PROTOCOL,
+        "protocol_version": CONTEXT_PLAN_PROTOCOL if complete_envelope else "agent_context_plan_v1",
         "token_accounting_mode": (
             "provider_actual" if input_token_count is not None else "utf8_quarter_estimate_v1"
         ),
@@ -256,6 +280,10 @@ def plan_context(
         "total_token_count": None,
         "input_token_budget": input_token_budget,
         "output_token_budget": reserved_output_tokens,
+        **({"context_window_tokens": context_window_tokens,
+            "token_counts": {"system": system_tokens, "tools": tool_tokens,
+                                 "messages": total_tokens(kept), "output_reserve": reserved_output_tokens,
+                                 "safety_reserve": safety_tokens}} if complete_envelope else {}),
         "prompt_cache_prefix_hash": hashlib.sha256(stable_prefix.encode("utf-8")).hexdigest(),
         "priority_units": priority_counts,
         "sets": set_counts,
@@ -270,7 +298,7 @@ def plan_context(
         "body_persisted": False,
     }
     audit["plan_hash"] = control_hash(audit)
-    return ContextPlanResult(tuple(unit.key for unit in kept), audit)
+    return ContextPlanResult(tuple(unit.key for unit in kept), audit, tuple(kept))
 
 
 def apply_provider_usage(

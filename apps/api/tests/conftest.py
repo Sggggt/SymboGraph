@@ -340,7 +340,7 @@ def fake_model_stack(monkeypatch: pytest.MonkeyPatch):
             return None
 
         async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None) -> dict:
-            if "INTENT EXECUTION PLANNING V5" in system_prompt:
+            if "INTENT EXECUTION PLANNING V6" in system_prompt:
                 import json
                 packet = json.loads(user_prompt)
                 capabilities = packet["capabilities"]

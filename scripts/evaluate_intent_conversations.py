@@ -230,7 +230,8 @@ def _persisted_audit(
         and int(plan_rows[0].observation_json.get("resource_read_count") or 0) <= 2
         and plan_rows[0].observation_json.get("schema_repair_count") == 0
         and plan_rows[0].observation_json.get("model_call_count")
-        == int(plan_rows[0].observation_json.get("resource_read_count") or 0) + 1,
+        == int(plan_rows[0].observation_json.get("resource_read_count") or 0)
+        + int(plan_rows[0].observation_json.get("conversation_read_count") or 0) + 1,
         "no_online_reward": reward_count == 0 and lexical_reward_count == 0,
         "step_timing_complete": performance["protocol_version"]
         == "qa_stage_timing_v1"

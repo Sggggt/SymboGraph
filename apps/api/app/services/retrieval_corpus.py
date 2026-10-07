@@ -7,7 +7,7 @@ import re
 import unicodedata
 
 import numpy as np
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import load_only
 from threadpoolctl import threadpool_limits
 
@@ -93,10 +93,7 @@ class RetrievalCorpus:
                 chunk_columns.append(Chunk.chunk_version)
             if filters.partition or filters.content_kinds:
                 chunk_columns.append(Chunk.metadata_json)
-            raw = list(db.execute(select(Chunk, DocumentVersion, Document, VectorRecord)
-                .options(load_only(*chunk_columns),
-                    load_only(DocumentVersion.id, DocumentVersion.document_id, DocumentVersion.checksum, DocumentVersion.is_active),
-                    load_only(Document.id, Document.title, Document.source_type, Document.source_path, Document.tags, Document.is_active))
+            base_query = (select(Chunk, DocumentVersion, Document, VectorRecord)
                 .join(DocumentVersion, DocumentVersion.id == Chunk.document_version_id)
                 .join(Document, Document.id == Chunk.document_id)
                 .join(VectorRecord, VectorRecord.chunk_id == Chunk.id)
@@ -106,11 +103,19 @@ class RetrievalCorpus:
                        VectorRecord.embedding_dimension == schema.embedding_dimension,
                        VectorRecord.embedding_text_version == schema.embedding_text_version,
                        VectorRecord.chunk_schema_version == schema.chunk_schema_version,
-                       VectorRecord.vector_status == target.ready_vector_status)
+                       VectorRecord.vector_status == target.ready_vector_status))
+            query = base_query.where(Chunk.document_id.in_(filters.document_ids)) if filters.document_ids else base_query
+            raw = list(db.execute(query.options(load_only(*chunk_columns),
+                load_only(DocumentVersion.id, DocumentVersion.document_id, DocumentVersion.checksum, DocumentVersion.is_active),
+                load_only(Document.id, Document.title, Document.source_type, Document.source_path, Document.tags, Document.is_active))
                 .order_by(Chunk.id)))
             eligible = [row for row in raw if passes_filters(db, row[0], filters)]
-            if raw and not eligible:
-                raise EmptyFilteredRetrievalScope(len(raw))
+            if not eligible:
+                available_count = len(raw)
+                if not raw and filters.document_ids:
+                    available_count = db.scalar(select(func.count()).select_from(base_query.subquery())) or 0
+                if available_count:
+                    raise EmptyFilteredRetrievalScope(available_count)
             settings = get_settings()
             size = len(eligible) * schema.embedding_dimension * np.dtype(np.float64).itemsize * 2
             if size > settings.graph_compute_memory_mb * 1024 * 1024:

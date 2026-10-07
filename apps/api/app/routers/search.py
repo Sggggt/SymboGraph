@@ -270,19 +270,19 @@ async def qa(request: QARequest) -> dict:
     except (ConversationStateConflictError, ConversationStateIntegrityError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except LookupError as exc:
+        if isinstance(exc, (KeyError, IndexError)):
+            raise qa_execution_http_exception(exc) from exc
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
-        run_id = getattr(exc, "agent_run_id", None)
-        session_id = getattr(exc, "agent_session_id", None)
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "code": "agent_qa_failed",
-                "message": public_exception_message(exc),
-                "run_id": str(run_id) if run_id else None,
-                "session_id": str(session_id) if session_id else None,
-            },
-        ) from exc
+        raise qa_execution_http_exception(exc) from exc
+
+
+def qa_execution_http_exception(exc: Exception) -> HTTPException:
+    return HTTPException(status_code=502, detail={
+        "code": "agent_qa_failed", "message": public_exception_message(exc),
+        "run_id": str(exc.agent_run_id) if getattr(exc, "agent_run_id", None) else None,
+        "session_id": str(exc.agent_session_id) if getattr(exc, "agent_session_id", None) else None,
+    })
 
 
 @router.post(

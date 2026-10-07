@@ -5,7 +5,7 @@ import math
 import re
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator, model_serializer
 
 from app.retrieval_control_contracts import ResponseConstraint, SourceScopeObligation, control_hash
 
@@ -258,8 +258,13 @@ class IntentPlanningOutput(ClosedPlan):
         return self
 
 
+class ConversationUserContext(ClosedPlan):
+    turn_key: str = Field(pattern=r"^turn_[1-9][0-9]*$")
+    text: str = Field(min_length=1, max_length=12000)
+
+
 class TaskContract(ClosedPlan):
-    protocol_version: Literal["intent_task_v1"] = "intent_task_v1"
+    protocol_version: Literal["intent_task_v1", "intent_task_v2"] = "intent_task_v1"
     knowledge_base_id: str = Field(min_length=1, max_length=160)
     conversation_identity_hash: Identity
     conversation_scope_hash: Identity
@@ -268,20 +273,33 @@ class TaskContract(ClosedPlan):
     requirements: tuple[TaskRequirement, ...] = Field(default=(), max_length=8)
     entities: tuple[str, ...] = Field(default=(), max_length=16)
     response_constraints: tuple[ResponseConstraint, ...] = Field(default=(), max_length=12)
+    conversation_context: tuple[ConversationUserContext, ...] = Field(default=(), max_length=8)
+    session_instructions: tuple[str, ...] = Field(default=(), max_length=16)
     allow_partial: Literal[True] = True
+
+    @model_serializer(mode="wrap")
+    def preserve_history_identity(self, handler):
+        value = handler(self)
+        if self.protocol_version == "intent_task_v1" and not self.conversation_context:
+            value.pop("conversation_context", None)
+            value.pop("session_instructions", None)
+        return value
 
     @model_validator(mode="after")
     def user_authority(self):
+        if (self.conversation_context or self.session_instructions) and self.protocol_version != "intent_task_v2":
+            raise ValueError("intent_conversation_context_protocol_invalid")
         if not self.question.strip() or "\x00" in self.question:
             raise ValueError("intent_question_invalid")
         if len({r.id for r in self.requirements}) != len(self.requirements):
             raise ValueError("intent_duplicate_requirement")
+        quoted_user_text = (self.question, *(item.text for item in self.conversation_context), *self.session_instructions)
         for item in self.response_constraints:
             left, right = item.char_span
             if not 0 <= left < right <= len(self.question) or self.question[left:right] != item.text:
                 raise ValueError("intent_response_constraint_not_quoted")
         for requirement in self.requirements:
-            if any(not literal.strip() or literal not in self.question for literal in requirement.protected_literals):
+            if any(not literal.strip() or not any(literal in text for text in quoted_user_text) for literal in requirement.protected_literals):
                 raise ValueError("intent_protected_literal_not_quoted")
             nodes = [requirement.source_scope] if requirement.source_scope else []
             count = 0
@@ -295,7 +313,7 @@ class TaskContract(ClosedPlan):
                 if scope is not None:
                     nodes.append(scope)
                 selector = getattr(node, "selector", None)
-                if selector is not None and (not selector.reference.strip() or selector.reference not in self.question):
+                if selector is not None and (not selector.reference.strip() or not any(selector.reference in text for text in quoted_user_text)):
                     raise ValueError("intent_source_scope_not_quoted")
         return self
 
@@ -337,9 +355,13 @@ class AcceptedPlan(ClosedPlan):
 
 def accept_plan(proposal: IntentPlanningOutput, *, question: str, conversation_scope_hash: str,
                 filter_scope_hash: str, capabilities: CapabilityManifest,
-                conversation_identity_hash: str | None = None) -> AcceptedPlan:
+                conversation_identity_hash: str | None = None,
+                conversation_context: tuple[ConversationUserContext, ...] = (),
+                session_instructions: tuple[str, ...] = ()) -> AcceptedPlan:
     strategy = proposal.execution_strategy
     from app.services.task_constraints import response_constraints
+    quoted_user_text = (question, *(item.text for item in conversation_context), *session_instructions)
+    witnessed = lambda text: any(text in original for original in quoted_user_text)
 
     def quoted_scope(scope) -> bool:
         if scope is None:
@@ -356,7 +378,7 @@ def accept_plan(proposal: IntentPlanningOutput, *, question: str, conversation_s
             if child_scope is not None:
                 pending.append(child_scope)
             selector = getattr(node, "selector", None)
-            if selector is not None and selector.reference not in question:
+            if selector is not None and not witnessed(selector.reference):
                 return False
         return True
 
@@ -445,7 +467,7 @@ def accept_plan(proposal: IntentPlanningOutput, *, question: str, conversation_s
                 "protected_literals": tuple(
                     literal
                     for literal in item.protected_literals
-                    if literal in question
+                    if witnessed(literal)
                 ),
                 "source_scope": (
                     authorized_scope
@@ -496,11 +518,12 @@ def accept_plan(proposal: IntentPlanningOutput, *, question: str, conversation_s
                 raise ValueError("strategy_bilingual_concept_surfaces_missing")
     for group in strategy.lexical_groups:
         if group.kind == "quoted_literal" and any(
-            surface.provenance != "user_text" or surface.text not in question
+            surface.provenance != "user_text" or not witnessed(surface.text)
             for surface in group.surfaces
         ):
             raise ValueError("strategy_quoted_literal_not_user_text")
-    task = TaskContract(knowledge_base_id=capabilities.knowledge_base_id,
+    task = TaskContract(protocol_version="intent_task_v2" if conversation_context or session_instructions else "intent_task_v1",
+        conversation_context=conversation_context, session_instructions=session_instructions, knowledge_base_id=capabilities.knowledge_base_id,
         conversation_identity_hash=(conversation_identity_hash or control_hash(
             {"legacy_conversation_scope_hash": conversation_scope_hash}
         )), conversation_scope_hash=conversation_scope_hash, filter_scope_hash=filter_scope_hash,

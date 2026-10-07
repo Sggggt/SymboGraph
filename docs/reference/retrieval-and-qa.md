@@ -4,11 +4,21 @@
 
 ## 请求与规划
 
+### 统一会话上下文
+
+新请求使用 `intent_execution_planning_call_v6 / minimal_retrieval_plan_v2 / agent_context_plan_v2`。规划包含同 session 的有序完整近期 user/assistant 消息、可重放历史检查点和明确持久用户约束；它们没有事实授权。完整请求计入 system、工具 schema、当前 Task 与全部消息，从 `agent_context_window_tokens` 扣除输出预留及安全余量。
+
+`conversation.read(keys)` 只接受本轮显式历史 handle 范围中的临时 turn handles，返回完整问答对；每次至少消费一个未读 turn，批量及输入受工具 schema 和剩余预算约束。语义目录按稳定优先队列选择；只展示子集时明确 directory_complete=false，原问答保持完整并可恢复。读取加入同一工具会话。计划的可选 `context_turn_keys` 是最小语义选择，服务端映射为原始历史用户文本；原问题保持原样，实体和 requirements 解析指代。`intent_task_v2.conversation_context` 只携带同 session 原文核验的用户要求，历史 assistant 回答不能作为事实或来源责任见证。
+
+仅在预算压力下调用 `conversation.checkpoint` 选择关键原文片段，服务端核对消息与 quote，持久化 `conversation_checkpoint_v1` 的跨度、顺序、前缀身份，不复制原文。恢复从 transcript 重建检查点，归档 turn 可完整读取。小输入无需摘要调用。旧控制工具历史使用确定性闭合状态替代；合法原文工具对保持原子性。
+
+最终生成输入为原问题、解析后的 Task、见证用户约束与冻结工作集完整原文；旧回答和检查点只帮助规划。全部单次绝对截止覆盖队列、attempts 和 backoff，并受整链剩余时间约束。
+
 ### 统一入口
 
 后端 Search、同步 QA 和 SSE QA 共用同一规划与分层检索契约。Search 在结果与来源返回后结束，QA 再生成一次回答。前端不提供独立 Search 产品页，也不提供普通/摘要模式选择；问答仍使用后端共享检索契约，回答风格不控制图入口。
 
-LLM 在 `intent_execution_planning_call_v5` 连续规划会话中直接调用 `plan.retrieve`、条件可用的 `plan.reuse`、`plan.system_capability` 或 `plan.clarify`，也可先调用有界的 `resource.read_titles` 与 `resource.read_details`。assistant tool call 与 tool result 按顺序保留，不把已读材料复制进下一轮无状态 packet。它只能使用原问题、用户明确的会话约束、非事实性会话摘要、服务器提供的有界 capability manifest 和本轮获准的粗层导航材料。manifest 只包含会改变合法动作的层、通道、双语开关与预算上限，不包含数据库身份、旧答案或旧模型判决。
+LLM 在 `intent_execution_planning_call_v6` 连续规划会话中直接调用 `plan.retrieve`、条件可用的 `plan.reuse`、`plan.system_capability` 或 `plan.clarify`，也可先调用有界的 `resource.read_titles` 与 `resource.read_details`。assistant tool call 与 tool result 按顺序保留，不把已读材料复制进下一轮无状态 packet。它只能使用原问题、用户明确的会话约束、非事实性会话摘要、服务器提供的有界 capability manifest 和本轮获准的粗层导航材料。manifest 只包含会改变合法动作的层、通道、双语开关与预算上限，不包含数据库身份、旧答案或旧模型判决。
 
 计划必须在检索前通过最小工具 schema、确定性编译后的完整 `IntentPlanningOutput`、本地权限和预算校验并持久化。模型只能调用当前状态实际暴露的工具；服务端执行读取和提交。工具名固定动作和 route，模型不能在开放参数对象中再选一次工具，不能调用未暴露动作、选择不存在的字段、修改图边、放宽用户范围或直接提交数据库 ID。执行器依据最小工具参数行动。
 
@@ -18,13 +28,13 @@ LLM 在 `intent_execution_planning_call_v5` 连续规划会话中直接调用 `p
 
 执行器把实际完成的标题目录、详情读取和一次格式反馈按发生顺序写入 Agent run 轨迹，最终 plan 校验通过后再写规划完成事件。轨迹仅提供有限动作/计数/耗时审计；原文目录与摘要只进入本轮有界规划输入，不作为公开轨迹事实或回答证据。直接 plan 无读取事件；历史与断线恢复从同一持久事件序列读取。
 
-初始状态在 coarse 可用时暴露无参数 `resource.read_titles`；否则不暴露读取工具。标题目录返回后才暴露 `resource.read_details(keys)`，其中 keys 为本轮目录临时键、1–4个、不重复，不能使用数据库 ID；详情返回后不再暴露读取工具。各状态同时暴露合法计划工具：`plan.retrieve`，同会话复用可用时的 `plan.reuse`，以及无参数的 `plan.system_capability/plan.clarify`。最多两次读，正常路径最多三次规划模型调用。仅当计划参数或编译后的完整契约首次非法时，服务端返回不含原始响应的安全字段路径/错误码，并只暴露对应计划工具要求重提一次，总调用上限为四次。第二次仍非法则在正式检索前失败。
+初始状态在 coarse 可用时暴露无参数 `resource.read_titles`；否则不暴露资料导航读取工具。标题目录返回后才暴露 `resource.read_details(keys)`，其中 keys 为本轮目录临时键、1–4个、不重复，不能使用数据库 ID；详情返回后不再暴露资料导航读取工具。存在尚未展开的历史问答时同时暴露 `conversation.read(keys)`，每次消费有限未读集合中的至少一个 turn。各状态同时暴露合法计划工具：`plan.retrieve`，同会话复用可用时的 `plan.reuse`，以及无参数的 `plan.system_capability/plan.clarify`。资料导航最多两次读取，历史读取数不超过历史 turn 数；正常调用数为实际资料/历史读取数加一次计划提交。仅当计划参数或编译后的完整契约首次非法时，服务端返回不含原始响应的安全字段路径/错误码，并只暴露对应计划工具要求重提一次。总调用上限为历史 turn 数加四，且仍受共享绝对时限约束；第二次仍非法则在正式检索前失败。
 
 Anthropic 等原生工具路径必须返回且只返回一个当前允许的 `tool_use`；`end_turn` 文本、多个工具、未知工具或非对象参数均为 provider capability/shape 技术失败，不再提取文本 JSON。OpenAI-compatible 严格 JSON 路径使用与当前工具集合等价的闭合判别联合，但不会伪装成原生工具结果。两条 provider 路径最终投影到同一内部工具调用与同一执行校验。
 
 ### 最小检索计划
 
-`plan.retrieve` 与 `plan.reuse` 的 active 模型输出为 `minimal_retrieval_plan_v1`：
+`plan.retrieve` 与 `plan.reuse` 的 active 模型输出为 `minimal_retrieval_plan_v2`：
 
 ```text
 intent_primary = one intent enum
@@ -294,6 +304,8 @@ BM25 在任一层提名到的候选也必须是合法 active 节点，并通过�
 
 ### 物理路径
 
+过滤域同时约束入口、每一跳节点和最终来源。完整邻接读取不能扩大本轮候选域；域外邻居在入队前确定性裁除并计量，不得经过域外 chunk 形成路径后再在结果阶段补查。结果仅从已核验的当前域对象恢复，缓存身份包括这项遍历边界版本。
+
 新遍历协议为 `layered_distance_traversal_v2`。路径标签保存 layer、根入口、父节点、ordered edge path、累计距离、深度、visit counts、source/support refs 和来源角色。入口融合分与物理路径距离分列。
 
 遍历 dominance 以 `(root_node_id,node_id)` 保存每个根下的最佳状态，因此一个 chunk 可以拥有多条合法根路径。最终结果必须在 `top_k` 前按全局稳定遍历顺序以 `chunk_id` 去重，只保留首条最佳路径；trace 同时记录 `path_candidate_count`、唯一 `candidate_count` 和 `duplicate_path_candidate_count`。路径去重不删除图边、不改变 hard threshold，也不允许未遍历候选补位。
@@ -335,6 +347,12 @@ green 若具有 `semantic_uncertain` 或 `crossing_rq_boundary` 也进入本地�
 
 ### 来源约束
 
+候选准备可把显式文档 ID 过滤下推至带同 KB、active 文档版本与就绪向量条件的 SQL 查询，避免先物化域外正文和向量。下推后仍执行统一过滤与向量/来源身份核验。空域通过不读取正文和向量的原始可用计数区分“全库无可用来源”与“过滤无命中”，不得省略故障核验或扩大候选域。
+
+用户对“当前/本轮已选择或筛选资料”的指代由已有请求过滤域解释，不把其描述性措辞编译成新的字面标题责任。仅在请求具有显式文档过滤、原用户文本具有筛选指代见证、且引用未被明确标为文档名称/标题时，编译器剔除冗余 document/title selector 并记录计数，实体、requirements、查询和权重原样保留。明确命名或引用的来源要求不受此投影影响。
+
+实体名、业务编号、数值和用户约定的指代属于任务/检索语义，不自动形成原文结构位置责任。`text/label` selector 与任务实体或 protected literal 重合时，必须有原用户文本中明确的文本/段落/片段标签位置见证；否则在计划提交工具中返回 `entity_identifier_is_not_text_location`，允许同会话有界修正。真实章节、表格、公式、代码和文本位置责任继续按原范围代数核验。
+
 来源声明区分具体文档与资料族，不能把“某主题的报告”擅自缩成同名文件。过滤一致应用于各通道、所有层、结构恢复、复用和来源提交。字段包括 KB、document/version、source path/type、标签、表示类型与页码；未知页码不能满足具体页码限制。
 
 结构定位使用解析产生的标题、编号、角色、父子关系和原文区间；来源文字按非指令数据处理。用户明确的文档、章节、表格、公式和代码位置须经确定性范围代数核验，必要时可有一次检索前的有界 LLM 候选位置选择。此调用只能在服务器给定候选中定位，不判断答案，不启动结果修正循环。
@@ -369,7 +387,7 @@ Context Package 是回答唯一事实输入，包含实际原文、chunk/版本/
 
 每轮 assistant tool call 与 tool result 成对追加到同一消息历史。下一轮看到原始目录、所有尚未压缩的已读完整原文、既有调用/结果和最近安全错误。普通空、重复、越权或未读 handle 错误不执行动作，只返回 `{error,field}`，并在模型调用预算和共享总时限内允许有界修正；越权、跨域、身份漂移、provider 故障、取消和超时保持技术终态。恢复从持久 `ContextEventLog` 与权威 Context Package 重建相同消息顺序，正文不在 observation 中复制。
 
-每次模型调用前保存 `agent_context_plan_v1`：P0/P1 固定集合、working/compressed/evicted 数量、估算或实际 token、预留输出、稳定前缀 hash、压缩/截断和被排除语义单元。压缩先去除 P4 与重复目录，再压旧 P2 控制历史，最后整单元淘汰未选 P3；最近工具对、当前问题、未满足 requirement、合法工具和已提交原文不可有损压缩。若必要 P0/P1 仍超窗，返回容量技术失败。
+每次模型调用前保存 `agent_context_plan_v2`：P0/P1 固定集合、working/compressed/evicted 数量、估算或实际 token、预留输出、稳定前缀 hash、压缩/截断和被排除语义单元。压缩先去除 P4 与重复目录，再压旧 P2 控制历史，最后整单元淘汰未选 P3；最近工具对、当前问题、未满足 requirement、合法工具和已提交原文不可有损压缩。若必要 P0/P1 仍超窗，返回容量技术失败。
 
 冻结阶段重放完整 Context Package 和 source admission，验证提交及 mandatory handle 非重复且都属于包，并逐项核对原文 hash、span、文档版本、package 和 retrieval trace。结果写为 `generation_evidence_view_v1`，保存完整包 handle 到连续生成局部 `src_n` 的映射及身份，不保存正文。最终生成另建干净上下文，只包含 Task、回答约束和冻结工作集原文；Mid 目录、导航历史和未提交原文不进入事实输入。
 
@@ -390,6 +408,8 @@ Context Package 是回答唯一事实输入，包含实际原文、chunk/版本/
 需要澄清时询问真实歧义，不用模型记忆填补事实。会话摘要只帮助理解当前问题；当前用户要求优先，模型不能把历史 prose 升为新的来源责任。
 
 ## 状态、审计与失败
+
+已接纳执行的内部 `KeyError/IndexError` 属于技术失败，接口保留 run/session 恢复引用，不投影成资料库或会话不存在的 404；真实查找缺失仍使用 404。
 
 ```text
 接纳 → 可选粗层 resource/read → 最终规划 → 本地策略校验 → 来源定位/复用检查
